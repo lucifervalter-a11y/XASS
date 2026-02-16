@@ -1,0 +1,17 @@
+[Unit]
+Description=Serverredus Heartbeat Agent
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/serverredus
+EnvironmentFile=/opt/serverredus/.env
+ExecStart=/opt/serverredus/.venv/bin/python agent/agent.py --server-url http://127.0.0.1:8000 --api-key ${AGENT_API_KEY} --source-name debian-host --source-type SERVER_AGENT --interval-sec 30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
