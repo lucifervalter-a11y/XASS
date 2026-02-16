@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import select
@@ -33,6 +33,7 @@ from app.services.app_config import (
     set_away_schedule,
     set_quiet_hours_window,
     set_notify_chat,
+    set_iphone_shortcut_url,
     set_service_base_url,
     toggle_away_mode,
     toggle_quiet_hours,
@@ -178,6 +179,10 @@ class TelegramUpdateHandler:
             await self._handle_set_url_command(session, config, chat_id, user_id, text)
             await self._safe_send(chat_id, format_settings_text(await get_or_create_app_config(session, self.settings)), reply_markup=settings_keyboard())
             return
+        if command == "/setiphoneshortcut":
+            await self._handle_set_iphone_shortcut_command(session, config, chat_id, user_id, text)
+            await self._safe_send(chat_id, format_settings_text(await get_or_create_app_config(session, self.settings)), reply_markup=settings_keyboard())
+            return
         if command == "/away":
             await self._handle_away_command(session, config, user_id, chat_id, text)
             await self._safe_send(chat_id, format_settings_text(await get_or_create_app_config(session, self.settings)), reply_markup=settings_keyboard())
@@ -228,6 +233,14 @@ class TelegramUpdateHandler:
                 await self._safe_send(chat_id, "Нет доступа. Команда доступна только владельцу.")
                 return
             await self._handle_connect_iphone_command(config, user_id, chat_id)
+            return
+        if command in ("/iphoneshortcut", "/shortcut_iphone"):
+            if not is_owner(user_id, self.settings):
+                await self._safe_send(chat_id, "Нет доступа. Команда доступна только владельцу.")
+                return
+            if user_id is None:
+                return
+            await self._send_iphone_shortcut_setup(config, user_id, chat_id)
             return
         if command in ("/connect_vk", "/addvk", "/vksetup"):
             if not is_owner(user_id, self.settings):
@@ -504,6 +517,22 @@ class TelegramUpdateHandler:
             return None
         return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
+    def _normalize_icloud_shortcut_url(self, raw: str) -> str | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = urlsplit(text)
+        except Exception:
+            return None
+        if parsed.scheme != "https":
+            return None
+        if parsed.netloc.lower() != "www.icloud.com":
+            return None
+        if not parsed.path.lower().startswith("/shortcuts/"):
+            return None
+        return urlunsplit(("https", "www.icloud.com", parsed.path, "", ""))
+
     def _guess_public_base_url(self, config: AppConfig | None = None) -> str | None:
         raw = ""
         if config and config.service_base_url:
@@ -511,6 +540,11 @@ class TelegramUpdateHandler:
         elif self.settings.profile_public_url:
             raw = self.settings.profile_public_url
         return self._normalize_service_base_url(raw)
+
+    def _iphone_shortcut_import_url(self, config: AppConfig | None = None) -> str | None:
+        if not config:
+            return None
+        return self._normalize_icloud_shortcut_url(str(config.iphone_shortcut_url or ""))
 
     async def _handle_set_url_command(
         self,
@@ -552,6 +586,46 @@ class TelegramUpdateHandler:
 
         await set_service_base_url(session, config, normalized, int(user_id))
         await self._safe_send(chat_id, f"URL сервера сохранен: {normalized}")
+
+    async def _handle_set_iphone_shortcut_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+    ) -> None:
+        if not is_owner(user_id, self.settings):
+            await self._safe_send(chat_id, "Нет доступа. Команда доступна только владельцу.")
+            return
+
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1:
+            current = self._iphone_shortcut_import_url(config) or "-"
+            await self._safe_send(
+                chat_id,
+                (
+                    "Использование:\n"
+                    "/setiphoneshortcut https://www.icloud.com/shortcuts/XXXXXXXX\n"
+                    "/setiphoneshortcut off\n\n"
+                    f"Текущий URL: {current}"
+                ),
+            )
+            return
+
+        value = parts[1].strip()
+        if value.lower() in {"off", "clear", "none", "-"}:
+            await set_iphone_shortcut_url(session, config, None, int(user_id))
+            await self._safe_send(chat_id, "URL iPhone Shortcut очищен.")
+            return
+
+        normalized = self._normalize_icloud_shortcut_url(value)
+        if not normalized:
+            await self._safe_send(chat_id, "Некорректная ссылка. Нужен формат: https://www.icloud.com/shortcuts/...")
+            return
+
+        await set_iphone_shortcut_url(session, config, normalized, int(user_id))
+        await self._safe_send(chat_id, f"URL iPhone Shortcut сохранен: {normalized}")
 
     def _profile_iphone_hook_key(self) -> str:
         profile = load_profile(Path(self.settings.profile_json_path))
@@ -657,9 +731,66 @@ class TelegramUpdateHandler:
             "4) Быстрая проверка командой:",
             cmd or "(сначала задайте URL через /seturl)",
             "",
-            "Для iOS Shortcuts: сделайте Shortcut с действием “Get Contents of URL” (POST JSON) на этот endpoint и заголовком X-Api-Key.",
+            "5) Для iOS Shortcuts: нажмите кнопку «🧭 Галерея Shortcuts» ниже или команду /iphoneshortcut.",
         ]
-        await self._safe_send(chat_id, "\n".join(lines), reply_markup=self._now_source_switch_keyboard("iphone"))
+        await self._safe_send(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=self._iphone_shortcut_setup_keyboard("iphone", self._iphone_shortcut_import_url(config)),
+        )
+
+    async def _send_iphone_shortcut_setup(self, config: AppConfig, user_id: int, chat_id: int) -> None:
+        key = await self._ensure_profile_iphone_hook_key(user_id)
+        set_profile_now_playing_source(self.settings, "iphone")
+
+        base_url = self._guess_public_base_url(config)
+        if not base_url:
+            await self._safe_send(
+                chat_id,
+                "Сначала задайте URL сервера: /seturl https://your-domain.tld\n"
+                "После этого повторите команду /iphoneshortcut.",
+            )
+            return
+
+        endpoint = f"{base_url}/profile/now-playing/external"
+        shortcut_name = "Serverredus Now Playing"
+        run_shortcut_url = f"shortcuts://run-shortcut?name={quote(shortcut_name)}"
+        import_url = self._iphone_shortcut_import_url(config)
+
+        lines = [
+            "Готовая заготовка для iPhone Shortcuts",
+            "--------------------------------------",
+            f"Название команды: {shortcut_name}",
+            f"Endpoint: {endpoint}",
+            f"X-Api-Key: {key}",
+            "",
+            "Как собрать команду (1-2 минуты):",
+            "1) Откройте приложение Shortcuts (или кнопку «🧭 Галерея Shortcuts»).",
+            "2) Создайте новую команду и добавьте действие «Получить текущую песню».",
+            "3) Добавьте «Получить содержимое URL»:",
+            f"   URL: {endpoint}",
+            "   Метод: POST",
+            "   Заголовки:",
+            f"   - X-Api-Key: {key}",
+            "   - Content-Type: application/json",
+            "   JSON body (проще):",
+            '   {"source":"iphone","artist":"[Artist]","title":"[Title]"}',
+            "   или один полем text:",
+            '   {"source":"iphone","text":"[Artist] - [Title]"}',
+            "4) В Automation выберите запуск по «Музыка открыта» или «Началось воспроизведение».",
+            "",
+            "После создания можно запускать вручную по ссылке:",
+            run_shortcut_url,
+        ]
+        if import_url:
+            lines.extend(["", "Готовый импорт вашей команды:", import_url])
+        else:
+            lines.extend(["", "Если у вас есть iCloud-ссылка на готовую команду, задайте её:", "/setiphoneshortcut https://www.icloud.com/shortcuts/..."])
+        await self._safe_send(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=self._iphone_shortcut_setup_keyboard("iphone", import_url),
+        )
 
     async def _handle_connect_vk_command(self, chat_id: int) -> None:
         oauth_url = self._build_vk_oauth_url()
@@ -831,6 +962,19 @@ class TelegramUpdateHandler:
             ]
         }
 
+    def _iphone_shortcut_setup_keyboard(self, current_source: str, import_url: str | None = None) -> dict[str, Any]:
+        source_rows = self._now_source_switch_keyboard(current_source).get("inline_keyboard", [])
+        import_rows: list[list[dict[str, str]]] = []
+        if import_url:
+            import_rows.append([{"text": "📥 Импортировать Shortcut", "url": import_url}])
+        return {
+            "inline_keyboard": [
+                *import_rows,
+                [{"text": "🧭 Галерея Shortcuts", "url": "https://www.icloud.com/shortcuts/"}],
+                *source_rows,
+            ]
+        }
+
     def _build_now_source_text(self, current_source: str) -> str:
         return (
             "Источник now listening\n"
@@ -897,6 +1041,9 @@ class TelegramUpdateHandler:
                 {"text": "🟦 Подключить VK", "callback_data": "agents:connect:vk"},
             ],
             [
+                {"text": "🧩 Установить Shortcut", "callback_data": "agents:iphone:shortcut"},
+            ],
+            [
                 {
                     "text": f"{'✅ ' if current_source == 'pc_agent' else ''}ПК",
                     "callback_data": "agents:nowsource:set:pc_agent",
@@ -960,7 +1107,7 @@ class TelegramUpdateHandler:
                 "Удаление: кнопки ниже.",
                 "Добавление: кнопки «🔑 Код подключения» и «➕ Как добавить».",
                 "Архив для ПК: кнопка «📦 Скачать ZIP для ПК».",
-                "Подключение iPhone/VK: кнопки «🍎 Подключить iPhone» и «🟦 Подключить VK».",
+                "Подключение iPhone/VK: кнопки «🍎 Подключить iPhone», «🧩 Установить Shortcut» и «🟦 Подключить VK».",
                 "Переключение музыки: кнопки «ПК / iPhone / VK» или команда /nowsource <pc|iphone|vk>.",
             ]
         )
@@ -1262,6 +1409,17 @@ class TelegramUpdateHandler:
             if user_id is None:
                 return
             await self._handle_connect_iphone_command(config, user_id, chat_id)
+            await self._show_agents_panel(session, config, chat_id, message_id)
+            return
+        if data == "agents:iphone:shortcut":
+            if chat_id is None:
+                return
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Установка Shortcut доступна только владельцу.", self._agents_panel_keyboard(await list_sources(session)))
+                return
+            if user_id is None:
+                return
+            await self._send_iphone_shortcut_setup(config, user_id, chat_id)
             await self._show_agents_panel(session, config, chat_id, message_id)
             return
         if data == "agents:connect:vk":
@@ -1567,6 +1725,20 @@ class TelegramUpdateHandler:
                 "/seturl http://1.2.3.4:8001\n\n"
                 "Очистить:\n"
                 "/seturl off\n\n"
+                f"Текущий URL: {current_url}"
+            )
+            await self._safe_edit_or_send(chat_id, message_id, text, settings_keyboard())
+            return
+        if data == "settings:set_iphone_shortcut_url":
+            current_url = self._iphone_shortcut_import_url(config) or "-"
+            text = (
+                "URL готового iPhone Shortcut\n"
+                "---------------------------\n"
+                "Бот будет добавлять кнопку «📥 Импортировать Shortcut».\n\n"
+                "Установить:\n"
+                "/setiphoneshortcut https://www.icloud.com/shortcuts/XXXXXXXX\n\n"
+                "Очистить:\n"
+                "/setiphoneshortcut off\n\n"
                 f"Текущий URL: {current_url}"
             )
             await self._safe_edit_or_send(chat_id, message_id, text, settings_keyboard())

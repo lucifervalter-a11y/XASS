@@ -97,6 +97,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `/media <chat_id> <message_id>` - отправить сохранённые медиа по сообщению.
 - `/setnotify` - выставить текущий чат как канал уведомлений.
 - `/seturl <url | off>` - сохранить URL сервера для автогенерации готовых команд (без плейсхолдеров).
+- `/setiphoneshortcut <icloud_url | off>` - сохранить iCloud-ссылку на готовый iPhone Shortcut (кнопка импорта в боте).
 - `/quiettime <ЧЧ:ММ-ЧЧ:ММ>` - задать диапазон тихих часов вручную.
 - `/profile_panel` - панель редактирования контента профиля сайта (только owner).
 - `/weatherloc <Название | Широта | Долгота | Timezone>` - задать локацию автопогоды через бота (только owner).
@@ -104,6 +105,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `/nowsource <pc|iphone|vk>` - выбрать источник now listening (только owner; без аргумента показывает кнопки переключения).
 - `/iphonehook` - показать endpoint и ключ для iPhone webhook (только owner).
 - `/connect_iphone` (`/addiphone`) - автонастройка iPhone hook: бот генерирует ключ и присылает готовую команду.
+- `/iphoneshortcut` (`/shortcut_iphone`) - отправить готовую заготовку для iOS Shortcuts с автоподставленными endpoint/ключом.
 - `/connect_vk` (`/addvk`, `/vksetup`) - инструкция и OAuth-ссылка для VK.
 - `/vkset <vk_user_id> <vk_access_token>` - сохранить VK-данные без перезапуска.
 - `/vkclear` - очистить VK-данные.
@@ -234,8 +236,10 @@ chmod +x deploy/backup.sh
 Команды:
 - `/nowsource <pc|iphone|vk>` — переключить источник.
 - `/iphonehook` — показать endpoint + ключ для iPhone.
+- `/iphoneshortcut` — отправить «почти готовую» установку Shortcut (endpoint, ключ, кнопка открытия Shortcuts).
+- `/setiphoneshortcut https://www.icloud.com/shortcuts/...` — добавить кнопку `📥 Импортировать Shortcut`.
 - В `/agents` есть быстрые кнопки переключения источника (`ПК / iPhone / VK`).
-- В `/agents` есть кнопки `🍎 Подключить iPhone` и `🟦 Подключить VK`.
+- В `/agents` есть кнопки `🍎 Подключить iPhone`, `🧩 Установить Shortcut` и `🟦 Подключить VK`.
 - Быстрая автогенерация iPhone ключа: `/connect_iphone`.
 - Быстрое подключение VK токена: `/vkset <vk_user_id> <vk_access_token>`.
 - Перед этим один раз задайте URL: `/seturl https://ваш-домен` (или `http://IP:PORT`).
@@ -244,6 +248,7 @@ iPhone webhook endpoint:
 - `POST /profile/now-playing/external`
 - Header: `X-Api-Key: <IPHONE_NOW_PLAYING_API_KEY>`
 - JSON: `{"text":"Artist - Title","source":"iphone"}`
+  или `{"artist":"Artist","title":"Title","source":"iphone"}`
 
 Пример curl:
 
@@ -251,7 +256,7 @@ iPhone webhook endpoint:
 curl -X POST "https://YOUR_HOST/profile/now-playing/external" \
   -H "X-Api-Key: <IPHONE_NOW_PLAYING_API_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"text":"Artist - Title","source":"iphone"}'
+  -d '{"artist":"Artist","title":"Title","source":"iphone"}'
 ```
 
 Для VK:

@@ -65,6 +65,7 @@ def settings_keyboard() -> dict:
             ],
             [
                 {"text": "URL сервера", "callback_data": "settings:set_url"},
+                {"text": "URL Shortcut iPhone", "callback_data": "settings:set_iphone_shortcut_url"},
             ],
             [
                 {"text": "Назад", "callback_data": "panel:home"},
@@ -208,5 +209,6 @@ def format_settings_text(config: AppConfig) -> str:
         f"Кому можно писать в режиме «не в сети»: {bypass_count}\n"
         f"Автоответ: {away_message}\n"
         f"Чат уведомлений: {config.notify_chat_id}\n"
-        f"URL сервера: {config.service_base_url or '-'}"
+        f"URL сервера: {config.service_base_url or '-'}\n"
+        f"Shortcut iPhone: {config.iphone_shortcut_url or '-'}"
     )

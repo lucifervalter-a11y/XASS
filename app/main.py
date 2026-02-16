@@ -57,6 +57,20 @@ def _verify_api_key(header_value: str | None, expected: str, reason: str) -> Non
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid {reason} key")
 
 
+def _resolve_external_now_playing_text(payload: ExternalNowPlayingPayload) -> str:
+    direct_text = (payload.text or "").strip()
+    if direct_text:
+        return direct_text
+
+    artist = (payload.artist or "").strip()
+    title = (payload.title or payload.track or "").strip()
+    if artist and title:
+        return f"{artist} - {title}"
+    if title:
+        return title
+    return ""
+
+
 async def require_setup_api_key(x_api_key: str | None = Header(default=None)) -> None:
     _verify_api_key(x_api_key, settings.setup_api_key, "setup")
 
@@ -107,7 +121,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Serverredus Telegram Business Control",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -213,11 +227,18 @@ async def profile_now_playing_external(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="iphone now playing key is not configured")
     if incoming not in accepted:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid iphone now playing key")
-    updated = update_profile_now_playing_external(settings, payload.text, source=payload.source)
+    resolved_text = _resolve_external_now_playing_text(payload)
+    if not resolved_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty now playing payload. Send JSON with text, or artist+title.",
+        )
+    updated = update_profile_now_playing_external(settings, resolved_text, source=payload.source)
     return {
         "ok": True,
         "updated": updated,
         "source": payload.source,
+        "text": resolved_text,
     }
 
 

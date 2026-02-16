@@ -167,6 +167,8 @@ async def get_or_create_app_config(session: AsyncSession, settings: Settings) ->
         if config.service_base_url is None:
             config.service_base_url = (settings.profile_public_url or "").strip() or None
             changed = True
+        if config.iphone_shortcut_url is None:
+            config.iphone_shortcut_url = None
 
         if changed:
             await session.commit()
@@ -191,6 +193,7 @@ async def get_or_create_app_config(session: AsyncSession, settings: Settings) ->
         away_bypass_user_ids="",
         notify_chat_id=settings.notify_chat_id,
         service_base_url=(settings.profile_public_url or "").strip() or None,
+        iphone_shortcut_url=None,
     )
     session.add(config)
     await session.commit()
@@ -454,6 +457,22 @@ async def set_service_base_url(
     await session.commit()
     await session.refresh(config)
     await log_admin_action(session, actor_user_id, "set_service_base_url", {"service_base_url": clean})
+    return config
+
+
+async def set_iphone_shortcut_url(
+    session: AsyncSession,
+    config: AppConfig,
+    shortcut_url: str | None,
+    actor_user_id: int,
+) -> AppConfig:
+    clean = (shortcut_url or "").strip() or None
+    config.iphone_shortcut_url = clean
+    config.updated_by_user_id = actor_user_id
+    config.updated_at = _now_utc()
+    await session.commit()
+    await session.refresh(config)
+    await log_admin_action(session, actor_user_id, "set_iphone_shortcut_url", {"iphone_shortcut_url": clean})
     return config
 
 

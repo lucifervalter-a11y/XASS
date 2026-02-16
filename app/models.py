@@ -32,6 +32,7 @@ class AppConfig(Base):
     away_bypass_user_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
     notify_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     service_base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    iphone_shortcut_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

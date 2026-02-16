@@ -42,3 +42,6 @@ class AgentPairClaimResponse(BaseModel):
 class ExternalNowPlayingPayload(BaseModel):
     text: str = Field(default="", max_length=512)
     source: str = Field(default="iphone", min_length=1, max_length=32)
+    artist: str = Field(default="", max_length=256)
+    title: str = Field(default="", max_length=256)
+    track: str = Field(default="", max_length=256)

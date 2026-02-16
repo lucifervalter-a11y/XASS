@@ -61,6 +61,8 @@ def _apply_runtime_migrations(connection) -> None:
         migration_sql.append("ALTER TABLE app_config ADD COLUMN away_bypass_user_ids TEXT")
     if "service_base_url" not in columns:
         migration_sql.append("ALTER TABLE app_config ADD COLUMN service_base_url TEXT")
+    if "iphone_shortcut_url" not in columns:
+        migration_sql.append("ALTER TABLE app_config ADD COLUMN iphone_shortcut_url TEXT")
 
     for statement in migration_sql:
         connection.execute(text(statement))
