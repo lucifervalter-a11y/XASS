@@ -97,6 +97,7 @@ class TelegramUpdateHandler:
         self.profile_avatar_cursor: dict[int, int] = {}
         self.profile_avatar_upload_context: dict[int, dict[str, Any]] = {}
         self.away_bypass_contact_context: dict[int, dict[str, Any]] = {}
+        self.recent_message_cache: dict[tuple[int, int], dict[str, Any]] = {}
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -106,6 +107,7 @@ class TelegramUpdateHandler:
         )
 
     async def handle_update(self, session: AsyncSession, update: dict[str, Any]) -> None:
+        self._cache_recent_message(update)
         config = await get_or_create_app_config(session, self.settings)
         await handle_update_logging(
             session,
@@ -148,6 +150,48 @@ class TelegramUpdateHandler:
             if item:
                 return item
         return None
+
+    def _extract_media_file_ids(self, message: dict[str, Any]) -> list[dict[str, str]]:
+        media: list[dict[str, str]] = []
+        photos = message.get("photo") or []
+        if isinstance(photos, list) and photos:
+            largest = photos[-1]
+            if isinstance(largest, dict):
+                file_id = (largest.get("file_id") or "").strip()
+                if file_id:
+                    media.append({"media_type": "photo", "file_id": file_id})
+
+        for key in ("video", "document", "voice", "video_note", "audio", "sticker", "animation"):
+            item = message.get(key)
+            if not isinstance(item, dict):
+                continue
+            file_id = (item.get("file_id") or "").strip()
+            if file_id:
+                media.append({"media_type": key, "file_id": file_id})
+        return media
+
+    def _cache_recent_message(self, update: dict[str, Any]) -> None:
+        for key in MESSAGE_KEYS:
+            message = update.get(key)
+            if not isinstance(message, dict):
+                continue
+            chat = message.get("chat") or {}
+            chat_id = chat.get("id")
+            message_id = message.get("message_id")
+            try:
+                chat_id_int = int(chat_id)
+                message_id_int = int(message_id)
+            except (TypeError, ValueError):
+                continue
+            text = (message.get("text") or message.get("caption") or "").strip()
+            self.recent_message_cache[(chat_id_int, message_id_int)] = {
+                "text": text,
+                "chat_username": (chat.get("username") or "").strip(),
+                "media_items": self._extract_media_file_ids(message),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            }
+            while len(self.recent_message_cache) > 800:
+                self.recent_message_cache.pop(next(iter(self.recent_message_cache)))
 
     async def _handle_command(self, session: AsyncSession, message: dict[str, Any], text: str) -> None:
         from_user = message.get("from") or {}
@@ -3486,6 +3530,35 @@ class TelegramUpdateHandler:
                 sent += 1
         return sent
 
+    async def _send_media_file_ids(
+        self,
+        *,
+        chat_id: int,
+        source_chat_id: int,
+        source_message_id: int,
+        media_items: list[dict[str, str]],
+        max_items: int = 4,
+    ) -> int:
+        if not self.bot_client:
+            return 0
+        sent = 0
+        for item in media_items:
+            if sent >= max_items:
+                break
+            file_id = (item.get("file_id") or "").strip()
+            media_type = (item.get("media_type") or "media").strip()
+            if not file_id:
+                continue
+            caption = f"{media_type}: {source_chat_id}/{source_message_id}"
+            try:
+                await self.bot_client.send_document_by_file_id(chat_id, file_id, caption=caption)
+                sent += 1
+            except TelegramApiError as exc:
+                logger.warning("Не удалось отправить кэш-медиа по file_id: %s", exc)
+            except Exception:
+                logger.warning("Не удалось отправить кэш-медиа по file_id", exc_info=True)
+        return sent
+
     async def _notify_deleted_events(self, session: AsyncSession, config: AppConfig, update: dict[str, Any]) -> None:
         if not self.bot_client:
             return
@@ -3510,6 +3583,13 @@ class TelegramUpdateHandler:
                 mid_int = int(mid)
             except (TypeError, ValueError):
                 continue
+            cache_key = (chat_id_int, mid_int)
+            cache_entry = self.recent_message_cache.get(cache_key) or {}
+            cached_text = str(cache_entry.get("text") or "").strip()
+            cached_username = str(cache_entry.get("chat_username") or "").strip()
+            cached_media_items = cache_entry.get("media_items") or []
+            if not isinstance(cached_media_items, list):
+                cached_media_items = []
             log_item = await session.scalar(select(MessageLog).where(MessageLog.chat_id == chat_id_int, MessageLog.telegram_message_id == mid_int))
             assets: list[MediaAsset] = []
             if log_item is not None:
@@ -3523,12 +3603,17 @@ class TelegramUpdateHandler:
                 txt = log_item.text_content
             elif assets:
                 txt = "удалено сообщение с медиа (файлы отправлены ниже)"
+            elif cached_text:
+                txt = cached_text
+            elif cached_media_items:
+                txt = "удалено сообщение с медиа (файлы отправлены ниже)"
             log_chat = (log_item.raw_event or {}).get("chat") if log_item and isinstance(log_item.raw_event, dict) else {}
             log_username = (log_chat or {}).get("username") if isinstance(log_chat, dict) else None
-            effective_username = chat_username or log_username
+            effective_username = chat_username or log_username or cached_username
             link_html = self._format_html_links(self._build_deleted_message_links(chat_id_int, mid_int, effective_username))
             link_block = f"\n{link_html}" if link_html else ""
-            media_block = f"\nМедиа: <b>{len(assets)}</b>" if assets else ""
+            media_count = len(assets) if assets else len(cached_media_items)
+            media_block = f"\nМедиа: <b>{media_count}</b>" if media_count else ""
             await self._safe_send(
                 notify_chat_id,
                 (
@@ -3546,6 +3631,14 @@ class TelegramUpdateHandler:
                     source_message_id=mid_int,
                     assets=assets,
                 )
+            elif cached_media_items:
+                await self._send_media_file_ids(
+                    chat_id=notify_chat_id,
+                    source_chat_id=chat_id_int,
+                    source_message_id=mid_int,
+                    media_items=cached_media_items,
+                )
+            self.recent_message_cache.pop(cache_key, None)
 
     def _inline_diff(self, old_text: str, new_text: str) -> str:
         if old_text == new_text:
