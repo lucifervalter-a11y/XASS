@@ -351,15 +351,23 @@ foreach ($projects as $item) {
         }
 
         .topbar {
-            display: flex;
+            display: grid;
+            grid-template-columns: auto 1fr auto;
             align-items: center;
-            justify-content: space-between;
-            gap: 12px;
+            gap: 14px;
             border: 1px solid var(--line);
             border-radius: 14px;
             background: rgba(7, 12, 24, 0.84);
-            padding: 10px 12px;
-            backdrop-filter: blur(8px);
+            padding: 12px 14px;
+            backdrop-filter: blur(10px);
+            min-height: 74px;
+        }
+
+        .topbar-spacer {
+            width: 152px;
+            height: 1px;
+            visibility: hidden;
+            pointer-events: none;
         }
 
         .back-link {
@@ -383,6 +391,14 @@ foreach ($projects as $item) {
             margin: 0;
             font-size: clamp(20px, 2.8vw, 34px);
             letter-spacing: 0.01em;
+            justify-self: center;
+            text-align: center;
+            padding: 6px 16px;
+            border-radius: 12px;
+            border: 1px solid rgba(124, 178, 255, 0.26);
+            background: rgba(8, 15, 30, 0.64);
+            backdrop-filter: blur(12px);
+            box-shadow: 0 12px 28px rgba(6, 16, 35, 0.38);
         }
 
         .subtitle {
@@ -564,6 +580,44 @@ foreach ($projects as $item) {
                 grid-template-columns: 1fr;
             }
         }
+
+        @media (max-width: 700px) {
+            .topbar {
+                grid-template-columns: 1fr;
+                min-height: 0;
+                gap: 10px;
+                padding: 12px;
+                background: rgba(7, 12, 24, 0.72);
+                backdrop-filter: blur(12px);
+            }
+            .topbar-spacer {
+                display: none;
+            }
+            .back-link {
+                justify-self: start;
+            }
+            .title {
+                justify-self: start;
+                text-align: left;
+                width: fit-content;
+                max-width: 100%;
+                font-size: clamp(24px, 8vw, 34px);
+                background: rgba(8, 15, 30, 0.78);
+                border-color: rgba(130, 196, 255, 0.3);
+                box-shadow: 0 14px 34px rgba(3, 10, 24, 0.55);
+            }
+            .card-body {
+                background: rgba(8, 15, 30, 0.72);
+                backdrop-filter: blur(10px);
+                border-top: 1px solid rgba(123, 173, 236, 0.2);
+            }
+            .project-title,
+            .project-subtitle,
+            .description,
+            .years {
+                text-shadow: 0 2px 12px rgba(2, 9, 20, 0.8);
+            }
+        }
     </style>
 </head>
 <body>
@@ -579,10 +633,8 @@ foreach ($projects as $item) {
 <main class="wrap">
     <header class="topbar">
         <a class="back-link" href="/profile.php">← Вернуться назад</a>
-        <div>
-            <h1 class="title">Проекты</h1>
-            <p class="subtitle">Актуальный список из data/projects.json</p>
-        </div>
+        <h1 class="title">Проекты</h1>
+        <span class="topbar-spacer" aria-hidden="true"></span>
     </header>
 
     <?php if ($featured !== null): ?>
