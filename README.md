@@ -307,17 +307,28 @@ curl -X POST "https://YOUR_HOST/profile/now-playing/external" \
 
 ## One-file installer (Linux)
 
-Use one script for full setup in terminal:
+Fast setup from a clean server in one command:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/lucifervalter-a11y/XASS/main/bootstrap-install.sh)
+```
+
+What this does:
+- downloads/updates repo to selected folder;
+- runs `install.sh` interactive wizard automatically;
+- asks for required values (BOT token, owner/admin IDs, keys, mode).
+
+To auto-run project after install:
+1. In wizard select mode `server`.
+2. Confirm `Install systemd services now?` -> `y`.
+3. Services will be enabled and started (`serverredus-backend`, optional `serverredus-agent`).
+
+Manual fallback (if you already have project files):
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
-
-Installer modes:
-- `local` - sets `USE_POLLING=true` and prepares local run.
-- `server` - sets `USE_POLLING=false` and can install systemd services.
-- `agent` - installs heartbeat-only client (`.agent.env` + `run-agent.sh`) with optional systemd autostart.
 
 ## Agent Pairing (Auto Key for PC)
 
