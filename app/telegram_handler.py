@@ -1922,7 +1922,9 @@ class TelegramUpdateHandler:
         else:
             lines.append("Последняя в origin: -")
 
-        if status.has_updates:
+        if status.current is None or status.remote is None:
+            lines.append("Статус: не удалось определить обновления.")
+        elif status.has_updates:
             lines.append("Статус: доступно обновление.")
         else:
             lines.append("Статус: обновлений нет.")

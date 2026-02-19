@@ -113,6 +113,15 @@ def _run_command(
     return completed
 
 
+def _is_git_repo(cwd: Path) -> bool:
+    completed = _run_command(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=cwd,
+        check=False,
+    )
+    return completed.returncode == 0 and (completed.stdout or "").strip().lower() == "true"
+
+
 def _command_exists(name: str) -> bool:
     from shutil import which
 
@@ -156,9 +165,15 @@ def get_current_branch(*, repo_root: Path | None = None) -> str:
     return branch or "main"
 
 
-def fetch_remote(branch: str, *, repo_root: Path | None = None, log_path: Path | None = None) -> None:
+def fetch_remote(branch: str, *, repo_root: Path | None = None, log_path: Path | None = None) -> bool:
     root = repo_root or _repo_root()
-    _run_command(["git", "fetch", "--prune", "origin", branch], cwd=root, log_path=log_path, check=False)
+    completed = _run_command(
+        ["git", "fetch", "--prune", "origin", branch],
+        cwd=root,
+        log_path=log_path,
+        check=False,
+    )
+    return completed.returncode == 0
 
 
 def _remote_branch_exists(branch: str, *, repo_root: Path) -> bool:
@@ -454,11 +469,35 @@ def read_changelog_excerpt(*, repo_root: Path | None = None, max_lines: int = 80
 def get_update_status(settings: Settings) -> UpdateStatus:
     root = _repo_root()
     errors: list[str] = []
+    release = get_latest_release_notes(settings)
+    changelog_excerpt = read_changelog_excerpt(repo_root=root) if release is None else None
+
+    if not _is_git_repo(root):
+        branch = (settings.update_branch or "").strip() or "main"
+        errors.append("Каталог приложения не является git-репозиторием (.git отсутствует).")
+        errors.append("Источник данных для /update: локальный git (HEAD и origin/<ветка>).")
+        return UpdateStatus(
+            branch=branch,
+            current=None,
+            remote=None,
+            has_updates=False,
+            commits=[],
+            release=release,
+            changelog_excerpt=changelog_excerpt,
+            errors=errors,
+        )
+
     try:
         branch = resolve_branch(settings, repo_root=root)
-        fetch_remote(branch, repo_root=root)
+        fetch_ok = fetch_remote(branch, repo_root=root)
+        if not fetch_ok:
+            errors.append(f"Не удалось выполнить git fetch origin {branch}.")
         current = get_commit_info("HEAD", repo_root=root)
         remote = get_remote_commit(branch, repo_root=root)
+        if current is None:
+            errors.append("Не удалось определить текущий commit (HEAD).")
+        if remote is None:
+            errors.append(f"Не удалось определить commit origin/{branch}.")
         has_updates = bool(current and remote and current.full_hash != remote.full_hash)
         commits = get_commits_between("HEAD", f"origin/{branch}", repo_root=root, limit=30) if has_updates else []
     except Exception as exc:
@@ -469,8 +508,6 @@ def get_update_status(settings: Settings) -> UpdateStatus:
         has_updates = False
         commits = []
 
-    release = get_latest_release_notes(settings)
-    changelog_excerpt = read_changelog_excerpt(repo_root=root) if release is None else None
     return UpdateStatus(
         branch=branch,
         current=current,
@@ -620,4 +657,3 @@ def read_update_log_tail(settings: Settings, *, lines: int = 40) -> str:
     else:
         selected = all_lines[-lines:]
     return "\n".join(selected).strip()
-
