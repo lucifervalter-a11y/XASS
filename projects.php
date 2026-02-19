@@ -96,7 +96,8 @@ function normalize_media_src(mixed $value): string
     if (preg_match('~^https?://~i', $text) === 1) {
         return $text;
     }
-    return '';
+    // Backward compatibility for values like "assets/projects/file.jpg"
+    return '/' . ltrim($text, '/');
 }
 
 function normalize_tags(mixed $value): array

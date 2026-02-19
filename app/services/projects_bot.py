@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -81,14 +82,20 @@ class ProjectsBotService:
         years = item.get("years") if isinstance(item.get("years"), dict) else {}
         tags = item.get("tags") if isinstance(item.get("tags"), list) else []
         cover = item.get("cover") if isinstance(item.get("cover"), dict) else {}
+        subtitle = str(item.get("subtitle") or "").strip() or "-"
+        description = str(item.get("description") or "").strip() or "-"
+        if len(description) > 220:
+            description = f"{description[:217]}..."
         return (
-            f"Название: {item.get('title') or '-'}\\n"
-            f"ID: {item.get('id') or '-'}\\n"
-            f"Статус: {item.get('status') or '-'}\\n"
-            f"Годы: {years.get('from') or '-'}-{years.get('to') or '-'}\\n"
-            f"Ссылка: {item.get('url') or 'нет'}\\n"
-            f"Теги: {', '.join(str(v) for v in tags) if tags else '-'}\\n"
-            f"Cover: {cover.get('type') or 'image'} | {cover.get('src') or '-'}\\n"
+            f"Название: {item.get('title') or '-'}\n"
+            f"ID: {item.get('id') or '-'}\n"
+            f"Статус: {item.get('status') or '-'}\n"
+            f"Годы: {years.get('from') or '-'}-{years.get('to') or '-'}\n"
+            f"Подзаголовок: {subtitle}\n"
+            f"Описание: {description}\n"
+            f"Ссылка: {item.get('url') or 'нет'}\n"
+            f"Теги: {', '.join(str(v) for v in tags) if tags else '-'}\n"
+            f"Cover: {cover.get('type') or 'image'} | {cover.get('src') or '-'}\n"
             f"Обновлено: {item.get('updated_at') or '-'}"
         )
 
@@ -127,7 +134,11 @@ class ProjectsBotService:
     def _parse_tags(self, raw: str) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
-        for part in (raw or "").split(","):
+        source = (raw or "").strip()
+        if not source:
+            return []
+        # Accept: "python, fastapi", "python fastapi", "python;fastapi"
+        for part in re.split(r"[,\s;]+", source):
             tag = part.strip()
             if not tag:
                 continue
@@ -199,7 +210,7 @@ class ProjectsBotService:
             lines.append(f"{idx}. {item.get('title') or '-'} | {item.get('status') or '-'} | {years.get('from') or '-'}-{years.get('to') or '-'}")
         if not projects:
             lines.append("Список пуст. Нажмите «Добавить проект».")
-        await self.safe_edit_or_send(chat_id, message_id, "\\n".join(lines), self._list_keyboard(projects, p, pages))
+        await self.safe_edit_or_send(chat_id, message_id, "\n".join(lines), self._list_keyboard(projects, p, pages))
 
     async def show_project(self, *, chat_id: int | None, message_id: int | None, project_id: str) -> None:
         if chat_id is None:
@@ -218,7 +229,7 @@ class ProjectsBotService:
         _, site_cfg_path, _, _ = self._paths()
         cfg = ensure_site_config_exists(site_cfg_path)
         bg = cfg.get("projects_background") if isinstance(cfg.get("projects_background"), dict) else {}
-        text = f"Фон проектов\\n------------\\nТип: {bg.get('type') or 'image'}\\nsrc: {bg.get('src') or '-'}"
+        text = f"Фон проектов\n------------\nТип: {bg.get('type') or 'image'}\nsrc: {bg.get('src') or '-'}"
         kb = {"inline_keyboard": [[{"text": "🖼 Upload image", "callback_data": "projects:bgimg"}, {"text": "🎬 Upload video", "callback_data": "projects:bgvid"}], [{"text": "🔗 URL", "callback_data": "projects:bgurl"}, {"text": "🧹 Очистить", "callback_data": "projects:bgclear"}], [{"text": "⬅️ К проектам", "callback_data": "projects:list:0"}]]}
         await self.safe_edit_or_send(chat_id, message_id, text, kb)
     async def handle_callback(self, *, chat_id: int | None, message_id: int | None, user_id: int, data: str) -> bool:
@@ -577,9 +588,9 @@ class ProjectsBotService:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True, trust_env=False) as client:
                 response = await client.get(url, headers={"User-Agent": "serverredus-project-check/1.0"})
             ok = 200 <= response.status_code < 400
-            await self.safe_send(chat_id, f"Проверка URL: {'доступен' if ok else 'недоступен'}\\nHTTP: {response.status_code}\\n{response.url}")
+            await self.safe_send(chat_id, f"Проверка URL: {'доступен' if ok else 'недоступен'}\nHTTP: {response.status_code}\n{response.url}")
         except Exception as exc:
-            await self.safe_send(chat_id, f"Проверка URL: ошибка\\n{exc}")
+            await self.safe_send(chat_id, f"Проверка URL: ошибка\n{exc}")
 
     def _extract_media(self, message: dict[str, Any], media_type: str) -> tuple[str, str] | None:
         if media_type == "image":
