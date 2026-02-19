@@ -514,6 +514,7 @@ $weatherDetails = array_slice($weatherParts, 1, 4);
 $weatherIcon = weatherIconFromText($weatherText !== '' ? $weatherText : $weatherMainLine);
 $telegramLabel = $displayUsername !== '' ? "t.me/{$displayUsername}" : 'Открыть Telegram';
 $weatherLabel = $weatherLocationName !== '' ? "Погода · {$weatherLocationName}" : 'Погода';
+$projectsPageUrl = '/projects.php';
 ?>
 <!doctype html>
 <html lang="ru">
@@ -740,6 +741,18 @@ $weatherLabel = $weatherLocationName !== '' ? "Погода · {$weatherLocation
         }
 
         .mini-link:hover { border-color: rgba(var(--glow), 0.5); }
+
+        .projects-link {
+            margin-top: 10px;
+            background: linear-gradient(140deg, rgba(17, 34, 58, 0.92), rgba(7, 15, 28, 0.92));
+            border-color: rgba(107, 177, 246, 0.48);
+            box-shadow: 0 10px 26px rgba(15, 44, 90, 0.22);
+        }
+
+        .projects-link:hover {
+            border-color: rgba(150, 217, 255, 0.72);
+            box-shadow: 0 12px 30px rgba(26, 75, 146, 0.34);
+        }
 
         .telegram-strip {
             margin-top: 12px;
@@ -1056,6 +1069,10 @@ $weatherLabel = $weatherLocationName !== '' ? "Погода · {$weatherLocation
                     </a>
                 <?php endforeach; ?>
             </div>
+
+            <a class="mini-link projects-link" href="<?= escapeHtml($projectsPageUrl) ?>">
+                ↗ Проекты
+            </a>
 
             <?php if (!empty($moreLinks)): ?>
                 <div class="more-links">

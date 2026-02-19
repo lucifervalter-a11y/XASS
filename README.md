@@ -100,6 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `/setiphoneshortcut <icloud_url | off>` - сохранить iCloud-ссылку на готовый iPhone Shortcut (кнопка импорта в боте).
 - `/quiettime <ЧЧ:ММ-ЧЧ:ММ>` - задать диапазон тихих часов вручную.
 - `/profile_panel` - панель редактирования контента профиля сайта (только owner).
+- `/projects` - панель управления проектами (добавить/редактировать/удалить/featured/фон страницы, только owner).
 - `/weatherloc <Название | Широта | Долгота | Timezone>` - задать локацию автопогоды через бота (только owner).
 - `/weatherrefresh` - принудительно обновить погоду сейчас (только owner).
 - `/nowsource <pc|iphone|vk>` - выбрать источник now listening (только owner; без аргумента показывает кнопки переключения).
@@ -296,6 +297,13 @@ curl -X POST "https://YOUR_HOST/profile/now-playing/external" \
 - случайные фото/скриншоты из других чатов теперь игнорируются
 - новый файл автоматически станет текущим `avatar_url` в профиле
 - листание аватаров доступно в `/profile_panel` -> `🖼 Аватары`
+
+## Projects page
+
+- New web page: `/projects.php` (also `/projects/`).
+- Data source: `data/projects.json` (or `PROJECTS_JSON_PATH` env override).
+- Background source: `data/site_config.json` key `projects_background` (or `SITE_CONFIG_JSON_PATH` env override).
+- Profile page now has a direct button to open Projects.
 
 ## One-file installer (Linux)
 
