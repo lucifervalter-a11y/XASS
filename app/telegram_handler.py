@@ -1,5 +1,6 @@
 ﻿import logging
 import secrets
+import asyncio
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -67,6 +68,15 @@ from app.services.profile_editor import (
     validate_http_url,
 )
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, sync_profile_weather
+from app.services.projects_bot import ProjectsBotService
+from app.services.updater import (
+    CommitInfo,
+    UpdateStatus,
+    get_update_status,
+    read_update_log_tail,
+    rollback,
+    run_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +95,13 @@ class TelegramUpdateHandler:
         self.profile_avatar_cursor: dict[int, int] = {}
         self.profile_avatar_upload_context: dict[int, dict[str, Any]] = {}
         self.away_bypass_contact_context: dict[int, dict[str, Any]] = {}
+        self.projects_service = ProjectsBotService(
+            settings=settings,
+            bot_client=bot_client,
+            safe_send=self._safe_send,
+            safe_edit_or_send=self._safe_edit_or_send,
+            path_to_url=self._avatar_path_to_url,
+        )
 
     async def handle_update(self, session: AsyncSession, update: dict[str, Any]) -> None:
         config = await get_or_create_app_config(session, self.settings)
@@ -113,6 +130,10 @@ class TelegramUpdateHandler:
         if await self._maybe_handle_profile_avatar_upload(message):
             return
         if await self._maybe_handle_profile_dialog_input(message):
+            return
+        if await self._maybe_handle_projects_upload(message):
+            return
+        if await self._maybe_handle_projects_dialog_input(message):
             return
 
         text = (message.get("text") or "").strip()
@@ -209,6 +230,24 @@ class TelegramUpdateHandler:
             return
         if command == "/pcname":
             await self._handle_pcname_command(session, chat_id, user_id, text)
+            return
+        if command == "/update":
+            if not is_owner(user_id, self.settings):
+                await self._safe_send(chat_id, "Нет доступа. Обновление доступно только владельцу.")
+                return
+            await self._show_update_panel(chat_id=chat_id, message_id=None)
+            return
+        if command == "/projects":
+            if not is_owner(user_id, self.settings):
+                await self._safe_send(chat_id, "Нет доступа. Управление проектами доступно только владельцу.")
+                return
+            await self._show_projects_panel(chat_id=chat_id, message_id=None, page=0)
+            return
+        if command == "/projects_bg":
+            if not is_owner(user_id, self.settings):
+                await self._safe_send(chat_id, "Нет доступа. Настройка фона доступна только владельцу.")
+                return
+            await self._show_projects_background_panel(chat_id=chat_id, message_id=None)
             return
         if command == "/profile_panel":
             if not is_owner(user_id, self.settings):
@@ -1388,6 +1427,12 @@ class TelegramUpdateHandler:
         if data == "panel:logs":
             await self._safe_edit_or_send(chat_id, message_id, await self._build_logs_text(session), main_panel_keyboard())
             return
+        if data == "panel:update":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                return
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+            return
         if data == "agents:pair:create":
             if chat_id is None:
                 return
@@ -1510,6 +1555,12 @@ class TelegramUpdateHandler:
                 return
             await self._show_profile_panel(chat_id, message_id)
             return
+        if data == "panel:projects":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Раздел проектов доступен только владельцу.", main_panel_keyboard())
+                return
+            await self._show_projects_panel(chat_id=chat_id, message_id=message_id, page=0)
+            return
         if data == "panel:settings":
             await self._safe_edit_or_send(chat_id, message_id, format_settings_text(config), settings_keyboard())
             return
@@ -1524,9 +1575,58 @@ class TelegramUpdateHandler:
                 return
             await self._handle_profile_callback(chat_id, message_id, user_id, data)
             return
+        if data.startswith("projects:"):
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(
+                    chat_id,
+                    message_id,
+                    "Нет доступа. Управление проектами доступно только владельцу.",
+                    main_panel_keyboard(),
+                )
+                return
+            await self._handle_projects_callback(chat_id=chat_id, message_id=message_id, user_id=user_id, data=data)
+            return
         if data == "panel:export":
             if chat_id is not None:
                 await self._send_export(session, chat_id, user_id)
+            return
+        if data == "update:refresh":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                return
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+            return
+        if data == "update:changes":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                return
+            if chat_id is None:
+                return
+            await self._send_update_changes(chat_id=chat_id)
+            return
+        if data == "update:run":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                return
+            await self._run_update_flow(chat_id=chat_id, message_id=message_id)
+            return
+        if data == "update:rollback:ask":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", main_panel_keyboard())
+                return
+            await self._safe_edit_or_send(chat_id, message_id, "Откатить проект к предыдущему известному commit?", self._update_rollback_confirm_keyboard())
+            return
+        if data == "update:rollback:run":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", main_panel_keyboard())
+                return
+            await self._run_rollback_flow(chat_id=chat_id, message_id=message_id)
+            return
+        if data == "update:rollback:cancel":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", main_panel_keyboard())
+                return
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
             return
         if data == "settings:save_mode":
             config = await cycle_save_mode(session, config, user_id)
@@ -1743,6 +1843,258 @@ class TelegramUpdateHandler:
             )
             await self._safe_edit_or_send(chat_id, message_id, text, settings_keyboard())
             return
+
+    async def _show_projects_panel(self, *, chat_id: int | None, message_id: int | None, page: int = 0) -> None:
+        await self.projects_service.show_panel(chat_id=chat_id, message_id=message_id, page=page)
+
+    async def _show_projects_background_panel(self, *, chat_id: int | None, message_id: int | None) -> None:
+        await self.projects_service.show_bg(chat_id=chat_id, message_id=message_id)
+
+    async def _handle_projects_callback(
+        self,
+        *,
+        chat_id: int | None,
+        message_id: int | None,
+        user_id: int,
+        data: str,
+    ) -> None:
+        await self.projects_service.handle_callback(chat_id=chat_id, message_id=message_id, user_id=user_id, data=data)
+
+    async def _maybe_handle_projects_dialog_input(self, message: dict[str, Any]) -> bool:
+        user_id = (message.get("from") or {}).get("id")
+        return await self.projects_service.maybe_handle_dialog_input(message, user_id=user_id)
+
+    async def _maybe_handle_projects_upload(self, message: dict[str, Any]) -> bool:
+        user_id = (message.get("from") or {}).get("id")
+        return await self.projects_service.maybe_handle_upload(message, user_id=user_id)
+
+    def _format_commit_datetime(self, raw_iso: str) -> str:
+        text = (raw_iso or "").strip()
+        if not text:
+            return "-"
+        try:
+            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    def _format_commit_brief(self, item: CommitInfo | None) -> str:
+        if item is None:
+            return "-"
+        stamp = self._format_commit_datetime(item.date_iso)
+        subject = (item.subject or "").strip()
+        return f"{item.short_hash} ({stamp}) {subject}"
+
+    def _update_panel_keyboard(self, status: UpdateStatus) -> dict[str, Any]:
+        updates_label = "🚀 Обновить сейчас" if status.has_updates else "🚀 Проверить и обновить"
+        rows: list[list[dict[str, str]]] = [
+            [{"text": "🔄 Обновить статус", "callback_data": "update:refresh"}],
+            [
+                {"text": "📋 Показать изменения", "callback_data": "update:changes"},
+                {"text": updates_label, "callback_data": "update:run"},
+            ],
+            [{"text": "↩️ Откатиться", "callback_data": "update:rollback:ask"}],
+            [{"text": "⬅️ Назад", "callback_data": "panel:home"}],
+        ]
+        return {"inline_keyboard": rows}
+
+    def _update_rollback_confirm_keyboard(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Подтвердить откат", "callback_data": "update:rollback:run"},
+                    {"text": "✖️ Отмена", "callback_data": "update:rollback:cancel"},
+                ],
+            ]
+        }
+
+    def _format_update_status_text(self, status: UpdateStatus) -> str:
+        lines = [
+            "Обновление проекта",
+            "------------------",
+            f"Ветка: {status.branch}",
+            f"Текущая версия: {self._format_commit_brief(status.current)}",
+        ]
+        if status.remote:
+            lines.append(f"Последняя в origin: {self._format_commit_brief(status.remote)}")
+        else:
+            lines.append("Последняя в origin: -")
+
+        if status.has_updates:
+            lines.append("Статус: доступно обновление.")
+        else:
+            lines.append("Статус: обновлений нет.")
+
+        if status.commits:
+            lines.extend(["", "Коротко по изменениям:"])
+            for item in status.commits[:5]:
+                lines.append(f"- {item.short_hash} {item.subject}")
+
+        if status.release:
+            release_name = (status.release.get("name") or status.release.get("tag") or "").strip()
+            if release_name:
+                lines.extend(["", f"Release: {release_name}"])
+
+        if status.errors:
+            lines.extend(["", "Ошибки при проверке:"])
+            lines.extend(f"- {err}" for err in status.errors)
+        return "\n".join(lines)
+
+    def _chunk_text(self, text: str, limit: int = 3500) -> list[str]:
+        clean = text.strip()
+        if not clean:
+            return []
+        if len(clean) <= limit:
+            return [clean]
+        chunks: list[str] = []
+        current = ""
+        for line in clean.splitlines():
+            candidate = f"{current}\n{line}".strip() if current else line
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            if len(line) <= limit:
+                current = line
+            else:
+                start = 0
+                while start < len(line):
+                    part = line[start : start + limit]
+                    if len(part) == limit:
+                        chunks.append(part)
+                    else:
+                        current = part
+                    start += limit
+                if len(line) % limit == 0:
+                    current = ""
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async def _show_update_panel(self, *, chat_id: int | None, message_id: int | None) -> None:
+        if chat_id is None:
+            return
+        status = await asyncio.to_thread(get_update_status, self.settings)
+        text = self._format_update_status_text(status)
+        await self._safe_edit_or_send(chat_id, message_id, text, self._update_panel_keyboard(status))
+
+    async def _send_update_changes(self, *, chat_id: int) -> None:
+        status = await asyncio.to_thread(get_update_status, self.settings)
+        lines = [
+            "Изменения перед обновлением",
+            "---------------------------",
+            f"Ветка: {status.branch}",
+            "",
+        ]
+        if status.release:
+            release_name = (status.release.get("name") or status.release.get("tag") or "").strip() or "-"
+            published = self._format_commit_datetime(str(status.release.get("published_at") or ""))
+            lines.extend(
+                [
+                    f"Release: {release_name}",
+                    f"Опубликован: {published}",
+                ]
+            )
+            release_url = str(status.release.get("url") or "").strip()
+            if release_url:
+                lines.append(f"URL: {release_url}")
+            body = str(status.release.get("body") or "").strip()
+            if body:
+                lines.extend(["", "Release notes:", body])
+        elif status.changelog_excerpt:
+            lines.extend(["CHANGELOG.md (фрагмент):", status.changelog_excerpt])
+        elif status.commits:
+            lines.append("Релиз-нот не найден, показываю коммиты.")
+        else:
+            lines.append("Изменений между текущей и удаленной версией нет.")
+
+        if status.commits:
+            lines.extend(["", "Коммиты:"])
+            for item in status.commits:
+                lines.append(
+                    f"- {item.short_hash} {item.subject} ({item.author}, {self._format_commit_datetime(item.date_iso)})"
+                )
+
+        text = "\n".join(lines).strip()
+        for chunk in self._chunk_text(text):
+            await self._safe_send(chat_id, chunk)
+
+    async def _run_update_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
+        if chat_id is None:
+            return
+        await self._safe_edit_or_send(chat_id, message_id, "Обновляю проект, подождите...", None)
+        result = await asyncio.to_thread(run_update, self.settings)
+        status = await asyncio.to_thread(get_update_status, self.settings)
+        log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+
+        summary_lines = []
+        if result.ok:
+            summary_lines.append("✅ Обновление завершено.")
+        else:
+            summary_lines.append("❌ Обновление завершилось с ошибкой.")
+            if result.error:
+                summary_lines.append(f"Ошибка: {result.error}")
+
+        summary_lines.extend(
+            [
+                f"Ветка: {result.branch}",
+                f"Было: {self._format_commit_brief(result.before)}",
+                f"Стало: {self._format_commit_brief(result.after)}",
+                f"Изменено файлов: {len(result.changed_files)}",
+            ]
+        )
+        if result.steps:
+            summary_lines.append("Шаги: " + ", ".join(result.steps))
+
+        await self._safe_edit_or_send(
+            chat_id,
+            message_id,
+            "\n".join(summary_lines),
+            self._update_panel_keyboard(status),
+        )
+
+        if log_tail:
+            for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
+                await self._safe_send(chat_id, chunk)
+
+    async def _run_rollback_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
+        if chat_id is None:
+            return
+        await self._safe_edit_or_send(chat_id, message_id, "Выполняю откат, подождите...", None)
+        result = await asyncio.to_thread(rollback, self.settings, None)
+        status = await asyncio.to_thread(get_update_status, self.settings)
+        log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+
+        lines = []
+        if result.ok:
+            lines.append("✅ Откат выполнен.")
+        else:
+            lines.append("❌ Откат завершился с ошибкой.")
+            if result.error:
+                lines.append(f"Ошибка: {result.error}")
+        lines.extend(
+            [
+                f"Целевой commit: {result.target_commit or '-'}",
+                f"Было: {self._format_commit_brief(result.before)}",
+                f"Стало: {self._format_commit_brief(result.after)}",
+            ]
+        )
+        if result.steps:
+            lines.append("Шаги: " + ", ".join(result.steps))
+
+        await self._safe_edit_or_send(
+            chat_id,
+            message_id,
+            "\n".join(lines),
+            self._update_panel_keyboard(status),
+        )
+
+        if log_tail:
+            for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
+                await self._safe_send(chat_id, chunk)
 
     def _profile_paths(self) -> tuple[Path, Path, Path]:
         return (

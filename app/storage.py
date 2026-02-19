@@ -14,6 +14,16 @@ def ensure_data_dirs() -> None:
     Path(settings.profile_backups_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.profile_audit_log_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.profile_avatars_dir).mkdir(parents=True, exist_ok=True)
+    projects_path = Path(settings.projects_json_path)
+    projects_path.parent.mkdir(parents=True, exist_ok=True)
+    site_config_path = Path(settings.site_config_json_path)
+    site_config_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.projects_backups_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.projects_audit_log_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.projects_assets_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.backgrounds_assets_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.update_log_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.update_state_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 def _safe_token(value: str) -> str:

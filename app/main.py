@@ -27,6 +27,7 @@ from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbe
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.profile_editor import ensure_profile_exists, load_profile
 from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, update_profile_now_playing_external
+from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
 
@@ -83,6 +84,8 @@ class WebhookSetupPayload(BaseModel):
 async def lifespan(_: FastAPI):
     ensure_data_dirs()
     ensure_profile_exists(Path(settings.profile_json_path))
+    ensure_projects_exists(Path(settings.projects_json_path))
+    ensure_site_config_exists(Path(settings.site_config_json_path))
     await init_db()
     async with SessionLocal() as session:
         await get_or_create_app_config(session, settings)
@@ -121,7 +124,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Serverredus Telegram Business Control",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 

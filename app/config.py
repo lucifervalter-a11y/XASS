@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     profile_audit_log_path: str = "./data/audit.log"
     profile_public_url: str = ""
     profile_avatars_dir: str = "./data/avatars"
+    projects_json_path: str = "./data/projects.json"
+    site_config_json_path: str = "./data/site_config.json"
+    projects_backups_dir: str = "./data/backups/projects"
+    projects_audit_log_path: str = "./data/projects_audit.log"
+    projects_assets_dir: str = "./assets/projects"
+    backgrounds_assets_dir: str = "./assets/backgrounds"
     now_playing_source_default: str = "pc_agent"
     iphone_now_playing_api_key: str = ""
     iphone_now_playing_stale_minutes: int = 180
@@ -69,6 +75,17 @@ class Settings(BaseSettings):
     polling_request_timeout_sec: int = 25
     polling_retry_delay_sec: int = 2
     polling_drop_pending_updates: bool = False
+    github_repo: str = ""
+    github_token: str = ""
+    update_branch: str = "main"
+    service_restart_mode: str = "systemd"
+    systemd_service_name: str = "serverredus-backend"
+    docker_compose_file: str = ""
+    docker_compose_service: str = ""
+    pm2_process_name: str = ""
+    custom_restart_cmd: str = ""
+    update_log_path: str = "./data/logs/update.log"
+    update_state_path: str = "./data/update_state.json"
     timezone: str = "UTC"
     top_processes_limit: int = 5
 
@@ -125,6 +142,19 @@ class Settings(BaseSettings):
             return "UTC"
         text = str(value).strip()
         return text or "UTC"
+
+    @field_validator("service_restart_mode", mode="before")
+    @classmethod
+    def _normalize_restart_mode(cls, value: Any) -> str:
+        allowed = {"systemd", "docker_compose", "pm2", "custom", "none"}
+        text = str(value or "").strip().lower()
+        return text if text in allowed else "systemd"
+
+    @field_validator("update_branch", mode="before")
+    @classmethod
+    def _normalize_update_branch(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        return text or "main"
 
     @field_validator("now_playing_source_default", mode="before")
     @classmethod
