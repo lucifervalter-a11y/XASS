@@ -1756,7 +1756,7 @@ class TelegramUpdateHandler:
                 return
             if chat_id is None:
                 return
-            await self._send_update_changes(chat_id=chat_id)
+            await self._send_update_changes(chat_id=chat_id, message_id=message_id)
             return
         if data == "update:run":
             if not is_owner(user_id, self.settings):
@@ -2065,6 +2065,13 @@ class TelegramUpdateHandler:
             ]
         }
 
+    def _update_changes_keyboard(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "⬅️ К обновлению", "callback_data": "update:refresh"}],
+            ]
+        }
+
     def _format_update_status_text(self, status: UpdateStatus) -> str:
         lines = [
             "🆕 Обновление проекта",
@@ -2217,7 +2224,7 @@ class TelegramUpdateHandler:
         text = self._format_update_status_text(status)
         await self._safe_edit_or_send(chat_id, message_id, text, self._update_panel_keyboard(status))
 
-    async def _send_update_changes(self, *, chat_id: int) -> None:
+    async def _send_update_changes(self, *, chat_id: int, message_id: int | None = None) -> None:
         status = await asyncio.to_thread(get_update_status, self.settings)
         lines = [
             "Изменения перед обновлением",
@@ -2262,7 +2269,21 @@ class TelegramUpdateHandler:
             lines.extend(f"- {err}" for err in status.errors)
 
         text = "\n".join(lines).strip()
-        for chunk in self._chunk_text(text):
+        chunks = self._chunk_text(text)
+        if message_id is not None:
+            if not chunks:
+                await self._safe_edit_or_send(chat_id, message_id, "Изменений нет.", self._update_changes_keyboard())
+                return
+            primary = chunks[0]
+            if len(chunks) > 1:
+                primary = (
+                    f"{primary}\n\n"
+                    f"…Показана первая часть ({len(primary)} символов). "
+                    "Сократите release notes/коммиты или смотрите лог на сервере."
+                )
+            await self._safe_edit_or_send(chat_id, message_id, primary, self._update_changes_keyboard())
+            return
+        for chunk in chunks:
             await self._safe_send(chat_id, chunk)
 
     async def _run_update_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
@@ -3960,8 +3981,8 @@ class TelegramUpdateHandler:
     ) -> None:
         if chat_id is None or not self.bot_client:
             return
-        try:
-            if message_id is not None:
+        if message_id is not None:
+            try:
                 await self.bot_client.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -3971,8 +3992,19 @@ class TelegramUpdateHandler:
                     disable_web_page_preview=disable_web_page_preview,
                 )
                 return
-        except Exception:
-            pass
+            except TelegramApiError as exc:
+                desc = (exc.description or "").lower()
+                if exc.status_code == 400 and (
+                    "message is not modified" in desc
+                    or "message can't be edited" in desc
+                    or "message to edit not found" in desc
+                ):
+                    return
+                logger.warning("Не удалось обновить сообщение меню: %s", exc)
+                return
+            except Exception:
+                logger.warning("Не удалось обновить сообщение меню", exc_info=True)
+                return
         await self._safe_send(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
 
     async def _safe_send(
