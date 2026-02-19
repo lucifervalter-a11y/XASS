@@ -1,6 +1,7 @@
 ﻿import logging
 import secrets
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -2214,8 +2215,32 @@ class TelegramUpdateHandler:
         await self._safe_send(chat_id, f"♻️ Перезапуск сервиса ({reason})...")
         try:
             await asyncio.to_thread(restart_service, self.settings)
+            await self._safe_send(chat_id, "✅ Перезапуск выполнен.")
         except Exception as exc:
+            if self._should_fallback_to_self_restart(exc):
+                await self._safe_send(
+                    chat_id,
+                    "⚠️ Нет прав на systemctl restart. Перезапускаю процесс через systemd (Restart=always)...",
+                )
+                await asyncio.sleep(1.0)
+                os._exit(0)
             await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис: {exc}")
+
+    def _should_fallback_to_self_restart(self, exc: Exception) -> bool:
+        mode = (self.settings.service_restart_mode or "systemd").strip().lower()
+        if mode != "systemd":
+            return False
+        text = str(exc or "").lower()
+        auth_markers = (
+            "interactive authentication required",
+            "authentication is required",
+            "permission denied",
+            "access denied",
+        )
+        if not any(marker in text for marker in auth_markers):
+            return False
+        # Safe fallback only when running as a systemd service.
+        return bool(os.environ.get("INVOCATION_ID")) or os.getppid() == 1
 
     async def _show_update_panel(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
