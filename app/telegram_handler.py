@@ -44,6 +44,7 @@ from app.services.auth import is_authorized, is_owner
 from app.services.export import export_messages_csv
 from app.services.heartbeat import delete_source_by_id, list_sources, rename_source
 from app.services.message_logging import handle_update_logging
+from app.services.message_logging import mark_single_deleted_message
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.panel import (
     format_pc_text,
@@ -3241,20 +3242,41 @@ class TelegramUpdateHandler:
         await self._safe_send(chat_id, away_text, business_connection_id=business_connection_id)
         await self._notify_away_capture(session, config, message)
 
+        deleted_success = False
         try:
             if self.bot_client:
                 if business_connection_id:
-                    await self.bot_client.delete_business_messages(
+                    deleted_success = await self.bot_client.delete_business_messages(
                         business_connection_id=business_connection_id,
                         chat_id=chat_id,
                         message_ids=[message_id],
                     )
                 else:
-                    await self.bot_client.delete_message(chat_id, message_id)
+                    deleted_success = await self.bot_client.delete_message(chat_id, message_id)
         except TelegramApiError as exc:
             logger.warning("Не удалось удалить сообщение в away-режиме: %s", exc)
         except Exception:
             logger.warning("Не удалось удалить сообщение в away-режиме", exc_info=True)
+
+        if deleted_success:
+            try:
+                await mark_single_deleted_message(
+                    session,
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    chat_type=str(chat.get("type") or "unknown"),
+                    chat_title=(chat.get("title") or chat.get("username")),
+                    payload={
+                        "source": "away_mode_delete",
+                        "business_connection_id": business_connection_id,
+                        "chat_id": chat_id,
+                        "message_ids": [message_id],
+                    },
+                    save_mode=config.save_mode,
+                )
+                await session.commit()
+            except Exception:
+                logger.warning("Не удалось пометить сообщение удаленным в БД (away-режим)", exc_info=True)
         return True
 
     async def _notify_away_capture(self, session: AsyncSession, config: AppConfig, message: dict[str, Any]) -> None:

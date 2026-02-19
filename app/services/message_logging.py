@@ -23,6 +23,29 @@ def _extract_text(message: dict[str, Any]) -> str | None:
     return message.get("text") or message.get("caption")
 
 
+def _to_int_or_none(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_message_ids(values: Any) -> list[int]:
+    if not isinstance(values, list):
+        return []
+    result: list[int] = []
+    seen: set[int] = set()
+    for item in values:
+        parsed = _to_int_or_none(item)
+        if parsed is None or parsed in seen:
+            continue
+        seen.add(parsed)
+        result.append(parsed)
+    return result
+
+
 def _extract_reply_to(message: dict[str, Any]) -> int | None:
     reply = message.get("reply_to_message") or {}
     return reply.get("message_id")
@@ -231,8 +254,12 @@ async def log_single_message(
         existing.direction = direction
         existing.reply_to_message_id = reply_to
         existing.raw_event = message
-        existing.deleted = False
-        existing.deleted_at = None
+        incoming_ts = edited_at or message_date
+        if existing.deleted:
+            # Keep deleted state if we process stale create/edit updates that are older than delete timestamp.
+            if not (existing.deleted_at and incoming_ts and incoming_ts <= existing.deleted_at):
+                existing.deleted = False
+                existing.deleted_at = None
         if message_date:
             existing.message_date = message_date
         if edited_at:
@@ -246,56 +273,98 @@ async def log_single_message(
         await _store_media(session, bot_client, existing, media_items, save_mode)
 
 
-async def mark_deleted_messages(session: AsyncSession, payload: dict[str, Any]) -> None:
+async def _mark_deleted_message(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    chat_type: str,
+    chat_title: str | None,
+    message_id: int,
+    payload: dict[str, Any],
+    save_mode: SaveMode,
+) -> None:
+    message_log = await _get_message_log(session, chat_id=chat_id, telegram_message_id=message_id)
+    now = datetime.now(timezone.utc)
+    if message_log is None:
+        if not _is_allowed(save_mode, chat_type):
+            return
+        # Keep a tombstone entry when delete event arrives before create event.
+        tombstone = MessageLog(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            chat_title=chat_title,
+            telegram_message_id=message_id,
+            from_user_id=None,
+            from_username=None,
+            direction="incoming",
+            reply_to_message_id=None,
+            message_date=now,
+            edited_at=None,
+            text_content=None,
+            tags="delete_tombstone",
+            deleted=True,
+            deleted_at=now,
+            raw_event=payload,
+        )
+        session.add(tombstone)
+        await session.flush()
+        await _add_revision(session, tombstone.id, MessageEventType.DELETE, None)
+        return
+
+    was_deleted = bool(message_log.deleted)
+    message_log.deleted = True
+    message_log.deleted_at = now
+    message_log.raw_event = payload
+    if not was_deleted:
+        await _add_revision(session, message_log.id, MessageEventType.DELETE, message_log.text_content)
+
+
+async def mark_single_deleted_message(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    message_id: int,
+    chat_type: str = "unknown",
+    chat_title: str | None = None,
+    payload: dict[str, Any] | None = None,
+    save_mode: SaveMode | str = SaveMode.SAVE_BASIC,
+) -> None:
+    mode = SaveMode(save_mode) if isinstance(save_mode, str) else save_mode
+    await _mark_deleted_message(
+        session,
+        chat_id=chat_id,
+        chat_type=chat_type or "unknown",
+        chat_title=chat_title,
+        message_id=message_id,
+        payload=payload or {"source": "internal_delete_mark"},
+        save_mode=mode,
+    )
+
+
+async def mark_deleted_messages(
+    session: AsyncSession,
+    payload: dict[str, Any],
+    *,
+    save_mode: SaveMode,
+) -> None:
     chat = payload.get("chat") or {}
-    chat_id = chat.get("id") or payload.get("chat_id")
-    chat_type = chat.get("type", "unknown")
+    chat_id = _to_int_or_none(chat.get("id") or payload.get("chat_id"))
+    chat_type = str(chat.get("type") or "unknown")
     chat_title = chat.get("title") or chat.get("username")
-    message_ids = payload.get("message_ids") or []
+    message_ids = _normalize_message_ids(payload.get("message_ids"))
     if chat_id is None or not message_ids:
         return
 
-    existing_items = list(
-        await session.scalars(
-            select(MessageLog).where(
-                MessageLog.chat_id == chat_id,
-                MessageLog.telegram_message_id.in_(message_ids),
-            )
-        )
-    )
-    existing_by_message_id = {item.telegram_message_id: item for item in existing_items}
-
-    now = datetime.now(timezone.utc)
     for message_id in message_ids:
-        message_log = existing_by_message_id.get(message_id)
-        if message_log is None:
-            # Keep a tombstone entry when delete event arrives before create event.
-            tombstone = MessageLog(
-                chat_id=chat_id,
-                chat_type=chat_type,
-                chat_title=chat_title,
-                telegram_message_id=message_id,
-                from_user_id=None,
-                from_username=None,
-                direction="incoming",
-                reply_to_message_id=None,
-                message_date=now,
-                edited_at=None,
-                text_content=None,
-                tags="delete_tombstone",
-                deleted=True,
-                deleted_at=now,
-                raw_event=payload,
-            )
-            session.add(tombstone)
-            await session.flush()
-            await _add_revision(session, tombstone.id, MessageEventType.DELETE, None)
-            continue
-
-        message_log.deleted = True
-        message_log.deleted_at = now
-        message_log.raw_event = payload
-        await _add_revision(session, message_log.id, MessageEventType.DELETE, message_log.text_content)
+        await _mark_deleted_message(
+            session,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            chat_title=chat_title,
+            message_id=message_id,
+            payload=payload,
+            save_mode=save_mode,
+        )
 
 
 async def handle_update_logging(
@@ -333,9 +402,7 @@ async def handle_update_logging(
     deleted_payload = update.get("deleted_business_messages")
     if deleted_payload:
         save_mode = SaveMode(config.save_mode)
-        payload_chat_type = ((deleted_payload.get("chat") or {}).get("type") or "unknown")
-        if _is_allowed(save_mode, payload_chat_type):
-            await mark_deleted_messages(session, deleted_payload)
+        if save_mode != SaveMode.SAVE_OFF:
+            await mark_deleted_messages(session, deleted_payload, save_mode=save_mode)
 
     await session.commit()
-
