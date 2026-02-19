@@ -98,6 +98,7 @@ class TelegramUpdateHandler:
         self.profile_avatar_upload_context: dict[int, dict[str, Any]] = {}
         self.away_bypass_contact_context: dict[int, dict[str, Any]] = {}
         self.recent_message_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.background_tasks: set[asyncio.Task[Any]] = set()
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -2030,6 +2031,18 @@ class TelegramUpdateHandler:
             chunks.append(current)
         return chunks
 
+    def _schedule_background_task(self, task: asyncio.Task[Any]) -> None:
+        self.background_tasks.add(task)
+        task.add_done_callback(lambda t: self.background_tasks.discard(t))
+
+    async def _restart_service_after_delay(self, *, chat_id: int, reason: str, delay_sec: float = 3.0) -> None:
+        await asyncio.sleep(max(0.5, delay_sec))
+        await self._safe_send(chat_id, f"♻️ Перезапуск сервиса ({reason})...")
+        try:
+            await asyncio.to_thread(restart_service, self.settings)
+        except Exception as exc:
+            await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис: {exc}")
+
     async def _show_update_panel(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
             return
@@ -2119,7 +2132,6 @@ class TelegramUpdateHandler:
         )
         await self._safe_edit_or_send(chat_id, message_id, loading_text, None)
         result = await asyncio.to_thread(run_update, self.settings, execute_restart=False)
-        status = await asyncio.to_thread(get_update_status, self.settings)
         log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
         update_applied = (
             result.ok
@@ -2149,24 +2161,24 @@ class TelegramUpdateHandler:
         if update_applied and result.restart_required:
             summary_lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
-        await self._safe_edit_or_send(
-            chat_id,
-            message_id,
-            "\n".join(summary_lines),
-            self._update_panel_keyboard(status),
-        )
+        await self._safe_send(chat_id, "\n".join(summary_lines))
+        await self._show_update_panel(chat_id=chat_id, message_id=message_id)
 
         if log_tail:
             for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
                 await self._safe_send(chat_id, chunk)
 
         if update_applied and result.restart_required:
-            await self._safe_send(chat_id, "♻️ Применяю обновление: перезапускаю сервис...")
-            await asyncio.sleep(0.8)
-            try:
-                await asyncio.to_thread(restart_service, self.settings)
-            except Exception as exc:
-                await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис: {exc}")
+            await self._safe_send(chat_id, "✅ Обновление применено. Возвращаю меню обновления и запускаю перезапуск.")
+            self._schedule_background_task(
+                asyncio.create_task(
+                    self._restart_service_after_delay(
+                        chat_id=chat_id,
+                        reason="после обновления",
+                        delay_sec=3.0,
+                    )
+                )
+            )
 
     async def _run_rollback_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
@@ -2178,7 +2190,6 @@ class TelegramUpdateHandler:
             None,
         )
         result = await asyncio.to_thread(rollback, self.settings, None, execute_restart=False)
-        status = await asyncio.to_thread(get_update_status, self.settings)
         log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
         rollback_applied = (
             result.ok
@@ -2206,24 +2217,24 @@ class TelegramUpdateHandler:
         if rollback_applied and result.restart_required:
             lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
-        await self._safe_edit_or_send(
-            chat_id,
-            message_id,
-            "\n".join(lines),
-            self._update_panel_keyboard(status),
-        )
+        await self._safe_send(chat_id, "\n".join(lines))
+        await self._show_update_panel(chat_id=chat_id, message_id=message_id)
 
         if log_tail:
             for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
                 await self._safe_send(chat_id, chunk)
 
         if rollback_applied and result.restart_required:
-            await self._safe_send(chat_id, "♻️ Применяю откат: перезапускаю сервис...")
-            await asyncio.sleep(0.8)
-            try:
-                await asyncio.to_thread(restart_service, self.settings)
-            except Exception as exc:
-                await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис после отката: {exc}")
+            await self._safe_send(chat_id, "✅ Откат применен. Возвращаю меню обновления и запускаю перезапуск.")
+            self._schedule_background_task(
+                asyncio.create_task(
+                    self._restart_service_after_delay(
+                        chat_id=chat_id,
+                        reason="после отката",
+                        delay_sec=3.0,
+                    )
+                )
+            )
 
     def _profile_paths(self) -> tuple[Path, Path, Path]:
         return (
