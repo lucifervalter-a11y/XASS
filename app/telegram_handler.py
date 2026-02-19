@@ -100,6 +100,7 @@ class TelegramUpdateHandler:
         self.away_bypass_contact_context: dict[int, dict[str, Any]] = {}
         self.recent_message_cache: dict[tuple[int, int], dict[str, Any]] = {}
         self.background_tasks: set[asyncio.Task[Any]] = set()
+        self.update_jobs: dict[int, asyncio.Task[Any]] = {}
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -2141,6 +2142,27 @@ class TelegramUpdateHandler:
         self.background_tasks.add(task)
         task.add_done_callback(lambda t: self.background_tasks.discard(t))
 
+    def _schedule_update_job(self, chat_id: int, task: asyncio.Task[Any]) -> None:
+        self.update_jobs[chat_id] = task
+        self.background_tasks.add(task)
+
+        def _on_done(done: asyncio.Task[Any]) -> None:
+            self.background_tasks.discard(done)
+            if self.update_jobs.get(chat_id) is done:
+                self.update_jobs.pop(chat_id, None)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Update background task failed")
+
+        task.add_done_callback(_on_done)
+
+    def _has_running_update_job(self, chat_id: int) -> bool:
+        task = self.update_jobs.get(chat_id)
+        return bool(task and not task.done())
+
     async def _restart_service_after_delay(self, *, chat_id: int, reason: str, delay_sec: float = 3.0) -> None:
         await asyncio.sleep(max(0.5, delay_sec))
         await self._safe_send(chat_id, f"♻️ Перезапуск сервиса ({reason})...")
@@ -2226,6 +2248,11 @@ class TelegramUpdateHandler:
             )
             return
 
+        if self._has_running_update_job(chat_id):
+            await self._safe_send(chat_id, "⏳ Обновление уже выполняется. Дождитесь завершения.")
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+            return
+
         loading_text = "\n".join(
             [
                 "🛠️ Обновление запущено",
@@ -2237,6 +2264,17 @@ class TelegramUpdateHandler:
             ]
         )
         await self._safe_edit_or_send(chat_id, message_id, loading_text, None)
+        self._schedule_update_job(
+            chat_id,
+            asyncio.create_task(
+                self._run_update_flow_worker(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            ),
+        )
+
+    async def _run_update_flow_worker(self, *, chat_id: int, message_id: int | None) -> None:
         result = await asyncio.to_thread(run_update, self.settings, execute_restart=False)
         log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
         update_applied = (
@@ -2289,12 +2327,27 @@ class TelegramUpdateHandler:
     async def _run_rollback_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
             return
+        if self._has_running_update_job(chat_id):
+            await self._safe_send(chat_id, "⏳ Уже выполняется обновление/откат. Дождитесь завершения.")
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+            return
         await self._safe_edit_or_send(
             chat_id,
             message_id,
             "🧯 Выполняю откат...\n\n🔄 Восстанавливаю commit\n♻️ Подготовка перезапуска",
             None,
         )
+        self._schedule_update_job(
+            chat_id,
+            asyncio.create_task(
+                self._run_rollback_flow_worker(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            ),
+        )
+
+    async def _run_rollback_flow_worker(self, *, chat_id: int, message_id: int | None) -> None:
         result = await asyncio.to_thread(rollback, self.settings, None, execute_restart=False)
         log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
         rollback_applied = (

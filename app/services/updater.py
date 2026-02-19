@@ -94,18 +94,31 @@ def _run_command(
     cwd: Path,
     log_path: Path | None = None,
     check: bool = True,
+    timeout_sec: int | None = 300,
 ) -> subprocess.CompletedProcess[str]:
     if log_path:
         _append_log(log_path, f"$ {' '.join(args)}")
-    completed = subprocess.run(
-        args,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout_sec,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cmd_text = " ".join(args)
+        timeout_msg = f"Command timed out after {int(timeout_sec or 0)}s: {cmd_text}"
+        if log_path:
+            _append_log(log_path, timeout_msg)
+        raise UpdateError(timeout_msg) from exc
     if log_path:
         if completed.stdout:
             _append_log(log_path, completed.stdout.strip())
