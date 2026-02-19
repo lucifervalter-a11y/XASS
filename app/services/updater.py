@@ -528,6 +528,19 @@ def run_update(settings: Settings) -> UpdateRunResult:
     remote = None
     branch = (settings.update_branch or "").strip() or get_current_branch(repo_root=root)
     changed_files: list[str] = []
+    if not _is_git_repo(root):
+        error = "Каталог приложения не является git-репозиторием (.git отсутствует)."
+        _append_log(log_path, f"=== update skipped: {error} ===")
+        return UpdateRunResult(
+            ok=False,
+            branch=branch,
+            before=before,
+            after=before,
+            remote=None,
+            changed_files=[],
+            steps=[],
+            error=error,
+        )
     try:
         _append_log(log_path, "=== update start ===")
         branch = resolve_branch(settings, repo_root=root)
@@ -594,6 +607,17 @@ def rollback(settings: Settings, target_commit: str | None = None) -> RollbackRe
     log_path = _log_path(settings, root)
     before = get_commit_info("HEAD", repo_root=root)
     steps: list[str] = []
+    if not _is_git_repo(root):
+        error = "Каталог приложения не является git-репозиторием (.git отсутствует)."
+        _append_log(log_path, f"=== rollback skipped: {error} ===")
+        return RollbackResult(
+            ok=False,
+            target_commit=None,
+            before=before,
+            after=before,
+            steps=[],
+            error=error,
+        )
     state = _load_state(settings, root)
     candidate = (target_commit or "").strip() or str(state.get("previous_head") or "").strip() or str(state.get("last_known_good") or "").strip()
     if not candidate:

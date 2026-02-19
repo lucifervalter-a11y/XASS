@@ -1991,6 +1991,7 @@ class TelegramUpdateHandler:
             f"Ветка: {status.branch}",
             "",
         ]
+        unresolved_git = (status.current is None or status.remote is None) and bool(status.errors)
         if status.release:
             release_name = (status.release.get("name") or status.release.get("tag") or "").strip() or "-"
             published = self._format_commit_datetime(str(status.release.get("published_at") or ""))
@@ -2010,6 +2011,8 @@ class TelegramUpdateHandler:
             lines.extend(["CHANGELOG.md (фрагмент):", status.changelog_excerpt])
         elif status.commits:
             lines.append("Релиз-нот не найден, показываю коммиты.")
+        elif unresolved_git:
+            lines.append("Не удалось построить список изменений: git-метаданные недоступны.")
         else:
             lines.append("Изменений между текущей и удаленной версией нет.")
 
@@ -2020,6 +2023,10 @@ class TelegramUpdateHandler:
                     f"- {item.short_hash} {item.subject} ({item.author}, {self._format_commit_datetime(item.date_iso)})"
                 )
 
+        if status.errors:
+            lines.extend(["", "Ошибки при проверке:"])
+            lines.extend(f"- {err}" for err in status.errors)
+
         text = "\n".join(lines).strip()
         for chunk in self._chunk_text(text):
             await self._safe_send(chat_id, chunk)
@@ -2027,6 +2034,25 @@ class TelegramUpdateHandler:
     async def _run_update_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
             return
+        pre_status = await asyncio.to_thread(get_update_status, self.settings)
+        if pre_status.current is None or pre_status.remote is None:
+            lines = [
+                "❌ Обновление сейчас недоступно.",
+                f"Ветка: {pre_status.branch}",
+                "Причина: нет данных git (HEAD/origin).",
+            ]
+            if pre_status.errors:
+                lines.append("")
+                lines.append("Ошибки:")
+                lines.extend(f"- {err}" for err in pre_status.errors)
+            await self._safe_edit_or_send(
+                chat_id,
+                message_id,
+                "\n".join(lines),
+                self._update_panel_keyboard(pre_status),
+            )
+            return
+
         await self._safe_edit_or_send(chat_id, message_id, "Обновляю проект, подождите...", None)
         result = await asyncio.to_thread(run_update, self.settings)
         status = await asyncio.to_thread(get_update_status, self.settings)
