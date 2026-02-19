@@ -2042,12 +2042,13 @@ class TelegramUpdateHandler:
         return f"{item.short_hash} ({stamp}) {subject}"
 
     def _update_panel_keyboard(self, status: UpdateStatus) -> dict[str, Any]:
-        updates_label = "🚀 Обновить сейчас" if status.has_updates else "🚀 Проверить и обновить"
+        updates_label = "🚀 Обновить сейчас" if status.has_updates else "✅ Обновлений нет"
+        updates_callback = "update:run" if status.has_updates else "update:refresh"
         rows: list[list[dict[str, str]]] = [
             [{"text": "🔄 Обновить статус", "callback_data": "update:refresh"}],
             [
                 {"text": "📋 Показать изменения", "callback_data": "update:changes"},
-                {"text": updates_label, "callback_data": "update:run"},
+                {"text": updates_label, "callback_data": updates_callback},
             ],
             [{"text": "↩️ Откатиться", "callback_data": "update:rollback:ask"}],
             [{"text": "⬅️ Назад", "callback_data": "panel:home"}],
@@ -2163,6 +2164,44 @@ class TelegramUpdateHandler:
         task = self.update_jobs.get(chat_id)
         return bool(task and not task.done())
 
+    def _update_progress_stage(self, percent: int) -> str:
+        if percent < 30:
+            return "🔎 Проверяю репозиторий и доступные коммиты..."
+        if percent < 60:
+            return "📥 Загружаю изменения..."
+        if percent < 85:
+            return "📦 Применяю обновление..."
+        return "🧾 Формирую итог и готовлю перезапуск..."
+
+    def _format_update_progress_text(self, percent: int) -> str:
+        bounded = max(0, min(99, int(percent)))
+        filled = max(0, min(10, bounded // 10))
+        bar = ("█" * filled) + ("░" * (10 - filled))
+        stage = self._update_progress_stage(bounded)
+        return "\n".join(
+            [
+                "🛠️ Обновление запущено",
+                "",
+                f"[{bar}] {bounded}%",
+                stage,
+            ]
+        )
+
+    async def _update_progress_pulse(self, *, chat_id: int, message_id: int | None, stop_event: asyncio.Event) -> None:
+        percent = 12
+        while not stop_event.is_set():
+            await self._safe_edit_or_send(
+                chat_id,
+                message_id,
+                self._format_update_progress_text(percent),
+                None,
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=2.4)
+                break
+            except asyncio.TimeoutError:
+                percent = min(93, percent + 6)
+
     async def _restart_service_after_delay(self, *, chat_id: int, reason: str, delay_sec: float = 3.0) -> None:
         await asyncio.sleep(max(0.5, delay_sec))
         await self._safe_send(chat_id, f"♻️ Перезапуск сервиса ({reason})...")
@@ -2248,22 +2287,21 @@ class TelegramUpdateHandler:
             )
             return
 
+        if not pre_status.has_updates:
+            await self._safe_edit_or_send(
+                chat_id,
+                message_id,
+                "✅ Обновлений нет. Текущая версия уже актуальна.",
+                self._update_panel_keyboard(pre_status),
+            )
+            return
+
         if self._has_running_update_job(chat_id):
             await self._safe_send(chat_id, "⏳ Обновление уже выполняется. Дождитесь завершения.")
             await self._show_update_panel(chat_id=chat_id, message_id=message_id)
             return
 
-        loading_text = "\n".join(
-            [
-                "🛠️ Обновление запущено",
-                "",
-                "🔎 Проверяю репозиторий и доступные коммиты...",
-                "📥 Загружаю изменения...",
-                "📦 Применяю обновление...",
-                "♻️ Готовлю перезапуск сервиса...",
-            ]
-        )
-        await self._safe_edit_or_send(chat_id, message_id, loading_text, None)
+        await self._safe_edit_or_send(chat_id, message_id, self._format_update_progress_text(10), None)
         self._schedule_update_job(
             chat_id,
             asyncio.create_task(
@@ -2275,54 +2313,73 @@ class TelegramUpdateHandler:
         )
 
     async def _run_update_flow_worker(self, *, chat_id: int, message_id: int | None) -> None:
-        result = await asyncio.to_thread(run_update, self.settings, execute_restart=False)
-        log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
-        update_applied = (
-            result.ok
-            and result.before is not None
-            and result.after is not None
-            and result.before.full_hash != result.after.full_hash
+        stop_event = asyncio.Event()
+        pulse_task = asyncio.create_task(
+            self._update_progress_pulse(chat_id=chat_id, message_id=message_id, stop_event=stop_event)
         )
+        try:
+            result = await asyncio.to_thread(run_update, self.settings, execute_restart=False)
+            stop_event.set()
+            try:
+                await pulse_task
+            except Exception:
+                pass
 
-        summary_lines = []
-        if result.ok:
-            summary_lines.append("✅ Обновление завершено.")
-        else:
-            summary_lines.append("❌ Обновление завершилось с ошибкой.")
-            if result.error:
-                summary_lines.append(f"Ошибка: {result.error}")
+            log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+            update_applied = (
+                result.ok
+                and result.before is not None
+                and result.after is not None
+                and result.before.full_hash != result.after.full_hash
+            )
 
-        summary_lines.extend(
-            [
-                f"Ветка: {result.branch}",
-                f"Было: {self._format_commit_brief(result.before)}",
-                f"Стало: {self._format_commit_brief(result.after)}",
-                f"Изменено файлов: {len(result.changed_files)}",
-            ]
-        )
-        if result.steps:
-            summary_lines.append("Шаги: " + ", ".join(result.steps))
-        if update_applied and result.restart_required:
-            summary_lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
+            summary_lines = []
+            if result.ok:
+                summary_lines.append("✅ Обновление завершено (100%).")
+            else:
+                summary_lines.append("❌ Обновление завершилось с ошибкой.")
+                if result.error:
+                    summary_lines.append(f"Ошибка: {result.error}")
 
-        await self._safe_send(chat_id, "\n".join(summary_lines))
-        await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+            summary_lines.extend(
+                [
+                    f"Ветка: {result.branch}",
+                    f"Было: {self._format_commit_brief(result.before)}",
+                    f"Стало: {self._format_commit_brief(result.after)}",
+                    f"Изменено файлов: {len(result.changed_files)}",
+                ]
+            )
+            if result.steps:
+                summary_lines.append("Шаги: " + ", ".join(result.steps))
+            if update_applied and result.restart_required:
+                summary_lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
-        if log_tail:
-            for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
-                await self._safe_send(chat_id, chunk)
+            await self._safe_send(chat_id, "\n".join(summary_lines))
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
 
-        if update_applied and result.restart_required:
-            await self._safe_send(chat_id, "✅ Обновление применено. Возвращаю меню обновления и запускаю перезапуск.")
-            self._schedule_background_task(
-                asyncio.create_task(
-                    self._restart_service_after_delay(
-                        chat_id=chat_id,
-                        reason="после обновления",
-                        delay_sec=3.0,
+            if log_tail:
+                for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
+                    await self._safe_send(chat_id, chunk)
+
+            if update_applied and result.restart_required:
+                await self._safe_send(chat_id, "✅ Обновление применено. Возвращаю меню обновления и запускаю перезапуск.")
+                self._schedule_background_task(
+                    asyncio.create_task(
+                        self._restart_service_after_delay(
+                            chat_id=chat_id,
+                            reason="после обновления",
+                            delay_sec=3.0,
+                        )
                     )
                 )
-            )
+        except Exception as exc:
+            stop_event.set()
+            try:
+                await pulse_task
+            except Exception:
+                pass
+            await self._safe_send(chat_id, f"❌ Ошибка фонового обновления: {exc}")
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
 
     async def _run_rollback_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
