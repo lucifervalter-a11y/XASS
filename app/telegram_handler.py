@@ -2346,17 +2346,22 @@ class TelegramUpdateHandler:
             except Exception:
                 pass
 
-            log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+            log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, lines=40)
             update_applied = (
                 result.ok
                 and result.before is not None
                 and result.after is not None
                 and result.before.full_hash != result.after.full_hash
             )
+            no_updates = bool(result.ok and not update_applied and "no updates" in {step.strip().lower() for step in result.steps})
 
             summary_lines = []
-            if result.ok:
-                summary_lines.append("✅ Обновление завершено (100%).")
+            if result.ok and update_applied:
+                summary_lines.append("✅ Обновление применено (100%).")
+            elif result.ok and no_updates:
+                summary_lines.append("ℹ️ Обновлений не было. Текущая версия уже актуальна.")
+            elif result.ok:
+                summary_lines.append("✅ Проверка завершена (100%).")
             else:
                 summary_lines.append("❌ Обновление завершилось с ошибкой.")
                 if result.error:
@@ -2427,7 +2432,7 @@ class TelegramUpdateHandler:
 
     async def _run_rollback_flow_worker(self, *, chat_id: int, message_id: int | None) -> None:
         result = await asyncio.to_thread(rollback, self.settings, None, execute_restart=False)
-        log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+        log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, lines=40)
         rollback_applied = (
             result.ok
             and result.before is not None

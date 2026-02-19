@@ -714,7 +714,7 @@ def rollback(settings: Settings, target_commit: str | None = None, *, execute_re
         )
 
 
-def read_update_log_tail(settings: Settings, *, lines: int = 40) -> str:
+def read_update_log_tail(settings: Settings, lines: int = 40) -> str:
     root = _repo_root()
     path = _log_path(settings, root)
     if not path.exists():
