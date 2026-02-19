@@ -102,9 +102,17 @@ def _slugify(value: str) -> str:
 
 def _normalize_tags(value: Any) -> list[str]:
     if isinstance(value, str):
-        items = [part.strip() for part in value.split(",")]
+        items = [part.strip() for part in re.split(r"[,\s;]+", value)]
     elif isinstance(value, list):
-        items = [str(item).strip() for item in value]
+        items = []
+        for raw_item in value:
+            text = str(raw_item).strip()
+            if not text:
+                continue
+            for part in re.split(r"[,\s;]+", text):
+                part = part.strip()
+                if part:
+                    items.append(part)
     else:
         items = []
     result: list[str] = []
@@ -341,4 +349,3 @@ def project_card_text(project: dict[str, Any]) -> str:
         f"Теги: {tags_text}\n"
         f"Обновлено: {project.get('updated_at') or '-'}"
     )
-

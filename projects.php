@@ -102,12 +102,26 @@ function normalize_media_src(mixed $value): string
 
 function normalize_tags(mixed $value): array
 {
-    if (!is_array($value)) {
+    if (is_string($value)) {
+        $parts = preg_split('/[,\s;]+/u', $value) ?: [];
+    } elseif (is_array($value)) {
+        $parts = [];
+        foreach ($value as $item) {
+            $text = text_value($item);
+            if ($text === '') {
+                continue;
+            }
+            $split = preg_split('/[,\s;]+/u', $text) ?: [];
+            foreach ($split as $part) {
+                $parts[] = $part;
+            }
+        }
+    } else {
         return [];
     }
     $result = [];
     $seen = [];
-    foreach ($value as $item) {
+    foreach ($parts as $item) {
         $tag = text_value($item);
         if ($tag === '') {
             continue;
