@@ -1,6 +1,6 @@
-# Serverredus: Telegram Business Bot + Backend + Agent
+# XASS: Telegram Business Bot + Backend + Agent
 
-MVP по вашему ТЗ:
+
 - Telegram webhook + `/panel` (кнопки: статус, сервер, ПК, логи, настройки, экспорт).
 - Heartbeat от агентов (`PC_AGENT`/`SERVER_AGENT`) с offline/recovered-уведомлениями.
 - Логирование сообщений/правок/удалений (что реально доступно через Bot API updates).
