@@ -47,6 +47,8 @@ class UpdateRunResult:
     remote: CommitInfo | None
     changed_files: list[str]
     steps: list[str]
+    restart_required: bool
+    restart_performed: bool
     error: str | None
 
 
@@ -57,6 +59,8 @@ class RollbackResult:
     before: CommitInfo | None
     after: CommitInfo | None
     steps: list[str]
+    restart_required: bool
+    restart_performed: bool
     error: str | None
 
 
@@ -520,7 +524,7 @@ def get_update_status(settings: Settings) -> UpdateStatus:
     )
 
 
-def run_update(settings: Settings) -> UpdateRunResult:
+def run_update(settings: Settings, *, execute_restart: bool = True) -> UpdateRunResult:
     root = _repo_root()
     log_path = _log_path(settings, root)
     steps: list[str] = []
@@ -528,6 +532,9 @@ def run_update(settings: Settings) -> UpdateRunResult:
     remote = None
     branch = (settings.update_branch or "").strip() or get_current_branch(repo_root=root)
     changed_files: list[str] = []
+    restart_mode = (settings.service_restart_mode or "systemd").strip().lower()
+    restart_required = False
+    restart_performed = False
     if not _is_git_repo(root):
         error = "Каталог приложения не является git-репозиторием (.git отсутствует)."
         _append_log(log_path, f"=== update skipped: {error} ===")
@@ -539,6 +546,8 @@ def run_update(settings: Settings) -> UpdateRunResult:
             remote=None,
             changed_files=[],
             steps=[],
+            restart_required=False,
+            restart_performed=False,
             error=error,
         )
     try:
@@ -558,14 +567,21 @@ def run_update(settings: Settings) -> UpdateRunResult:
                 remote=remote,
                 changed_files=[],
                 steps=["no updates"],
+                restart_required=False,
+                restart_performed=False,
                 error=None,
             )
 
         changed_files = get_changed_files_between("HEAD", f"origin/{branch}", repo_root=root)
         pull_fast_forward(branch, repo_root=root, log_path=log_path)
         steps.extend(run_post_update_steps(changed_files, repo_root=root, log_path=log_path))
-        restart_note = restart_service(settings, repo_root=root, log_path=log_path)
-        steps.append(restart_note)
+        restart_required = restart_mode not in {"", "none"}
+        if restart_required and execute_restart:
+            restart_note = restart_service(settings, repo_root=root, log_path=log_path)
+            steps.append(restart_note)
+            restart_performed = True
+        elif restart_required:
+            steps.append("restart deferred")
         after = get_commit_info("HEAD", repo_root=root)
         state = _load_state(settings, root)
         state.update(
@@ -586,6 +602,8 @@ def run_update(settings: Settings) -> UpdateRunResult:
             remote=remote,
             changed_files=changed_files,
             steps=steps,
+            restart_required=restart_required,
+            restart_performed=restart_performed,
             error=None,
         )
     except Exception as exc:
@@ -598,15 +616,20 @@ def run_update(settings: Settings) -> UpdateRunResult:
             remote=remote,
             changed_files=changed_files,
             steps=steps,
+            restart_required=restart_required,
+            restart_performed=restart_performed,
             error=str(exc),
         )
 
 
-def rollback(settings: Settings, target_commit: str | None = None) -> RollbackResult:
+def rollback(settings: Settings, target_commit: str | None = None, *, execute_restart: bool = True) -> RollbackResult:
     root = _repo_root()
     log_path = _log_path(settings, root)
     before = get_commit_info("HEAD", repo_root=root)
     steps: list[str] = []
+    restart_mode = (settings.service_restart_mode or "systemd").strip().lower()
+    restart_required = restart_mode not in {"", "none"}
+    restart_performed = False
     if not _is_git_repo(root):
         error = "Каталог приложения не является git-репозиторием (.git отсутствует)."
         _append_log(log_path, f"=== rollback skipped: {error} ===")
@@ -616,6 +639,8 @@ def rollback(settings: Settings, target_commit: str | None = None) -> RollbackRe
             before=before,
             after=before,
             steps=[],
+            restart_required=False,
+            restart_performed=False,
             error=error,
         )
     state = _load_state(settings, root)
@@ -627,14 +652,20 @@ def rollback(settings: Settings, target_commit: str | None = None) -> RollbackRe
             before=before,
             after=before,
             steps=[],
+            restart_required=False,
+            restart_performed=False,
             error="Rollback commit is not known",
         )
     try:
         _append_log(log_path, f"=== rollback start -> {candidate} ===")
         _run_command(["git", "reset", "--hard", candidate], cwd=root, log_path=log_path, check=True)
         steps.append(f"git reset --hard {candidate}")
-        restart_note = restart_service(settings, repo_root=root, log_path=log_path)
-        steps.append(restart_note)
+        if restart_required and execute_restart:
+            restart_note = restart_service(settings, repo_root=root, log_path=log_path)
+            steps.append(restart_note)
+            restart_performed = True
+        elif restart_required:
+            steps.append("restart deferred")
         after = get_commit_info("HEAD", repo_root=root)
         if after:
             state.update(
@@ -652,6 +683,8 @@ def rollback(settings: Settings, target_commit: str | None = None) -> RollbackRe
             before=before,
             after=after,
             steps=steps,
+            restart_required=restart_required,
+            restart_performed=restart_performed,
             error=None,
         )
     except Exception as exc:
@@ -662,6 +695,8 @@ def rollback(settings: Settings, target_commit: str | None = None) -> RollbackRe
             before=before,
             after=get_commit_info("HEAD", repo_root=root),
             steps=steps,
+            restart_required=restart_required,
+            restart_performed=restart_performed,
             error=str(exc),
         )
 

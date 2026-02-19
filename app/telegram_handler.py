@@ -75,6 +75,7 @@ from app.services.updater import (
     UpdateStatus,
     get_update_status,
     read_update_log_tail,
+    restart_service,
     rollback,
     run_update,
 )
@@ -1913,22 +1914,22 @@ class TelegramUpdateHandler:
 
     def _format_update_status_text(self, status: UpdateStatus) -> str:
         lines = [
-            "Обновление проекта",
+            "🆕 Обновление проекта",
             "------------------",
-            f"Ветка: {status.branch}",
-            f"Текущая версия: {self._format_commit_brief(status.current)}",
+            f"🌿 Ветка: {status.branch}",
+            f"📌 Текущая версия: {self._format_commit_brief(status.current)}",
         ]
         if status.remote:
-            lines.append(f"Последняя в origin: {self._format_commit_brief(status.remote)}")
+            lines.append(f"☁️ Последняя в origin: {self._format_commit_brief(status.remote)}")
         else:
-            lines.append("Последняя в origin: -")
+            lines.append("☁️ Последняя в origin: -")
 
         if status.current is None or status.remote is None:
-            lines.append("Статус: не удалось определить обновления.")
+            lines.append("⚠️ Статус: не удалось определить обновления.")
         elif status.has_updates:
-            lines.append("Статус: доступно обновление.")
+            lines.append("🚀 Статус: доступно обновление.")
         else:
-            lines.append("Статус: обновлений нет.")
+            lines.append("✅ Статус: обновлений нет.")
 
         if status.commits:
             lines.extend(["", "Коротко по изменениям:"])
@@ -1943,6 +1944,14 @@ class TelegramUpdateHandler:
         if status.errors:
             lines.extend(["", "Ошибки при проверке:"])
             lines.extend(f"- {err}" for err in status.errors)
+            if any(".git" in err for err in status.errors):
+                lines.extend(
+                    [
+                        "",
+                        "Подсказка: папка сервера развернута без .git.",
+                        "Для автообновления через бот нужен запуск из git-клона (git pull).",
+                    ]
+                )
         return "\n".join(lines)
 
     def _chunk_text(self, text: str, limit: int = 3500) -> list[str]:
@@ -2054,10 +2063,26 @@ class TelegramUpdateHandler:
             )
             return
 
-        await self._safe_edit_or_send(chat_id, message_id, "Обновляю проект, подождите...", None)
-        result = await asyncio.to_thread(run_update, self.settings)
+        loading_text = "\n".join(
+            [
+                "🛠️ Обновление запущено",
+                "",
+                "🔎 Проверяю репозиторий и доступные коммиты...",
+                "📥 Загружаю изменения...",
+                "📦 Применяю обновление...",
+                "♻️ Готовлю перезапуск сервиса...",
+            ]
+        )
+        await self._safe_edit_or_send(chat_id, message_id, loading_text, None)
+        result = await asyncio.to_thread(run_update, self.settings, execute_restart=False)
         status = await asyncio.to_thread(get_update_status, self.settings)
         log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+        update_applied = (
+            result.ok
+            and result.before is not None
+            and result.after is not None
+            and result.before.full_hash != result.after.full_hash
+        )
 
         summary_lines = []
         if result.ok:
@@ -2077,6 +2102,8 @@ class TelegramUpdateHandler:
         )
         if result.steps:
             summary_lines.append("Шаги: " + ", ".join(result.steps))
+        if update_applied and result.restart_required:
+            summary_lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
         await self._safe_edit_or_send(
             chat_id,
@@ -2089,13 +2116,32 @@ class TelegramUpdateHandler:
             for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
                 await self._safe_send(chat_id, chunk)
 
+        if update_applied and result.restart_required:
+            await self._safe_send(chat_id, "♻️ Применяю обновление: перезапускаю сервис...")
+            await asyncio.sleep(0.8)
+            try:
+                await asyncio.to_thread(restart_service, self.settings)
+            except Exception as exc:
+                await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис: {exc}")
+
     async def _run_rollback_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
             return
-        await self._safe_edit_or_send(chat_id, message_id, "Выполняю откат, подождите...", None)
-        result = await asyncio.to_thread(rollback, self.settings, None)
+        await self._safe_edit_or_send(
+            chat_id,
+            message_id,
+            "🧯 Выполняю откат...\n\n🔄 Восстанавливаю commit\n♻️ Подготовка перезапуска",
+            None,
+        )
+        result = await asyncio.to_thread(rollback, self.settings, None, execute_restart=False)
         status = await asyncio.to_thread(get_update_status, self.settings)
         log_tail = await asyncio.to_thread(read_update_log_tail, self.settings, 40)
+        rollback_applied = (
+            result.ok
+            and result.before is not None
+            and result.after is not None
+            and result.before.full_hash != result.after.full_hash
+        )
 
         lines = []
         if result.ok:
@@ -2113,6 +2159,8 @@ class TelegramUpdateHandler:
         )
         if result.steps:
             lines.append("Шаги: " + ", ".join(result.steps))
+        if rollback_applied and result.restart_required:
+            lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
         await self._safe_edit_or_send(
             chat_id,
@@ -2124,6 +2172,14 @@ class TelegramUpdateHandler:
         if log_tail:
             for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
                 await self._safe_send(chat_id, chunk)
+
+        if rollback_applied and result.restart_required:
+            await self._safe_send(chat_id, "♻️ Применяю откат: перезапускаю сервис...")
+            await asyncio.sleep(0.8)
+            try:
+                await asyncio.to_thread(restart_service, self.settings)
+            except Exception as exc:
+                await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис после отката: {exc}")
 
     def _profile_paths(self) -> tuple[Path, Path, Path]:
         return (
