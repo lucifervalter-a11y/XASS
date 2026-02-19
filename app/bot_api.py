@@ -194,6 +194,12 @@ class TelegramBotClient:
             files = {"document": (path.name, handle, mime_type)}
             return await self._request("sendDocument", data=data, files=files)
 
+    async def send_document_by_file_id(self, chat_id: int, file_id: str, caption: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"chat_id": chat_id, "document": file_id}
+        if caption:
+            payload["caption"] = caption
+        return await self._request("sendDocument", payload=payload)
+
     async def delete_message(self, chat_id: int, message_id: int) -> bool:
         result = await self._request("deleteMessage", payload={"chat_id": chat_id, "message_id": message_id})
         return bool(result)

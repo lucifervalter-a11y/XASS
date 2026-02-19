@@ -3444,6 +3444,48 @@ class TelegramUpdateHandler:
             return ""
         return " | ".join(f'<a href="{escape(url, quote=True)}">{escape(label)}</a>' for label, url in links)
 
+    async def _send_message_media_assets(
+        self,
+        *,
+        chat_id: int,
+        source_chat_id: int,
+        source_message_id: int,
+        assets: list[MediaAsset],
+        max_items: int = 4,
+    ) -> int:
+        if not self.bot_client:
+            return 0
+        sent = 0
+        for asset in assets:
+            if sent >= max_items:
+                break
+            caption = f"{asset.media_type}: {source_chat_id}/{source_message_id}"
+            delivered = False
+            local_path = (asset.local_path or "").strip()
+            if local_path:
+                path = Path(local_path)
+                if path.exists():
+                    try:
+                        await self.bot_client.send_document(chat_id, path, caption=caption)
+                        delivered = True
+                    except TelegramApiError as exc:
+                        logger.warning("Не удалось отправить сохраненный медиа-файл: %s", exc)
+                    except Exception:
+                        logger.warning("Не удалось отправить сохраненный медиа-файл", exc_info=True)
+
+            if not delivered and asset.file_id:
+                try:
+                    await self.bot_client.send_document_by_file_id(chat_id, asset.file_id, caption=caption)
+                    delivered = True
+                except TelegramApiError as exc:
+                    logger.warning("Не удалось отправить медиа по file_id: %s", exc)
+                except Exception:
+                    logger.warning("Не удалось отправить медиа по file_id", exc_info=True)
+
+            if delivered:
+                sent += 1
+        return sent
+
     async def _notify_deleted_events(self, session: AsyncSession, config: AppConfig, update: dict[str, Any]) -> None:
         if not self.bot_client:
             return
@@ -3469,24 +3511,41 @@ class TelegramUpdateHandler:
             except (TypeError, ValueError):
                 continue
             log_item = await session.scalar(select(MessageLog).where(MessageLog.chat_id == chat_id_int, MessageLog.telegram_message_id == mid_int))
+            assets: list[MediaAsset] = []
+            if log_item is not None:
+                assets = list(
+                    await session.scalars(
+                        select(MediaAsset).where(MediaAsset.message_id == log_item.id).order_by(MediaAsset.id.asc())
+                    )
+                )
             txt = "сообщение удалено до чтения"
             if log_item and log_item.text_content:
                 txt = log_item.text_content
+            elif assets:
+                txt = "удалено сообщение с медиа (файлы отправлены ниже)"
             log_chat = (log_item.raw_event or {}).get("chat") if log_item and isinstance(log_item.raw_event, dict) else {}
             log_username = (log_chat or {}).get("username") if isinstance(log_chat, dict) else None
             effective_username = chat_username or log_username
             link_html = self._format_html_links(self._build_deleted_message_links(chat_id_int, mid_int, effective_username))
             link_block = f"\n{link_html}" if link_html else ""
+            media_block = f"\nМедиа: <b>{len(assets)}</b>" if assets else ""
             await self._safe_send(
                 notify_chat_id,
                 (
                     f"🗑️ <b>Сообщение удалено</b>\n"
-                    f"Чат: <code>{chat_id_int}</code> | Msg: <code>{mid_int}</code>{link_block}\n"
+                    f"Чат: <code>{chat_id_int}</code> | Msg: <code>{mid_int}</code>{media_block}{link_block}\n"
                     f"<blockquote>{escape(txt[:900])}</blockquote>"
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
+            if assets:
+                await self._send_message_media_assets(
+                    chat_id=notify_chat_id,
+                    source_chat_id=chat_id_int,
+                    source_message_id=mid_int,
+                    assets=assets,
+                )
 
     def _inline_diff(self, old_text: str, new_text: str) -> str:
         if old_text == new_text:
@@ -3541,17 +3600,14 @@ class TelegramUpdateHandler:
         if not self.bot_client:
             await self._safe_send(chat_id, "BOT_TOKEN не настроен.")
             return
-        sent = False
-        for asset in assets:
-            if not asset.local_path:
-                continue
-            p = Path(asset.local_path)
-            if not p.exists():
-                continue
-            await self.bot_client.send_document(chat_id, p, caption=f"{asset.media_type}: {source_chat_id}/{source_message_id}")
-            sent = True
+        sent = await self._send_message_media_assets(
+            chat_id=chat_id,
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            assets=assets,
+        )
         if not sent:
-            await self._safe_send(chat_id, "Файлы медиа не найдены на диске.")
+            await self._safe_send(chat_id, "Медиа не удалось отправить (нет локального файла и доступа по file_id).")
 
     async def _safe_edit_or_send(
         self,
