@@ -87,6 +87,7 @@ EDIT_NOTIFICATION_KEYS = ("edited_message", "edited_business_message")
 DELETED_NOTIFICATION_KEY = "deleted_business_messages"
 ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_AVATAR_FILE_SIZE = 15 * 1024 * 1024
+RECENT_MEDIA_CACHE_TTL_SEC = 10 * 60
 
 
 class TelegramUpdateHandler:
@@ -108,7 +109,7 @@ class TelegramUpdateHandler:
         )
 
     async def handle_update(self, session: AsyncSession, update: dict[str, Any]) -> None:
-        self._cache_recent_message(update)
+        await self._cache_recent_message(update)
         config = await get_or_create_app_config(session, self.settings)
         await handle_update_logging(
             session,
@@ -171,7 +172,56 @@ class TelegramUpdateHandler:
                 media.append({"media_type": key, "file_id": file_id})
         return media
 
-    def _cache_recent_message(self, update: dict[str, Any]) -> None:
+    def _deleted_media_cache_dir(self) -> Path:
+        root = Path(self.settings.media_root)
+        path = root / "deleted_cache"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    async def _download_cached_media_file(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        index: int,
+        file_id: str,
+    ) -> str:
+        if not self.bot_client:
+            return ""
+        try:
+            tg_file = await self.bot_client.get_file(file_id)
+            file_path = str(tg_file.get("file_path") or "").strip()
+            if not file_path:
+                return ""
+            suffix = Path(file_path).suffix or ".bin"
+            target = self._deleted_media_cache_dir() / str(chat_id) / f"{message_id}_{index}{suffix}"
+            await self.bot_client.download_file(file_path, target)
+            return str(target)
+        except Exception:
+            return ""
+
+    async def _cleanup_cached_media_after_ttl(self, cache_key: tuple[int, int], ttl_sec: int = RECENT_MEDIA_CACHE_TTL_SEC) -> None:
+        await asyncio.sleep(max(60, ttl_sec))
+        entry = self.recent_message_cache.pop(cache_key, None)
+        if not isinstance(entry, dict):
+            return
+        media_items = entry.get("media_items") or []
+        if not isinstance(media_items, list):
+            return
+        for item in media_items:
+            if not isinstance(item, dict):
+                continue
+            local_path = str(item.get("local_path") or "").strip()
+            if not local_path:
+                continue
+            try:
+                path = Path(local_path)
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                logger.warning("Не удалось удалить кэш-файл медиа: %s", local_path)
+
+    async def _cache_recent_message(self, update: dict[str, Any]) -> None:
         for key in MESSAGE_KEYS:
             message = update.get(key)
             if not isinstance(message, dict):
@@ -184,15 +234,71 @@ class TelegramUpdateHandler:
                 message_id_int = int(message_id)
             except (TypeError, ValueError):
                 continue
+
+            cache_key = (chat_id_int, message_id_int)
             text = (message.get("text") or message.get("caption") or "").strip()
-            self.recent_message_cache[(chat_id_int, message_id_int)] = {
-                "text": text,
-                "chat_username": (chat.get("username") or "").strip(),
-                "media_items": self._extract_media_file_ids(message),
+            raw_media = self._extract_media_file_ids(message)
+            previous_entry_raw = self.recent_message_cache.get(cache_key)
+            previous_entry = previous_entry_raw if isinstance(previous_entry_raw, dict) else {}
+            previous_media = previous_entry.get("media_items") or []
+            previous_by_file_id: dict[str, str] = {}
+            if isinstance(previous_media, list):
+                for old_item in previous_media:
+                    if not isinstance(old_item, dict):
+                        continue
+                    old_file_id = str(old_item.get("file_id") or "").strip()
+                    old_local_path = str(old_item.get("local_path") or "").strip()
+                    if old_file_id and old_local_path:
+                        previous_by_file_id[old_file_id] = old_local_path
+
+            media_items: list[dict[str, str]] = []
+            for idx, item in enumerate(raw_media[:6], start=1):
+                media_type = str(item.get("media_type") or "media").strip() or "media"
+                file_id = str(item.get("file_id") or "").strip()
+                if not file_id:
+                    continue
+                local_path = previous_by_file_id.get(file_id, "")
+                if not local_path:
+                    local_path = await self._download_cached_media_file(
+                        chat_id=chat_id_int,
+                        message_id=message_id_int,
+                        index=idx,
+                        file_id=file_id,
+                    )
+                media_items.append({"media_type": media_type, "file_id": file_id, "local_path": local_path})
+
+            cleanup_scheduled = bool(previous_entry.get("cleanup_scheduled")) if isinstance(previous_entry, dict) else False
+            self.recent_message_cache[cache_key] = {
+                "text": text or str(previous_entry.get("text") or "").strip(),
+                "chat_username": (chat.get("username") or str(previous_entry.get("chat_username") or "")).strip(),
+                "media_items": media_items or (previous_media if isinstance(previous_media, list) else []),
                 "cached_at": datetime.now(timezone.utc).isoformat(),
+                "cleanup_scheduled": True,
             }
+
+            if not cleanup_scheduled:
+                self._schedule_background_task(asyncio.create_task(self._cleanup_cached_media_after_ttl(cache_key)))
+
             while len(self.recent_message_cache) > 800:
-                self.recent_message_cache.pop(next(iter(self.recent_message_cache)))
+                old_key = next(iter(self.recent_message_cache))
+                old_entry = self.recent_message_cache.pop(old_key, {})
+                if not isinstance(old_entry, dict):
+                    continue
+                old_media = old_entry.get("media_items") or []
+                if not isinstance(old_media, list):
+                    continue
+                for old_item in old_media:
+                    if not isinstance(old_item, dict):
+                        continue
+                    old_local_path = str(old_item.get("local_path") or "").strip()
+                    if not old_local_path:
+                        continue
+                    try:
+                        old_path = Path(old_local_path)
+                        if old_path.exists():
+                            old_path.unlink()
+                    except Exception:
+                        pass
 
     async def _handle_command(self, session: AsyncSession, message: dict[str, Any], text: str) -> None:
         from_user = message.get("from") or {}
@@ -3558,16 +3664,31 @@ class TelegramUpdateHandler:
                 break
             file_id = (item.get("file_id") or "").strip()
             media_type = (item.get("media_type") or "media").strip()
+            local_path = (item.get("local_path") or "").strip()
             if not file_id:
                 continue
             caption = f"{media_type}: {source_chat_id}/{source_message_id}"
-            try:
-                await self.bot_client.send_document_by_file_id(chat_id, file_id, caption=caption)
+            delivered = False
+            if local_path:
+                try:
+                    local_file = Path(local_path)
+                    if local_file.exists():
+                        await self.bot_client.send_document(chat_id, local_file, caption=caption)
+                        delivered = True
+                except TelegramApiError as exc:
+                    logger.warning("Не удалось отправить кэш-медиа локально: %s", exc)
+                except Exception:
+                    logger.warning("Не удалось отправить кэш-медиа локально", exc_info=True)
+            if not delivered:
+                try:
+                    await self.bot_client.send_document_by_file_id(chat_id, file_id, caption=caption)
+                    delivered = True
+                except TelegramApiError as exc:
+                    logger.warning("Не удалось отправить кэш-медиа по file_id: %s", exc)
+                except Exception:
+                    logger.warning("Не удалось отправить кэш-медиа по file_id", exc_info=True)
+            if delivered:
                 sent += 1
-            except TelegramApiError as exc:
-                logger.warning("Не удалось отправить кэш-медиа по file_id: %s", exc)
-            except Exception:
-                logger.warning("Не удалось отправить кэш-медиа по file_id", exc_info=True)
         return sent
 
     async def _notify_deleted_events(self, session: AsyncSession, config: AppConfig, update: dict[str, Any]) -> None:
@@ -3595,11 +3716,15 @@ class TelegramUpdateHandler:
             except (TypeError, ValueError):
                 continue
             cache_key = (chat_id_int, mid_int)
-            cache_entry = self.recent_message_cache.get(cache_key) or {}
+            cache_entry_raw = self.recent_message_cache.get(cache_key)
+            cache_entry = cache_entry_raw if isinstance(cache_entry_raw, dict) else {}
+            cache_used_for_delete = bool(cache_entry.get("used_for_delete"))
             cached_text = str(cache_entry.get("text") or "").strip()
             cached_username = str(cache_entry.get("chat_username") or "").strip()
             cached_media_items = cache_entry.get("media_items") or []
             if not isinstance(cached_media_items, list):
+                cached_media_items = []
+            if cache_used_for_delete:
                 cached_media_items = []
             log_item = await session.scalar(select(MessageLog).where(MessageLog.chat_id == chat_id_int, MessageLog.telegram_message_id == mid_int))
             assets: list[MediaAsset] = []
@@ -3649,7 +3774,8 @@ class TelegramUpdateHandler:
                     source_message_id=mid_int,
                     media_items=cached_media_items,
                 )
-            self.recent_message_cache.pop(cache_key, None)
+                cache_entry["used_for_delete"] = True
+                self.recent_message_cache[cache_key] = cache_entry
 
     def _inline_diff(self, old_text: str, new_text: str) -> str:
         if old_text == new_text:
