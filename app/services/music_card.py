@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -55,6 +56,25 @@ def normalize_track_input(text: str) -> str:
         if lowered.startswith(prefix):
             raw = raw[len(prefix):].strip(" -:")
             break
+    raw = re.sub(r"^[^0-9A-Za-z\u0400-\u04FF]+", "", raw).strip()
+    lowered = raw.lower()
+    noisy_leading_words = (
+        "переписываю ",
+        "слушаю ",
+        "играет ",
+        "играю ",
+        "playing ",
+        "listening ",
+        "now playing ",
+    )
+    for marker in noisy_leading_words:
+        if lowered.startswith(marker):
+            raw = raw[len(marker):].strip(" -:|")
+            break
+    if ":" in raw:
+        left, right = raw.split(":", maxsplit=1)
+        if len(left.split()) <= 3 and right.strip():
+            raw = right.strip(" -:|")
     return raw
 
 
@@ -149,6 +169,13 @@ async def build_music_card(query_text: str) -> MusicCard:
                 search_terms.append(parsed_title)
             if parsed_artist:
                 search_terms.append(parsed_artist)
+            tokens = normalized.split()
+            if len(tokens) >= 2:
+                search_terms.append(" ".join(tokens[1:]))
+            if len(tokens) >= 3:
+                search_terms.append(" ".join(tokens[-2:]))
+            if len(tokens) >= 4:
+                search_terms.append(" ".join(tokens[-3:]))
 
             seen_terms: set[str] = set()
             for term in search_terms:
