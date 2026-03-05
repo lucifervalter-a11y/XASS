@@ -1,11 +1,43 @@
-﻿import ctypes
+import ctypes
 import json
 import platform
+import re
 import shutil
 import subprocess
 from typing import Any
 
 import psutil
+
+MUSIC_WINDOW_MARKERS = (
+    "youtube music",
+    "spotify",
+    "apple music",
+    "yandex music",
+    "яндекс музыка",
+    "vk music",
+    "deezer",
+    "soundcloud",
+)
+
+WINDOW_TITLE_NOISE_MARKERS = (
+    "командная строка",
+    "powershell",
+    "cmd.exe",
+    "uvicorn",
+    "python",
+    "диспетчер задач",
+    "task manager",
+    "удаленное управление",
+    "remote desktop",
+)
+
+BROWSER_SUFFIXES = (
+    "google chrome",
+    "microsoft edge",
+    "opera",
+    "mozilla firefox",
+    "яндекс браузер",
+)
 
 
 def _run_powershell(command: str, timeout_sec: int = 8) -> tuple[str, str]:
@@ -145,8 +177,39 @@ def _windows_now_playing() -> str | None:
         return title
     if artist:
         return artist
-    if app:
-        return app
+    title_fallback, proc_fallback = _windows_active_window()
+    from_title = _extract_track_from_window_title(title_fallback, proc_fallback)
+    if from_title:
+        return from_title
+    return None
+
+
+def _extract_track_from_window_title(title: str | None, process_name: str | None) -> str | None:
+    raw = (title or "").strip()
+    if not raw:
+        return None
+
+    lower_title = raw.lower()
+    lower_proc = (process_name or "").lower()
+    if any(marker in lower_title for marker in WINDOW_TITLE_NOISE_MARKERS):
+        return None
+    if any(marker in lower_proc for marker in WINDOW_TITLE_NOISE_MARKERS):
+        return None
+
+    normalized = re.sub(r"\s+", " ", raw).strip(" -|")
+    parts = [chunk.strip() for chunk in normalized.split(" - ") if chunk.strip()]
+    if len(parts) >= 2:
+        while parts and parts[-1].lower() in BROWSER_SUFFIXES:
+            parts.pop()
+        while parts and parts[-1].lower() in MUSIC_WINDOW_MARKERS:
+            parts.pop()
+        if len(parts) >= 2:
+            candidate = " - ".join(parts[:2]).strip()
+            if candidate:
+                return candidate
+
+    if any(marker in lower_title for marker in MUSIC_WINDOW_MARKERS):
+        return normalized
     return None
 
 
@@ -170,7 +233,11 @@ def _linux_now_playing() -> str | None:
 def get_now_playing() -> str | None:
     system = platform.system().lower()
     if system == "windows":
-        return _windows_now_playing()
+        direct = _windows_now_playing()
+        if direct:
+            return direct
+        title, process_name = _windows_active_window()
+        return _extract_track_from_window_title(title, process_name)
     if system == "linux":
         return _linux_now_playing()
     return None
