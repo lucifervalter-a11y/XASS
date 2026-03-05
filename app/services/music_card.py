@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote
 
 import httpx
 
@@ -221,18 +221,19 @@ async def build_music_card(query_text: str) -> MusicCard:
 
 def build_search_links(card: MusicCard) -> dict[str, str]:
     q = _clean_text(card.query)
-    if card.album:
+    if card.album and _clean_text(card.album).lower() not in q.lower():
         q = f"{q} {card.album}".strip()
 
     if not q:
         return {}
 
-    encoded_plus = quote_plus(q)
-    encoded_url = quote(q, safe="")
+    encoded_query = quote(q, safe="")
+    encoded_url = encoded_query
+    apple_url = _clean_text(card.album_url) or f"https://music.apple.com/search?term={encoded_query}"
     return {
-        "VK": f"https://vk.com/audio?q={encoded_plus}",
+        "VK": f"https://vk.com/audio?section=search&q={encoded_query}",
         "Shazam": f"https://www.shazam.com/search/{encoded_url}",
-        "Apple Music": f"https://music.apple.com/search?term={encoded_plus}",
-        "Google": f"https://www.google.com/search?q={encoded_plus}",
-        "Yandex Music": f"https://music.yandex.ru/search?text={encoded_plus}",
+        "Apple Music": apple_url,
+        "Google": f"https://www.google.com/search?q={encoded_query}",
+        "Yandex Music": f"https://music.yandex.ru/search?text={encoded_query}",
     }
