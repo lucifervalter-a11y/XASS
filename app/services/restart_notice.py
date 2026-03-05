@@ -39,3 +39,10 @@ def pop_restart_notice(settings: Settings) -> dict[str, Any] | None:
         return None
     return payload
 
+
+def clear_restart_notice(settings: Settings) -> None:
+    path = _notice_path(settings)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass

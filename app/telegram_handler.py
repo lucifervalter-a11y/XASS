@@ -72,7 +72,7 @@ from app.services.profile_editor import (
 )
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, sync_profile_weather
 from app.services.projects_bot import ProjectsBotService
-from app.services.restart_notice import save_restart_notice
+from app.services.restart_notice import clear_restart_notice, save_restart_notice
 from app.services.weather_card import build_weather_card, build_weather_links
 from app.services.updater import (
     CommitInfo,
@@ -2450,18 +2450,21 @@ class TelegramUpdateHandler:
     async def _restart_service_after_delay(self, *, chat_id: int, reason: str, delay_sec: float = 3.0) -> None:
         await asyncio.sleep(max(0.5, delay_sec))
         await self._safe_send(chat_id, f"♻️ Перезапуск сервиса ({reason})...")
+        # Save pending notice before restart attempt; after reboot/startup the app will send success.
+        save_restart_notice(self.settings, chat_id=chat_id, reason=reason)
         try:
             await asyncio.to_thread(restart_service, self.settings)
-            await self._safe_send(chat_id, "✅ Перезапуск выполнен.")
+            # Do not send success here: process can be terminated immediately by systemctl restart.
+            # Success confirmation is sent on next startup from app.main lifespan.
         except Exception as exc:
             if self._should_fallback_to_self_restart(exc):
-                save_restart_notice(self.settings, chat_id=chat_id, reason=reason)
                 await self._safe_send(
                     chat_id,
                     "⚠️ Нет прав на systemctl restart. Перезапускаю процесс через systemd (Restart=always)...",
                 )
                 await asyncio.sleep(1.0)
                 os._exit(0)
+            clear_restart_notice(self.settings)
             await self._safe_send(chat_id, f"❌ Не удалось перезапустить сервис: {exc}")
 
     def _should_fallback_to_self_restart(self, exc: Exception) -> bool:
