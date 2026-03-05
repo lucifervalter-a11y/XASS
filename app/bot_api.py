@@ -234,12 +234,10 @@ class TelegramBotClient:
         self,
         *,
         business_connection_id: str,
-        chat_id: int,
         message_ids: list[int],
     ) -> bool:
         payload: dict[str, Any] = {
             "business_connection_id": business_connection_id,
-            "chat_id": chat_id,
             "message_ids": message_ids,
         }
         result = await self._request("deleteBusinessMessages", payload=payload)

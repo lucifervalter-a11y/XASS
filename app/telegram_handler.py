@@ -262,15 +262,21 @@ class TelegramUpdateHandler:
             return
         try:
             if business_connection_id:
-                await self.bot_client.delete_business_messages(
+                deleted = await self.bot_client.delete_business_messages(
                     business_connection_id=business_connection_id,
-                    chat_id=chat_id,
                     message_ids=[int(message_id)],
                 )
-            else:
+                if deleted:
+                    return
+            await self.bot_client.delete_message(int(chat_id), int(message_id))
+        except TelegramApiError as first_exc:
+            try:
                 await self.bot_client.delete_message(int(chat_id), int(message_id))
+            except Exception:
+                logger.warning("Не удалось удалить команду .muz/.weather: %s", first_exc)
         except Exception:
-            logger.warning("Не удалось удалить команду .muz", exc_info=True)
+            logger.warning("Не удалось удалить команду .muz/.weather", exc_info=True)
+            
 
     async def _handle_muz_command(
         self,
@@ -3947,7 +3953,6 @@ class TelegramUpdateHandler:
                 if business_connection_id:
                     deleted_success = await self.bot_client.delete_business_messages(
                         business_connection_id=business_connection_id,
-                        chat_id=chat_id,
                         message_ids=[message_id],
                     )
                 else:
