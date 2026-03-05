@@ -26,6 +26,7 @@ from app.services.app_config import get_or_create_app_config
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.profile_editor import ensure_profile_exists, load_profile
+from app.services.restart_notice import pop_restart_notice
 from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, update_profile_now_playing_external
 from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
 from app.storage import ensure_data_dirs
@@ -107,6 +108,24 @@ async def lifespan(_: FastAPI):
         logger.info("Startup mode: polling")
     else:
         logger.info("Startup mode: webhook")
+
+    if bot_client:
+        try:
+            notice = pop_restart_notice(settings)
+            if isinstance(notice, dict):
+                chat_id_raw = notice.get("chat_id")
+                reason = str(notice.get("reason") or "перезапуск").strip() or "перезапуск"
+                try:
+                    chat_id = int(chat_id_raw)
+                except (TypeError, ValueError):
+                    chat_id = 0
+                if chat_id:
+                    await bot_client.send_message(
+                        chat_id,
+                        f"✅ Сервис успешно перезапущен ({reason}).",
+                    )
+        except Exception:
+            logger.warning("Failed to deliver restart success notice", exc_info=True)
     try:
         yield
     finally:

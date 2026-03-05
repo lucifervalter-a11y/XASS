@@ -72,6 +72,7 @@ from app.services.profile_editor import (
 )
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, sync_profile_weather
 from app.services.projects_bot import ProjectsBotService
+from app.services.restart_notice import save_restart_notice
 from app.services.weather_card import build_weather_card, build_weather_links
 from app.services.updater import (
     CommitInfo,
@@ -2454,6 +2455,7 @@ class TelegramUpdateHandler:
             await self._safe_send(chat_id, "✅ Перезапуск выполнен.")
         except Exception as exc:
             if self._should_fallback_to_self_restart(exc):
+                save_restart_notice(self.settings, chat_id=chat_id, reason=reason)
                 await self._safe_send(
                     chat_id,
                     "⚠️ Нет прав на systemctl restart. Перезапускаю процесс через systemd (Restart=always)...",

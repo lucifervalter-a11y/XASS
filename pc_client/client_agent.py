@@ -5,6 +5,7 @@ import socket
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import psutil
@@ -27,6 +28,77 @@ def normalize_server_url(value: str) -> str:
     if ":" in raw:
         return f"http://{raw}".rstrip("/")
     return f"http://{raw}:8001".rstrip("/")
+
+
+def _response_preview(text: str, limit: int = 220) -> str:
+    cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit]}..."
+
+
+def _parse_json_body(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_server_candidates(value: str) -> list[str]:
+    normalized = normalize_server_url(value)
+    parsed = urlsplit(normalized)
+    if not parsed.hostname:
+        return [normalized]
+
+    base_path = parsed.path.rstrip("/")
+    if parsed.port is not None or base_path:
+        return [normalized]
+
+    host = parsed.hostname
+    candidates = [normalized]
+    if parsed.scheme == "https":
+        candidates.extend(
+            [
+                f"https://{host}:8001",
+                f"http://{host}:8001",
+                f"http://{host}:8000",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                f"http://{host}:8001",
+                f"http://{host}:8000",
+            ]
+        )
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in candidates:
+        item = item.rstrip("/")
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def discover_backend_url(server_url: str) -> str:
+    candidates = _build_server_candidates(server_url)
+    with httpx.Client(timeout=8, trust_env=False) as client:
+        for candidate in candidates:
+            health_url = f"{candidate}/health"
+            try:
+                response = client.get(health_url)
+            except Exception:
+                continue
+            if response.status_code >= 400:
+                continue
+            payload = _parse_json_body(response)
+            if isinstance(payload, dict) and str(payload.get("status") or "").lower() == "ok":
+                return candidate
+    return normalize_server_url(server_url)
 
 
 def load_config() -> dict[str, Any]:
@@ -112,15 +184,23 @@ def claim_pair_code(
     with httpx.Client(timeout=20, trust_env=False) as client:
         response = client.post(endpoint, json=payload)
 
+    body = _parse_json_body(response)
     if response.status_code >= 400:
         detail = ""
-        try:
-            detail = response.json().get("detail") or ""
-        except Exception:
-            detail = response.text.strip()
+        if isinstance(body, dict):
+            detail = str(body.get("detail") or body.get("description") or "").strip()
+        if not detail:
+            detail = _response_preview(response.text)
         raise RuntimeError(f"pair failed: HTTP {response.status_code} {detail}".strip())
 
-    body = response.json()
+    if not isinstance(body, dict):
+        content_type = response.headers.get("content-type", "")
+        preview = _response_preview(response.text)
+        raise RuntimeError(
+            "pair failed: backend returned non-JSON response. "
+            f"Check --server-url (current: {server_url}). "
+            f"content-type={content_type!r}, body={preview!r}"
+        )
     if not body.get("ok"):
         raise RuntimeError("pair failed: server returned ok=false")
     if not body.get("agent_api_key"):
@@ -147,6 +227,10 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
     pair_code = input("Код привязки (из /agents), Enter если хотите ввести AGENT_API_KEY: ").strip()
     api_key = ""
     if pair_code:
+        discovered_url = discover_backend_url(server_url)
+        if discovered_url != server_url:
+            print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
+            server_url = discovered_url
         result = claim_pair_code(
             server_url=server_url,
             pair_code=pair_code,
@@ -233,6 +317,10 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
     pair_code = (args.pair_code or "").strip()
     if pair_code:
         server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
+        discovered_url = discover_backend_url(server_url)
+        if discovered_url != server_url:
+            print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
+            server_url = discovered_url
         source_name = str(config.get("source_name") or socket.gethostname())
         source_type = str(config.get("source_type") or "PC_AGENT")
         result = claim_pair_code(
@@ -269,7 +357,15 @@ def run_agent(config: dict[str, Any]) -> None:
             try:
                 response = client.post(endpoint, headers=headers, json=payload)
                 response.raise_for_status()
-                body = response.json()
+                body = _parse_json_body(response)
+                if not isinstance(body, dict):
+                    content_type = response.headers.get("content-type", "")
+                    preview = _response_preview(response.text)
+                    raise RuntimeError(
+                        "heartbeat failed: backend returned non-JSON response. "
+                        f"Check server URL ({config['server_url']}). "
+                        f"content-type={content_type!r}, body={preview!r}"
+                    )
                 msg = f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')}"
                 if body.get("new_source"):
                     msg += " | новый агент зарегистрирован"
@@ -309,6 +405,13 @@ def main() -> None:
         if changed_by_args:
             save_config(config)
         print(f"Используется конфиг: {CONFIG_PATH}")
+
+    server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
+    discovered_url = discover_backend_url(server_url)
+    if discovered_url != server_url:
+        print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
+        config["server_url"] = discovered_url
+        save_config(config)
 
     if args.init_only:
         print("[pc-client] init-only completed")

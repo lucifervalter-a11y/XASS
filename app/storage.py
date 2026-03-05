@@ -24,6 +24,7 @@ def ensure_data_dirs() -> None:
     Path(settings.backgrounds_assets_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.update_log_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.update_state_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.restart_notice_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 def _safe_token(value: str) -> str:

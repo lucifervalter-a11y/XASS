@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     custom_restart_cmd: str = ""
     update_log_path: str = "./data/logs/update.log"
     update_state_path: str = "./data/update_state.json"
+    restart_notice_path: str = "./data/restart_notice.json"
     timezone: str = "UTC"
     top_processes_limit: int = 5
 
