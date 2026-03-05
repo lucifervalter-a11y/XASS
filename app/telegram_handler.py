@@ -72,6 +72,7 @@ from app.services.profile_editor import (
 )
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, sync_profile_weather
 from app.services.projects_bot import ProjectsBotService
+from app.services.weather_card import build_weather_card, build_weather_links
 from app.services.updater import (
     CommitInfo,
     UpdateStatus,
@@ -169,10 +170,13 @@ class TelegramUpdateHandler:
             return False
 
         command = text.split()[0].lower()
-        if command != ".muz":
-            return False
-        await self._handle_muz_command(session, config, message, text)
-        return True
+        if command == ".muz":
+            await self._handle_muz_command(session, config, message, text)
+            return True
+        if command == ".weather":
+            await self._handle_weather_dot_command(session, config, message, text)
+            return True
+        return False
 
     def _muz_keyboard(self, links: dict[str, str], album_url: str | None = None) -> dict[str, Any] | None:
         rows: list[list[dict[str, str]]] = []
@@ -288,6 +292,77 @@ class TelegramUpdateHandler:
         except Exception:
             logger.warning("Не удалось отправить карточку .muz", exc_info=True)
             await self._safe_send(int(chat_id), "Не удалось построить карточку трека. Попробуйте позже.")
+
+    def _weather_keyboard(self, links: dict[str, str]) -> dict[str, Any] | None:
+        rows: list[list[dict[str, str]]] = []
+        first_row: list[dict[str, str]] = []
+        second_row: list[dict[str, str]] = []
+        for label in ("Google", "Яндекс"):
+            url = links.get(label)
+            if url:
+                first_row.append({"text": label, "url": url})
+        for label in ("2GIS", "Windy"):
+            url = links.get(label)
+            if url:
+                second_row.append({"text": label, "url": url})
+        if first_row:
+            rows.append(first_row)
+        if second_row:
+            rows.append(second_row)
+        if not rows:
+            return None
+        return {"inline_keyboard": rows}
+
+    def _extract_weather_query(self, message: dict[str, Any], text: str) -> str:
+        raw = text[len(".weather"):].strip()
+        if raw:
+            return raw
+        reply = message.get("reply_to_message") or {}
+        replied_text = (reply.get("text") or reply.get("caption") or "").strip()
+        return replied_text
+
+    async def _handle_weather_dot_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        message: dict[str, Any],
+        text: str,
+    ) -> None:
+        if not self.bot_client:
+            return
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None:
+            return
+
+        query = self._extract_weather_query(message, text)
+        profile = load_profile(Path(self.settings.profile_json_path))
+        card = await build_weather_card(query, profile)
+        if card is None:
+            await self._safe_send(
+                int(chat_id),
+                "Не удалось получить погоду. Пример:\n.weather Москва\nили просто .weather для сохраненной локации.",
+            )
+            return
+
+        links = build_weather_links(card)
+        keyboard = self._weather_keyboard(links)
+        lines = [
+            f"🌤 <b>Погода: {escape(card.location_name)}</b>",
+            f"🌡 {escape(card.temperature)} (ощущается как {escape(card.feels_like)})",
+            f"☁️ {escape(card.weather_text)}",
+            f"💧 Влажность: {escape(card.humidity)}",
+            f"💨 Ветер: {escape(card.wind_speed)}",
+            f"🕒 Обновлено: {escape(card.updated_time)}",
+        ]
+        await self._safe_send(
+            int(chat_id),
+            "\n".join(lines),
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            business_connection_id=message.get("business_connection_id"),
+        )
+        await self._maybe_delete_command_message(message)
 
     def _extract_message(self, update: dict[str, Any]) -> dict[str, Any] | None:
         for key in MESSAGE_KEYS:
