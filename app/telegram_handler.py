@@ -217,6 +217,7 @@ class TelegramUpdateHandler:
         heartbeat_timeout_minutes: int,
     ) -> str:
         timeout_sec = max(60, int(heartbeat_timeout_minutes) * 60)
+        now_playing_ttl_sec = max(timeout_sec * 3, 45 * 60)
         now = datetime.now(timezone.utc)
         sources = list(
             await session.scalars(
@@ -237,6 +238,17 @@ class TelegramUpdateHandler:
             age_sec = max(int((now - last_seen.astimezone(timezone.utc)).total_seconds()), 0)
             if age_sec > timeout_sec:
                 continue
+            now_playing_seen = str(payload.get("now_playing_last_seen_at") or "").strip()
+            if now_playing_seen:
+                try:
+                    parsed = datetime.fromisoformat(now_playing_seen.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    now_age_sec = max(int((now - parsed.astimezone(timezone.utc)).total_seconds()), 0)
+                    if now_age_sec > now_playing_ttl_sec:
+                        continue
+                except ValueError:
+                    pass
             normalized = normalize_track_input(now_playing)
             if normalized:
                 return normalized

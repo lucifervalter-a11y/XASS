@@ -363,10 +363,15 @@ async def sync_profile_now_playing_from_heartbeat(
         if source is not None:
             payload = source.last_payload or {}
             now_playing = _to_clean_text(payload.get("now_playing"))
+            now_playing_last_seen = _parse_iso_datetime(payload.get("now_playing_last_seen_at"))
             age_sec = int((now - _ensure_utc(source.last_seen_at)).total_seconds())
             is_stale = age_sec > max(60, heartbeat_timeout_minutes * 60)
+            now_playing_ttl_sec = max(heartbeat_timeout_minutes * 60 * 3, 45 * 60)
+            now_playing_stale = False
+            if now_playing_last_seen is not None:
+                now_playing_stale = int((now - now_playing_last_seen).total_seconds()) > now_playing_ttl_sec
 
-            if now_playing and source.is_online and not is_stale:
+            if now_playing and source.is_online and not is_stale and not now_playing_stale:
                 new_text = now_playing
             elif source.is_online and not is_stale:
                 new_text = "Сейчас ничего не играет"

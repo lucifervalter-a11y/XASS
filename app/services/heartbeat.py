@@ -22,6 +22,12 @@ def _ensure_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _resolve_timezone(tz_name: str) -> timezone | ZoneInfo:
     cleaned = (tz_name or "").strip() or "UTC"
     try:
@@ -62,8 +68,11 @@ async def process_heartbeat(
     is_new = source is None
     now = _now_utc()
     raw_payload = payload.model_dump(mode="json")
+    incoming_now_playing = _clean_text(raw_payload.get("now_playing"))
 
     if is_new:
+        if incoming_now_playing:
+            raw_payload["now_playing_last_seen_at"] = now.isoformat()
         source = HeartbeatSource(
             source_name=payload.source_name,
             source_type=payload.source_type.value,
@@ -73,6 +82,17 @@ async def process_heartbeat(
         )
         session.add(source)
     else:
+        previous_payload = source.last_payload if isinstance(source.last_payload, dict) else {}
+        previous_now_playing = _clean_text(previous_payload.get("now_playing"))
+        previous_now_seen = _clean_text(previous_payload.get("now_playing_last_seen_at"))
+        if incoming_now_playing:
+            raw_payload["now_playing_last_seen_at"] = now.isoformat()
+        elif previous_now_playing:
+            raw_payload["now_playing"] = previous_now_playing
+            if previous_now_seen:
+                raw_payload["now_playing_last_seen_at"] = previous_now_seen
+            else:
+                raw_payload["now_playing_last_seen_at"] = now.isoformat()
         if not source.is_online:
             recovered = True
         source.source_type = payload.source_type.value
