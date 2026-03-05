@@ -26,7 +26,7 @@ from app.services.app_config import get_or_create_app_config
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.profile_editor import ensure_profile_exists, load_profile
-from app.services.restart_notice import pop_restart_notice
+from app.services.restart_notice import clear_restart_notice, get_restart_notice
 from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, update_profile_now_playing_external
 from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
 from app.storage import ensure_data_dirs
@@ -40,6 +40,18 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
 update_handler = TelegramUpdateHandler(settings, bot_client)
+
+
+def _restart_notice_chat_candidates(primary_chat_id: Any) -> list[int]:
+    candidates: list[int] = []
+    for value in (primary_chat_id, settings.notify_chat_id, settings.owner_user_id):
+        try:
+            parsed = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed and parsed not in candidates:
+            candidates.append(parsed)
+    return candidates
 
 
 def _notify_chat_id(config_chat_id: int | None) -> int | None:
@@ -111,21 +123,26 @@ async def lifespan(_: FastAPI):
 
     if bot_client:
         try:
-            notice = pop_restart_notice(settings)
+            notice = get_restart_notice(settings)
             if isinstance(notice, dict):
-                chat_id_raw = notice.get("chat_id")
                 reason = str(notice.get("reason") or "перезапуск").strip() or "перезапуск"
-                try:
-                    chat_id = int(chat_id_raw)
-                except (TypeError, ValueError):
-                    chat_id = 0
-                if chat_id:
-                    await bot_client.send_message(
-                        chat_id,
-                        f"✅ Сервис успешно перезапущен ({reason}).",
-                    )
+                sent = False
+                for chat_id in _restart_notice_chat_candidates(notice.get("chat_id")):
+                    try:
+                        await bot_client.send_message(
+                            chat_id,
+                            f"✅ Сервис успешно перезапущен ({reason}).",
+                        )
+                        sent = True
+                        break
+                    except Exception:
+                        logger.warning("Failed to deliver restart success notice to chat_id=%s", chat_id)
+                if sent:
+                    clear_restart_notice(settings)
+                else:
+                    logger.warning("Restart success notice retained for next startup attempt")
         except Exception:
-            logger.warning("Failed to deliver restart success notice", exc_info=True)
+            logger.warning("Failed to process restart success notice", exc_info=True)
     try:
         yield
     finally:

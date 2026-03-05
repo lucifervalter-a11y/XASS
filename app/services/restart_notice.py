@@ -40,6 +40,19 @@ def pop_restart_notice(settings: Settings) -> dict[str, Any] | None:
     return payload
 
 
+def get_restart_notice(settings: Settings) -> dict[str, Any] | None:
+    path = _notice_path(settings)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def clear_restart_notice(settings: Settings) -> None:
     path = _notice_path(settings)
     try:
