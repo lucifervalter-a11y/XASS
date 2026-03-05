@@ -195,8 +195,6 @@ class TelegramUpdateHandler:
             rows.append(first_row)
         if second_row:
             rows.append(second_row)
-        if album_url:
-            rows.append([{"text": "Альбом", "url": album_url}])
         if not rows:
             return None
         return {"inline_keyboard": rows}
