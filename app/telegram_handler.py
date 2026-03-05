@@ -212,6 +212,36 @@ class TelegramUpdateHandler:
         profile = load_profile(Path(self.settings.profile_json_path))
         return str(profile.get("now_listening_text") or "").strip(), False
 
+    async def _resolve_live_now_playing(
+        self,
+        session: AsyncSession,
+        heartbeat_timeout_minutes: int,
+    ) -> str:
+        timeout_sec = max(60, int(heartbeat_timeout_minutes) * 60)
+        now = datetime.now(timezone.utc)
+        sources = list(
+            await session.scalars(
+                select(HeartbeatSource)
+                .where(HeartbeatSource.is_online.is_(True))
+                .order_by(HeartbeatSource.last_seen_at.desc())
+                .limit(10)
+            )
+        )
+        for source in sources:
+            payload = source.last_payload if isinstance(source.last_payload, dict) else {}
+            now_playing = str(payload.get("now_playing") or "").strip()
+            if not now_playing:
+                continue
+            last_seen = source.last_seen_at
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            age_sec = max(int((now - last_seen.astimezone(timezone.utc)).total_seconds()), 0)
+            if age_sec > timeout_sec:
+                continue
+            if normalize_track_input(now_playing):
+                return now_playing
+        return ""
+
     async def _maybe_delete_command_message(self, message: dict[str, Any]) -> None:
         if not self.bot_client:
             return
@@ -244,14 +274,24 @@ class TelegramUpdateHandler:
         chat_id = (message.get("chat") or {}).get("id")
         if chat_id is None:
             return
+        business_connection_id = message.get("business_connection_id")
 
         await sync_profile_now_playing_from_heartbeat(session, self.settings, config.heartbeat_timeout_minutes)
         query, is_explicit = self._extract_muz_query(message, text)
         normalized_query = normalize_track_input(query)
+        if not normalized_query and not is_explicit:
+            fallback_query = await self._resolve_live_now_playing(
+                session,
+                config.heartbeat_timeout_minutes,
+            )
+            if fallback_query:
+                query = fallback_query
+                normalized_query = normalize_track_input(fallback_query)
         if not normalized_query:
             await self._safe_send(
                 int(chat_id),
-                "Не нашел трек. Используйте:\n.muz Исполнитель - Трек\nили ответьте .muz на сообщение с названием трека.",
+                "Сейчас не вижу активного трека.\nИспользуйте:\n.muz Исполнитель - Трек\nили ответьте .muz на сообщение с названием трека.",
+                business_connection_id=business_connection_id,
             )
             return
 
@@ -274,7 +314,6 @@ class TelegramUpdateHandler:
         lines.append(f"🔎 Поиск: <code>{escape(card.query or normalized_query)}</code>")
         caption = "\n".join(lines)
 
-        business_connection_id = message.get("business_connection_id")
         try:
             if card.artwork_url:
                 try:
@@ -307,7 +346,11 @@ class TelegramUpdateHandler:
             await self._maybe_delete_command_message(message)
         except Exception:
             logger.warning("Не удалось отправить карточку .muz", exc_info=True)
-            await self._safe_send(int(chat_id), "Не удалось построить карточку трека. Попробуйте позже.")
+            await self._safe_send(
+                int(chat_id),
+                "Не удалось построить карточку трека. Попробуйте позже.",
+                business_connection_id=business_connection_id,
+            )
 
     def _weather_keyboard(self, links: dict[str, str]) -> dict[str, Any] | None:
         rows: list[list[dict[str, str]]] = []
@@ -353,10 +396,12 @@ class TelegramUpdateHandler:
         query = self._extract_weather_query(message, text)
         profile = load_profile(Path(self.settings.profile_json_path))
         card = await build_weather_card(query, profile)
+        business_connection_id = message.get("business_connection_id")
         if card is None:
             await self._safe_send(
                 int(chat_id),
                 "Не удалось получить погоду. Пример:\n.weather Москва\nили просто .weather для сохраненной локации.",
+                business_connection_id=business_connection_id,
             )
             return
 
@@ -370,7 +415,6 @@ class TelegramUpdateHandler:
             f"💨 Ветер: {escape(card.wind_speed)}",
             f"🕒 Обновлено: {escape(card.updated_time)}",
         ]
-        business_connection_id = message.get("business_connection_id")
         try:
             await self._safe_send(
                 int(chat_id),
@@ -383,7 +427,11 @@ class TelegramUpdateHandler:
             await self._maybe_delete_command_message(message)
         except Exception:
             logger.warning("Не удалось отправить карточку .weather", exc_info=True)
-            await self._safe_send(int(chat_id), "Не удалось отправить погоду в чат.")
+            await self._safe_send(
+                int(chat_id),
+                "Не удалось отправить погоду в чат.",
+                business_connection_id=business_connection_id,
+            )
 
     def _extract_message(self, update: dict[str, Any]) -> dict[str, Any] | None:
         for key in MESSAGE_KEYS:
