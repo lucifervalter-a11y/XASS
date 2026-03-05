@@ -105,6 +105,7 @@ class TelegramUpdateHandler:
         self.recent_message_cache: dict[tuple[int, int], dict[str, Any]] = {}
         self.background_tasks: set[asyncio.Task[Any]] = set()
         self.update_jobs: dict[int, asyncio.Task[Any]] = {}
+        self.start_shortcut_hint_sent: set[int] = set()
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -600,6 +601,7 @@ class TelegramUpdateHandler:
 
         if command in ("/start", "/panel"):
             await self._safe_send(chat_id, panel_text(), reply_markup=main_panel_keyboard())
+            await self._ensure_start_shortcut(chat_id)
             return
         if command == "/server":
             m = collect_server_metrics(top_processes_limit=self.settings.top_processes_limit)
@@ -1761,8 +1763,28 @@ class TelegramUpdateHandler:
             "one_time_keyboard": True,
         }
 
+    def _start_shortcut_keyboard(self) -> dict[str, Any]:
+        return {
+            "keyboard": [
+                [{"text": "/start 🏠"}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
+
     def _remove_reply_keyboard(self) -> dict[str, Any]:
         return {"remove_keyboard": True}
+
+    async def _ensure_start_shortcut(self, chat_id: int) -> None:
+        if chat_id in self.start_shortcut_hint_sent:
+            return
+        self.start_shortcut_hint_sent.add(chat_id)
+        await self._safe_send(
+            chat_id,
+            "Быстрый доступ включен: кнопка «/start 🏠» закреплена снизу.",
+            reply_markup=self._start_shortcut_keyboard(),
+            disable_notification=True,
+        )
 
     def _set_away_contact_context(self, user_id: int, chat_id: int, mode: str) -> None:
         self.away_bypass_contact_context[user_id] = {
