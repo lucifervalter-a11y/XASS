@@ -200,16 +200,16 @@ class TelegramUpdateHandler:
             return None
         return {"inline_keyboard": rows}
 
-    def _extract_muz_query(self, message: dict[str, Any], text: str) -> str:
+    def _extract_muz_query(self, message: dict[str, Any], text: str) -> tuple[str, bool]:
         raw = text[len(".muz"):].strip()
         if raw:
-            return raw
+            return raw, True
         reply = message.get("reply_to_message") or {}
         replied_text = (reply.get("text") or reply.get("caption") or "").strip()
         if replied_text:
-            return replied_text
+            return replied_text, True
         profile = load_profile(Path(self.settings.profile_json_path))
-        return str(profile.get("now_listening_text") or "").strip()
+        return str(profile.get("now_listening_text") or "").strip(), False
 
     async def _maybe_delete_command_message(self, message: dict[str, Any]) -> None:
         if not self.bot_client:
@@ -245,7 +245,7 @@ class TelegramUpdateHandler:
             return
 
         await sync_profile_now_playing_from_heartbeat(session, self.settings, config.heartbeat_timeout_minutes)
-        query = self._extract_muz_query(message, text)
+        query, is_explicit = self._extract_muz_query(message, text)
         normalized_query = normalize_track_input(query)
         if not normalized_query:
             await self._safe_send(
@@ -258,10 +258,15 @@ class TelegramUpdateHandler:
         links = build_search_links(card)
         keyboard = self._muz_keyboard(links, card.album_url)
 
-        title = card.title or card.query or normalized_query
+        if is_explicit:
+            title = query.strip()
+        else:
+            title = card.title or card.query or normalized_query
         lines = [f"🎵 <b>{escape(title)}</b>"]
-        if card.artist:
+        if card.artist and not is_explicit:
             lines.append(f"👤 {escape(card.artist)}")
+        elif card.artist and is_explicit:
+            lines.append(f"🔎 Найдено: {escape(card.artist)}")
         if card.album:
             lines.append(f"💿 Альбом: {escape(card.album)}")
         lines.append("")
@@ -271,14 +276,24 @@ class TelegramUpdateHandler:
         business_connection_id = message.get("business_connection_id")
         try:
             if card.artwork_url:
-                await self.bot_client.send_photo(
-                    int(chat_id),
-                    card.artwork_url,
-                    business_connection_id=business_connection_id,
-                    caption=caption[:1024],
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
+                try:
+                    await self.bot_client.send_photo(
+                        int(chat_id),
+                        card.artwork_url,
+                        business_connection_id=business_connection_id,
+                        caption=caption[:1024],
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    await self._safe_send(
+                        int(chat_id),
+                        caption,
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        business_connection_id=business_connection_id,
+                    )
             else:
                 await self._safe_send(
                     int(chat_id),
@@ -354,15 +369,20 @@ class TelegramUpdateHandler:
             f"💨 Ветер: {escape(card.wind_speed)}",
             f"🕒 Обновлено: {escape(card.updated_time)}",
         ]
-        await self._safe_send(
-            int(chat_id),
-            "\n".join(lines),
-            reply_markup=keyboard,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            business_connection_id=message.get("business_connection_id"),
-        )
-        await self._maybe_delete_command_message(message)
+        business_connection_id = message.get("business_connection_id")
+        try:
+            await self._safe_send(
+                int(chat_id),
+                "\n".join(lines),
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                business_connection_id=business_connection_id,
+            )
+            await self._maybe_delete_command_message(message)
+        except Exception:
+            logger.warning("Не удалось отправить карточку .weather", exc_info=True)
+            await self._safe_send(int(chat_id), "Не удалось отправить погоду в чат.")
 
     def _extract_message(self, update: dict[str, Any]) -> dict[str, Any] | None:
         for key in MESSAGE_KEYS:

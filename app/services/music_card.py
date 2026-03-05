@@ -13,6 +13,9 @@ NO_MUSIC_MARKERS = {
     "iPhone: нет свежих данных".lower(),
     "нет данных с пк",
     "vk: нет данных",
+    "не в сети",
+    "не указано",
+    "нет данных",
 }
 
 
@@ -38,7 +41,14 @@ def normalize_track_input(text: str) -> str:
         return ""
     lowered = raw.lower()
     for marker in NO_MUSIC_MARKERS:
-        if lowered == marker:
+        if lowered == marker or marker in lowered:
+            return ""
+    noisy_prefixes = (
+        "открыто приложение:",
+        "сейчас на пк",
+    )
+    for prefix in noisy_prefixes:
+        if lowered.startswith(prefix):
             return ""
     prefixes = ("iphone:", "vk:", "pc:")
     for prefix in prefixes:
@@ -149,4 +159,3 @@ def build_search_links(card: MusicCard) -> dict[str, str]:
         "Google": f"https://www.google.com/search?q={encoded_plus}",
         "Yandex Music": f"https://music.yandex.ru/search?text={encoded_plus}",
     }
-
