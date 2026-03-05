@@ -47,6 +47,7 @@ from app.services.heartbeat import delete_source_by_id, list_sources, rename_sou
 from app.services.message_logging import handle_update_logging
 from app.services.message_logging import mark_single_deleted_message
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
+from app.services.music_card import build_music_card, build_search_links, normalize_track_input
 from app.services.panel import (
     format_pc_text,
     format_server_text,
@@ -145,8 +146,148 @@ class TelegramUpdateHandler:
             return
 
         text = (message.get("text") or "").strip()
+        if text.startswith("."):
+            handled = await self._handle_dot_command(session, config, message, text)
+            if handled:
+                return
         if text.startswith("/"):
             await self._handle_command(session, message, text)
+
+    async def _handle_dot_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        message: dict[str, Any],
+        text: str,
+    ) -> bool:
+        from_user = message.get("from") or {}
+        user_id = from_user.get("id")
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None:
+            return False
+        if not is_authorized(user_id, self.settings):
+            return False
+
+        command = text.split()[0].lower()
+        if command != ".muz":
+            return False
+        await self._handle_muz_command(session, config, message, text)
+        return True
+
+    def _muz_keyboard(self, links: dict[str, str], album_url: str | None = None) -> dict[str, Any] | None:
+        rows: list[list[dict[str, str]]] = []
+        first_row: list[dict[str, str]] = []
+        second_row: list[dict[str, str]] = []
+        for label in ("VK", "Shazam"):
+            url = links.get(label)
+            if url:
+                first_row.append({"text": label, "url": url})
+        for label in ("Google", "Yandex Music"):
+            url = links.get(label)
+            if url:
+                second_row.append({"text": label, "url": url})
+        if first_row:
+            rows.append(first_row)
+        if second_row:
+            rows.append(second_row)
+        if album_url:
+            rows.append([{"text": "Альбом", "url": album_url}])
+        if not rows:
+            return None
+        return {"inline_keyboard": rows}
+
+    def _extract_muz_query(self, message: dict[str, Any], text: str) -> str:
+        raw = text[len(".muz"):].strip()
+        if raw:
+            return raw
+        reply = message.get("reply_to_message") or {}
+        replied_text = (reply.get("text") or reply.get("caption") or "").strip()
+        if replied_text:
+            return replied_text
+        profile = load_profile(Path(self.settings.profile_json_path))
+        return str(profile.get("now_listening_text") or "").strip()
+
+    async def _maybe_delete_command_message(self, message: dict[str, Any]) -> None:
+        if not self.bot_client:
+            return
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        business_connection_id = message.get("business_connection_id")
+        if chat_id is None or message_id is None:
+            return
+        try:
+            if business_connection_id:
+                await self.bot_client.delete_business_messages(
+                    business_connection_id=business_connection_id,
+                    chat_id=chat_id,
+                    message_ids=[int(message_id)],
+                )
+            else:
+                await self.bot_client.delete_message(int(chat_id), int(message_id))
+        except Exception:
+            logger.warning("Не удалось удалить команду .muz", exc_info=True)
+
+    async def _handle_muz_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        message: dict[str, Any],
+        text: str,
+    ) -> None:
+        if not self.bot_client:
+            return
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None:
+            return
+
+        await sync_profile_now_playing_from_heartbeat(session, self.settings, config.heartbeat_timeout_minutes)
+        query = self._extract_muz_query(message, text)
+        normalized_query = normalize_track_input(query)
+        if not normalized_query:
+            await self._safe_send(
+                int(chat_id),
+                "Не нашел трек. Используйте:\n.muz Исполнитель - Трек\nили ответьте .muz на сообщение с названием трека.",
+            )
+            return
+
+        card = await build_music_card(normalized_query)
+        links = build_search_links(card)
+        keyboard = self._muz_keyboard(links, card.album_url)
+
+        title = card.title or card.query or normalized_query
+        lines = [f"🎵 <b>{escape(title)}</b>"]
+        if card.artist:
+            lines.append(f"👤 {escape(card.artist)}")
+        if card.album:
+            lines.append(f"💿 Альбом: {escape(card.album)}")
+        lines.append("")
+        lines.append(f"🔎 Поиск: <code>{escape(card.query or normalized_query)}</code>")
+        caption = "\n".join(lines)
+
+        business_connection_id = message.get("business_connection_id")
+        try:
+            if card.artwork_url:
+                await self.bot_client.send_photo(
+                    int(chat_id),
+                    card.artwork_url,
+                    business_connection_id=business_connection_id,
+                    caption=caption[:1024],
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            else:
+                await self._safe_send(
+                    int(chat_id),
+                    caption,
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    business_connection_id=business_connection_id,
+                )
+            await self._maybe_delete_command_message(message)
+        except Exception:
+            logger.warning("Не удалось отправить карточку .muz", exc_info=True)
+            await self._safe_send(int(chat_id), "Не удалось построить карточку трека. Попробуйте позже.")
 
     def _extract_message(self, update: dict[str, Any]) -> dict[str, Any] | None:
         for key in MESSAGE_KEYS:

@@ -110,6 +110,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `/connect_vk` (`/addvk`, `/vksetup`) - инструкция и OAuth-ссылка для VK.
 - `/vkset <vk_user_id> <vk_access_token>` - сохранить VK-данные без перезапуска.
 - `/vkclear` - очистить VK-данные.
+- `.muz [исполнитель - трек]` - отправить музыкальную карточку (обложка + трек + альбом + кнопки поиска VK/Shazam/Google/Yandex Music). Если аргумент не указан, берется reply-текст или текущее `now_listening_text`.
 
 ## Важные ограничения (честно)
 

@@ -135,6 +135,32 @@ class TelegramBotClient:
             payload["parse_mode"] = parse_mode
         return await self._request("sendMessage", payload=payload)
 
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: str,
+        *,
+        business_connection_id: str | None = None,
+        caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
+        disable_notification: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "photo": photo,
+            "disable_notification": disable_notification,
+        }
+        if business_connection_id:
+            payload["business_connection_id"] = business_connection_id
+        if caption:
+            payload["caption"] = caption
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return await self._request("sendPhoto", payload=payload)
+
     async def edit_message_text(
         self,
         chat_id: int,
