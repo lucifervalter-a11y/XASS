@@ -317,7 +317,8 @@ class TelegramUpdateHandler:
         if card.artist and not is_explicit:
             lines.append(f"👤 {escape(card.artist)}")
         elif card.artist and is_explicit:
-            lines.append(f"🔎 Найдено: {escape(card.artist)}")
+            found_parts = [item for item in (card.artist, card.title) if item]
+            lines.append(f"🔎 Найдено: {escape(' - '.join(found_parts) if found_parts else card.artist)}")
         if card.album:
             lines.append(f"💿 Альбом: {escape(card.album)}")
         lines.append("")
