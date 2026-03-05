@@ -229,16 +229,6 @@ class TelegramUpdateHandler:
         for source in sources:
             payload = source.last_payload if isinstance(source.last_payload, dict) else {}
             now_playing = str(payload.get("now_playing") or "").strip()
-            active_app = str(payload.get("active_app") or "").strip()
-            activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
-            activity_title = str(activity.get("title") or "").strip() if isinstance(activity, dict) else ""
-            activity_text = str(activity.get("text") or "").strip() if isinstance(activity, dict) else ""
-            if not now_playing:
-                for fallback in (active_app, activity_title, activity_text):
-                    candidate = normalize_track_input(fallback)
-                    if candidate:
-                        now_playing = candidate
-                        break
             if not now_playing:
                 continue
             last_seen = source.last_seen_at

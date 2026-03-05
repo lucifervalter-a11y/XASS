@@ -12,15 +12,19 @@ DEEZER_SEARCH_URL = "https://api.deezer.com/search"
 TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
 
 NO_MUSIC_MARKERS = {
-    "сейчас ничего не играет",
-    "iPhone: нет свежих данных".lower(),
-    "нет данных с пк",
-    "vk: нет данных",
-    "не в сети",
-    "не указано",
-    "нет данных",
+    "\u0441\u0435\u0439\u0447\u0430\u0441 \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u0438\u0433\u0440\u0430\u0435\u0442",
+    "iphone: \u043d\u0435\u0442 \u0441\u0432\u0435\u0436\u0438\u0445 \u0434\u0430\u043d\u043d\u044b\u0445",
+    "\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445 \u0441 \u043f\u043a",
+    "vk: \u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445",
+    "\u043d\u0435 \u0432 \u0441\u0435\u0442\u0438",
+    "\u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u043e",
+    "\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445",
+    "\u0443\u0434\u0430\u043b\u0435\u043d\u043d\u043e\u0435 \u0443\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435",
+    "remote desktop",
+    "teamviewer",
+    "anydesk",
+    "rustdesk",
 }
-
 
 @dataclass(slots=True)
 class MusicCard:
@@ -47,8 +51,8 @@ def normalize_track_input(text: str) -> str:
         if lowered == marker or marker in lowered:
             return ""
     noisy_prefixes = (
-        "открыто приложение:",
-        "сейчас на пк",
+        "РѕС‚РєСЂС‹С‚Рѕ РїСЂРёР»РѕР¶РµРЅРёРµ:",
+        "СЃРµР№С‡Р°СЃ РЅР° РїРє",
     )
     for prefix in noisy_prefixes:
         if lowered.startswith(prefix):
@@ -61,10 +65,10 @@ def normalize_track_input(text: str) -> str:
     raw = re.sub(r"^[^0-9A-Za-z\u0400-\u04FF]+", "", raw).strip()
     lowered = raw.lower()
     noisy_leading_words = (
-        "переписываю ",
-        "слушаю ",
-        "играет ",
-        "играю ",
+        "РїРµСЂРµРїРёСЃС‹РІР°СЋ ",
+        "СЃР»СѓС€Р°СЋ ",
+        "РёРіСЂР°РµС‚ ",
+        "РёРіСЂР°СЋ ",
         "playing ",
         "listening ",
         "now playing ",
@@ -73,6 +77,20 @@ def normalize_track_input(text: str) -> str:
         if lowered.startswith(marker):
             raw = raw[len(marker):].strip(" -:|")
             break
+    lowered = raw.lower()
+    noisy_substrings = (
+        "удаленное управление",
+        "remote desktop",
+        "teamviewer",
+        "anydesk",
+        "rustdesk",
+    )
+    if any(marker in lowered for marker in noisy_substrings):
+        return ""
+    if re.search(r"\(\d{2,}\s+\d{2,}\s+\d{2,}\)", raw):
+        return ""
+    if re.search(r"\b[a-z]\d{3,}\(", lowered):
+        return ""
     if ":" in raw:
         left, right = raw.split(":", maxsplit=1)
         if len(left.split()) <= 3 and right.strip():
@@ -84,7 +102,7 @@ def split_artist_title(text: str) -> tuple[str, str]:
     raw = normalize_track_input(text)
     if not raw:
         return "", ""
-    separators = (" - ", " — ", " – ", "-", "—", "–")
+    separators = (" - ", " вЂ” ", " вЂ“ ", "-", "вЂ”", "вЂ“")
     for sep in separators:
         if sep in raw:
             left, right = raw.split(sep, maxsplit=1)
