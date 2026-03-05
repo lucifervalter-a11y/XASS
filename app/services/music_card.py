@@ -89,6 +89,40 @@ def _upgrade_artwork_size(url: str) -> str:
     return upgraded
 
 
+async def _itunes_search_first(
+    client: httpx.AsyncClient,
+    *,
+    term: str,
+    entity: str,
+    limit: int = 1,
+) -> dict[str, Any] | None:
+    clean_term = _clean_text(term)
+    if not clean_term:
+        return None
+    try:
+        response = await client.get(
+            ITUNES_SEARCH_URL,
+            params={
+                "term": clean_term,
+                "entity": entity,
+                "limit": max(1, int(limit)),
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    if not isinstance(first, dict):
+        return None
+    return first
+
+
 async def build_music_card(query_text: str) -> MusicCard:
     normalized = normalize_track_input(query_text)
     if not normalized:
@@ -96,38 +130,80 @@ async def build_music_card(query_text: str) -> MusicCard:
 
     parsed_artist, parsed_title = split_artist_title(normalized)
 
-    payload = {}
-    try:
-        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
-            response = await client.get(
-                ITUNES_SEARCH_URL,
-                params={"term": normalized, "entity": "song", "limit": 1},
-            )
-            response.raise_for_status()
-            payload = response.json() if isinstance(response.json(), dict) else {}
-    except Exception:
-        payload = {}
-
-    result = None
-    if isinstance(payload, dict):
-        results = payload.get("results")
-        if isinstance(results, list) and results:
-            first = results[0]
-            if isinstance(first, dict):
-                result = first
-
     artist = parsed_artist
     title = parsed_title
     album = ""
     artwork = ""
     album_url = ""
 
-    if result:
-        artist = _clean_text(result.get("artistName")) or artist
-        title = _clean_text(result.get("trackName")) or title
-        album = _clean_text(result.get("collectionName"))
-        artwork = _upgrade_artwork_size(_clean_text(result.get("artworkUrl100")))
-        album_url = _clean_text(result.get("collectionViewUrl")) or _clean_text(result.get("trackViewUrl"))
+    track_result: dict[str, Any] | None = None
+    album_result: dict[str, Any] | None = None
+    artist_result: dict[str, Any] | None = None
+
+    try:
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            search_terms: list[str] = [normalized]
+            if parsed_artist and parsed_title:
+                search_terms.append(f"{parsed_artist} {parsed_title}")
+            if parsed_title:
+                search_terms.append(parsed_title)
+            if parsed_artist:
+                search_terms.append(parsed_artist)
+
+            seen_terms: set[str] = set()
+            for term in search_terms:
+                key = term.strip().lower()
+                if not key or key in seen_terms:
+                    continue
+                seen_terms.add(key)
+                track_result = await _itunes_search_first(client, term=term, entity="song")
+                if track_result:
+                    break
+
+            if not track_result:
+                album_seed = parsed_artist or normalized
+                album_result = await _itunes_search_first(client, term=album_seed, entity="album")
+
+            if not track_result and not album_result:
+                artist_seed = parsed_artist or normalized
+                artist_result = await _itunes_search_first(client, term=artist_seed, entity="musicArtist")
+
+            if not track_result and album_result and not _clean_text(album_result.get("artworkUrl100")):
+                artist_name = _clean_text(album_result.get("artistName"))
+                if artist_name:
+                    fallback_album = await _itunes_search_first(client, term=artist_name, entity="album")
+                    if fallback_album:
+                        album_result = fallback_album
+
+            if not track_result and artist_result:
+                artist_name = _clean_text(artist_result.get("artistName"))
+                if artist_name:
+                    fallback_album = await _itunes_search_first(client, term=artist_name, entity="album")
+                    if fallback_album:
+                        album_result = fallback_album
+    except Exception:
+        track_result = None
+        album_result = None
+        artist_result = None
+
+    if track_result:
+        artist = _clean_text(track_result.get("artistName")) or artist
+        title = _clean_text(track_result.get("trackName")) or title
+        album = _clean_text(track_result.get("collectionName"))
+        artwork = _upgrade_artwork_size(_clean_text(track_result.get("artworkUrl100")))
+        album_url = _clean_text(track_result.get("collectionViewUrl")) or _clean_text(track_result.get("trackViewUrl"))
+    elif album_result:
+        artist = _clean_text(album_result.get("artistName")) or artist or normalized
+        if not parsed_title:
+            title = ""
+        album = _clean_text(album_result.get("collectionName"))
+        artwork = _upgrade_artwork_size(_clean_text(album_result.get("artworkUrl100")))
+        album_url = _clean_text(album_result.get("collectionViewUrl"))
+    elif artist_result:
+        artist = _clean_text(artist_result.get("artistName")) or artist or normalized
+        if not parsed_title:
+            title = ""
+        album_url = _clean_text(artist_result.get("artistLinkUrl")) or _clean_text(artist_result.get("artistViewUrl"))
 
     if not artist and not title:
         title = normalized
@@ -156,6 +232,7 @@ def build_search_links(card: MusicCard) -> dict[str, str]:
     return {
         "VK": f"https://vk.com/audio?q={encoded_plus}",
         "Shazam": f"https://www.shazam.com/search/{encoded_url}",
+        "Apple Music": f"https://music.apple.com/search?term={encoded_plus}",
         "Google": f"https://www.google.com/search?q={encoded_plus}",
         "Yandex Music": f"https://music.yandex.ru/search?text={encoded_plus}",
     }

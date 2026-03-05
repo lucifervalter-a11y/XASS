@@ -183,7 +183,7 @@ class TelegramUpdateHandler:
         rows: list[list[dict[str, str]]] = []
         first_row: list[dict[str, str]] = []
         second_row: list[dict[str, str]] = []
-        for label in ("VK", "Shazam"):
+        for label in ("VK", "Shazam", "Apple Music"):
             url = links.get(label)
             if url:
                 first_row.append({"text": label, "url": url})
