@@ -220,7 +220,7 @@ class TelegramUpdateHandler:
         sources = list(
             await session.scalars(
                 select(HeartbeatSource)
-                .where(HeartbeatSource.is_online.is_(True))
+                .where(HeartbeatSource.source_type == "PC_AGENT")
                 .order_by(HeartbeatSource.last_seen_at.desc())
                 .limit(10)
             )
@@ -4053,6 +4053,12 @@ class TelegramUpdateHandler:
             return ""
         return " | ".join(f'<a href="{escape(url, quote=True)}">{escape(label)}</a>' for label, url in links)
 
+    def _is_hidden_deleted_command(self, text: str) -> bool:
+        raw = (text or "").strip().lower()
+        if not raw:
+            return False
+        return raw.startswith(".muz") or raw.startswith(".weather")
+
     async def _send_message_media_assets(
         self,
         *,
@@ -4191,6 +4197,8 @@ class TelegramUpdateHandler:
                 txt = cached_text
             elif cached_media_items:
                 txt = "удалено сообщение с медиа (файлы отправлены ниже)"
+            if self._is_hidden_deleted_command(cached_text) or self._is_hidden_deleted_command(log_item.text_content if log_item else ""):
+                continue
             log_chat = (log_item.raw_event or {}).get("chat") if log_item and isinstance(log_item.raw_event, dict) else {}
             log_username = (log_chat or {}).get("username") if isinstance(log_chat, dict) else None
             effective_username = chat_username or log_username or cached_username
