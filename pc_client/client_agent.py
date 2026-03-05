@@ -394,30 +394,37 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
-    config = ensure_minimal_defaults(load_config())
-    config, changed_by_args = apply_cli_overrides(config, args)
+    try:
+        args = build_arg_parser().parse_args()
+        config = ensure_minimal_defaults(load_config())
+        config, changed_by_args = apply_cli_overrides(config, args)
 
-    if not config.get("server_url") or not config.get("api_key"):
-        config = setup_wizard(config)
-        changed_by_args = True
-    else:
-        if changed_by_args:
+        if not config.get("server_url") or not config.get("api_key"):
+            config = setup_wizard(config)
+            changed_by_args = True
+        else:
+            if changed_by_args:
+                save_config(config)
+            print(f"Используется конфиг: {CONFIG_PATH}")
+
+        server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
+        discovered_url = discover_backend_url(server_url)
+        if discovered_url != server_url:
+            print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
+            config["server_url"] = discovered_url
             save_config(config)
-        print(f"Используется конфиг: {CONFIG_PATH}")
 
-    server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
-    discovered_url = discover_backend_url(server_url)
-    if discovered_url != server_url:
-        print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
-        config["server_url"] = discovered_url
-        save_config(config)
+        if args.init_only:
+            print("[pc-client] init-only completed")
+            return
 
-    if args.init_only:
-        print("[pc-client] init-only completed")
-        return
-
-    run_agent(config)
+        run_agent(config)
+    except KeyboardInterrupt:
+        print("\n[pc-client] stopped by user")
+    except Exception as exc:
+        print(f"[pc-client] error: {exc}")
+        print("[pc-client] hint: проверьте --server-url (должен вести на backend API), pair-code и доступность /health")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
