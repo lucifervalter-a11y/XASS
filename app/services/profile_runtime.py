@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import Settings
 from app.models import HeartbeatSource
+from app.services.music_card import normalize_track_input
 from app.services.profile_editor import ensure_profile_exists, save_profile
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -146,40 +147,40 @@ def _format_weather_updated_time(raw_value: Any, timezone_name: str) -> str:
 
 def _weather_code_to_ru(code: int) -> str:
     mapping = {
-        0: "Ясно",
-        1: "Малооблачно",
-        2: "Переменная облачность",
-        3: "Пасмурно",
-        45: "Туман",
-        48: "Туман",
-        51: "Морось",
-        53: "Морось",
-        55: "Морось",
-        56: "Ледяная морось",
-        57: "Ледяная морось",
-        61: "Дождь",
-        63: "Дождь",
-        65: "Дождь",
-        66: "Ледяной дождь",
-        67: "Ледяной дождь",
-        71: "Снег",
-        73: "Снег",
-        75: "Снег",
-        77: "Снежная крупа",
-        80: "Ливень",
-        81: "Ливень",
-        82: "Ливень",
-        85: "Снегопад",
-        86: "Снегопад",
-        95: "Гроза",
-        96: "Гроза с градом",
-        99: "Гроза с градом",
+        0: "РЇСЃРЅРѕ",
+        1: "РњР°Р»РѕРѕР±Р»Р°С‡РЅРѕ",
+        2: "РџРµСЂРµРјРµРЅРЅР°СЏ РѕР±Р»Р°С‡РЅРѕСЃС‚СЊ",
+        3: "РџР°СЃРјСѓСЂРЅРѕ",
+        45: "РўСѓРјР°РЅ",
+        48: "РўСѓРјР°РЅ",
+        51: "РњРѕСЂРѕСЃСЊ",
+        53: "РњРѕСЂРѕСЃСЊ",
+        55: "РњРѕСЂРѕСЃСЊ",
+        56: "Р›РµРґСЏРЅР°СЏ РјРѕСЂРѕСЃСЊ",
+        57: "Р›РµРґСЏРЅР°СЏ РјРѕСЂРѕСЃСЊ",
+        61: "Р”РѕР¶РґСЊ",
+        63: "Р”РѕР¶РґСЊ",
+        65: "Р”РѕР¶РґСЊ",
+        66: "Р›РµРґСЏРЅРѕР№ РґРѕР¶РґСЊ",
+        67: "Р›РµРґСЏРЅРѕР№ РґРѕР¶РґСЊ",
+        71: "РЎРЅРµРі",
+        73: "РЎРЅРµРі",
+        75: "РЎРЅРµРі",
+        77: "РЎРЅРµР¶РЅР°СЏ РєСЂСѓРїР°",
+        80: "Р›РёРІРµРЅСЊ",
+        81: "Р›РёРІРµРЅСЊ",
+        82: "Р›РёРІРµРЅСЊ",
+        85: "РЎРЅРµРіРѕРїР°Рґ",
+        86: "РЎРЅРµРіРѕРїР°Рґ",
+        95: "Р“СЂРѕР·Р°",
+        96: "Р“СЂРѕР·Р° СЃ РіСЂР°РґРѕРј",
+        99: "Р“СЂРѕР·Р° СЃ РіСЂР°РґРѕРј",
     }
-    return mapping.get(code, "Без уточнения")
+    return mapping.get(code, "Р‘РµР· СѓС‚РѕС‡РЅРµРЅРёСЏ")
 
 
 def _select_weather_location(profile: dict[str, Any]) -> tuple[str, float, float, str, int, bool]:
-    location_name = _to_clean_text(profile.get("weather_location_name")) or "Москва"
+    location_name = _to_clean_text(profile.get("weather_location_name")) or "РњРѕСЃРєРІР°"
     latitude = _to_float(profile.get("weather_latitude"), 55.7558)
     longitude = _to_float(profile.get("weather_longitude"), 37.6176)
     timezone_name = _to_clean_text(profile.get("weather_timezone")) or "Europe/Moscow"
@@ -224,15 +225,15 @@ async def _fetch_weather_text(
     weather_code_raw = current.get("weather_code")
     weather_code = int(weather_code_raw) if isinstance(weather_code_raw, (int, float)) else -1
 
-    parts = [f"{location_name}: {temperature}°C", _weather_code_to_ru(weather_code)]
+    parts = [f"{location_name}: {temperature}В°C", _weather_code_to_ru(weather_code)]
     if apparent:
-        parts.append(f"ощущается как {apparent}°C")
+        parts.append(f"РѕС‰СѓС‰Р°РµС‚СЃСЏ РєР°Рє {apparent}В°C")
     if wind:
-        parts.append(f"ветер {wind} м/с")
+        parts.append(f"РІРµС‚РµСЂ {wind} Рј/СЃ")
 
     updated = _format_weather_updated_time(current.get("time"), timezone_name)
     if updated:
-        parts.append(f"обновлено {updated}")
+        parts.append(f"РѕР±РЅРѕРІР»РµРЅРѕ {updated}")
 
     return ", ".join(parts)
 
@@ -323,7 +324,7 @@ async def sync_profile_now_playing_from_heartbeat(
             current_updated_at is None
             or (now - current_updated_at) >= timedelta(minutes=refresh_minutes)
             or not current_text
-            or current_text == "VK: нет данных"
+            or current_text == "VK: РЅРµС‚ РґР°РЅРЅС‹С…"
         )
         if should_refresh:
             fetched = await _fetch_vk_now_playing_resolved(
@@ -331,7 +332,7 @@ async def sync_profile_now_playing_from_heartbeat(
                 access_token=vk_access_token,
                 api_version=settings.vk_api_version or "5.199",
             )
-            new_text = fetched or "VK: нет данных"
+            new_text = fetched or "VK: РЅРµС‚ РґР°РЅРЅС‹С…"
             if new_text != current_text:
                 profile["now_listening_text"] = new_text
                 changed = True
@@ -344,9 +345,9 @@ async def sync_profile_now_playing_from_heartbeat(
             current_updated_at is None
             or (now - current_updated_at) >= timedelta(minutes=stale_minutes)
         )
-        new_text = current_text or "Сейчас ничего не играет"
+        new_text = current_text or "РЎРµР№С‡Р°СЃ РЅРёС‡РµРіРѕ РЅРµ РёРіСЂР°РµС‚"
         if is_stale:
-            new_text = "iPhone: нет свежих данных"
+            new_text = "iPhone: РЅРµС‚ СЃРІРµР¶РёС… РґР°РЅРЅС‹С…"
         if new_text != current_text:
             profile["now_listening_text"] = new_text
             changed = True
@@ -359,10 +360,14 @@ async def sync_profile_now_playing_from_heartbeat(
             .limit(1)
         )
 
-        new_text = "Нет данных с ПК"
+        new_text = "РќРµС‚ РґР°РЅРЅС‹С… СЃ РџРљ"
         if source is not None:
             payload = source.last_payload or {}
             now_playing = _to_clean_text(payload.get("now_playing"))
+            activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
+            activity_title = _to_clean_text(activity.get("title")) if isinstance(activity, dict) else ""
+            activity_text = _to_clean_text(activity.get("text")) if isinstance(activity, dict) else ""
+            active_app = _to_clean_text(payload.get("active_app"))
             now_playing_last_seen = _parse_iso_datetime(payload.get("now_playing_last_seen_at"))
             age_sec = int((now - _ensure_utc(source.last_seen_at)).total_seconds())
             is_stale = age_sec > max(60, heartbeat_timeout_minutes * 60)
@@ -371,12 +376,22 @@ async def sync_profile_now_playing_from_heartbeat(
             if now_playing_last_seen is not None:
                 now_playing_stale = int((now - now_playing_last_seen).total_seconds()) > now_playing_ttl_sec
 
-            if now_playing and source.is_online and not is_stale and not now_playing_stale:
-                new_text = now_playing
+            normalized_now_playing = normalize_track_input(now_playing) if now_playing else ""
+            if normalized_now_playing and source.is_online and not is_stale and not now_playing_stale:
+                new_text = normalized_now_playing
             elif source.is_online and not is_stale:
-                new_text = "Сейчас ничего не играет"
+                fallback = ""
+                for candidate in (activity_title, active_app, activity_text):
+                    normalized_candidate = normalize_track_input(candidate)
+                    if normalized_candidate:
+                        fallback = normalized_candidate
+                        break
+                if fallback:
+                    new_text = fallback
+                else:
+                    new_text = "Сейчас ничего не играет"
             else:
-                new_text = f"{source.source_name}: не в сети"
+                new_text = f"{source.source_name}: РЅРµ РІ СЃРµС‚Рё"
 
         if new_text != current_text:
             profile["now_listening_text"] = new_text
@@ -406,7 +421,7 @@ def update_profile_now_playing_external(settings: Settings, text: str, source: s
     profile = ensure_profile_exists(profile_path)
 
     normalized_source = _normalize_now_playing_source(source, "iphone")
-    cleaned_text = _to_clean_text(text) or "Сейчас ничего не играет"
+    cleaned_text = _to_clean_text(text) or "РЎРµР№С‡Р°СЃ РЅРёС‡РµРіРѕ РЅРµ РёРіСЂР°РµС‚"
 
     changed = False
     if _to_clean_text(profile.get("now_listening_text")) != cleaned_text:
@@ -448,3 +463,5 @@ async def sync_profile_weather(settings: Settings, *, force: bool = False) -> bo
     profile["weather_updated_at"] = now.isoformat()
     save_profile(profile_path, profile)
     return True
+
+

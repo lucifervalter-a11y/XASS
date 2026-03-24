@@ -317,6 +317,10 @@ class TelegramUpdateHandler:
         profile = load_profile(Path(self.settings.profile_json_path))
         return str(profile.get("now_listening_text") or "").strip(), False
 
+    def _profile_now_playing_text(self) -> str:
+        profile = load_profile(Path(self.settings.profile_json_path))
+        return str(profile.get("now_listening_text") or "").strip()
+
     async def _resolve_live_now_playing(
         self,
         session: AsyncSession,
@@ -333,53 +337,41 @@ class TelegramUpdateHandler:
                 .limit(10)
             )
         )
-        activity_music_markers = (
-            "youtube music",
-            "spotify",
-            "yandex music",
-            "яндекс музыка",
-            "apple music",
-            "deezer",
-            "soundcloud",
-            "vk music",
-        )
         for source in sources:
             payload = source.last_payload if isinstance(source.last_payload, dict) else {}
-            now_playing = str(payload.get("now_playing") or "").strip()
-            if not now_playing:
-                activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
-                activity_title = str(activity.get("title") or "").strip() if isinstance(activity, dict) else ""
-                activity_text = str(activity.get("text") or "").strip() if isinstance(activity, dict) else ""
-                for candidate_raw in (activity_title, activity_text):
-                    lowered = candidate_raw.lower()
-                    if not lowered:
-                        continue
-                    if not any(marker in lowered for marker in activity_music_markers):
-                        continue
-                    now_playing = candidate_raw
-                    break
-            if not now_playing:
-                continue
             last_seen = source.last_seen_at
             if last_seen.tzinfo is None:
                 last_seen = last_seen.replace(tzinfo=timezone.utc)
             age_sec = max(int((now - last_seen.astimezone(timezone.utc)).total_seconds()), 0)
             if age_sec > timeout_sec:
                 continue
+
+            now_playing = str(payload.get("now_playing") or "").strip()
             now_playing_seen = str(payload.get("now_playing_last_seen_at") or "").strip()
-            if now_playing_seen:
-                try:
-                    parsed = datetime.fromisoformat(now_playing_seen.replace("Z", "+00:00"))
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=timezone.utc)
-                    now_age_sec = max(int((now - parsed.astimezone(timezone.utc)).total_seconds()), 0)
-                    if now_age_sec > now_playing_ttl_sec:
-                        continue
-                except ValueError:
-                    pass
-            normalized = normalize_track_input(now_playing)
-            if normalized:
-                return normalized
+            if now_playing:
+                stale_now = False
+                if now_playing_seen:
+                    try:
+                        parsed = datetime.fromisoformat(now_playing_seen.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        now_age_sec = max(int((now - parsed.astimezone(timezone.utc)).total_seconds()), 0)
+                        stale_now = now_age_sec > now_playing_ttl_sec
+                    except ValueError:
+                        stale_now = False
+                if not stale_now:
+                    normalized = normalize_track_input(now_playing)
+                    if normalized:
+                        return normalized
+
+            activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
+            activity_title = str(activity.get("title") or "").strip() if isinstance(activity, dict) else ""
+            activity_text = str(activity.get("text") or "").strip() if isinstance(activity, dict) else ""
+            active_app = str(payload.get("active_app") or "").strip()
+            for candidate_raw in (activity_title, active_app, activity_text):
+                normalized = normalize_track_input(candidate_raw)
+                if normalized:
+                    return normalized
         return ""
 
     async def _maybe_delete_command_message(self, message: dict[str, Any]) -> None:
@@ -422,9 +414,21 @@ class TelegramUpdateHandler:
             return
         business_connection_id = message.get("business_connection_id")
 
-        await sync_profile_now_playing_from_heartbeat(session, self.settings, config.heartbeat_timeout_minutes)
+        profile_query_before_sync = self._profile_now_playing_text()
         query, is_explicit = self._extract_muz_query(message, text)
         normalized_query = normalize_track_input(query)
+        if not normalized_query and not is_explicit:
+            await sync_profile_now_playing_from_heartbeat(session, self.settings, config.heartbeat_timeout_minutes)
+            profile_query_after_sync = self._profile_now_playing_text()
+            normalized_after_sync = normalize_track_input(profile_query_after_sync)
+            normalized_before_sync = normalize_track_input(profile_query_before_sync)
+            if normalized_after_sync:
+                query = profile_query_after_sync
+                normalized_query = normalized_after_sync
+            elif normalized_before_sync:
+                query = profile_query_before_sync
+                normalized_query = normalized_before_sync
+
         if not normalized_query and not is_explicit:
             fallback_query = await self._resolve_live_now_playing(
                 session,
