@@ -98,7 +98,8 @@ MAX_AVATAR_FILE_SIZE = 15 * 1024 * 1024
 RECENT_MEDIA_CACHE_TTL_SEC = 10 * 60
 MUTE_NOTICE_COOLDOWN_SEC = 5 * 60
 DEFAULT_MUTE_NOTICE_TEXT = "🔇 Вас замутил пользователь, сорри.\n\nСнять мут может только владелец."
-MOJIBAKE_CHUNK_RE = re.compile(r"(?:[РСрс][\u0400-\u04FF]){2,}")
+MOJIBAKE_CYR_RE = re.compile(r"(?:[\u0420\u0421\u0440\u0441][\u0400-\u04FF]){2,}")
+MOJIBAKE_LAT_RE = re.compile(r"(?:[\u00D0\u00D1\u00F0\u00F1].){3,}")
 NON_TRACK_STATUS_MARKERS = (
     "сейчас ничего не играет",
     "iphone: нет свежих данных",
@@ -344,11 +345,13 @@ class TelegramUpdateHandler:
         raw = (text or "").strip()
         if not raw:
             return False
-        chunks = MOJIBAKE_CHUNK_RE.findall(raw)
-        if not chunks:
-            return False
-        noisy_len = sum(len(item) for item in chunks)
-        return noisy_len >= max(8, len(raw) // 3)
+        if MOJIBAKE_CYR_RE.search(raw) or MOJIBAKE_LAT_RE.search(raw):
+            return True
+        suspicious_chars = set("\u0420\u0421\u0440\u0441\u00D0\u00D1\u00F0\u00F1")
+        suspicious_count = sum(1 for ch in raw if ch in suspicious_chars)
+        if suspicious_count >= 6 and suspicious_count >= max(4, len(raw) // 5):
+            return True
+        return False
 
     def _is_non_track_status_text(self, text: str) -> bool:
         raw = (text or "").strip()
