@@ -2,6 +2,7 @@
 import secrets
 import asyncio
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -97,6 +98,16 @@ MAX_AVATAR_FILE_SIZE = 15 * 1024 * 1024
 RECENT_MEDIA_CACHE_TTL_SEC = 10 * 60
 MUTE_NOTICE_COOLDOWN_SEC = 5 * 60
 DEFAULT_MUTE_NOTICE_TEXT = "🔇 Вас замутил пользователь, сорри.\n\nСнять мут может только владелец."
+MOJIBAKE_CHUNK_RE = re.compile(r"(?:[РСрс][\u0400-\u04FF]){2,}")
+NON_TRACK_STATUS_MARKERS = (
+    "сейчас ничего не играет",
+    "iphone: нет свежих данных",
+    "нет свежих данных",
+    "нет данных с пк",
+    "нет данных",
+    "не в сети",
+    "vk: нет данных",
+)
 
 
 class TelegramUpdateHandler:
@@ -329,6 +340,27 @@ class TelegramUpdateHandler:
         profile = load_profile(Path(self.settings.profile_json_path))
         return str(profile.get("now_listening_text") or "").strip()
 
+    def _looks_like_mojibake(self, text: str) -> bool:
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        chunks = MOJIBAKE_CHUNK_RE.findall(raw)
+        if not chunks:
+            return False
+        noisy_len = sum(len(item) for item in chunks)
+        return noisy_len >= max(8, len(raw) // 3)
+
+    def _is_non_track_status_text(self, text: str) -> bool:
+        raw = (text or "").strip()
+        if not raw:
+            return True
+        lowered = raw.lower()
+        if any(marker in lowered for marker in NON_TRACK_STATUS_MARKERS):
+            return True
+        if self._looks_like_mojibake(raw):
+            return True
+        return False
+
     async def _resolve_live_now_playing(
         self,
         session: AsyncSession,
@@ -424,12 +456,22 @@ class TelegramUpdateHandler:
 
         profile_query_before_sync = self._profile_now_playing_text()
         query, is_explicit = self._extract_muz_query(message, text)
+        if self._is_non_track_status_text(query):
+            query = ""
         normalized_query = normalize_track_input(query)
         if not normalized_query and not is_explicit:
             await sync_profile_now_playing_from_heartbeat(session, self.settings, config.heartbeat_timeout_minutes)
             profile_query_after_sync = self._profile_now_playing_text()
-            normalized_after_sync = normalize_track_input(profile_query_after_sync)
-            normalized_before_sync = normalize_track_input(profile_query_before_sync)
+            normalized_after_sync = (
+                ""
+                if self._is_non_track_status_text(profile_query_after_sync)
+                else normalize_track_input(profile_query_after_sync)
+            )
+            normalized_before_sync = (
+                ""
+                if self._is_non_track_status_text(profile_query_before_sync)
+                else normalize_track_input(profile_query_before_sync)
+            )
             if normalized_after_sync:
                 query = profile_query_after_sync
                 normalized_query = normalized_after_sync
@@ -454,6 +496,15 @@ class TelegramUpdateHandler:
             return
 
         card = await build_music_card(normalized_query)
+        resolved_query = (card.query or normalized_query or "").strip()
+        if self._is_non_track_status_text(resolved_query):
+            await self._safe_send(
+                int(chat_id),
+                "Сейчас не вижу активного трека.\nИспользуйте:\n.muz Исполнитель - Трек\nили ответьте .muz на сообщение с названием трека.",
+                business_connection_id=business_connection_id,
+            )
+            await self._maybe_delete_command_message(message)
+            return
         links = build_search_links(card)
         keyboard = self._muz_keyboard(links, card.album_url)
 
