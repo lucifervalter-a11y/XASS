@@ -101,6 +101,14 @@ def get_away_bypass_user_ids(config: AppConfig) -> set[int]:
     return _parse_user_ids(config.away_bypass_user_ids)
 
 
+def get_muted_chat_ids(config: AppConfig) -> set[int]:
+    return _parse_user_ids(config.muted_chat_ids)
+
+
+def is_chat_muted(config: AppConfig, chat_id: int) -> bool:
+    return int(chat_id) in get_muted_chat_ids(config)
+
+
 def is_in_daily_window(local_minute: int, start_minute: int, end_minute: int) -> bool:
     start = int(start_minute) % (24 * 60)
     end = int(end_minute) % (24 * 60)
@@ -164,6 +172,9 @@ async def get_or_create_app_config(session: AsyncSession, settings: Settings) ->
         if config.away_bypass_user_ids is None:
             config.away_bypass_user_ids = ""
             changed = True
+        if config.muted_chat_ids is None:
+            config.muted_chat_ids = ""
+            changed = True
         if config.service_base_url is None:
             config.service_base_url = (settings.profile_public_url or "").strip() or None
             changed = True
@@ -191,6 +202,7 @@ async def get_or_create_app_config(session: AsyncSession, settings: Settings) ->
         away_schedule_start_minute=23 * 60,
         away_schedule_end_minute=8 * 60,
         away_bypass_user_ids="",
+        muted_chat_ids="",
         notify_chat_id=settings.notify_chat_id,
         service_base_url=(settings.profile_public_url or "").strip() or None,
         iphone_shortcut_url=None,
@@ -432,6 +444,38 @@ async def remove_away_bypass_user_id(session: AsyncSession, config: AppConfig, b
     user_ids = get_away_bypass_user_ids(config)
     user_ids.discard(int(bypass_user_id))
     return await set_away_bypass_user_ids(session, config, user_ids, actor_user_id)
+
+
+async def set_muted_chat_ids(
+    session: AsyncSession,
+    config: AppConfig,
+    chat_ids: set[int],
+    actor_user_id: int,
+) -> AppConfig:
+    config.muted_chat_ids = _serialize_user_ids(chat_ids)
+    config.updated_by_user_id = actor_user_id
+    config.updated_at = _now_utc()
+    await session.commit()
+    await session.refresh(config)
+    await log_admin_action(
+        session,
+        actor_user_id,
+        "set_muted_chat_ids",
+        {"count": len(chat_ids), "chat_ids": sorted(chat_ids)},
+    )
+    return config
+
+
+async def mute_chat(session: AsyncSession, config: AppConfig, chat_id: int, actor_user_id: int) -> AppConfig:
+    chat_ids = get_muted_chat_ids(config)
+    chat_ids.add(int(chat_id))
+    return await set_muted_chat_ids(session, config, chat_ids, actor_user_id)
+
+
+async def unmute_chat(session: AsyncSession, config: AppConfig, chat_id: int, actor_user_id: int) -> AppConfig:
+    chat_ids = get_muted_chat_ids(config)
+    chat_ids.discard(int(chat_id))
+    return await set_muted_chat_ids(session, config, chat_ids, actor_user_id)
 
 
 async def set_notify_chat(session: AsyncSession, config: AppConfig, chat_id: int, actor_user_id: int) -> AppConfig:

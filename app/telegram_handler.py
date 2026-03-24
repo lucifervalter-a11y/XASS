@@ -24,8 +24,10 @@ from app.services.app_config import (
     format_time_range,
     get_or_create_app_config,
     get_away_bypass_user_ids,
+    is_chat_muted,
     is_away_mode_active,
     log_admin_action,
+    mute_chat,
     parse_time_range,
     remove_away_bypass_user_id,
     set_away_message,
@@ -39,6 +41,7 @@ from app.services.app_config import (
     set_service_base_url,
     toggle_away_mode,
     toggle_quiet_hours,
+    unmute_chat,
 )
 from app.services.agent_pairing import issue_pair_code
 from app.services.auth import is_authorized, is_owner
@@ -92,6 +95,8 @@ DELETED_NOTIFICATION_KEY = "deleted_business_messages"
 ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_AVATAR_FILE_SIZE = 15 * 1024 * 1024
 RECENT_MEDIA_CACHE_TTL_SEC = 10 * 60
+MUTE_NOTICE_COOLDOWN_SEC = 5 * 60
+DEFAULT_MUTE_NOTICE_TEXT = "🔇 Вас замутил пользователь, сорри.\n\nЧтобы снять мут, напишите .unmute"
 
 
 class TelegramUpdateHandler:
@@ -103,6 +108,7 @@ class TelegramUpdateHandler:
         self.profile_avatar_upload_context: dict[int, dict[str, Any]] = {}
         self.away_bypass_contact_context: dict[int, dict[str, Any]] = {}
         self.recent_message_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.chat_mute_notice_sent_at: dict[int, datetime] = {}
         self.background_tasks: set[asyncio.Task[Any]] = set()
         self.update_jobs: dict[int, asyncio.Task[Any]] = {}
         self.start_shortcut_hint_sent: set[int] = set()
@@ -136,6 +142,8 @@ class TelegramUpdateHandler:
         if not message:
             return
         if await self._maybe_handle_away_mode(session, config, message):
+            return
+        if await self._maybe_handle_chat_mute(session, config, message):
             return
         if await self._maybe_handle_away_bypass_contact(session, config, message):
             return
@@ -172,6 +180,12 @@ class TelegramUpdateHandler:
             return False
 
         command = text.split()[0].lower()
+        if command == ".mute":
+            await self._handle_mute_dot_command(session, config, message)
+            return True
+        if command == ".unmute":
+            await self._handle_unmute_dot_command(session, config, message)
+            return True
         if command == ".muz":
             await self._handle_muz_command(session, config, message, text)
             return True
@@ -179,6 +193,98 @@ class TelegramUpdateHandler:
             await self._handle_weather_dot_command(session, config, message, text)
             return True
         return False
+
+    async def _handle_mute_dot_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        message: dict[str, Any],
+    ) -> None:
+        if not self.bot_client:
+            return
+        from_user = message.get("from") or {}
+        user_id = from_user.get("id")
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None or user_id is None:
+            return
+        business_connection_id = message.get("business_connection_id")
+        chat_id_int = int(chat_id)
+
+        already_muted = is_chat_muted(config, chat_id_int)
+        if not already_muted:
+            config = await mute_chat(session, config, chat_id_int, int(user_id))
+
+        self.chat_mute_notice_sent_at[chat_id_int] = datetime.now(timezone.utc)
+        if already_muted:
+            text = "🔇 Чат уже на муте.\n\nЧтобы снять мут, напишите .unmute"
+        else:
+            text = "🔇 Помолчим.\n\nВас замутил пользователь, сорри.\nЧтобы снять мут, напишите .unmute"
+        await self._safe_send(chat_id_int, text, business_connection_id=business_connection_id)
+        await self._maybe_delete_command_message(message)
+
+    async def _handle_unmute_dot_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        message: dict[str, Any],
+    ) -> None:
+        if not self.bot_client:
+            return
+        from_user = message.get("from") or {}
+        user_id = from_user.get("id")
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None or user_id is None:
+            return
+        business_connection_id = message.get("business_connection_id")
+        chat_id_int = int(chat_id)
+
+        was_muted = is_chat_muted(config, chat_id_int)
+        if was_muted:
+            config = await unmute_chat(session, config, chat_id_int, int(user_id))
+
+        self.chat_mute_notice_sent_at.pop(chat_id_int, None)
+        if was_muted:
+            text = "🔊 Говори."
+        else:
+            text = "🔊 Мут уже снят."
+        await self._safe_send(chat_id_int, text, business_connection_id=business_connection_id)
+        await self._maybe_delete_command_message(message)
+
+    async def _maybe_handle_chat_mute(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        message: dict[str, Any],
+    ) -> bool:
+        if not self.bot_client:
+            return False
+        chat_id = (message.get("chat") or {}).get("id")
+        from_user = message.get("from") or {}
+        user_id = from_user.get("id")
+        if chat_id is None or user_id is None:
+            return False
+        chat_id_int = int(chat_id)
+        if not is_chat_muted(config, chat_id_int):
+            return False
+        if is_authorized(user_id, self.settings):
+            return False
+        if from_user.get("is_bot"):
+            return False
+
+        now = datetime.now(timezone.utc)
+        last = self.chat_mute_notice_sent_at.get(chat_id_int)
+        if last is not None:
+            delta = (now - last).total_seconds()
+            if delta < MUTE_NOTICE_COOLDOWN_SEC:
+                return True
+
+        self.chat_mute_notice_sent_at[chat_id_int] = now
+        await self._safe_send(
+            chat_id_int,
+            DEFAULT_MUTE_NOTICE_TEXT,
+            business_connection_id=message.get("business_connection_id"),
+        )
+        return True
 
     def _muz_keyboard(self, links: dict[str, str], album_url: str | None = None) -> dict[str, Any] | None:
         rows: list[list[dict[str, str]]] = []
@@ -227,9 +333,31 @@ class TelegramUpdateHandler:
                 .limit(10)
             )
         )
+        activity_music_markers = (
+            "youtube music",
+            "spotify",
+            "yandex music",
+            "яндекс музыка",
+            "apple music",
+            "deezer",
+            "soundcloud",
+            "vk music",
+        )
         for source in sources:
             payload = source.last_payload if isinstance(source.last_payload, dict) else {}
             now_playing = str(payload.get("now_playing") or "").strip()
+            if not now_playing:
+                activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
+                activity_title = str(activity.get("title") or "").strip() if isinstance(activity, dict) else ""
+                activity_text = str(activity.get("text") or "").strip() if isinstance(activity, dict) else ""
+                for candidate_raw in (activity_title, activity_text):
+                    lowered = candidate_raw.lower()
+                    if not lowered:
+                        continue
+                    if not any(marker in lowered for marker in activity_music_markers):
+                        continue
+                    now_playing = candidate_raw
+                    break
             if not now_playing:
                 continue
             last_seen = source.last_seen_at
@@ -4098,7 +4226,12 @@ class TelegramUpdateHandler:
         raw = (text or "").strip().lower()
         if not raw:
             return False
-        return raw.startswith(".muz") or raw.startswith(".weather")
+        return (
+            raw.startswith(".muz")
+            or raw.startswith(".weather")
+            or raw.startswith(".mute")
+            or raw.startswith(".unmute")
+        )
 
     async def _send_message_media_assets(
         self,
