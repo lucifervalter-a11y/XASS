@@ -10,6 +10,7 @@ import httpx
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 DEEZER_SEARCH_URL = "https://api.deezer.com/search"
 TOKEN_RE = re.compile(r"[0-9A-Za-z\u0400-\u04FF]+")
+MOJIBAKE_CHUNK_RE = re.compile(r"(?:[РСрс][\u0400-\u04FF]){2,}")
 
 NO_MUSIC_MARKERS = {
     "\u0441\u0435\u0439\u0447\u0430\u0441 \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u0438\u0433\u0440\u0430\u0435\u0442",
@@ -42,9 +43,37 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-def normalize_track_input(text: str) -> str:
+def _looks_like_mojibake(text: str) -> bool:
     raw = _clean_text(text)
     if not raw:
+        return False
+    chunks = MOJIBAKE_CHUNK_RE.findall(raw)
+    if not chunks:
+        return False
+    noisy_len = sum(len(item) for item in chunks)
+    return noisy_len >= max(8, len(raw) // 3)
+
+
+def _try_repair_mojibake(text: str) -> str:
+    raw = _clean_text(text)
+    if not raw or not _looks_like_mojibake(raw):
+        return raw
+    for source_encoding in ("cp1251", "latin1", "cp866"):
+        try:
+            repaired = raw.encode(source_encoding).decode("utf-8")
+        except Exception:
+            continue
+        repaired = _clean_text(repaired)
+        if repaired and not _looks_like_mojibake(repaired):
+            return repaired
+    return raw
+
+
+def normalize_track_input(text: str) -> str:
+    raw = _try_repair_mojibake(_clean_text(text))
+    if not raw:
+        return ""
+    if _looks_like_mojibake(raw):
         return ""
     lowered = raw.lower()
     for marker in NO_MUSIC_MARKERS:

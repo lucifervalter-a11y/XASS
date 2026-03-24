@@ -421,7 +421,14 @@ def update_profile_now_playing_external(settings: Settings, text: str, source: s
     profile = ensure_profile_exists(profile_path)
 
     normalized_source = _normalize_now_playing_source(source, "iphone")
-    cleaned_text = _to_clean_text(text) or "РЎРµР№С‡Р°СЃ РЅРёС‡РµРіРѕ РЅРµ РёРіСЂР°РµС‚"
+    cleaned_text = _to_clean_text(text)
+    normalized_text = normalize_track_input(cleaned_text) if cleaned_text else ""
+    if normalized_text:
+        cleaned_text = normalized_text
+    elif not cleaned_text:
+        cleaned_text = "РЎРµР№С‡Р°СЃ РЅРёС‡РµРіРѕ РЅРµ РёРіСЂР°РµС‚"
+    else:
+        cleaned_text = "РЎРµР№С‡Р°СЃ РЅРёС‡РµРіРѕ РЅРµ РёРіСЂР°РµС‚"
 
     changed = False
     if _to_clean_text(profile.get("now_listening_text")) != cleaned_text:
