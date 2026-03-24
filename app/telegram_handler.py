@@ -96,7 +96,7 @@ ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_AVATAR_FILE_SIZE = 15 * 1024 * 1024
 RECENT_MEDIA_CACHE_TTL_SEC = 10 * 60
 MUTE_NOTICE_COOLDOWN_SEC = 5 * 60
-DEFAULT_MUTE_NOTICE_TEXT = "🔇 Вас замутил пользователь, сорри.\n\nЧтобы снять мут, напишите .unmute"
+DEFAULT_MUTE_NOTICE_TEXT = "🔇 Вас замутил пользователь, сорри.\n\nСнять мут может только владелец."
 
 
 class TelegramUpdateHandler:
@@ -181,9 +181,13 @@ class TelegramUpdateHandler:
 
         command = text.split()[0].lower()
         if command == ".mute":
+            if not is_owner(user_id, self.settings):
+                return False
             await self._handle_mute_dot_command(session, config, message)
             return True
         if command == ".unmute":
+            if not is_owner(user_id, self.settings):
+                return False
             await self._handle_unmute_dot_command(session, config, message)
             return True
         if command == ".muz":
@@ -207,6 +211,8 @@ class TelegramUpdateHandler:
         chat_id = (message.get("chat") or {}).get("id")
         if chat_id is None or user_id is None:
             return
+        if not is_owner(user_id, self.settings):
+            return
         business_connection_id = message.get("business_connection_id")
         chat_id_int = int(chat_id)
 
@@ -216,9 +222,9 @@ class TelegramUpdateHandler:
 
         self.chat_mute_notice_sent_at[chat_id_int] = datetime.now(timezone.utc)
         if already_muted:
-            text = "🔇 Чат уже на муте.\n\nЧтобы снять мут, напишите .unmute"
+            text = "🔇 Чат уже на муте.\n\nСнять мут: команда .unmute (только владелец)."
         else:
-            text = "🔇 Помолчим.\n\nВас замутил пользователь, сорри.\nЧтобы снять мут, напишите .unmute"
+            text = "🔇 Помолчим.\n\nВас замутил пользователь, сорри.\nСнять мут: команда .unmute (только владелец)."
         await self._safe_send(chat_id_int, text, business_connection_id=business_connection_id)
         await self._maybe_delete_command_message(message)
 
@@ -235,6 +241,8 @@ class TelegramUpdateHandler:
         chat_id = (message.get("chat") or {}).get("id")
         if chat_id is None or user_id is None:
             return
+        if not is_owner(user_id, self.settings):
+            return
         business_connection_id = message.get("business_connection_id")
         chat_id_int = int(chat_id)
 
@@ -244,9 +252,9 @@ class TelegramUpdateHandler:
 
         self.chat_mute_notice_sent_at.pop(chat_id_int, None)
         if was_muted:
-            text = "🔊 Говори."
+            text = f"🔊 Говори.\n\nМут снят владельцем (id: {int(user_id)})."
         else:
-            text = "🔊 Мут уже снят."
+            text = f"🔊 Мут уже снят.\n\nПроверил владелец (id: {int(user_id)})."
         await self._safe_send(chat_id_int, text, business_connection_id=business_connection_id)
         await self._maybe_delete_command_message(message)
 
