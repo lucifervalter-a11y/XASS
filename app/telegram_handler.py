@@ -443,6 +443,52 @@ class TelegramUpdateHandler:
             logger.warning("Не удалось удалить команду .muz/.weather", exc_info=True)
             
 
+    def _muz_no_track_hint(self) -> str:
+        """Return informative hint when .muz can't find an active track."""
+        try:
+            profile = load_profile(Path(self.settings.profile_json_path))
+            source = str(profile.get("now_listening_source") or "pc_agent").strip()
+            last_text = str(profile.get("now_listening_text") or "").strip()
+            last_updated_raw = str(profile.get("now_listening_updated_at") or "").strip()
+            last_updated = ""
+            if last_updated_raw:
+                try:
+                    dt = datetime.fromisoformat(last_updated_raw.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_sec = int((datetime.now(timezone.utc) - dt).total_seconds())
+                    if age_sec < 60:
+                        last_updated = "только что"
+                    elif age_sec < 3600:
+                        last_updated = f"{age_sec // 60} мин. назад"
+                    else:
+                        last_updated = f"{age_sec // 3600} ч. назад"
+                except Exception:
+                    pass
+            lines = ["🎵 Активный трек не найден."]
+            source_label = {"iphone": "iPhone Shortcut", "vk": "VK", "pc_agent": "ПК агент"}.get(source, source)
+            lines.append(f"Источник: {source_label}")
+            if last_text and not self._is_non_track_status_text(last_text):
+                age_note = f" ({last_updated})" if last_updated else ""
+                lines.append(f"Последний трек{age_note}: {last_text}")
+            elif last_text:
+                age_note = f" ({last_updated})" if last_updated else ""
+                lines.append(f"Статус источника{age_note}: {last_text}")
+            if source == "iphone":
+                lines.append("\nЧтобы обновить — запустите iPhone Shortcut вручную.")
+            elif source == "vk":
+                lines.append("\nЧтобы обновить — включите музыку ВКонтакте.")
+            else:
+                lines.append("\nЧтобы указать трек вручную:")
+            lines.append(".muz Исполнитель - Название трека")
+        except Exception:
+            lines = [
+                "🎵 Активный трек не найден.",
+                "Укажите трек вручную:",
+                ".muz Исполнитель - Название трека",
+            ]
+        return "\n".join(lines)
+
     async def _handle_muz_command(
         self,
         session: AsyncSession,
@@ -493,7 +539,7 @@ class TelegramUpdateHandler:
         if not normalized_query:
             await self._safe_send(
                 int(chat_id),
-                "Сейчас не вижу активного трека.\nИспользуйте:\n.muz Исполнитель - Трек\nили ответьте .muz на сообщение с названием трека.",
+                self._muz_no_track_hint(),
                 business_connection_id=business_connection_id,
             )
             return
@@ -503,7 +549,7 @@ class TelegramUpdateHandler:
         if self._is_non_track_status_text(resolved_query):
             await self._safe_send(
                 int(chat_id),
-                "Сейчас не вижу активного трека.\nИспользуйте:\n.muz Исполнитель - Трек\nили ответьте .muz на сообщение с названием трека.",
+                self._muz_no_track_hint(),
                 business_connection_id=business_connection_id,
             )
             await self._maybe_delete_command_message(message)
@@ -768,9 +814,17 @@ class TelegramUpdateHandler:
                 media_items.append({"media_type": media_type, "file_id": file_id, "local_path": local_path})
 
             cleanup_scheduled = bool(previous_entry.get("cleanup_scheduled")) if isinstance(previous_entry, dict) else False
+            from_user = message.get("from") or {}
+            from_username = str(from_user.get("username") or "").strip()
+            if not from_username:
+                parts = [str(from_user.get("first_name") or "").strip(), str(from_user.get("last_name") or "").strip()]
+                from_username = " ".join(p for p in parts if p)
+            chat_title = str(chat.get("title") or chat.get("username") or "").strip()
             self.recent_message_cache[cache_key] = {
                 "text": text or str(previous_entry.get("text") or "").strip(),
                 "chat_username": (chat.get("username") or str(previous_entry.get("chat_username") or "")).strip(),
+                "from_name": from_username or str(previous_entry.get("from_name") or "").strip(),
+                "chat_title": chat_title or str(previous_entry.get("chat_title") or "").strip(),
                 "media_items": media_items or (previous_media if isinstance(previous_media, list) else []),
                 "cached_at": datetime.now(timezone.utc).isoformat(),
                 "cleanup_scheduled": True,
@@ -4442,15 +4496,65 @@ class TelegramUpdateHandler:
             log_chat = (log_item.raw_event or {}).get("chat") if log_item and isinstance(log_item.raw_event, dict) else {}
             log_username = (log_chat or {}).get("username") if isinstance(log_chat, dict) else None
             effective_username = chat_username or log_username or cached_username
+
+            # Sender info
+            sender_name = ""
+            if log_item:
+                sender_name = (log_item.from_username or "").strip()
+            if not sender_name:
+                cached_from = cache_entry.get("from_name") or ""
+                sender_name = str(cached_from).strip()
+
+            # Chat title
+            chat_title = ""
+            if log_item:
+                chat_title = (log_item.chat_title or "").strip()
+            if not chat_title:
+                cached_chat_title = str(cache_entry.get("chat_title") or "").strip()
+                chat_title = cached_chat_title
+            if not chat_title and effective_username:
+                chat_title = f"@{effective_username.lstrip('@')}"
+
+            # Message time
+            msg_time = ""
+            if log_item and log_item.message_date:
+                try:
+                    aware = log_item.message_date if log_item.message_date.tzinfo else log_item.message_date.replace(tzinfo=timezone.utc)
+                    msg_time = aware.strftime("%H:%M")
+                except Exception:
+                    pass
+
+            # Direction arrow
+            direction = (log_item.direction or "incoming") if log_item else "incoming"
+            dir_arrow = "→" if direction == "outgoing" else "←"
+
             link_html = self._format_html_links(self._build_deleted_message_links(chat_id_int, mid_int, effective_username))
-            link_block = f"\n{link_html}" if link_html else ""
             media_count = len(assets) if assets else len(cached_media_items)
-            media_block = f"\nМедиа: <b>{media_count}</b>" if media_count else ""
+
+            # Build header line: who, from which chat, at what time
+            header_parts = []
+            if sender_name:
+                header_parts.append(escape(sender_name))
+            if chat_title:
+                header_parts.append(f"в <b>{escape(chat_title)}</b>")
+            if msg_time:
+                header_parts.append(f"в {msg_time}")
+            header_line = f"{dir_arrow} {' '.join(header_parts)}" if header_parts else f"чат <code>{chat_id_int}</code>"
+
+            # Build meta line
+            meta_parts = [f"msg <code>{mid_int}</code>"]
+            if media_count:
+                media_emoji = "📎" if media_count == 1 else "📎"
+                meta_parts.append(f"{media_emoji} медиа: <b>{media_count}</b>")
+            if link_html:
+                meta_parts.append(link_html)
+            meta_line = " · ".join(meta_parts)
+
             await self._safe_send(
                 notify_chat_id,
                 (
-                    f"🗑️ <b>Сообщение удалено</b>\n"
-                    f"Чат: <code>{chat_id_int}</code> | Msg: <code>{mid_int}</code>{media_block}{link_block}\n"
+                    f"🗑 <b>Удалено</b> — {header_line}\n"
+                    f"<i>{meta_line}</i>\n\n"
                     f"<blockquote>{escape(txt[:900])}</blockquote>"
                 ),
                 parse_mode="HTML",
