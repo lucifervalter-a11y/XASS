@@ -229,4 +229,5 @@ async def authenticate_agent_api_key(
         return None
 
     credential.last_used_at = _now_utc()
+    await session.commit()
     return AgentAuthResult(mode="issued", source_name=credential.source_name, credential_id=credential.id)

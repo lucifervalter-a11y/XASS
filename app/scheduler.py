@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.bot_api import TelegramBotClient
 from app.config import Settings
@@ -36,7 +36,7 @@ async def offline_check_loop(
                 if stale_sources and bot_client and not is_quiet_hours(config, settings):
                     chat_id = _notification_chat_id(settings, config.notify_chat_id)
                     if chat_id:
-                        now = datetime.utcnow().isoformat()
+                        now = datetime.now(timezone.utc).isoformat()
                         for source in stale_sources:
                             text = (
                                 f"OFFLINE alert\n"
