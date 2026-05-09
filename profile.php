@@ -24,6 +24,10 @@ $defaultProfile = [
     'weather_refresh_minutes' => 60,
     'weather_updated_at' => '',
     'avatar_url' => '',
+    'discord_active' => false,
+    'discord_game' => null,
+    'discord_elapsed_sec' => null,
+    'discord_updated_at' => '',
 ];
 
 $profilePath = getenv('PROFILE_JSON_PATH');
@@ -172,6 +176,19 @@ function extractTelegramUsername(string $url): string
         return '';
     }
     return ltrim($candidate, '@');
+}
+
+function formatElapsed(int $seconds): string
+{
+    if ($seconds < 60) {
+        return "{$seconds}с";
+    }
+    if ($seconds < 3600) {
+        return floor($seconds / 60) . "м";
+    }
+    $hours = (int)floor($seconds / 3600);
+    $mins  = (int)floor(($seconds % 3600) / 60);
+    return $mins > 0 ? "{$hours}ч {$mins}м" : "{$hours}ч";
 }
 
 function httpGet(string $url, int $timeoutSeconds = 8): ?string
@@ -433,6 +450,14 @@ if (is_readable($profilePath)) {
             );
             $profile['weather_updated_at'] = toStringSafe($decoded['weather_updated_at'] ?? $profile['weather_updated_at']);
             $profile['avatar_url'] = toStringSafe($decoded['avatar_url'] ?? $profile['avatar_url']);
+            $profile['discord_active'] = toBoolSafe($decoded['discord_active'] ?? false, false);
+            $profile['discord_game'] = isset($decoded['discord_game']) && is_string($decoded['discord_game'])
+                ? trim($decoded['discord_game'])
+                : null;
+            $profile['discord_elapsed_sec'] = is_numeric($decoded['discord_elapsed_sec'] ?? null)
+                ? (int)$decoded['discord_elapsed_sec']
+                : null;
+            $profile['discord_updated_at'] = toStringSafe($decoded['discord_updated_at'] ?? '');
 
             $links = normalizeLinks($decoded['links'] ?? null);
             if ($links) {
@@ -515,6 +540,17 @@ $weatherIcon = weatherIconFromText($weatherText !== '' ? $weatherText : $weather
 $telegramLabel = $displayUsername !== '' ? "t.me/{$displayUsername}" : 'Открыть Telegram';
 $weatherLabel = $weatherLocationName !== '' ? "Погода · {$weatherLocationName}" : 'Погода';
 $projectsPageUrl = '/projects.php';
+
+// Discord status vars
+$discordActive = toBoolSafe($profile['discord_active'] ?? false, false);
+$discordGame = is_string($profile['discord_game'] ?? null) && ($profile['discord_game'] ?? '') !== ''
+    ? $profile['discord_game']
+    : null;
+$discordElapsed = is_numeric($profile['discord_elapsed_sec'] ?? null) ? (int)$profile['discord_elapsed_sec'] : null;
+$discordUpdatedAt = toStringSafe($profile['discord_updated_at'] ?? '');
+$discordUpdatedTs = $discordUpdatedAt !== '' ? strtotime($discordUpdatedAt) : false;
+$discordFresh = $discordUpdatedTs !== false && (time() - $discordUpdatedTs) < 300;
+$showDiscordOnline = $discordActive && $discordFresh;
 ?>
 <!doctype html>
 <html lang="ru">
@@ -1113,6 +1149,50 @@ $projectsPageUrl = '/projects.php';
             font-size: 12px; font-weight: 600;
         }
 
+        /* ── DISCORD CARD ──────────────────────────────────── */
+        .discord-card { border-color: rgba(88, 101, 242, 0.35); }
+        .discord-row { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
+        .discord-dot {
+            flex-shrink: 0;
+            display: inline-block;
+            width: 9px; height: 9px;
+            border-radius: 50%;
+        }
+        .discord-dot.online {
+            background: #57f287;
+            box-shadow: 0 0 7px rgba(87, 242, 135, 0.60);
+        }
+        .discord-dot.offline { background: #747f8d; }
+        .discord-status-text { font-size: 14px; color: var(--muted2); font-weight: 500; }
+        .discord-game { color: var(--fg); font-weight: 600; }
+        .discord-elapsed { color: var(--muted); font-size: 12px; margin-left: 4px; }
+
+        /* ── ACTIVITY FEED ──────────────────────────────────── */
+        .activity-feed { margin-top: 28px; }
+        .activity-feed-title {
+            font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+            text-transform: uppercase; color: var(--muted); margin-bottom: 12px;
+        }
+        .activity-items { display: flex; flex-direction: column; gap: 10px; }
+        .activity-item {
+            display: flex; align-items: flex-start; gap: 12px;
+            padding: 10px 14px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--glass-2);
+        }
+        .activity-icon { font-size: 18px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+        .activity-content { flex: 1; min-width: 0; }
+        .activity-label {
+            font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+            text-transform: uppercase; color: var(--muted); margin-bottom: 2px;
+        }
+        .activity-value {
+            font-size: 14px; font-weight: 600; color: var(--fg);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .activity-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
         /* ── RESPONSIVE ─────────────────────────────────────── */
         @media (max-width: 1080px) {
             .page { grid-template-columns: 1fr; }
@@ -1120,6 +1200,7 @@ $projectsPageUrl = '/projects.php';
             .profile-card { flex: 1 1 320px; }
             .music-card   { flex: 1 1 220px; }
             .weather-card { flex: 1 1 220px; }
+            .discord-card { flex: 1 1 220px; }
             .links-grid { grid-template-columns: repeat(2, 1fr); }
         }
         @media (max-width: 580px) {
@@ -1130,7 +1211,7 @@ $projectsPageUrl = '/projects.php';
             .hero-bio { font-size: 15.5px; margin-top: 13px; }
             .links-grid { grid-template-columns: 1fr; }
             .aside { flex-direction: column; }
-            .profile-card, .music-card, .weather-card { flex: 1 1 100%; }
+            .profile-card, .music-card, .weather-card, .discord-card { flex: 1 1 100%; }
             .tg-url { font-size: 18px; }
             .weather-temp { font-size: 30px; }
             .weather-emoji { font-size: 38px; }
@@ -1221,6 +1302,62 @@ $projectsPageUrl = '/projects.php';
             </header>
             <blockquote class="quote-body"><?= nl2br(escapeHtml($profile['quote'])) ?></blockquote>
         </article>
+
+        <!-- ACTIVITY FEED -->
+        <?php
+            $activityItems = [];
+            if (!$noTrack && $nowListeningText !== '') {
+                $activityItems[] = [
+                    'icon'  => '🎵',
+                    'label' => 'Слушает',
+                    'value' => $nowListeningText,
+                    'meta'  => '',
+                ];
+            }
+            if ($showDiscordOnline && $discordGame !== null) {
+                $gameMeta = $discordElapsed !== null ? '· ' . formatElapsed($discordElapsed) : '';
+                $activityItems[] = [
+                    'icon'  => '🎮',
+                    'label' => 'Играет',
+                    'value' => $discordGame,
+                    'meta'  => $gameMeta,
+                ];
+            } elseif ($showDiscordOnline) {
+                $activityItems[] = [
+                    'icon'  => '💬',
+                    'label' => 'Discord',
+                    'value' => 'Онлайн',
+                    'meta'  => '',
+                ];
+            }
+            if ($weatherText !== '') {
+                $activityItems[] = [
+                    'icon'  => $weatherIcon,
+                    'label' => 'Погода',
+                    'value' => $weatherMainLine,
+                    'meta'  => $weatherDetails[0] ?? '',
+                ];
+            }
+        ?>
+        <?php if (!empty($activityItems)): ?>
+        <div class="activity-feed">
+            <div class="activity-feed-title">Активность</div>
+            <div class="activity-items">
+                <?php foreach ($activityItems as $item): ?>
+                <div class="activity-item">
+                    <div class="activity-icon" aria-hidden="true"><?= escapeHtml($item['icon']) ?></div>
+                    <div class="activity-content">
+                        <div class="activity-label"><?= escapeHtml($item['label']) ?></div>
+                        <div class="activity-value"><?= escapeHtml($item['value']) ?></div>
+                        <?php if ($item['meta'] !== ''): ?>
+                            <div class="activity-meta"><?= escapeHtml($item['meta']) ?></div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
 
     </div><!-- .main-col -->
 
@@ -1320,6 +1457,26 @@ $projectsPageUrl = '/projects.php';
                     <?php endforeach; ?>
                 </div>
             <?php endif; ?>
+        </article>
+
+        <!-- DISCORD CARD -->
+        <article class="card discord-card">
+            <div class="card-label">Discord</div>
+            <div class="discord-row">
+                <span class="discord-dot <?= $showDiscordOnline ? 'online' : 'offline' ?>"></span>
+                <div class="discord-status-text">
+                    <?php if ($showDiscordOnline && $discordGame !== null): ?>
+                        Играет в <span class="discord-game"><?= escapeHtml($discordGame) ?></span>
+                        <?php if ($discordElapsed !== null): ?>
+                            <span class="discord-elapsed">· <?= escapeHtml(formatElapsed($discordElapsed)) ?></span>
+                        <?php endif; ?>
+                    <?php elseif ($showDiscordOnline): ?>
+                        Онлайн в Discord
+                    <?php else: ?>
+                        Не в сети
+                    <?php endif; ?>
+                </div>
+            </div>
         </article>
 
     </aside><!-- .aside -->

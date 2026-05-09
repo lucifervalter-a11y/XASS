@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 import psutil
 
+from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -154,8 +155,9 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
     now_playing = get_now_playing() if include_now_playing else None
     activity = get_active_activity() if include_activity else {}
     active_app = (activity.get("title") or activity.get("process")) if isinstance(activity, dict) else None
+    discord = get_discord_activity()
 
-    return {
+    payload: dict[str, Any] = {
         "source_name": config["source_name"],
         "source_type": config.get("source_type") or "PC_AGENT",
         "metrics": metrics,
@@ -165,6 +167,9 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
         "activity": activity if isinstance(activity, dict) else {},
         "tags": [platform.system(), platform.node()],
     }
+    if discord is not None:
+        payload["discord"] = discord
+    return payload
 
 
 def claim_pair_code(

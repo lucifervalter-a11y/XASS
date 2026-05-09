@@ -15,6 +15,7 @@ class HeartbeatPayload(BaseModel):
     activity: dict[str, Any] = Field(default_factory=dict)
     processes: list[dict[str, Any]] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    discord: dict[str, Any] | None = None
 
 
 class HeartbeatResponse(BaseModel):

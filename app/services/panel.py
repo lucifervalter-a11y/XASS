@@ -138,6 +138,19 @@ def format_status_text(sources: list[HeartbeatSource], timeout_minutes: int) -> 
         lines.append(f"{index}. {source.source_name} [{source.source_type}]")
         lines.append(f"   Состояние: {status}")
         lines.append(f"   Последний heartbeat: {last_seen_at.isoformat()} ({max(age_sec, 0)} сек. назад)")
+        payload = source.last_payload or {}
+        discord = payload.get("discord") if isinstance(payload.get("discord"), dict) else {}
+        if isinstance(discord, dict) and discord.get("is_online"):
+            game = str(discord.get("game") or "").strip()
+            elapsed_sec = discord.get("elapsed_sec")
+            elapsed_str = ""
+            if isinstance(elapsed_sec, (int, float)) and not isinstance(elapsed_sec, bool):
+                sec = int(elapsed_sec)
+                elapsed_str = f" · {sec // 3600}ч {(sec % 3600) // 60}м" if sec >= 3600 else f" · {sec // 60}м"
+            if game:
+                lines.append(f"   Discord: 🎮 {game}{elapsed_str}")
+            else:
+                lines.append(f"   Discord: 💬 онлайн")
     return "\n".join(lines)
 
 
@@ -168,11 +181,29 @@ def format_pc_text(sources: list[HeartbeatSource], timeout_minutes: int) -> str:
                 now_playing = f"Открыто: {active_app}"
             else:
                 now_playing = "нет данных"
+        discord = payload.get("discord") if isinstance(payload.get("discord"), dict) else {}
+        discord_line = ""
+        if isinstance(discord, dict) and discord.get("is_online"):
+            game = str(discord.get("game") or "").strip()
+            elapsed_sec = discord.get("elapsed_sec")
+            if game:
+                elapsed_str = ""
+                if isinstance(elapsed_sec, (int, float)) and not isinstance(elapsed_sec, bool):
+                    sec = int(elapsed_sec)
+                    if sec < 3600:
+                        elapsed_str = f" · {sec // 60}м"
+                    else:
+                        elapsed_str = f" · {sec // 3600}ч {(sec % 3600) // 60}м"
+                discord_line = f"🎮 {game}{elapsed_str}"
+            else:
+                discord_line = "💬 В Discord"
         status = "В СЕТИ" if source.is_online else "НЕ В СЕТИ"
         lines.append(f"{index}. {source.source_name}")
         lines.append(f"   Состояние: {status}")
         lines.append(f"   CPU: {cpu}% | RAM: {ram}%")
         lines.append(f"   Активность: {now_playing}")
+        if discord_line:
+            lines.append(f"   Discord: {discord_line}")
     return "\n".join(lines)
 
 

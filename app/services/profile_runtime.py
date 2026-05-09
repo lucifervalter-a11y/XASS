@@ -445,6 +445,24 @@ def update_profile_now_playing_external(settings: Settings, text: str, source: s
     return changed
 
 
+def update_profile_discord(settings: Settings, discord_data: dict[str, Any]) -> None:
+    """Persist Discord activity from heartbeat payload into the profile JSON."""
+    profile_path = Path(settings.profile_json_path)
+    profile = ensure_profile_exists(profile_path)
+    now = _now_utc()
+    profile["discord_active"] = bool(discord_data.get("is_online", False))
+    game = _to_clean_text(discord_data.get("game") or "")
+    profile["discord_game"] = game if game else None
+    elapsed = discord_data.get("elapsed_sec")
+    profile["discord_elapsed_sec"] = (
+        int(elapsed)
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+        else None
+    )
+    profile["discord_updated_at"] = now.isoformat()
+    save_profile(profile_path, profile)
+
+
 async def sync_profile_weather(settings: Settings, *, force: bool = False) -> bool:
     profile_path = Path(settings.profile_json_path)
     profile = ensure_profile_exists(profile_path)

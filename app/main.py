@@ -27,7 +27,7 @@ from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbe
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.profile_editor import ensure_profile_exists, load_profile, save_profile
 from app.services.restart_notice import clear_restart_notice, get_restart_notice
-from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, update_profile_now_playing_external
+from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
@@ -221,6 +221,8 @@ async def agent_heartbeat(
     config = await get_or_create_app_config(session, settings)
     source, recovered, is_new = await process_heartbeat(session, payload)
     await sync_profile_now_playing_from_heartbeat(session, settings, config.heartbeat_timeout_minutes)
+    if isinstance(payload.discord, dict) and payload.discord:
+        update_profile_discord(settings, payload.discord)
 
     if is_new and bot_client:
         chat_id = _notify_chat_id(config.notify_chat_id)
