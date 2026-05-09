@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import secrets
 import asyncio
 import os
@@ -54,6 +54,7 @@ from app.services.monitoring import collect_server_metrics, collect_systemd_stat
 from app.services.music_card import build_music_card, build_search_links, normalize_track_input
 from app.services.panel import (
     format_pc_text,
+    dot_commands_help_text,
     format_server_text,
     format_settings_text,
     format_status_text,
@@ -202,11 +203,21 @@ class TelegramUpdateHandler:
                 return False
             await self._handle_unmute_dot_command(session, config, message)
             return True
-        if command == ".muz":
+        if command in (".muz", ".music"):
             await self._handle_muz_command(session, config, message, text)
             return True
         if command == ".weather":
             await self._handle_weather_dot_command(session, config, message, text)
+            return True
+        if command == ".help":
+            chat_id_int = int(chat_id)
+            business_connection_id = message.get("business_connection_id")
+            await self._safe_send(
+                chat_id_int,
+                dot_commands_help_text(),
+                business_connection_id=business_connection_id,
+            )
+            await self._maybe_delete_command_message(message)
             return True
         return False
 
@@ -327,7 +338,9 @@ class TelegramUpdateHandler:
         return {"inline_keyboard": rows}
 
     def _extract_muz_query(self, message: dict[str, Any], text: str) -> tuple[str, bool]:
-        raw = text[len(".muz"):].strip()
+        # Strip whatever command prefix was used (.muz or .music)
+        parts = text.split(None, 1)
+        raw = parts[1].strip() if len(parts) > 1 else ""
         if raw:
             return raw, True
         reply = message.get("reply_to_message") or {}
@@ -527,6 +540,31 @@ class TelegramUpdateHandler:
             elif normalized_before_sync:
                 query = profile_query_before_sync
                 normalized_query = normalized_before_sync
+
+        # iPhone source: treat last-known track as current if updated within 3 hours.
+        # iPhone Shortcut pushes on track change, so whatever is in profile IS the track.
+        if not normalized_query and not is_explicit:
+            try:
+                _ip = load_profile(Path(self.settings.profile_json_path))
+                if str(_ip.get("now_listening_source") or "").strip().lower() == "iphone":
+                    _ip_text = str(_ip.get("now_listening_text") or "").strip()
+                    _ip_raw = str(_ip.get("now_listening_updated_at") or "").strip()
+                    _ip_fresh = False
+                    if _ip_raw:
+                        try:
+                            _ip_dt = datetime.fromisoformat(_ip_raw.replace("Z", "+00:00"))
+                            if _ip_dt.tzinfo is None:
+                                _ip_dt = _ip_dt.replace(tzinfo=timezone.utc)
+                            _ip_fresh = int((datetime.now(timezone.utc) - _ip_dt).total_seconds()) < 3 * 3600
+                        except Exception:
+                            pass
+                    if _ip_fresh and _ip_text and not self._is_non_track_status_text(_ip_text):
+                        _ip_norm = normalize_track_input(_ip_text)
+                        if _ip_norm:
+                            query = _ip_text
+                            normalized_query = _ip_norm
+            except Exception:
+                pass
 
         if not normalized_query and not is_explicit:
             fallback_query = await self._resolve_live_now_playing(
@@ -4491,7 +4529,7 @@ class TelegramUpdateHandler:
                 txt = cached_text
             elif cached_media_items:
                 txt = "удалено сообщение с медиа (файлы отправлены ниже)"
-            if self._is_hidden_deleted_command(cached_text) or self._is_hidden_deleted_command(log_item.text_content if log_item else ""):
+            if self._is_hidden_deleted_command(cached_text) or self._is_hidden_deleted_command((log_item.text_content or "") if log_item else ""):
                 continue
             log_chat = (log_item.raw_event or {}).get("chat") if log_item and isinstance(log_item.raw_event, dict) else {}
             log_username = (log_chat or {}).get("username") if isinstance(log_chat, dict) else None

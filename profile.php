@@ -521,638 +521,809 @@ $projectsPageUrl = '/projects.php';
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title><?= escapeHtml($profile['name']) ?> - Профиль</title>
+    <title><?= escapeHtml($profile['name']) ?> — Профиль</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap');
 
         :root {
-            --bg-main: #05070c;
-            --card: rgba(8, 14, 25, 0.86);
-            --card-soft: rgba(11, 18, 33, 0.76);
-            --line: rgba(113, 156, 214, 0.22);
-            --line-strong: rgba(113, 156, 214, 0.34);
-            --text: #f3f7ff;
-            --muted: #97a9c8;
+            --bg: #04080f;
+            --glass: rgba(10, 17, 32, 0.70);
+            --glass-2: rgba(14, 22, 42, 0.62);
+            --border: rgba(255, 255, 255, 0.07);
+            --border-hover: rgba(72, 186, 255, 0.48);
             --glow: 72, 186, 255;
+            --accent: #48bafe;
+            --accent2: #7c6ffe;
+            --pink: #ff6b9d;
+            --text: #eef2ff;
+            --muted: #7b96c2;
+            --muted2: #a8bfe0;
+            --mono: 'JetBrains Mono', monospace;
         }
 
-        * { box-sizing: border-box; }
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html { scroll-behavior: smooth; }
 
         body {
-            margin: 0;
-            font-family: "Manrope", "Segoe UI", Tahoma, sans-serif;
-            background:
-                radial-gradient(1100px 580px at 8% -12%, rgba(48, 116, 201, 0.28), transparent 58%),
-                radial-gradient(850px 520px at 90% 0%, rgba(63, 87, 180, 0.18), transparent 58%),
-                var(--bg-main);
+            font-family: 'Manrope', system-ui, sans-serif;
+            background: var(--bg);
             color: var(--text);
-            line-height: 1.45;
             min-height: 100vh;
             overflow-x: hidden;
-            position: relative;
-            animation: bgShift 16s ease-in-out infinite alternate;
+            line-height: 1.5;
         }
 
+        /* ── STAR FIELD ─────────────────────────────────────── */
         body::before {
-            content: "";
+            content: '';
             position: fixed;
             inset: 0;
-            z-index: -1;
+            z-index: 0;
             pointer-events: none;
             background-image:
-                linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
-            background-size: 56px 56px;
-            opacity: 0.22;
+                radial-gradient(1px 1px at 8%  12%, rgba(255,255,255,0.55) 0%, transparent 100%),
+                radial-gradient(1px 1px at 22% 44%, rgba(255,255,255,0.40) 0%, transparent 100%),
+                radial-gradient(1.5px 1.5px at 37%  7%, rgba(255,255,255,0.50) 0%, transparent 100%),
+                radial-gradient(1px 1px at 52% 68%, rgba(255,255,255,0.45) 0%, transparent 100%),
+                radial-gradient(1px 1px at 67% 28%, rgba(255,255,255,0.35) 0%, transparent 100%),
+                radial-gradient(1.5px 1.5px at 79% 53%, rgba(255,255,255,0.50) 0%, transparent 100%),
+                radial-gradient(1px 1px at 91% 83%, rgba(255,255,255,0.40) 0%, transparent 100%),
+                radial-gradient(1px 1px at 13% 74%, rgba(255,255,255,0.30) 0%, transparent 100%),
+                radial-gradient(1px 1px at 33% 91%, rgba(255,255,255,0.35) 0%, transparent 100%),
+                radial-gradient(1.5px 1.5px at 58% 49%, rgba(255,255,255,0.28) 0%, transparent 100%),
+                radial-gradient(1px 1px at 86% 11%, rgba(255,255,255,0.45) 0%, transparent 100%),
+                radial-gradient(1px 1px at  4% 57%, rgba(255,255,255,0.25) 0%, transparent 100%),
+                radial-gradient(1px 1px at 74% 96%, rgba(255,255,255,0.35) 0%, transparent 100%),
+                radial-gradient(1px 1px at 46% 34%, rgba(255,255,255,0.20) 0%, transparent 100%),
+                radial-gradient(1.5px 1.5px at 18% 21%, rgba(180,210,255,0.40) 0%, transparent 100%),
+                radial-gradient(1px 1px at 63% 77%, rgba(180,210,255,0.30) 0%, transparent 100%),
+                radial-gradient(1px 1px at 94% 43%, rgba(255,255,255,0.25) 0%, transparent 100%),
+                radial-gradient(1px 1px at  2% 89%, rgba(255,255,255,0.30) 0%, transparent 100%),
+                radial-gradient(1px 1px at 43% 60%, rgba(255,255,255,0.22) 0%, transparent 100%),
+                radial-gradient(1.5px 1.5px at 29% 33%, rgba(200,220,255,0.35) 0%, transparent 100%);
+            animation: twinkle 7s ease-in-out infinite alternate;
         }
+        @keyframes twinkle { from { opacity: 0.65; } to { opacity: 1; } }
 
-        body::after {
-            content: "";
+        /* ── ANIMATED ORBS ──────────────────────────────────── */
+        .orb {
             position: fixed;
-            inset: -28%;
-            z-index: -2;
+            border-radius: 50%;
+            filter: blur(88px);
             pointer-events: none;
-            background:
-                radial-gradient(45% 40% at 18% 24%, rgba(57, 143, 246, 0.20), transparent 72%),
-                radial-gradient(35% 38% at 82% 18%, rgba(96, 111, 255, 0.20), transparent 70%),
-                radial-gradient(42% 46% at 52% 80%, rgba(43, 180, 242, 0.14), transparent 74%);
-            filter: blur(16px) saturate(112%);
-            animation: auroraSweep 26s linear infinite;
+            z-index: 0;
+            will-change: transform;
+        }
+        .orb-1 {
+            width: 640px; height: 520px;
+            background: radial-gradient(ellipse, rgba(48, 122, 236, 0.30), transparent 70%);
+            top: -18%; left: -12%;
+            animation: orbDrift1 26s ease-in-out infinite;
+        }
+        .orb-2 {
+            width: 520px; height: 460px;
+            background: radial-gradient(ellipse, rgba(100, 80, 255, 0.26), transparent 70%);
+            top: 2%; right: -10%;
+            animation: orbDrift2 30s ease-in-out infinite;
+        }
+        .orb-3 {
+            width: 420px; height: 380px;
+            background: radial-gradient(ellipse, rgba(30, 200, 220, 0.16), transparent 70%);
+            bottom: 12%; left: 18%;
+            animation: orbDrift3 34s ease-in-out infinite;
+        }
+        .orb-4 {
+            width: 360px; height: 320px;
+            background: radial-gradient(ellipse, rgba(255, 75, 130, 0.12), transparent 70%);
+            bottom: -8%; right: 12%;
+            animation: orbDrift4 24s ease-in-out infinite;
+        }
+        @keyframes orbDrift1 {
+            0%,100% { transform: translate(0,0) scale(1); }
+            35%  { transform: translate(5%,5%) scale(1.09); }
+            68%  { transform: translate(-3%,8%) scale(0.94); }
+        }
+        @keyframes orbDrift2 {
+            0%,100% { transform: translate(0,0) scale(1); }
+            42%  { transform: translate(-7%,4%) scale(1.07); }
+            72%  { transform: translate(5%,-6%) scale(1.02); }
+        }
+        @keyframes orbDrift3 {
+            0%,100% { transform: translate(0,0) scale(1); }
+            50%  { transform: translate(9%,-7%) scale(1.12); }
+        }
+        @keyframes orbDrift4 {
+            0%,100% { transform: translate(0,0) scale(1); }
+            47%  { transform: translate(-6%,5%) scale(0.88); }
         }
 
-        @keyframes auroraSweep {
-            0% {
-                transform: translate3d(-5%, -2%, 0) scale(1);
-                filter: blur(16px) saturate(112%) hue-rotate(0deg);
-            }
-            50% {
-                transform: translate3d(6%, 4%, 0) scale(1.08);
-                filter: blur(18px) saturate(118%) hue-rotate(16deg);
-            }
-            100% {
-                transform: translate3d(-4%, 7%, 0) scale(1.03);
-                filter: blur(16px) saturate(112%) hue-rotate(-10deg);
-            }
-        }
-
-        @keyframes bgShift {
-            0% {
-                background-position: 0 0, 0 0, 0 0;
-            }
-            100% {
-                background-position: 4% 0, -5% 3%, 0 0;
-            }
-        }
-
+        /* ── LAYOUT ─────────────────────────────────────────── */
         .page {
-            width: min(1160px, 100% - 36px);
-            margin: 30px auto 44px;
+            position: relative;
+            z-index: 1;
+            width: min(1180px, 100% - 32px);
+            margin: 38px auto 64px;
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 360px;
-            gap: 24px;
+            grid-template-columns: minmax(0, 1fr) 380px;
+            gap: 20px;
             align-items: start;
         }
+        .main-col { display: flex; flex-direction: column; gap: 16px; }
+        .aside    { display: flex; flex-direction: column; gap: 14px; }
 
-        .main-column { display: grid; gap: 14px; }
-
-        .panel {
-            background: linear-gradient(170deg, var(--card), var(--card-soft));
-            border: 1px solid var(--line);
-            border-radius: 20px;
+        /* ── GLASS CARD BASE ────────────────────────────────── */
+        .card {
+            background: var(--glass);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            backdrop-filter: blur(22px) saturate(160%);
+            -webkit-backdrop-filter: blur(22px) saturate(160%);
             box-shadow:
-                0 20px 42px rgba(0, 0, 0, 0.36),
-                inset 0 1px 0 rgba(255, 255, 255, 0.04);
-            backdrop-filter: blur(6px);
+                0 4px 8px rgba(0,0,0,0.12),
+                0 18px 44px rgba(0,0,0,0.36),
+                inset 0 1px 0 rgba(255,255,255,0.06);
+            transition: border-color 0.3s ease, box-shadow 0.3s ease;
+            overflow: hidden;
+        }
+        .card:hover {
+            border-color: var(--border-hover);
+            box-shadow:
+                0 4px 8px rgba(0,0,0,0.12),
+                0 22px 54px rgba(0,0,0,0.42),
+                0 0 0 1px rgba(72,186,255,0.12),
+                inset 0 1px 0 rgba(255,255,255,0.09);
         }
 
-        .hero { padding: 22px 22px 16px; }
+        /* ── ENTRANCE ANIMATIONS ─────────────────────────────── */
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(30px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes slideLeft {
+            from { opacity: 0; transform: translateX(30px); }
+            to   { opacity: 1; transform: translateX(0); }
+        }
+        .main-col > .card:nth-child(1) { animation: slideUp 0.65s cubic-bezier(0.16,1,0.3,1) 0.05s both; }
+        .main-col > .card:nth-child(2) { animation: slideUp 0.65s cubic-bezier(0.16,1,0.3,1) 0.18s both; }
+        .main-col > .card:nth-child(3) { animation: slideUp 0.65s cubic-bezier(0.16,1,0.3,1) 0.30s both; }
+        .aside > .card:nth-child(1) { animation: slideLeft 0.70s cubic-bezier(0.16,1,0.3,1) 0.08s both; }
+        .aside > .card:nth-child(2) { animation: slideLeft 0.70s cubic-bezier(0.16,1,0.3,1) 0.20s both; }
+        .aside > .card:nth-child(3) { animation: slideLeft 0.70s cubic-bezier(0.16,1,0.3,1) 0.32s both; }
+
+        /* ── HERO CARD ──────────────────────────────────────── */
+        .hero { padding: 28px 28px 24px; }
+
+        .hero-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            font-size: 11.5px;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: rgba(72,186,255,0.09);
+            border: 1px solid rgba(72,186,255,0.22);
+            border-radius: 999px;
+            padding: 5px 13px;
+            margin-bottom: 18px;
+        }
+        .hero-tag-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--accent);
+            animation: blink 2.2s ease-in-out infinite;
+        }
+        @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.25; } }
 
         .headline {
-            margin: 0;
-            font-size: clamp(26px, 3vw, 39px);
-            line-height: 1.08;
-            font-weight: 800;
+            font-size: clamp(27px, 3.6vw, 48px);
+            font-weight: 900;
+            line-height: 1.06;
+            letter-spacing: -0.025em;
         }
-
-        .headline span {
-            color: #ff7f8d;
-            text-shadow: 0 0 16px rgba(255, 127, 141, 0.45);
+        .headline-name {
+            background: linear-gradient(130deg, #ffffff 25%, var(--accent) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
-
-        .role { margin: 6px 0 0; color: #b8cae7; font-size: 18px; }
-
-        .bio {
-            margin: 14px 0 0;
-            color: #d9e6ff;
-            font-size: 18px;
-            line-height: 1.55;
-            max-width: 72ch;
+        .hero-role {
+            margin-top: 10px;
+            font-size: 17px;
+            font-weight: 500;
+            color: var(--muted2);
+            letter-spacing: 0.01em;
         }
-
-        .stack-row {
+        .hero-bio {
             margin-top: 16px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
+            font-size: 17px;
+            line-height: 1.68;
+            color: rgba(218, 232, 255, 0.88);
+            max-width: 68ch;
         }
 
+        /* ── TECH STACK ─────────────────────────────────────── */
+        .stack { margin-top: 20px; display: flex; flex-wrap: wrap; gap: 8px; }
         .chip {
-            font-size: 13px;
-            line-height: 1;
-            padding: 8px 11px;
+            font-size: 12px;
+            font-weight: 700;
+            font-family: var(--mono);
+            padding: 7px 14px;
             border-radius: 999px;
-            border: 1px solid var(--line-strong);
-            background: rgba(8, 16, 30, 0.75);
-            color: #d5e5ff;
-            font-weight: 600;
+            background: rgba(72,186,255,0.08);
+            border: 1px solid rgba(72,186,255,0.20);
+            color: var(--accent);
+            letter-spacing: 0.04em;
+            transition: background 0.22s, border-color 0.22s, transform 0.22s;
+            cursor: default;
+        }
+        .chip:hover {
+            background: rgba(72,186,255,0.17);
+            border-color: rgba(72,186,255,0.52);
+            transform: translateY(-2px);
         }
 
-        .cta-grid {
-            margin-top: 16px;
+        /* ── LINKS GRID ─────────────────────────────────────── */
+        .links-grid {
+            margin-top: 24px;
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 10px;
         }
-
-        .cta-link {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            min-height: 62px;
-            border-radius: 14px;
-            padding: 13px 14px;
-            background: rgba(5, 10, 20, 0.86);
-            border: 1px solid var(--line);
-            color: #f2f7ff;
-            text-decoration: none;
-            transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
-        }
-
-        .cta-link:hover {
-            border-color: rgba(var(--glow), 0.52);
-            background: rgba(9, 17, 33, 0.98);
-            transform: translateY(-1px);
-        }
-
-        .cta-icon {
-            width: 30px;
-            height: 30px;
-            border-radius: 8px;
-            border: 1px solid var(--line-strong);
-            display: grid;
-            place-items: center;
-            font-size: 13px;
-            font-weight: 800;
-            color: #b7d8ff;
-            font-family: "JetBrains Mono", monospace;
-            background: rgba(13, 23, 44, 0.9);
-            flex: 0 0 30px;
-        }
-
-        .cta-text {
-            font-size: clamp(14px, 1.45vw, 28px);
-            font-weight: 700;
-            line-height: 1.15;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .more-links {
-            margin-top: 10px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-
-        .mini-link {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            min-height: 47px;
-            padding: 10px 13px;
-            border-radius: 12px;
-            border: 1px solid var(--line);
-            background: rgba(6, 12, 23, 0.84);
-            color: #eaf2ff;
-            text-decoration: none;
-            font-size: 15px;
-            font-weight: 600;
-        }
-
-        .mini-link:hover { border-color: rgba(var(--glow), 0.5); }
-
-        .projects-link {
-            margin-top: 10px;
-            background: linear-gradient(140deg, rgba(17, 34, 58, 0.92), rgba(7, 15, 28, 0.92));
-            border-color: rgba(107, 177, 246, 0.48);
-            box-shadow: 0 10px 26px rgba(15, 44, 90, 0.22);
-        }
-
-        .projects-link:hover {
-            border-color: rgba(150, 217, 255, 0.72);
-            box-shadow: 0 12px 30px rgba(26, 75, 146, 0.34);
-        }
-
-        .telegram-strip {
-            margin-top: 12px;
+        .link-card {
             display: flex;
             align-items: center;
             gap: 12px;
-            padding: 8px 10px;
-            border-radius: 14px;
+            padding: 14px 16px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            color: var(--text);
             text-decoration: none;
-            color: #f7fcff;
-            border: 1px solid rgba(105, 181, 229, 0.52);
-            background:
-                radial-gradient(440px 140px at 16% 48%, rgba(162, 238, 255, 0.26), transparent 50%),
-                linear-gradient(97deg, rgba(42, 164, 231, 0.95), rgba(42, 130, 216, 0.76));
-            box-shadow: 0 14px 34px rgba(18, 95, 163, 0.33);
+            font-weight: 600;
+            font-size: 15px;
+            min-height: 58px;
+            transition: all 0.25s cubic-bezier(0.16,1,0.3,1);
         }
-
-        .telegram-strip .plane {
-            width: 46px;
-            height: 46px;
-            border-radius: 13px;
-            background: rgba(0, 0, 0, 0.55);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            display: grid;
-            place-items: center;
-            font-size: 23px;
-            line-height: 1;
-            flex: 0 0 46px;
+        .link-card:hover {
+            background: rgba(72,186,255,0.10);
+            border-color: rgba(72,186,255,0.46);
+            transform: translateY(-3px);
+            box-shadow: 0 10px 28px rgba(72,186,255,0.16);
         }
-
-        .telegram-strip .tg-url {
-            margin-left: auto;
-            font-size: clamp(18px, 2vw, 31px);
-            font-weight: 800;
-            letter-spacing: 0.01em;
+        .link-num {
+            width: 32px; height: 32px;
+            border-radius: 10px;
+            background: rgba(72,186,255,0.11);
+            border: 1px solid rgba(72,186,255,0.24);
+            display: grid; place-items: center;
+            font-family: var(--mono);
+            font-size: 13px; font-weight: 700;
+            color: var(--accent);
+            flex-shrink: 0;
         }
+        .link-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-        .quote-panel { margin-top: 14px; padding: 0; overflow: hidden; }
-
-        .quote-header {
-            padding: 18px 20px 12px;
-            font-size: clamp(20px, 2.4vw, 34px);
-            font-weight: 800;
-            border-bottom: 1px solid rgba(128, 153, 194, 0.15);
-        }
-
-        .quote-body {
-            margin: 0;
-            padding: 18px 20px 20px;
-            font-size: 18px;
-            color: #d8e7ff;
-            line-height: 1.55;
-            border-left: 3px solid rgba(72, 200, 255, 0.56);
-            background: linear-gradient(145deg, rgba(8, 15, 30, 0.88), rgba(5, 11, 22, 0.92));
-        }
-
-        .aside-card { overflow: hidden; }
-
-        .aside-banner {
-            height: 120px;
-            background:
-                linear-gradient(130deg, rgba(71, 142, 229, 0.38), rgba(69, 67, 147, 0.46)),
-                radial-gradient(290px 130px at 74% 38%, rgba(209, 119, 205, 0.27), transparent 65%),
-                #0c1424;
-            border-bottom: 1px solid rgba(153, 179, 224, 0.18);
-        }
-
-        .aside-body {
-            padding: 0 18px 18px;
-            margin-top: -40px;
-        }
-
-        .avatar {
-            width: 86px;
-            height: 86px;
-            border-radius: 50%;
-            object-fit: cover;
-            border: 3px solid rgba(86, 152, 230, 0.72);
-            box-shadow: 0 0 0 4px rgba(5, 10, 19, 0.92);
-            background: linear-gradient(145deg, #2a4063, #0f1d33);
-        }
-
-        .muted-id {
+        /* ── PROJECTS BUTTON ────────────────────────────────── */
+        .projects-btn {
             margin-top: 10px;
-            color: #8ea1c2;
-            font-size: 14px;
-            font-family: "JetBrains Mono", monospace;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            border-radius: 14px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(107,177,246,0.38);
+            color: var(--text);
+            text-decoration: none;
+            font-weight: 700;
+            font-size: 15px;
+            min-height: 46px;
+            transition: all 0.25s ease;
+        }
+        .projects-btn:hover {
+            background: rgba(107,177,246,0.12);
+            border-color: rgba(107,177,246,0.68);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(72,186,255,0.16);
         }
 
-        .handle {
-            margin: 4px 0 0;
-            font-size: clamp(28px, 2.9vw, 44px);
-            font-weight: 800;
-            letter-spacing: 0.01em;
+        /* ── EXTRA LINKS ────────────────────────────────────── */
+        .more-links { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+        .mini-link {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 10px 16px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            color: var(--muted2);
+            text-decoration: none;
+            font-size: 14px; font-weight: 600;
+            min-height: 44px;
+            transition: all 0.22s ease;
+        }
+        .mini-link:hover {
+            border-color: rgba(72,186,255,0.42);
+            color: var(--text);
+            background: rgba(72,186,255,0.08);
         }
 
-        .small-title { margin: 6px 0 0; color: #9eb3d4; font-size: 16px; }
-
-        .status-grid {
-            margin-top: 14px;
-            display: grid;
-            gap: 9px;
-        }
-
-        .status-row {
-            border: 1px solid rgba(133, 160, 202, 0.18);
-            border-radius: 11px;
-            background: rgba(6, 11, 21, 0.76);
-            padding: 10px 12px;
+        /* ── TELEGRAM BUTTON ─────────────────────────────────── */
+        .tg-btn {
+            margin-top: 16px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 14px 20px;
+            border-radius: 18px;
+            text-decoration: none;
+            color: #fff;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.13) 0%, transparent 55%),
+                linear-gradient(140deg, #2aabee 0%, #229ed9 50%, #1a87c2 100%);
+            border: 1px solid rgba(255,255,255,0.22);
+            box-shadow:
+                0 8px 32px rgba(34,158,217,0.42),
+                inset 0 1px 0 rgba(255,255,255,0.26);
+            transition: all 0.30s cubic-bezier(0.16,1,0.3,1);
             position: relative;
             overflow: hidden;
         }
+        .tg-btn::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.16), transparent 55%);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+        }
+        .tg-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 16px 48px rgba(34,158,217,0.56), inset 0 1px 0 rgba(255,255,255,0.30);
+        }
+        .tg-btn:hover::after { opacity: 1; }
+        .tg-icon {
+            width: 48px; height: 48px;
+            border-radius: 14px;
+            background: rgba(0,0,0,0.24);
+            border: 1px solid rgba(255,255,255,0.20);
+            display: grid; place-items: center;
+            font-size: 26px; line-height: 1;
+            flex-shrink: 0;
+        }
+        .tg-meta { flex: 1; overflow: hidden; }
+        .tg-label {
+            font-size: 11px; font-weight: 700;
+            opacity: 0.75; letter-spacing: 0.08em;
+            text-transform: uppercase; margin-bottom: 2px;
+        }
+        .tg-url {
+            font-size: clamp(17px, 2.2vw, 26px);
+            font-weight: 800; letter-spacing: 0.01em;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tg-arrow { font-size: 20px; opacity: 0.65; flex-shrink: 0; }
 
-        .status-label {
-            color: #9fb3d5;
-            font-size: 13px;
+        /* ── QUOTE CARD ─────────────────────────────────────── */
+        .quote-card { padding: 0; }
+        .quote-hdr {
+            padding: 18px 24px 14px;
+            font-size: 11px; font-weight: 800;
+            letter-spacing: 0.12em; text-transform: uppercase;
+            color: var(--muted);
+            border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; gap: 10px;
+        }
+        .quote-hdr-bar {
+            width: 4px; height: 14px; border-radius: 2px; flex-shrink: 0;
+            background: linear-gradient(180deg, var(--accent), var(--accent2));
+        }
+        .quote-body {
+            padding: 22px 24px 24px;
+            font-size: 17px;
+            line-height: 1.68;
+            color: rgba(218,232,255,0.90);
+            font-style: italic;
+            position: relative;
+        }
+        .quote-body::before {
+            content: '\201C';
+            position: absolute;
+            top: 6px; left: 14px;
+            font-size: 84px; line-height: 1;
+            color: rgba(72,186,255,0.10);
+            font-family: Georgia, 'Times New Roman', serif;
+            font-style: normal;
+            pointer-events: none;
+        }
+
+        /* ── PROFILE IDENTITY CARD ───────────────────────────── */
+        .profile-card { padding: 0; }
+        .profile-banner {
+            height: 112px;
+            background:
+                radial-gradient(ellipse 80% 130% at 28% 50%, rgba(50,118,236,0.45), transparent 65%),
+                radial-gradient(ellipse 70% 120% at 82% 38%, rgba(120,100,254,0.42), transparent 65%),
+                radial-gradient(ellipse 60% 90%  at 52% 82%, rgba(255,100,150,0.22), transparent 70%),
+                linear-gradient(135deg, #0d1a36, #0a1328);
+            position: relative; overflow: hidden;
+        }
+        .profile-banner::after {
+            content: '';
+            position: absolute;
+            bottom: -1px; left: 0; right: 0;
+            height: 44px;
+            background: linear-gradient(to bottom, transparent, var(--glass));
+            pointer-events: none;
+        }
+        .profile-body { padding: 0 20px 22px; margin-top: -46px; }
+
+        /* ── AVATAR ─────────────────────────────────────────── */
+        .avatar-wrap {
+            display: inline-block;
+            position: relative;
+            width: 90px; height: 90px;
+        }
+        .avatar-ring {
+            position: absolute;
+            inset: -4px; border-radius: 50%;
+            background: conic-gradient(from 0deg, var(--accent), var(--accent2), var(--pink), var(--accent));
+            animation: spinRing 5s linear infinite;
+            z-index: 0;
+        }
+        @keyframes spinRing { to { transform: rotate(360deg); } }
+        .avatar-inner {
+            position: relative; z-index: 1;
+            width: 90px; height: 90px;
+            border-radius: 50%;
+            background: var(--bg);
+            padding: 3px;
+        }
+        .avatar-img, .avatar-placeholder {
+            width: 100%; height: 100%;
+            border-radius: 50%;
+            display: block;
+        }
+        .avatar-img { object-fit: cover; }
+        .avatar-placeholder {
+            background: linear-gradient(135deg, #1a3461, #0f2040);
+            display: grid; place-items: center;
+            font-size: 26px; font-weight: 900;
+            color: var(--accent); letter-spacing: -0.02em;
+        }
+
+        .user-realname {
+            font-family: var(--mono);
+            font-size: 11.5px;
+            color: rgba(72,186,255,0.65);
+            margin-top: 12px;
+        }
+        .handle {
+            font-size: clamp(24px, 3.2vw, 36px);
+            font-weight: 900; letter-spacing: -0.01em;
+            margin-top: 5px; line-height: 1.1;
+        }
+        .handle-at { color: var(--muted); font-weight: 400; }
+        .user-title { margin-top: 5px; font-size: 14px; color: var(--muted); font-weight: 500; }
+
+        /* ── SECTION LABEL ──────────────────────────────────── */
+        .card-label {
+            font-size: 11px; font-weight: 800;
+            letter-spacing: 0.13em; text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 14px;
+            display: flex; align-items: center; gap: 8px;
+        }
+
+        /* ── MUSIC CARD ─────────────────────────────────────── */
+        .music-card { padding: 20px; }
+
+        .now-playing-bars {
+            display: flex; align-items: flex-end; gap: 3px;
+            height: 16px;
+        }
+        .eq-bar {
+            width: 3px; border-radius: 2px;
+            background: var(--accent);
+            transform-origin: bottom;
+            animation: eq 0.75s ease-in-out infinite alternate;
+        }
+        .eq-bar:nth-child(1) { height: 6px;  animation-delay: 0.00s; }
+        .eq-bar:nth-child(2) { height: 12px; animation-delay: 0.18s; }
+        .eq-bar:nth-child(3) { height: 8px;  animation-delay: 0.36s; }
+        @keyframes eq {
+            from { transform: scaleY(0.25); opacity: 0.6; }
+            to   { transform: scaleY(1);    opacity: 1; }
+        }
+        .eq-bar.idle {
+            animation: none;
+            height: 4px; opacity: 0.35;
+        }
+
+        .track-name {
+            font-size: 15.5px; font-weight: 700;
+            line-height: 1.38; color: var(--text);
             margin-bottom: 4px;
         }
+        .track-none { color: var(--muted); font-size: 15px; font-weight: 500; }
 
-        .status-value {
-            color: #e7efff;
-            font-size: 15px;
-            line-height: 1.4;
-            word-break: break-word;
-        }
-
-        .status-value a,
-        .status-value a:visited {
-            color: #ccf4ff;
+        .music-btns { margin-top: 13px; display: flex; flex-wrap: wrap; gap: 7px; }
+        .music-btn {
+            display: inline-flex; align-items: center;
+            padding: 6px 12px;
+            border-radius: 999px;
+            border: 1px solid rgba(72,186,255,0.26);
+            background: rgba(72,186,255,0.07);
+            color: var(--accent);
+            font-size: 12px; font-weight: 700;
             text-decoration: none;
-        }
-
-        .status-value a:hover { text-decoration: underline; }
-
-        .music-actions {
-            margin-top: 9px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 7px;
-        }
-
-        .music-action {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
+            transition: all 0.2s ease;
             min-height: 30px;
-            padding: 0 10px;
-            border-radius: 999px;
-            border: 1px solid rgba(122, 181, 236, 0.44);
-            background: linear-gradient(150deg, rgba(27, 55, 95, 0.9), rgba(15, 36, 66, 0.9));
-            color: #dff0ff;
-            text-decoration: none;
-            font-size: 12px;
-            font-weight: 700;
-            letter-spacing: 0.02em;
-            transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
         }
-
-        .music-action:hover {
+        .music-btn:hover {
+            background: rgba(72,186,255,0.17);
+            border-color: rgba(72,186,255,0.58);
             transform: translateY(-1px);
-            border-color: rgba(154, 220, 255, 0.78);
-            box-shadow: 0 7px 18px rgba(53, 132, 228, 0.27);
-            text-decoration: none;
         }
-
-        .music-action.disabled {
-            border-color: rgba(129, 145, 173, 0.28);
-            background: rgba(16, 24, 38, 0.75);
-            color: #93a5c3;
+        .music-btn.disabled {
+            border-color: var(--border);
+            color: var(--muted); background: transparent;
             pointer-events: none;
         }
 
-        .weather-row {
-            border-color: rgba(91, 178, 250, 0.40);
-            background: linear-gradient(150deg, rgba(12, 24, 43, 0.90), rgba(6, 14, 28, 0.90));
-        }
-
-        .weather-row::before {
-            content: "";
-            position: absolute;
-            inset: -1px;
-            z-index: 0;
-            pointer-events: none;
+        /* ── WEATHER CARD ───────────────────────────────────── */
+        .weather-card {
+            padding: 20px;
             background:
-                radial-gradient(120px 38px at 12% 0, rgba(109, 203, 255, 0.18), transparent 70%),
-                radial-gradient(130px 38px at 90% 100%, rgba(136, 170, 255, 0.14), transparent 72%);
+                radial-gradient(ellipse 90% 60% at 92% 5%, rgba(48,120,236,0.11), transparent 60%),
+                var(--glass);
         }
-
-        .weather-row > * {
-            position: relative;
-            z-index: 1;
+        .weather-top { display: flex; align-items: center; gap: 14px; }
+        .weather-emoji {
+            font-size: 46px; line-height: 1;
+            filter: drop-shadow(0 0 14px rgba(72,186,255,0.42));
         }
-
-        .weather-main {
-            display: flex;
-            align-items: center;
-            gap: 9px;
-            font-weight: 700;
-            line-height: 1.35;
+        .weather-temp-block { flex: 1; min-width: 0; }
+        .weather-temp {
+            font-size: clamp(30px, 4.5vw, 44px);
+            font-weight: 900; letter-spacing: -0.025em; line-height: 1;
+            background: linear-gradient(130deg, #ffffff 40%, var(--accent) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
-
-        .weather-icon {
-            display: inline-grid;
-            place-items: center;
-            width: 28px;
-            height: 28px;
-            border-radius: 9px;
-            background: rgba(42, 104, 190, 0.33);
-            border: 1px solid rgba(128, 196, 255, 0.36);
-            font-size: 15px;
-            flex: 0 0 28px;
+        .weather-condition {
+            font-size: 14px; font-weight: 600; color: var(--muted2);
+            margin-top: 4px; line-height: 1.3;
         }
-
-        .weather-badges {
-            margin-top: 9px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
+        .weather-loc {
+            font-size: 12px; color: var(--muted);
+            font-weight: 500; margin-top: 3px;
         }
-
+        .weather-badges { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
         .weather-badge {
-            display: inline-flex;
-            align-items: center;
-            min-height: 25px;
-            max-width: 100%;
-            padding: 4px 8px;
+            display: inline-flex; align-items: center;
+            padding: 5px 11px;
             border-radius: 999px;
-            border: 1px solid rgba(125, 174, 232, 0.35);
-            background: rgba(15, 28, 48, 0.84);
-            color: #bcd4f2;
-            font-size: 12px;
-            font-weight: 600;
+            border: 1px solid rgba(72,186,255,0.20);
+            background: rgba(72,186,255,0.06);
+            color: var(--muted2);
+            font-size: 12px; font-weight: 600;
         }
 
-        @media (max-width: 1020px) {
+        /* ── RESPONSIVE ─────────────────────────────────────── */
+        @media (max-width: 1080px) {
             .page { grid-template-columns: 1fr; }
-            .aside-card { order: -1; }
-            .aside-body { margin-top: -34px; }
-            .cta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .aside { flex-direction: row; flex-wrap: wrap; order: -1; }
+            .profile-card { flex: 1 1 320px; }
+            .music-card   { flex: 1 1 220px; }
+            .weather-card { flex: 1 1 220px; }
+            .links-grid { grid-template-columns: repeat(2, 1fr); }
         }
-
-        @media (max-width: 720px) {
-            .page {
-                width: min(100% - 20px, 1160px);
-                margin-top: 14px;
-                gap: 14px;
-            }
-
-            .hero { padding: 16px 14px 14px; }
-            .headline { font-size: 30px; }
-            .role { font-size: 16px; }
-            .bio {
-                margin-top: 12px;
-                font-size: 16px;
-                line-height: 1.48;
-            }
-
-            .cta-grid { grid-template-columns: 1fr; }
-            .cta-link { min-height: 54px; }
-            .mini-link { min-height: 44px; font-size: 14px; }
-
-            .telegram-strip { padding: 8px; gap: 10px; }
-            .telegram-strip .plane {
-                width: 42px;
-                height: 42px;
-                font-size: 21px;
-                border-radius: 12px;
-            }
-            .telegram-strip .tg-url { font-size: 18px; }
-
-            .quote-header { padding: 14px 14px 10px; }
-            .quote-body {
-                padding: 14px;
-                font-size: 15px;
-            }
-
-            .aside-banner { height: 100px; }
-            .avatar {
-                width: 76px;
-                height: 76px;
-            }
-            .handle { font-size: 34px; }
-            .small-title { font-size: 15px; }
-            .status-value { font-size: 14px; }
-            .music-action { min-height: 28px; font-size: 11px; padding: 0 8px; }
-            .weather-main { gap: 7px; }
-            .weather-icon { width: 24px; height: 24px; font-size: 13px; border-radius: 8px; }
-            .weather-badge { font-size: 11px; padding: 3px 7px; }
+        @media (max-width: 580px) {
+            .page { width: calc(100% - 20px); margin: 14px auto 40px; gap: 12px; }
+            .hero { padding: 20px 18px 18px; }
+            .headline { font-size: 27px; }
+            .hero-role { font-size: 15px; }
+            .hero-bio { font-size: 15.5px; margin-top: 13px; }
+            .links-grid { grid-template-columns: 1fr; }
+            .aside { flex-direction: column; }
+            .profile-card, .music-card, .weather-card { flex: 1 1 100%; }
+            .tg-url { font-size: 18px; }
+            .weather-temp { font-size: 30px; }
+            .weather-emoji { font-size: 38px; }
+            .card { border-radius: 18px; }
+            .quote-body { font-size: 15.5px; padding: 18px 18px 20px; }
+            .hero-tag { font-size: 10.5px; }
+            .tg-btn { padding: 12px 16px; gap: 12px; }
+            .tg-icon { width: 42px; height: 42px; font-size: 22px; }
+            .profile-banner { height: 96px; }
+            .avatar-wrap { width: 78px; height: 78px; }
+            .avatar-inner { width: 78px; height: 78px; }
+            .avatar-placeholder { font-size: 22px; }
+            .handle { font-size: 26px; }
+        }
+        @media (max-width: 380px) {
+            .page { width: calc(100% - 14px); }
+            .headline { font-size: 24px; }
         }
     </style>
 </head>
 <body>
-<main class="page">
-    <section class="main-column">
-        <article class="panel hero">
-            <h1 class="headline">Привет! Я <span><?= escapeHtml($profile['name']) ?></span></h1>
-            <p class="role"><?= escapeHtml($profile['title']) ?></p>
-            <p class="bio"><?= nl2br(escapeHtml($profile['bio'])) ?></p>
+<div class="orb orb-1" aria-hidden="true"></div>
+<div class="orb orb-2" aria-hidden="true"></div>
+<div class="orb orb-3" aria-hidden="true"></div>
+<div class="orb orb-4" aria-hidden="true"></div>
 
-            <div class="stack-row">
+<main class="page">
+
+    <!-- ════ MAIN COLUMN ════ -->
+    <div class="main-col">
+
+        <!-- HERO -->
+        <article class="card hero">
+            <div class="hero-tag">
+                <span class="hero-tag-dot" aria-hidden="true"></span>
+                Профиль
+            </div>
+            <h1 class="headline">Привет, я&nbsp;<span class="headline-name"><?= escapeHtml($profile['name']) ?></span></h1>
+            <p class="hero-role"><?= escapeHtml($profile['title']) ?></p>
+            <p class="hero-bio"><?= nl2br(escapeHtml($profile['bio'])) ?></p>
+
+            <div class="stack">
                 <?php foreach ($profile['stack'] as $tech): ?>
                     <span class="chip"><?= escapeHtml($tech) ?></span>
                 <?php endforeach; ?>
             </div>
 
-            <div class="cta-grid">
+            <div class="links-grid">
                 <?php foreach ($mainLinks as $idx => $link): ?>
-                    <?php $linkUrl = toStringSafe($link['url'] ?? ''); ?>
-                    <?php $linkLabel = toStringSafe($link['label'] ?? 'Ссылка'); ?>
-                    <?php if ($linkUrl === '') { continue; } ?>
-                    <a class="cta-link" href="<?= escapeHtml($linkUrl) ?>" target="_blank" rel="noopener noreferrer">
-                        <span class="cta-icon"><?= $idx + 1 ?></span>
-                        <span class="cta-text"><?= escapeHtml($linkLabel) ?></span>
+                    <?php $lu = toStringSafe($link['url'] ?? ''); $ll = toStringSafe($link['label'] ?? 'Ссылка'); ?>
+                    <?php if ($lu === '') continue; ?>
+                    <a class="link-card" href="<?= escapeHtml($lu) ?>" target="_blank" rel="noopener noreferrer">
+                        <span class="link-num"><?= $idx + 1 ?></span>
+                        <span class="link-label"><?= escapeHtml($ll) ?></span>
                     </a>
                 <?php endforeach; ?>
             </div>
 
-            <a class="mini-link projects-link" href="<?= escapeHtml($projectsPageUrl) ?>">
-                ↗ Проекты
-            </a>
+            <a class="projects-btn" href="<?= escapeHtml($projectsPageUrl) ?>">↗&nbsp; Проекты</a>
 
             <?php if (!empty($moreLinks)): ?>
                 <div class="more-links">
                     <?php foreach ($moreLinks as $link): ?>
-                        <?php $linkUrl = toStringSafe($link['url'] ?? ''); ?>
-                        <?php $linkLabel = toStringSafe($link['label'] ?? 'Ссылка'); ?>
-                        <?php if ($linkUrl === '') { continue; } ?>
-                        <a class="mini-link" href="<?= escapeHtml($linkUrl) ?>" target="_blank" rel="noopener noreferrer">
-                            ↗ <?= escapeHtml($linkLabel) ?>
+                        <?php $lu = toStringSafe($link['url'] ?? ''); $ll = toStringSafe($link['label'] ?? 'Ссылка'); ?>
+                        <?php if ($lu === '') continue; ?>
+                        <a class="mini-link" href="<?= escapeHtml($lu) ?>" target="_blank" rel="noopener noreferrer">
+                            ↗ <?= escapeHtml($ll) ?>
                         </a>
                     <?php endforeach; ?>
                 </div>
             <?php endif; ?>
 
-            <a class="telegram-strip" href="<?= escapeHtml($profile['telegram_url']) ?>" target="_blank" rel="noopener noreferrer">
-                <span class="plane">✈</span>
-                <strong class="tg-url"><?= escapeHtml($telegramLabel) ?></strong>
+            <a class="tg-btn" href="<?= escapeHtml($profile['telegram_url']) ?>" target="_blank" rel="noopener noreferrer">
+                <span class="tg-icon" aria-hidden="true">✈</span>
+                <span class="tg-meta">
+                    <div class="tg-label">Написать в Telegram</div>
+                    <div class="tg-url"><?= escapeHtml($telegramLabel) ?></div>
+                </span>
+                <span class="tg-arrow" aria-hidden="true">→</span>
             </a>
-
-            <section class="panel quote-panel">
-                <header class="quote-header">✦ Цитата</header>
-                <blockquote class="quote-body"><?= nl2br(escapeHtml($profile['quote'])) ?></blockquote>
-            </section>
         </article>
-    </section>
 
-    <aside class="panel aside-card">
-        <div class="aside-banner"></div>
-        <div class="aside-body">
-            <?php if ($profile['avatar_url'] !== ''): ?>
-                <img class="avatar" src="<?= escapeHtml($profile['avatar_url']) ?>" alt="avatar">
-            <?php else: ?>
-                <div class="avatar" aria-hidden="true"></div>
-            <?php endif; ?>
+        <!-- QUOTE -->
+        <article class="card quote-card">
+            <header class="quote-hdr">
+                <span class="quote-hdr-bar" aria-hidden="true"></span>
+                Цитата
+            </header>
+            <blockquote class="quote-body"><?= nl2br(escapeHtml($profile['quote'])) ?></blockquote>
+        </article>
 
-            <div class="muted-id">«<?= escapeHtml($profile['name']) ?>»</div>
-            <h2 class="handle">@<?= escapeHtml($displayUsername !== '' ? $displayUsername : 'username') ?></h2>
-            <div class="small-title"><?= escapeHtml($profile['title']) ?></div>
+    </div><!-- .main-col -->
 
-            <div class="status-grid">
-                <section class="status-row">
-                    <div class="status-label">Telegram</div>
-                    <div class="status-value">
-                        <a href="<?= escapeHtml($profile['telegram_url']) ?>" target="_blank" rel="noopener noreferrer">
-                            <?= escapeHtml($profile['telegram_url']) ?>
-                        </a>
-                    </div>
-                </section>
-                <section class="status-row">
-                    <div class="status-label">Сейчас играет</div>
-                    <div class="status-value"><?= escapeHtml($nowListeningText !== '' ? $nowListeningText : 'Сейчас ничего не играет') ?></div>
-                    <div class="music-actions">
-                        <?php if ($canSearchTrack): ?>
-                            <?php foreach ($trackSearchLinks as $label => $url): ?>
-                                <a class="music-action" href="<?= escapeHtml($url) ?>" target="_blank" rel="noopener noreferrer">
-                                    <?= escapeHtml($label) ?>
-                                </a>
-                            <?php endforeach; ?>
+    <!-- ════ ASIDE ════ -->
+    <aside class="aside">
+
+        <!-- IDENTITY CARD -->
+        <article class="card profile-card">
+            <div class="profile-banner" aria-hidden="true"></div>
+            <div class="profile-body">
+                <div class="avatar-wrap">
+                    <div class="avatar-ring" aria-hidden="true"></div>
+                    <div class="avatar-inner">
+                        <?php if ($profile['avatar_url'] !== ''): ?>
+                            <img class="avatar-img"
+                                 src="<?= escapeHtml($profile['avatar_url']) ?>"
+                                 alt="Аватар <?= escapeHtml($profile['name']) ?>">
                         <?php else: ?>
-                            <span class="music-action disabled">Трек не найден</span>
+                            <div class="avatar-placeholder" aria-hidden="true">
+                                <?= escapeHtml(
+                                    function_exists('mb_strtoupper')
+                                        ? mb_strtoupper(mb_substr($profile['name'], 0, 2, 'UTF-8'), 'UTF-8')
+                                        : strtoupper(substr($profile['name'], 0, 2))
+                                ) ?>
+                            </div>
                         <?php endif; ?>
                     </div>
-                </section>
-                <section class="status-row weather-row">
-                    <div class="status-label"><?= escapeHtml($weatherLabel) ?></div>
-                    <div class="status-value weather-main">
-                        <span class="weather-icon"><?= escapeHtml($weatherIcon) ?></span>
-                        <span><?= escapeHtml($weatherMainLine) ?></span>
-                    </div>
-                    <?php if (!empty($weatherDetails)): ?>
-                        <div class="weather-badges">
-                            <?php foreach ($weatherDetails as $detail): ?>
-                                <span class="weather-badge"><?= escapeHtml($detail) ?></span>
-                            <?php endforeach; ?>
-                        </div>
-                    <?php endif; ?>
-                </section>
+                </div>
+                <div class="user-realname">«<?= escapeHtml($profile['name']) ?>»</div>
+                <h2 class="handle">
+                    <span class="handle-at">@</span><?= escapeHtml($displayUsername !== '' ? $displayUsername : 'username') ?>
+                </h2>
+                <div class="user-title"><?= escapeHtml($profile['title']) ?></div>
             </div>
-        </div>
-    </aside>
+        </article>
+
+        <!-- MUSIC CARD -->
+        <article class="card music-card">
+            <div class="card-label">
+                <div class="now-playing-bars" aria-hidden="true">
+                    <div class="eq-bar<?= $noTrack ? ' idle' : '' ?>"></div>
+                    <div class="eq-bar<?= $noTrack ? ' idle' : '' ?>"></div>
+                    <div class="eq-bar<?= $noTrack ? ' idle' : '' ?>"></div>
+                </div>
+                <?= $noTrack ? 'Музыка' : 'Сейчас играет' ?>
+            </div>
+
+            <?php if (!$noTrack): ?>
+                <div class="track-name"><?= escapeHtml($nowListeningText) ?></div>
+            <?php else: ?>
+                <div class="track-none">Сейчас ничего не играет</div>
+            <?php endif; ?>
+
+            <div class="music-btns">
+                <?php if ($canSearchTrack): ?>
+                    <?php foreach ($trackSearchLinks as $label => $url): ?>
+                        <a class="music-btn"
+                           href="<?= escapeHtml($url) ?>"
+                           target="_blank" rel="noopener noreferrer">
+                            <?= escapeHtml($label) ?>
+                        </a>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <span class="music-btn disabled">Нет трека</span>
+                <?php endif; ?>
+            </div>
+        </article>
+
+        <!-- WEATHER CARD -->
+        <?php
+            // Extract just the temperature portion for big display
+            $bigTemp = '';
+            if (preg_match('/(-?\d+(?:[.,]\d+)?\s*°[CF])/u', $weatherMainLine, $tempMatch)) {
+                $bigTemp = $tempMatch[1];
+            }
+            // Condition = first detail line (e.g. "Ясно")
+            $weatherCondition = $weatherDetails[0] ?? '';
+            // Remaining details (feels-like, wind, updated)
+            $weatherExtras = array_slice($weatherDetails, 1);
+        ?>
+        <article class="card weather-card">
+            <div class="card-label"><?= escapeHtml($weatherLabel) ?></div>
+            <div class="weather-top">
+                <div class="weather-emoji" aria-hidden="true"><?= escapeHtml($weatherIcon) ?></div>
+                <div class="weather-temp-block">
+                    <div class="weather-temp"><?= escapeHtml($bigTemp !== '' ? $bigTemp : $weatherMainLine) ?></div>
+                    <?php if ($weatherCondition !== ''): ?>
+                        <div class="weather-condition"><?= escapeHtml($weatherCondition) ?></div>
+                    <?php endif; ?>
+                    <div class="weather-loc"><?= escapeHtml($weatherLocationName) ?></div>
+                </div>
+            </div>
+            <?php if (!empty($weatherExtras)): ?>
+                <div class="weather-badges">
+                    <?php foreach ($weatherExtras as $badge): ?>
+                        <span class="weather-badge"><?= escapeHtml($badge) ?></span>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+        </article>
+
+    </aside><!-- .aside -->
+
 </main>
 </body>
 </html>
