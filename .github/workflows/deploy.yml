@@ -1,0 +1,36 @@
+name: Deploy to redvps.site
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd /opt/serverredus
+
+            echo "=== git pull ==="
+            git fetch --prune origin main
+            git pull --ff-only origin main
+
+            echo "=== pip install ==="
+            .venv/bin/pip install -r requirements.txt --quiet
+
+            echo "=== restart ==="
+            sudo systemctl restart serverredus-backend
+            sudo systemctl restart serverredus-agent || true
+
+            echo "=== status ==="
+            systemctl is-active serverredus-backend
