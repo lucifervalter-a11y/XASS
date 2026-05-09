@@ -219,6 +219,11 @@ class TelegramUpdateHandler:
             )
             await self._maybe_delete_command_message(message)
             return True
+        if command == ".vk":
+            if not is_owner(user_id, self.settings):
+                return False
+            await self._handle_vk_command(int(chat_id))
+            return True
         return False
 
     async def _handle_mute_dot_command(
@@ -518,6 +523,38 @@ class TelegramUpdateHandler:
 
         profile_query_before_sync = self._profile_now_playing_text()
         query, is_explicit = self._extract_muz_query(message, text)
+        # .muz iphone  →  show iOS Shortcut setup guide instead of searching
+        if is_explicit and query.strip().lower() in ("iphone", "ios", "shortcut", "айфон"):
+            iphone_key = self._effective_iphone_hook_key()
+            _base = self._guess_public_base_url(config)
+            _endpoint = f"{_base or 'https://redvps.site'}/profile/now-playing/external"
+            _key_display = iphone_key if iphone_key else "(не задан — выполни /connect_iphone)"
+            iphone_guide = "\n".join([
+                "📱 Настройка iOS Shortcut для Now Playing",
+                "──────────────────────────────────────────",
+                "",
+                f"Endpoint: POST {_endpoint}",
+                f"Header:   X-Api-Key: {_key_display}",
+                "",
+                "JSON body:",
+                '{"text": "Artist - Track Name"}',
+                "",
+                "Как настроить:",
+                "1. Открой приложение Shortcuts на iPhone",
+                "2. Создай автоматизацию «Когда открывается приложение Музыка»",
+                "3. Добавь действие «Получить текущую песню»",
+                "4. Добавь «Получить содержимое URL» (POST):",
+                f"   URL: {_endpoint}",
+                "   Заголовки: X-Api-Key → твой ключ",
+                '   Body (JSON): {"text": "[Artist] - [Title]"}',
+                "5. Сохрани автоматизацию",
+                "",
+                "Источник переключить: /nowsource iphone",
+                "Сгенерировать ключ: /connect_iphone",
+            ])
+            await self._safe_send(int(chat_id), iphone_guide, business_connection_id=business_connection_id)
+            return
+
         if self._is_non_track_status_text(query):
             query = ""
         normalized_query = normalize_track_input(query)
@@ -1605,6 +1642,65 @@ class TelegramUpdateHandler:
                 ]
             )
         await self._safe_send(chat_id, "\n".join(lines), reply_markup=self._now_source_switch_keyboard("vk"))
+
+    async def _handle_vk_command(self, chat_id: int) -> None:
+        """Dot-command .vk — show VK status and OAuth login button."""
+        from urllib.parse import quote as _quote
+
+        current_uid, current_token = self._profile_vk_credentials()
+        has_token = bool(current_token)
+        current_source = self._current_now_source()
+
+        # Build OAuth URL pointing at vk-auth.php
+        oauth_url: str | None = None
+        if self.settings.vk_app_id:
+            app_id = int(self.settings.vk_app_id)
+            version = (self.settings.vk_api_version or "5.199").strip() or "5.199"
+            secret = (self.settings.setup_api_key or "").strip()
+            redirect_uri = f"https://redvps.site/vk-auth.php?secret={_quote(secret, safe='')}"
+            oauth_url = (
+                "https://oauth.vk.com/authorize"
+                f"?client_id={app_id}"
+                "&display=mobile"
+                f"&redirect_uri={_quote(redirect_uri, safe='')}"
+                "&scope=status,offline"
+                "&response_type=token"
+                f"&v={version}"
+            )
+
+        status_line = (
+            f"user_id={current_uid}" if current_uid else "не подключён"
+        ) + (", токен задан" if has_token else "")
+
+        lines = [
+            "ВКонтакте — now listening",
+            "─────────────────────────",
+            f"Статус: {status_line}",
+            f"Источник: {self._display_now_source(current_source)}",
+        ]
+
+        # Last connected
+        try:
+            _p = load_profile(Path(self.settings.profile_json_path))
+            _conn_at = str(_p.get("vk_connected_at") or "").strip()
+            if _conn_at:
+                lines.append(f"Подключено: {_conn_at[:19].replace('T', ' ')} UTC")
+        except Exception:
+            pass
+
+        if not self.settings.vk_app_id:
+            lines.extend(["", "Задайте VK_APP_ID в .env для кнопки OAuth."])
+
+        keyboard_rows: list[list[dict[str, str]]] = []
+        if oauth_url:
+            keyboard_rows.append([{"text": "🔗 Войти через ВКонтакте", "url": oauth_url}])
+        keyboard_rows.append([{"text": "📊 Переключить источник на VK", "callback_data": "agents:nowsource:set:vk"}])
+
+        await self._safe_send(
+            chat_id,
+            "\n".join(lines),
+            reply_markup={"inline_keyboard": keyboard_rows},
+        )
 
     async def _handle_vk_set_command(
         self,

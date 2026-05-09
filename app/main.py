@@ -25,7 +25,7 @@ from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_co
 from app.services.app_config import get_or_create_app_config
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
-from app.services.profile_editor import ensure_profile_exists, load_profile
+from app.services.profile_editor import ensure_profile_exists, load_profile, save_profile
 from app.services.restart_notice import clear_restart_notice, get_restart_notice
 from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, update_profile_now_playing_external
 from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
@@ -91,6 +91,12 @@ async def require_setup_api_key(x_api_key: str | None = Header(default=None)) ->
 
 class WebhookSetupPayload(BaseModel):
     public_base_url: HttpUrl
+
+
+class VkSaveTokenPayload(BaseModel):
+    access_token: str
+    user_id: int
+    secret: str
 
 
 @asynccontextmanager
@@ -279,6 +285,27 @@ async def profile_now_playing_external(
         "source": payload.source,
         "text": resolved_text,
     }
+
+
+@app.post("/api/vk/save-token")
+async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
+    if not settings.setup_api_key or (payload.secret or "").strip() != settings.setup_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid secret")
+    token = (payload.access_token or "").strip()
+    if len(token) < 20:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="access_token is too short")
+    if payload.user_id <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="user_id must be positive")
+
+    profile_path = Path(settings.profile_json_path)
+    ensure_profile_exists(profile_path)
+    profile = load_profile(profile_path)
+    profile["vk_access_token"] = token
+    profile["vk_user_id"] = payload.user_id
+    profile["now_listening_source"] = "vk"
+    profile["vk_connected_at"] = datetime.now(timezone).isoformat()
+    save_profile(profile_path, profile)
+    return {"ok": True}
 
 
 @app.get("/server/metrics", dependencies=[Depends(require_setup_api_key)])

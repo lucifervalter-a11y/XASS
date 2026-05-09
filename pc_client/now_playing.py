@@ -15,6 +15,8 @@ MUSIC_WINDOW_MARKERS = (
     "yandex music",
     "яндекс музыка",
     "vk music",
+    "vk музыка",
+    "xvk",
     "deezer",
     "soundcloud",
 )
@@ -230,12 +232,57 @@ def _linux_now_playing() -> str | None:
         return None
 
 
+def _vk_window_now_playing() -> str | None:
+    """Read VK Music track from window title of VK Music desktop app."""
+    command = (
+        "Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | "
+        "Select-Object Name, MainWindowTitle | ConvertTo-Json -Compress"
+    )
+    try:
+        raw, _ = _run_powershell(command, timeout_sec=6)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+
+    vk_markers = ("vk music", "vk музыка", "xvk", "vkmusic")
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        proc_name = str(item.get("Name") or "").lower()
+        win_title = str(item.get("MainWindowTitle") or "").strip()
+        if not win_title:
+            continue
+        win_lower = win_title.lower()
+        if any(m in proc_name or m in win_lower for m in vk_markers):
+            # Parse "Artist - Track — VK Музыка" or "Track | VK Music"
+            for sep in (" — ", " | ", " - "):
+                parts = win_title.split(sep)
+                if len(parts) >= 2:
+                    cleaned = [p.strip() for p in parts if not any(m in p.lower() for m in vk_markers)]
+                    if cleaned:
+                        return " - ".join(cleaned[:2]) if len(cleaned) >= 2 else cleaned[0]
+            return win_title
+    return None
+
+
 def get_now_playing() -> str | None:
     system = platform.system().lower()
     if system == "windows":
         direct = _windows_now_playing()
         if direct:
             return direct
+        vk_window = _vk_window_now_playing()
+        if vk_window:
+            return vk_window
         title, process_name = _windows_active_window()
         return _extract_track_from_window_title(title, process_name)
     if system == "linux":
