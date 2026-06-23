@@ -129,6 +129,7 @@
   // The secret is passed as a query param in the redirect_uri
   var searchParams = new URLSearchParams(window.location.search);
   var secret = searchParams.get('secret') || '';
+  var chatId = parseInt(searchParams.get('chat_id') || '0', 10) || null;
 
   if (!accessToken || !userId) {
     showResult(false, 'Токен или user_id не найдены в ответе VK. Попробуйте авторизоваться снова через бота.');
@@ -142,7 +143,7 @@
   fetch('/api/vk/save-token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ access_token: accessToken, user_id: userId, secret: secret })
+    body: JSON.stringify({ access_token: accessToken, user_id: userId, secret: secret, chat_id: chatId })
   })
   .then(function (res) {
     return res.json().then(function (data) {

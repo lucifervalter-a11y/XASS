@@ -472,6 +472,40 @@ if (is_readable($profilePath)) {
     }
 }
 
+// ── ROTATING QUOTES ──────────────────────────────────────────────
+// Pick a random quote on each page load (like axetuz.zip). Falls back to the
+// single profile quote when the quotes file is empty/missing.
+$quotesPath = getenv('QUOTES_JSON_PATH');
+if (!$quotesPath) {
+    $quotesPath = __DIR__ . '/data/quotes.json';
+}
+$quotePool = [];
+if (is_readable($quotesPath)) {
+    $rawQuotes = file_get_contents($quotesPath);
+    if (is_string($rawQuotes) && $rawQuotes !== '') {
+        $decodedQuotes = json_decode($rawQuotes, true);
+        $list = is_array($decodedQuotes) ? ($decodedQuotes['quotes'] ?? $decodedQuotes) : [];
+        if (is_array($list)) {
+            foreach ($list as $item) {
+                if (is_string($item)) {
+                    $text = trim($item);
+                } elseif (is_array($item)) {
+                    $text = trim((string)($item['text'] ?? ''));
+                } else {
+                    $text = '';
+                }
+                if ($text !== '') {
+                    $quotePool[] = $text;
+                }
+            }
+        }
+    }
+}
+if (!empty($quotePool)) {
+    $profile['quote'] = $quotePool[array_rand($quotePool)];
+}
+$quotePoolJson = json_encode(array_values($quotePool), JSON_UNESCAPED_UNICODE);
+
 $weatherFromJson = toStringSafe($profile['weather_text'] ?? '');
 $weatherAutoEnabled = toBoolSafe($profile['weather_auto_enabled'] ?? true, true);
 $weatherLocationName = toStringSafe($profile['weather_location_name'] ?? 'Москва', 'Москва');
@@ -1086,6 +1120,19 @@ $showDiscordOnline = $discordActive && $discordFresh;
         }
         .track-none { color: var(--muted); font-size: 15px; font-weight: 500; }
 
+        .track-head { display: flex; gap: 12px; align-items: center; }
+        .track-art {
+            width: 58px; height: 58px; border-radius: 12px;
+            object-fit: cover; flex: 0 0 auto;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+            border: 1px solid var(--border);
+            opacity: 0; transform: scale(0.9);
+            transition: opacity .4s ease, transform .4s ease;
+        }
+        .track-art.show { opacity: 1; transform: scale(1); }
+        .track-head .track-name { margin-bottom: 0; }
+        #quoteCard { cursor: pointer; }
+
         .music-btns { margin-top: 13px; display: flex; flex-wrap: wrap; gap: 7px; }
         .music-btn {
             display: inline-flex; align-items: center;
@@ -1295,12 +1342,12 @@ $showDiscordOnline = $discordActive && $discordFresh;
         </article>
 
         <!-- QUOTE -->
-        <article class="card quote-card">
+        <article class="card quote-card" id="quoteCard" data-quotes='<?= htmlspecialchars($quotePoolJson, ENT_QUOTES, "UTF-8") ?>'>
             <header class="quote-hdr">
                 <span class="quote-hdr-bar" aria-hidden="true"></span>
                 Цитата
             </header>
-            <blockquote class="quote-body"><?= nl2br(escapeHtml($profile['quote'])) ?></blockquote>
+            <blockquote class="quote-body" id="quoteBody"><?= nl2br(escapeHtml($profile['quote'])) ?></blockquote>
         </article>
 
         <!-- ACTIVITY FEED -->
@@ -1406,7 +1453,10 @@ $showDiscordOnline = $discordActive && $discordFresh;
             </div>
 
             <?php if (!$noTrack): ?>
-                <div class="track-name"><?= escapeHtml($nowListeningText) ?></div>
+                <div class="track-head">
+                    <img id="trackArt" class="track-art" alt="" hidden>
+                    <div class="track-name" id="trackName"><?= escapeHtml($nowListeningText) ?></div>
+                </div>
             <?php else: ?>
                 <div class="track-none">Сейчас ничего не играет</div>
             <?php endif; ?>
@@ -1482,5 +1532,49 @@ $showDiscordOnline = $discordActive && $discordFresh;
     </aside><!-- .aside -->
 
 </main>
+
+<script>
+(function () {
+  // ── Album art for the now-playing card (iTunes lookup) ──
+  var nameEl = document.getElementById('trackName');
+  var artEl = document.getElementById('trackArt');
+  if (nameEl && artEl) {
+    var track = (nameEl.textContent || '').trim();
+    if (track) {
+      fetch('https://itunes.apple.com/search?term=' + encodeURIComponent(track) + '&media=music&limit=1&entity=song')
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data.results || !data.results.length) return;
+          var art = data.results[0].artworkUrl100;
+          if (!art) return;
+          art = art.replace('100x100bb', '300x300bb');
+          artEl.onload = function () { artEl.hidden = false; requestAnimationFrame(function () { artEl.classList.add('show'); }); };
+          artEl.src = art;
+        })
+        .catch(function () {});
+    }
+  }
+
+  // ── Tap the quote card to shuffle to another quote ──
+  var qCard = document.getElementById('quoteCard');
+  var qBody = document.getElementById('quoteBody');
+  if (qCard && qBody) {
+    var pool = [];
+    try { pool = JSON.parse(qCard.getAttribute('data-quotes') || '[]'); } catch (e) { pool = []; }
+    if (pool.length > 1) {
+      qCard.title = 'Нажмите для другой цитаты';
+      qCard.addEventListener('click', function () {
+        var current = (qBody.textContent || '').trim();
+        var next = current;
+        var guard = 0;
+        while (next === current && guard < 12) { next = pool[Math.floor(Math.random() * pool.length)]; guard++; }
+        qBody.style.opacity = '0';
+        setTimeout(function () { qBody.textContent = next; qBody.style.opacity = '1'; }, 180);
+      });
+      qBody.style.transition = 'opacity .18s ease';
+    }
+  }
+})();
+</script>
 </body>
 </html>

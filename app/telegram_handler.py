@@ -77,6 +77,7 @@ from app.services.profile_editor import (
 )
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, sync_profile_weather
 from app.services.projects_bot import ProjectsBotService
+from app.services.quotes_store import add_quote, delete_quote, load_quotes
 from app.services.restart_notice import clear_restart_notice, save_restart_notice
 from app.services.weather_card import build_weather_card, build_weather_links
 from app.services.updater import (
@@ -222,7 +223,7 @@ class TelegramUpdateHandler:
         if command == ".vk":
             if not is_owner(user_id, self.settings):
                 return False
-            await self._handle_vk_command(int(chat_id))
+            await self._handle_vk_command(int(chat_id), config)
             return True
         return False
 
@@ -943,7 +944,16 @@ class TelegramUpdateHandler:
         command = text.split()[0].split("@")[0].lower()
 
         if command in ("/start", "/panel"):
-            await self._safe_send(chat_id, panel_text(), reply_markup=main_panel_keyboard())
+            keyboard = main_panel_keyboard()
+            webapp_url = self._miniapp_url(config)
+            if webapp_url:
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "📱 Открыть мини-приложение", "web_app": {"url": webapp_url}}],
+                        *keyboard["inline_keyboard"],
+                    ]
+                }
+            await self._safe_send(chat_id, panel_text(), reply_markup=keyboard)
             await self._ensure_start_shortcut(chat_id)
             return
         if command == "/server":
@@ -1093,6 +1103,24 @@ class TelegramUpdateHandler:
                 await self._safe_send(chat_id, "Нет доступа. Команда доступна только владельцу.")
                 return
             await self._handle_weather_refresh_command(chat_id)
+            return
+        if command in ("/webapp", "/miniapp", "/app"):
+            await self._handle_webapp_command(config, chat_id)
+            return
+        if command in ("/quote", "/quoteadd"):
+            if not is_owner(user_id, self.settings):
+                await self._safe_send(chat_id, "Нет доступа. Команда доступна только владельцу.")
+                return
+            await self._handle_quote_add_command(chat_id, text)
+            return
+        if command in ("/quotes", "/quotelist"):
+            await self._handle_quotes_list_command(chat_id)
+            return
+        if command in ("/quotedel", "/quoteremove"):
+            if not is_owner(user_id, self.settings):
+                await self._safe_send(chat_id, "Нет доступа. Команда доступна только владельцу.")
+                return
+            await self._handle_quote_delete_command(chat_id, text)
             return
 
         await self._safe_send(chat_id, "Неизвестная команда. Используйте /panel.")
@@ -1643,21 +1671,24 @@ class TelegramUpdateHandler:
             )
         await self._safe_send(chat_id, "\n".join(lines), reply_markup=self._now_source_switch_keyboard("vk"))
 
-    async def _handle_vk_command(self, chat_id: int) -> None:
+    async def _handle_vk_command(self, chat_id: int, config: AppConfig | None = None) -> None:
         """Dot-command .vk — show VK status and OAuth login button."""
-        from urllib.parse import quote as _quote
+        from urllib.parse import quote as _quote, urlsplit as _urlsplit
 
         current_uid, current_token = self._profile_vk_credentials()
         has_token = bool(current_token)
         current_source = self._current_now_source()
 
-        # Build OAuth URL pointing at vk-auth.php
+        # Build OAuth URL pointing at vk-auth.php on the configured public host.
         oauth_url: str | None = None
         if self.settings.vk_app_id:
             app_id = int(self.settings.vk_app_id)
             version = (self.settings.vk_api_version or "5.199").strip() or "5.199"
             secret = (self.settings.setup_api_key or "").strip()
-            redirect_uri = f"https://redvps.site/vk-auth.php?secret={_quote(secret, safe='')}"
+            base = self._guess_public_base_url(config) or "https://redvps.site"
+            split = _urlsplit(base)
+            host = f"{split.scheme}://{split.netloc}" if split.scheme and split.netloc else "https://redvps.site"
+            redirect_uri = f"{host}/vk-auth.php?secret={_quote(secret, safe='')}&chat_id={int(chat_id)}"
             oauth_url = (
                 "https://oauth.vk.com/authorize"
                 f"?client_id={app_id}"
@@ -1777,6 +1808,82 @@ class TelegramUpdateHandler:
         if backup_path:
             lines.append(f"Бэкап: {backup_path.name}")
         await self._safe_send(chat_id, "\n".join(lines))
+
+    def _miniapp_url(self, config: AppConfig | None = None) -> str | None:
+        from urllib.parse import urlsplit as _urlsplit
+
+        base = self._guess_public_base_url(config)
+        if not base:
+            return None
+        split = _urlsplit(base)
+        if not (split.scheme and split.netloc):
+            return None
+        return f"{split.scheme}://{split.netloc}/miniapp.php"
+
+    async def _handle_webapp_command(self, config: AppConfig, chat_id: int) -> None:
+        url = self._miniapp_url(config)
+        if not url:
+            await self._safe_send(
+                chat_id,
+                "Сначала задайте URL сервера: /seturl https://your-domain.tld\n"
+                "После этого команда /webapp откроет мини-приложение.",
+            )
+            return
+        await self._safe_send(
+            chat_id,
+            (
+                "📱 XASS — мини-приложение\n"
+                "──────────────────────\n"
+                "Управляйте всем прямо из Telegram: статус, музыка, сервер,\n"
+                "настройки, логи, цитаты и вход через ВКонтакте."
+            ),
+            reply_markup={"inline_keyboard": [[{"text": "📱 Открыть XASS", "web_app": {"url": url}}]]},
+        )
+
+    async def _handle_quote_add_command(self, chat_id: int, text: str) -> None:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await self._safe_send(
+                chat_id,
+                "Использование:\n/quote <текст цитаты>\n\n"
+                "Цитаты показываются на сайте в случайном порядке при каждом заходе.\n"
+                "Список: /quotes",
+            )
+            return
+        entry = add_quote(Path(self.settings.quotes_json_path), parts[1])
+        if entry is None:
+            await self._safe_send(chat_id, "Пустая цитата.")
+            return
+        quotes = load_quotes(Path(self.settings.quotes_json_path))
+        await self._safe_send(
+            chat_id,
+            f"✅ Цитата добавлена (#{entry['id']}). Всего цитат: {len(quotes)}.",
+        )
+
+    async def _handle_quotes_list_command(self, chat_id: int) -> None:
+        quotes = load_quotes(Path(self.settings.quotes_json_path))
+        if not quotes:
+            await self._safe_send(chat_id, "Цитат пока нет. Добавьте: /quote <текст>")
+            return
+        lines = ["Цитаты", "──────"]
+        for index, item in enumerate(quotes, start=1):
+            text_val = str(item.get("text") or "")
+            preview = text_val if len(text_val) <= 80 else text_val[:77] + "…"
+            lines.append(f"{index}. [{item.get('id')}] {preview}")
+        lines.extend(["", "Удалить: /quotedel <id>", "Добавить: /quote <текст>"])
+        await self._safe_send(chat_id, "\n".join(lines))
+
+    async def _handle_quote_delete_command(self, chat_id: int, text: str) -> None:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await self._safe_send(chat_id, "Использование:\n/quotedel <id>\n\nID можно посмотреть в /quotes")
+            return
+        removed = delete_quote(Path(self.settings.quotes_json_path), parts[1].strip())
+        if not removed:
+            await self._safe_send(chat_id, "Цитата с таким ID не найдена. Список: /quotes")
+            return
+        quotes = load_quotes(Path(self.settings.quotes_json_path))
+        await self._safe_send(chat_id, f"🗑 Цитата удалена. Осталось: {len(quotes)}.")
 
     async def _handle_now_source_command(
         self,
