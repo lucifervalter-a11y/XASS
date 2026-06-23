@@ -809,9 +809,7 @@ textarea.input { resize:vertical; min-height:54px; }
         return;
       }
       if(!r.data){
-        var hint = r.status >= 500 ? 'Сервер вернул HTTP ' + r.status + ' — бэкенд упал или ещё запускается. Попробуйте через несколько секунд.' :
-                   r.status === 0   ? 'Нет соединения с сервером.' :
-                   'HTTP ' + r.status + ': сервер вернул не-JSON ответ.';
+        var hint = 'HTTP ' + r.status + ': ' + (r.raw ? r.raw.slice(0, 300).replace(/<[^>]+>/g,'').trim() : 'нет ответа');
         showDeny('⚠️', 'Ошибка подключения', hint, true);
         return;
       }

@@ -238,6 +238,12 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/mini/ping")
+async def mini_ping() -> dict[str, Any]:
+    import sys
+    return {"ok": True, "python": sys.version, "status": "backend running"}
+
+
 @app.post("/agent/pair/claim", response_model=AgentPairClaimResponse)
 async def agent_pair_claim(
     payload: AgentPairClaimPayload,
