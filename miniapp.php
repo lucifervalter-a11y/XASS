@@ -440,11 +440,15 @@ textarea.input { resize:vertical; min-height:54px; }
     if (opts.body && typeof opts.body !== 'string') { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
     var url = '/proxy.php?_p=' + encodeURIComponent('/api/mini/' + path);
     return fetch(url, opts).then(function(r){
-      var httpStatus = r.status;
-      return r.text().then(function(text){
+      return r.json().then(function(envelope){
+        // proxy.php always returns 200; real status is in envelope._s
+        var httpStatus = envelope._s || r.status;
+        var raw = envelope._b || '';
         var data = null;
-        try { data = JSON.parse(text); } catch(e) {}
-        return { status: httpStatus, data: data, raw: text };
+        try { data = JSON.parse(raw); } catch(e) {}
+        return { status: httpStatus, data: data, raw: raw };
+      }).catch(function(){
+        return { status: r.status, data: null, raw: '' };
       });
     });
   }
