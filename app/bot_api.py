@@ -262,3 +262,32 @@ class TelegramBotClient:
         if caption:
             payload["caption"] = caption
         return await self._request("copyMessage", payload=payload)
+
+    async def set_chat_menu_button(
+        self,
+        *,
+        chat_id: int | None = None,
+        menu_button: dict[str, Any] | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {}
+        if chat_id is not None:
+            payload["chat_id"] = chat_id
+        if menu_button is not None:
+            payload["menu_button"] = menu_button
+        result = await self._request("setChatMenuButton", payload=payload)
+        return bool(result)
+
+    async def set_my_commands(
+        self,
+        commands: list[dict[str, Any]],
+        *,
+        scope: dict[str, Any] | None = None,
+        language_code: str | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {"commands": commands}
+        if scope is not None:
+            payload["scope"] = scope
+        if language_code is not None:
+            payload["language_code"] = language_code
+        result = await self._request("setMyCommands", payload=payload)
+        return bool(result)

@@ -192,6 +192,16 @@ textarea.input { resize:vertical; min-height:54px; }
 .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 .deny { padding:60px 24px; text-align:center; }
 .deny-ico { font-size:48px; margin-bottom:16px; }
+
+/* update tab */
+.commit-item { padding:10px 0; border-bottom:1px solid var(--border); }
+.commit-item:last-child { border-bottom:none; }
+.commit-hash { font-family:var(--mono); font-size:11px; color:var(--accent); }
+.commit-msg { font-size:13.5px; font-weight:600; margin-top:2px; }
+.commit-meta { font-size:11px; color:var(--muted); margin-top:2px; }
+.badge-update { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:700; padding:5px 11px; border-radius:999px; background:rgba(72,186,255,.12); color:var(--accent); border:1px solid rgba(72,186,255,.25); margin-bottom:12px; }
+.badge-ok { display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:700; padding:5px 11px; border-radius:999px; background:rgba(67,211,158,.11); color:var(--green); border:1px solid rgba(67,211,158,.25); margin-bottom:12px; }
+.upd-log { font-family:var(--mono); font-size:12px; color:var(--muted2); background:rgba(0,0,0,.3); border:1px solid var(--border); border-radius:12px; padding:12px; margin-top:12px; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow-y:auto; }
 </style>
 </head>
 <body>
@@ -365,6 +375,32 @@ textarea.input { resize:vertical; min-height:54px; }
     </div>
   </section>
 
+  <!-- UPDATE -->
+  <section class="view" id="v-update">
+    <div class="card">
+      <div class="card-label"><span class="dot"></span> Текущая версия</div>
+      <div id="updCurrent"><div class="muted" style="font-size:13px">Нажмите «Проверить» для загрузки информации.</div></div>
+    </div>
+    <div class="card" id="updNewCard" style="display:none">
+      <div class="card-label"><span class="dot"></span> Доступные обновления</div>
+      <div id="updCommits"></div>
+    </div>
+    <div id="updResultCard" style="display:none">
+      <div class="card">
+        <div class="card-label"><span class="dot"></span> Результат обновления</div>
+        <div id="updResultBody"></div>
+      </div>
+    </div>
+    <div class="btn-row" style="margin-bottom:10px">
+      <button class="btn btn-ghost" id="updRefreshBtn">🔄 Проверить</button>
+      <button class="btn btn-primary" id="updGoBtn" style="display:none">⬆️ Обновить</button>
+    </div>
+    <div class="card">
+      <div class="card-label"><span class="dot"></span> Быстрые команды</div>
+      <div class="muted" style="font-size:13px; line-height:1.7">/update — панель обновления в боте<br>/start — главная панель<br>/status — статус heartbeat</div>
+    </div>
+  </section>
+
   <nav class="tabs">
     <button class="tab on" data-view="home"><span class="ti">🏠</span>Главная</button>
     <button class="tab" data-view="music"><span class="ti">🎵</span>Музыка</button>
@@ -372,6 +408,7 @@ textarea.input { resize:vertical; min-height:54px; }
     <button class="tab" data-view="settings"><span class="ti">⚙️</span>Настройки</button>
     <button class="tab" data-view="logs"><span class="ti">📝</span>Логи</button>
     <button class="tab" data-view="quotes"><span class="ti">💬</span>Цитаты</button>
+    <button class="tab" data-view="update"><span class="ti">🔄</span>Апдейт</button>
   </nav>
 </div>
 
@@ -420,6 +457,7 @@ textarea.input { resize:vertical; min-height:54px; }
       $('v-'+v).classList.add('on');
       if (v==='logs') loadLogs();
       if (v==='quotes') loadQuotes();
+      if (v==='update') loadUpdateStatus();
       window.scrollTo({top:0,behavior:'smooth'});
     });
   });
@@ -647,6 +685,88 @@ textarea.input { resize:vertical; min-height:54px; }
     });
   }
   $('vkMiniBtn').addEventListener('click', vkLogin);
+
+  // ---- update tab
+  var updState = { hasUpdates: false, loading: false };
+
+  function renderUpdateStatus(d) {
+    if (!d || !d.ok) { $('updCurrent').innerHTML = '<div class="muted">Ошибка загрузки.</div>'; return; }
+    updState.hasUpdates = !!d.has_updates;
+    var cur = d.current;
+    if (cur) {
+      $('updCurrent').innerHTML =
+        '<div class="badge-'+(d.has_updates?'update':'ok')+'">' +
+        (d.has_updates ? '⬆️ Доступно обновление' : '✅ Версия актуальна') + '</div>' +
+        '<div class="commit-item">' +
+        '<div class="commit-hash">' + esc(cur.short_hash) + ' · ' + esc(d.branch) + '</div>' +
+        '<div class="commit-msg">' + esc(cur.subject) + '</div>' +
+        '<div class="commit-meta">' + esc(cur.author) + ' · ' + (cur.date ? cur.date.slice(0,10) : '') + '</div>' +
+        '</div>';
+    } else {
+      $('updCurrent').innerHTML = '<div class="muted">Нет данных о текущем коммите.</div>';
+    }
+    if (d.has_updates && d.commits && d.commits.length) {
+      $('updNewCard').style.display = '';
+      $('updCommits').innerHTML = d.commits.map(function(c) {
+        return '<div class="commit-item"><div class="commit-hash">' + esc(c.short_hash) + '</div>' +
+          '<div class="commit-msg">' + esc(c.subject) + '</div>' +
+          '<div class="commit-meta">' + esc(c.author) + ' · ' + (c.date ? c.date.slice(0,10) : '') + '</div></div>';
+      }).join('');
+    } else {
+      $('updNewCard').style.display = 'none';
+    }
+    if (d.errors && d.errors.length) {
+      toast('⚠️ ' + d.errors[0]);
+    }
+    $('updGoBtn').style.display = (d.has_updates && state.isOwner) ? '' : 'none';
+  }
+
+  function loadUpdateStatus() {
+    if (updState.loading) return;
+    updState.loading = true;
+    $('updCurrent').innerHTML = '<div class="muted">Загрузка…</div>';
+    $('updNewCard').style.display = 'none';
+    $('updGoBtn').style.display = 'none';
+    api('update-status').then(function(r) {
+      updState.loading = false;
+      if (r.status === 403 || r.status === 401) { toast('Только для владельца'); return; }
+      renderUpdateStatus(r.data);
+    }).catch(function() { updState.loading = false; toast('Ошибка проверки обновлений'); });
+  }
+
+  function doUpdate() {
+    if (!state.isOwner) { toast('Только для владельца'); return; }
+    if (updState.loading) return;
+    haptic('medium');
+    updState.loading = true;
+    $('updGoBtn').style.display = 'none';
+    $('updResultCard').style.display = 'none';
+    $('updCurrent').innerHTML = '<div class="muted" style="display:flex;align-items:center;gap:10px"><div class="spinner"></div> Обновляю…</div>';
+    api('run-update', {method:'POST'}).then(function(r) {
+      updState.loading = false;
+      var d = r.data || {};
+      if (d.ok) {
+        var lines = ['✅ Обновление успешно'];
+        if (d.after) lines.push('Версия: ' + d.after.short_hash + ' — ' + d.after.subject);
+        if (d.steps && d.steps.length) lines.push('Шаги: ' + d.steps.join(', '));
+        if (d.restart_performed) lines.push('♻️ Сервис перезапущен');
+        $('updResultBody').innerHTML = '<div class="upd-log">' + esc(lines.join('\n')) + '</div>';
+      } else {
+        $('updResultBody').innerHTML = '<div class="upd-log" style="color:var(--red)">❌ ' + esc(d.error || 'Ошибка') + '</div>';
+      }
+      $('updResultCard').style.display = '';
+      loadUpdateStatus();
+      toast(d.ok ? '✅ Обновлено!' : '❌ Ошибка обновления');
+    }).catch(function() {
+      updState.loading = false;
+      $('updResultBody').innerHTML = '<div class="upd-log" style="color:var(--red)">❌ Нет ответа от сервера.</div>';
+      $('updResultCard').style.display = '';
+      toast('Ошибка сети');
+    });
+  }
+
+  $('updRefreshBtn').addEventListener('click', function() { haptic(); loadUpdateStatus(); });
+  $('updGoBtn').addEventListener('click', doUpdate);
 
   // ---- diagnostics
   $('diagBtn').addEventListener('click', function(){

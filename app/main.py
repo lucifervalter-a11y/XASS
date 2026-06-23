@@ -47,6 +47,7 @@ from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exi
 from app.services.restart_notice import clear_restart_notice, get_restart_notice
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
+from app.services.updater import get_update_status, run_update
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
 
@@ -180,6 +181,36 @@ async def lifespan(_: FastAPI):
                     logger.warning("Restart success notice retained for next startup attempt")
         except Exception:
             logger.warning("Failed to process restart success notice", exc_info=True)
+        try:
+            async with SessionLocal() as _s:
+                _cfg = await get_or_create_app_config(_s, settings)
+            _raw_base = (
+                (getattr(_cfg, "service_base_url", None) or "").strip()
+                or (settings.profile_public_url or "").strip()
+            )
+            if _raw_base:
+                _split = urlsplit(_raw_base)
+                if _split.scheme and _split.netloc:
+                    _miniapp_url = f"{_split.scheme}://{_split.netloc}/miniapp.php"
+                    await bot_client.set_chat_menu_button(
+                        menu_button={"type": "web_app", "text": "XASS", "web_app": {"url": _miniapp_url}}
+                    )
+                    logger.info("Chat menu button set to %s", _miniapp_url)
+        except Exception:
+            logger.warning("Failed to set chat menu button", exc_info=True)
+        try:
+            await bot_client.set_my_commands([
+                {"command": "start", "description": "Панель управления"},
+                {"command": "webapp", "description": "Открыть мини-приложение XASS"},
+                {"command": "status", "description": "Статус heartbeat-источников"},
+                {"command": "server", "description": "Метрики сервера"},
+                {"command": "pc", "description": "Состояние ПК-агентов"},
+                {"command": "update", "description": "Обновление бота и сервиса"},
+                {"command": "help", "description": "Все команды (.muz, .weather…)"},
+            ])
+            logger.info("Bot commands registered")
+        except Exception:
+            logger.warning("Failed to set bot commands", exc_info=True)
     try:
         yield
     finally:
@@ -642,6 +673,46 @@ async def mini_vk_url(
         f"&v={version}"
     )
     return {"ok": True, "url": oauth_url}
+
+
+@app.get("/api/mini/update-status")
+async def mini_update_status(
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    upd = await asyncio.to_thread(get_update_status, settings)
+    def _commit_dict(c: Any) -> dict[str, Any] | None:
+        if c is None:
+            return None
+        return {"short_hash": c.short_hash, "subject": c.subject, "author": c.author, "date": c.date_iso}
+    return {
+        "ok": True,
+        "branch": upd.branch,
+        "has_updates": upd.has_updates,
+        "current": _commit_dict(upd.current),
+        "remote": _commit_dict(upd.remote),
+        "commits": [_commit_dict(c) for c in upd.commits],
+        "errors": upd.errors,
+    }
+
+
+@app.post("/api/mini/run-update")
+async def mini_run_update(
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    result = await asyncio.to_thread(run_update, settings)
+    def _commit_dict(c: Any) -> dict[str, Any] | None:
+        if c is None:
+            return None
+        return {"short_hash": c.short_hash, "subject": c.subject}
+    return {
+        "ok": result.ok,
+        "branch": result.branch,
+        "before": _commit_dict(result.before),
+        "after": _commit_dict(result.after),
+        "steps": result.steps,
+        "restart_performed": result.restart_performed,
+        "error": result.error,
+    }
 
 
 @app.get("/server/metrics", dependencies=[Depends(require_setup_api_key)])
