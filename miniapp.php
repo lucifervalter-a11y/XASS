@@ -438,7 +438,8 @@ textarea.input { resize:vertical; min-height:54px; }
     opts.headers = opts.headers || {};
     opts.headers['X-Telegram-Init-Data'] = initData;
     if (opts.body && typeof opts.body !== 'string') { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
-    return fetch('/api/mini/' + path, opts).then(function(r){
+    var url = '/proxy.php?_p=' + encodeURIComponent('/api/mini/' + path);
+    return fetch(url, opts).then(function(r){
       var httpStatus = r.status;
       return r.text().then(function(text){
         var data = null;
