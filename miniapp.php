@@ -413,9 +413,10 @@ textarea.input { resize:vertical; min-height:54px; }
 </div>
 
 <div class="deny" id="deny" style="display:none">
-  <div class="deny-ico">🔒</div>
-  <h2 style="margin-bottom:10px">Доступ ограничен</h2>
-  <p class="muted" id="denyMsg">Откройте мини-приложение через кнопку в боте XASS.</p>
+  <div class="deny-ico" id="denyIco">🔒</div>
+  <h2 style="margin-bottom:10px" id="denyTitle">Доступ ограничен</h2>
+  <p class="muted" id="denyMsg" style="margin-bottom:20px;line-height:1.6">Откройте мини-приложение через кнопку в боте XASS.</p>
+  <button id="denyRetry" class="btn btn-ghost btn-sm" style="display:none;margin:0 auto;max-width:200px">🔄 Повторить</button>
 </div>
 
 <script>
@@ -438,7 +439,12 @@ textarea.input { resize:vertical; min-height:54px; }
     opts.headers['X-Telegram-Init-Data'] = initData;
     if (opts.body && typeof opts.body !== 'string') { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
     return fetch('/api/mini/' + path, opts).then(function(r){
-      return r.json().then(function(d){ return { status:r.status, data:d }; });
+      var httpStatus = r.status;
+      return r.text().then(function(text){
+        var data = null;
+        try { data = JSON.parse(text); } catch(e) {}
+        return { status: httpStatus, data: data, raw: text };
+      });
     });
   }
 
@@ -779,20 +785,43 @@ textarea.input { resize:vertical; min-height:54px; }
   });
 
   // ---- boot
+  function showDeny(ico, title, msg, showRetry) {
+    $('loading').style.display='none';
+    $('deny').style.display='block';
+    $('denyIco').textContent = ico || '🔒';
+    $('denyTitle').textContent = title || 'Доступ ограничен';
+    $('denyMsg').textContent = msg || '';
+    $('denyRetry').style.display = showRetry ? 'block' : 'none';
+  }
+
   function boot(){
+    $('loading').style.display='flex';
+    $('deny').style.display='none';
+    $('app').style.display='none';
     api('bootstrap').then(function(r){
-      if(r.status===401 || r.status===403){
-        $('loading').style.display='none';
-        $('deny').style.display='block';
-        if(r.status===403) $('denyMsg').textContent='Этот аккаунт не является владельцем XASS.';
+      if(r.status===401){
+        showDeny('🔒', 'Нет доступа', 'Этот аккаунт не авторизован в XASS.', false);
         return;
       }
-      if(!r.data || !r.data.ok){ $('loading').style.display='none'; $('deny').style.display='block'; return; }
+      if(r.status===403){
+        showDeny('🔒', 'Нет доступа', 'Этот аккаунт не является владельцем XASS.', false);
+        return;
+      }
+      if(!r.data){
+        var hint = r.status >= 500 ? 'Сервер вернул HTTP ' + r.status + ' — бэкенд упал или ещё запускается. Попробуйте через несколько секунд.' :
+                   r.status === 0   ? 'Нет соединения с сервером.' :
+                   'HTTP ' + r.status + ': сервер вернул не-JSON ответ.';
+        showDeny('⚠️', 'Ошибка подключения', hint, true);
+        return;
+      }
+      if(!r.data.ok){
+        showDeny('⚠️', 'Ошибка', r.data.detail || ('HTTP ' + r.status), true);
+        return;
+      }
       var b=r.data;
       state.isOwner = b.user && b.user.is_owner;
       $('loading').style.display='none';
       $('app').style.display='block';
-      // header
       var nm = (b.status && b.status.name) || (b.user && b.user.first_name) || 'XASS';
       $('hName').textContent = nm;
       $('hSub').textContent = (b.status && b.status.title) || 'панель управления';
@@ -805,11 +834,13 @@ textarea.input { resize:vertical; min-height:54px; }
       setOwnerUI();
       bindLinks();
       startPolling();
-    }).catch(function(){
-      $('loading').style.display='none'; $('deny').style.display='block';
-      $('denyMsg').textContent='Не удалось связаться с сервером.';
+    }).catch(function(err){
+      var msg = (err && err.message) ? 'Ошибка сети: ' + err.message : 'Нет ответа от сервера. Проверьте что бэкенд запущен.';
+      showDeny('⚠️', 'Нет связи с сервером', msg, true);
     });
   }
+
+  $('denyRetry').addEventListener('click', function(){ haptic(); boot(); });
 
   var pollT;
   function startPolling(){
