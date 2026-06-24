@@ -266,6 +266,15 @@ textarea.input { resize:vertical; min-height:54px; }
       <div class="row-v" id="vkMiniStatus" style="margin-bottom:12px">—</div>
       <button class="btn btn-vk" id="vkMiniBtn">Войти через ВКонтакте</button>
     </div>
+    <div class="card" id="discordMini">
+      <div class="card-label"><span class="dot"></span> Discord</div>
+      <div class="row-v" id="discordTagStatus" style="margin-bottom:12px">—</div>
+      <div class="field" style="margin-bottom:10px">
+        <input class="input" id="discordTagInput" placeholder="username или username#1234">
+        <button class="btn btn-ghost btn-sm" id="discordTagSave">Сохранить</button>
+      </div>
+      <div class="hint">Тег отображается на публичном профиле.</div>
+    </div>
   </section>
 
   <!-- MUSIC -->
@@ -495,7 +504,11 @@ textarea.input { resize:vertical; min-height:54px; }
       b.classList.toggle('on', b.getAttribute('data-src')===s.now_source);
     });
     $('wVal').textContent = s.weather || 'Не указано';
-    $('dcVal').textContent = s.discord_active ? ('Играет в ' + (s.discord_game||'—')) : 'Не в игре';
+    if (s.discord_fresh) {
+      $('dcVal').textContent = s.discord_active ? (s.discord_game ? ('🎮 ' + s.discord_game) : 'Онлайн') : 'Не в игре';
+    } else {
+      $('dcVal').textContent = s.discord_tag ? ('🔵 ' + s.discord_tag) : '—';
+    }
     // vk
     if (s.vk_connected){
       $('vkMiniStatus').innerHTML = '🟢 Подключён' + (s.vk_user_id?(' · id '+s.vk_user_id):'');
@@ -504,6 +517,10 @@ textarea.input { resize:vertical; min-height:54px; }
       $('vkMiniStatus').innerHTML = '🔴 Не подключён';
       $('vkMiniBtn').textContent = 'Войти через ВКонтакте';
     }
+    // discord tag
+    var dtag = s.discord_tag || '';
+    $('discordTagInput').value = dtag;
+    $('discordTagStatus').innerHTML = dtag ? ('🔵 ' + esc(dtag)) : '🔴 Не указан';
   }
 
   var artCache = {};
@@ -696,6 +713,20 @@ textarea.input { resize:vertical; min-height:54px; }
     });
   }
   $('vkMiniBtn').addEventListener('click', vkLogin);
+
+  // ---- Discord tag
+  $('discordTagSave').addEventListener('click', function() {
+    haptic();
+    var tag = $('discordTagInput').value.trim();
+    api('setting', { method: 'POST', body: { key: 'discord_tag', value: tag } }).then(function(r) {
+      if (r.data && r.data.ok) {
+        $('discordTagStatus').innerHTML = tag ? ('🔵 ' + esc(tag)) : '🔴 Не указан';
+        toast(tag ? 'Discord тег сохранён' : 'Discord тег удалён');
+      } else {
+        toast('Ошибка сохранения');
+      }
+    });
+  });
 
   // ---- update tab
   var updState = { hasUpdates: false, loading: false };

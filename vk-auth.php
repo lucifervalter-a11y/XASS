@@ -140,21 +140,25 @@
     return;
   }
 
-  fetch('/api/vk/save-token', {
+  fetch('/proxy.php?_p=/api/vk/save-token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ access_token: accessToken, user_id: userId, secret: secret, chat_id: chatId })
   })
-  .then(function (res) {
-    return res.json().then(function (data) {
-      return { status: res.status, data: data };
+  .then(function (r) {
+    return r.json().then(function (envelope) {
+      var httpStatus = envelope._s || r.status;
+      var raw = envelope._b || '';
+      var data = null;
+      try { data = JSON.parse(raw); } catch (e) {}
+      return { status: httpStatus, data: data };
     });
   })
   .then(function (result) {
     if (result.status === 200 && result.data && result.data.ok) {
-      showResult(true, '✅ ВКонтакте подключён! Музыка теперь будет обновляться автоматически.');
+      showResult(true, 'ВКонтакте подключён! Музыка теперь будет обновляться автоматически.');
     } else {
-      var detail = (result.data && result.data.detail) ? result.data.detail : 'Неизвестная ошибка сервера.';
+      var detail = (result.data && result.data.detail) ? result.data.detail : ('Ошибка ' + result.status);
       showResult(false, detail);
     }
   })

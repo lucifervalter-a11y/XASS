@@ -423,6 +423,18 @@ def _build_mini_status(profile: dict[str, Any]) -> dict[str, Any]:
     source = str(profile.get("now_listening_source") or settings.now_playing_source_default or "pc_agent").strip().lower()
     vk_uid = profile.get("vk_user_id")
     vk_connected = bool(str(profile.get("vk_access_token") or "").strip())
+    discord_active = bool(profile.get("discord_active"))
+    discord_updated_raw = str(profile.get("discord_updated_at") or "")
+    discord_fresh = False
+    if discord_updated_raw:
+        try:
+            from datetime import timezone as _tz
+            ts = datetime.fromisoformat(discord_updated_raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_tz.utc)
+            discord_fresh = (datetime.now(_tz.utc) - ts).total_seconds() < 300
+        except Exception:
+            pass
     return {
         "name": str(profile.get("name") or ""),
         "title": str(profile.get("title") or ""),
@@ -431,9 +443,11 @@ def _build_mini_status(profile: dict[str, Any]) -> dict[str, Any]:
         "weather": weather_text,
         "now_source": source,
         "now_source_label": _now_source_label(source),
-        "discord_active": bool(profile.get("discord_active")),
+        "discord_active": discord_active,
+        "discord_fresh": discord_fresh,
         "discord_game": profile.get("discord_game"),
         "discord_elapsed_sec": profile.get("discord_elapsed_sec"),
+        "discord_tag": str(profile.get("discord_tag") or ""),
         "vk_connected": vk_connected,
         "vk_user_id": vk_uid if vk_connected else None,
         "vk_connected_at": str(profile.get("vk_connected_at") or ""),
@@ -539,6 +553,13 @@ async def mini_setting(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown source")
             set_profile_now_playing_source(settings, target)
             await sync_profile_now_playing_from_heartbeat(session, settings, config.heartbeat_timeout_minutes)
+        elif key == "discord_tag":
+            tag = str(value or "").strip()
+            profile_path = Path(settings.profile_json_path)
+            ensure_profile_exists(profile_path)
+            p = load_profile(profile_path)
+            p["discord_tag"] = tag
+            save_profile(profile_path, p)
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown setting key: {key}")
     except HTTPException:

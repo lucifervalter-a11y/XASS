@@ -24,6 +24,7 @@ $defaultProfile = [
     'weather_refresh_minutes' => 60,
     'weather_updated_at' => '',
     'avatar_url' => '',
+    'discord_tag' => '',
     'discord_active' => false,
     'discord_game' => null,
     'discord_elapsed_sec' => null,
@@ -458,6 +459,7 @@ if (is_readable($profilePath)) {
                 ? (int)$decoded['discord_elapsed_sec']
                 : null;
             $profile['discord_updated_at'] = toStringSafe($decoded['discord_updated_at'] ?? '');
+            $profile['discord_tag'] = toStringSafe($decoded['discord_tag'] ?? '');
 
             $links = normalizeLinks($decoded['links'] ?? null);
             if ($links) {
@@ -576,6 +578,7 @@ $weatherLabel = $weatherLocationName !== '' ? "Погода · {$weatherLocation
 $projectsPageUrl = '/projects.php';
 
 // Discord status vars
+$discordTag = toStringSafe($profile['discord_tag'] ?? '');
 $discordActive = toBoolSafe($profile['discord_active'] ?? false, false);
 $discordGame = is_string($profile['discord_game'] ?? null) && ($profile['discord_game'] ?? '') !== ''
     ? $profile['discord_game']
@@ -1512,6 +1515,11 @@ $showDiscordOnline = $discordActive && $discordFresh;
         <!-- DISCORD CARD -->
         <article class="card discord-card">
             <div class="card-label">Discord</div>
+            <?php if ($discordTag !== ''): ?>
+            <div style="font-size:13px;font-weight:600;color:var(--fg);margin-bottom:8px;">
+                <a href="https://discord.com/users/<?= escapeHtml($discordTag) ?>" target="_blank" rel="noopener" style="color:inherit;text-decoration:none;">@<?= escapeHtml($discordTag) ?></a>
+            </div>
+            <?php endif; ?>
             <div class="discord-row">
                 <span class="discord-dot <?= $showDiscordOnline ? 'online' : 'offline' ?>"></span>
                 <div class="discord-status-text">
