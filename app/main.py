@@ -501,7 +501,7 @@ async def mini_bootstrap(
         "metrics": metrics,
         "services": services,
         "quotes_count": len(quotes),
-        "vk_app_id": settings.vk_app_id,
+        "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
     }
 
 
@@ -559,6 +559,15 @@ async def mini_setting(
             ensure_profile_exists(profile_path)
             p = load_profile(profile_path)
             p["discord_tag"] = tag
+            save_profile(profile_path, p)
+        elif key == "vk_app_id":
+            raw = str(value or "").strip()
+            if raw and not raw.isdigit():
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="VK App ID должен быть числом")
+            profile_path = Path(settings.profile_json_path)
+            ensure_profile_exists(profile_path)
+            p = load_profile(profile_path)
+            p["vk_app_id"] = raw
             save_profile(profile_path, p)
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown setting key: {key}")
@@ -673,8 +682,12 @@ async def mini_vk_url(
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    if not settings.vk_app_id:
-        return {"ok": False, "detail": "VK_APP_ID не задан в .env"}
+    profile = load_profile(Path(settings.profile_json_path))
+    profile_app_id_raw = str(profile.get("vk_app_id") or "").strip()
+    profile_app_id = int(profile_app_id_raw) if profile_app_id_raw.isdigit() else None
+    resolved_app_id = settings.vk_app_id or profile_app_id
+    if not resolved_app_id:
+        return {"ok": False, "detail": "VK_APP_ID не задан — укажите его в карточке ВКонтакте в мини-апп"}
     config = await get_or_create_app_config(session, settings)
     base = (config.service_base_url or settings.profile_public_url or "").strip().rstrip("/")
     # service_base_url may point at /profile.php; reduce to scheme+host.
@@ -684,7 +697,7 @@ async def mini_vk_url(
             base = f"{split.scheme}://{split.netloc}"
     if not base:
         base = "https://redvps.site"
-    app_id = int(settings.vk_app_id)
+    app_id = int(resolved_app_id)
     version = (settings.vk_api_version or "5.199").strip() or "5.199"
     secret = (settings.setup_api_key or "").strip()
     redirect_target = f"{base}/vk-auth.php?secret={quote(secret, safe='')}"

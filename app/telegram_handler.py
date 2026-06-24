@@ -1820,6 +1820,19 @@ class TelegramUpdateHandler:
             return None
         return f"{split.scheme}://{split.netloc}/miniapp.php"
 
+    def _main_kb(self, config: "AppConfig | None") -> dict:
+        """Main panel keyboard always including Mini App WebApp button when URL is known."""
+        kb = main_panel_keyboard()
+        url = self._miniapp_url(config)
+        if url:
+            return {
+                "inline_keyboard": [
+                    [{"text": "📱 XASS", "web_app": {"url": url}}],
+                    *kb["inline_keyboard"],
+                ]
+            }
+        return kb
+
     async def _handle_webapp_command(self, config: AppConfig, chat_id: int) -> None:
         url = self._miniapp_url(config)
         if not url:
@@ -2377,28 +2390,28 @@ class TelegramUpdateHandler:
         config = await get_or_create_app_config(session, self.settings)
 
         if data in ("panel", "panel:home"):
-            await self._safe_edit_or_send(chat_id, message_id, panel_text(), main_panel_keyboard())
+            await self._safe_edit_or_send(chat_id, message_id, panel_text(), self._main_kb(config))
             return
         if data == "panel:status":
-            await self._safe_edit_or_send(chat_id, message_id, format_status_text(await list_sources(session), config.heartbeat_timeout_minutes), main_panel_keyboard())
+            await self._safe_edit_or_send(chat_id, message_id, format_status_text(await list_sources(session), config.heartbeat_timeout_minutes), self._main_kb(config))
             return
         if data == "panel:server":
             m = collect_server_metrics(top_processes_limit=self.settings.top_processes_limit)
             s = collect_systemd_statuses(self.settings.monitored_services)
-            await self._safe_edit_or_send(chat_id, message_id, format_server_text(m, s), main_panel_keyboard())
+            await self._safe_edit_or_send(chat_id, message_id, format_server_text(m, s), self._main_kb(config))
             return
         if data == "panel:pc":
-            await self._safe_edit_or_send(chat_id, message_id, format_pc_text(await list_sources(session), config.heartbeat_timeout_minutes), main_panel_keyboard())
+            await self._safe_edit_or_send(chat_id, message_id, format_pc_text(await list_sources(session), config.heartbeat_timeout_minutes), self._main_kb(config))
             return
         if data == "panel:agents":
             await self._show_agents_panel(session, config, chat_id, message_id)
             return
         if data == "panel:logs":
-            await self._safe_edit_or_send(chat_id, message_id, await self._build_logs_text(session), main_panel_keyboard())
+            await self._safe_edit_or_send(chat_id, message_id, await self._build_logs_text(session), self._main_kb(config))
             return
         if data == "panel:update":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", self._main_kb(config))
                 return
             await self._show_update_panel(chat_id=chat_id, message_id=message_id)
             return
@@ -2493,7 +2506,7 @@ class TelegramUpdateHandler:
             return
         if data.startswith("agents:delete:"):
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Удаление агентов доступно только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Удаление агентов доступно только владельцу.", self._main_kb(config))
                 return
             source_id_text = data.split(":", maxsplit=2)[2]
             try:
@@ -2520,13 +2533,13 @@ class TelegramUpdateHandler:
             return
         if data == "panel:profile":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Раздел профиля доступен только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Раздел профиля доступен только владельцу.", self._main_kb(config))
                 return
             await self._show_profile_panel(chat_id, message_id)
             return
         if data == "panel:projects":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Раздел проектов доступен только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Раздел проектов доступен только владельцу.", self._main_kb(config))
                 return
             await self._show_projects_panel(chat_id=chat_id, message_id=message_id, page=0)
             return
@@ -2539,7 +2552,7 @@ class TelegramUpdateHandler:
                     chat_id,
                     message_id,
                     "Нет доступа. Редактирование профиля доступно только владельцу.",
-                    main_panel_keyboard(),
+                    self._main_kb(config),
                 )
                 return
             await self._handle_profile_callback(chat_id, message_id, user_id, data)
@@ -2550,7 +2563,7 @@ class TelegramUpdateHandler:
                     chat_id,
                     message_id,
                     "Нет доступа. Управление проектами доступно только владельцу.",
-                    main_panel_keyboard(),
+                    self._main_kb(config),
                 )
                 return
             await self._handle_projects_callback(chat_id=chat_id, message_id=message_id, user_id=user_id, data=data)
@@ -2561,13 +2574,13 @@ class TelegramUpdateHandler:
             return
         if data == "update:refresh":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", self._main_kb(config))
                 return
             await self._show_update_panel(chat_id=chat_id, message_id=message_id)
             return
         if data == "update:changes":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", self._main_kb(config))
                 return
             if chat_id is None:
                 return
@@ -2575,25 +2588,25 @@ class TelegramUpdateHandler:
             return
         if data == "update:run":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Обновление доступно только владельцу.", self._main_kb(config))
                 return
             await self._run_update_flow(chat_id=chat_id, message_id=message_id)
             return
         if data == "update:rollback:ask":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", self._main_kb(config))
                 return
             await self._safe_edit_or_send(chat_id, message_id, "Откатить проект к предыдущему известному commit?", self._update_rollback_confirm_keyboard())
             return
         if data == "update:rollback:run":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", self._main_kb(config))
                 return
             await self._run_rollback_flow(chat_id=chat_id, message_id=message_id)
             return
         if data == "update:rollback:cancel":
             if not is_owner(user_id, self.settings):
-                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", main_panel_keyboard())
+                await self._safe_edit_or_send(chat_id, message_id, "Нет доступа. Откат доступен только владельцу.", self._main_kb(config))
                 return
             await self._show_update_panel(chat_id=chat_id, message_id=message_id)
             return

@@ -265,6 +265,13 @@ textarea.input { resize:vertical; min-height:54px; }
       <div class="card-label"><span class="dot"></span> ВКонтакте</div>
       <div class="row-v" id="vkMiniStatus" style="margin-bottom:12px">—</div>
       <button class="btn btn-vk" id="vkMiniBtn">Войти через ВКонтакте</button>
+      <div id="vkAppIdBlock" style="margin-top:14px;border-top:1px solid rgba(255,255,255,.07);padding-top:12px;display:none">
+        <div class="hint" style="margin-bottom:8px">VK App ID (если не задан в .env)</div>
+        <div class="field">
+          <input class="input" id="vkAppIdInput" placeholder="например 54649740" inputmode="numeric">
+          <button class="btn btn-ghost btn-sm" id="vkAppIdSave">Сохранить</button>
+        </div>
+      </div>
     </div>
     <div class="card" id="discordMini">
       <div class="card-label"><span class="dot"></span> Discord</div>
@@ -517,6 +524,10 @@ textarea.input { resize:vertical; min-height:54px; }
       $('vkMiniStatus').innerHTML = '🔴 Не подключён';
       $('vkMiniBtn').textContent = 'Войти через ВКонтакте';
     }
+    // vk app id block — show if no app id configured
+    var hasAppId = !!state.vkAppId;
+    $('vkAppIdBlock').style.display = hasAppId ? 'none' : '';
+    if (!hasAppId) $('vkAppIdInput').value = '';
     // discord tag
     var dtag = s.discord_tag || '';
     $('discordTagInput').value = dtag;
@@ -714,6 +725,20 @@ textarea.input { resize:vertical; min-height:54px; }
   }
   $('vkMiniBtn').addEventListener('click', vkLogin);
 
+  // ---- VK App ID
+  $('vkAppIdSave').addEventListener('click', function() {
+    haptic();
+    var appId = $('vkAppIdInput').value.trim();
+    if (appId && !/^\d+$/.test(appId)) { toast('App ID должен быть числом'); return; }
+    api('setting', { method: 'POST', body: { key: 'vk_app_id', value: appId } }).then(function(r) {
+      if (r.data && r.data.ok) {
+        state.vkAppId = appId ? parseInt(appId) : null;
+        $('vkAppIdBlock').style.display = state.vkAppId ? 'none' : '';
+        toast(appId ? 'VK App ID сохранён' : 'VK App ID удалён');
+      } else { toast((r.data&&r.data.detail)||'Ошибка'); }
+    });
+  });
+
   // ---- Discord tag
   $('discordTagSave').addEventListener('click', function() {
     haptic();
@@ -797,7 +822,13 @@ textarea.input { resize:vertical; min-height:54px; }
         $('updResultBody').innerHTML = '<div class="upd-log" style="color:var(--red)">❌ ' + esc(d.error || 'Ошибка') + '</div>';
       }
       $('updResultCard').style.display = '';
-      loadUpdateStatus();
+      if (d.ok && d.restart_performed) {
+        // Backend is restarting — wait 10s before polling status
+        $('updCurrent').innerHTML = '<div class="muted" style="display:flex;align-items:center;gap:10px"><div class="spinner"></div> Сервер перезапускается…</div>';
+        setTimeout(function() { loadUpdateStatus(); }, 10000);
+      } else {
+        loadUpdateStatus();
+      }
       toast(d.ok ? '✅ Обновлено!' : '❌ Ошибка обновления');
     }).catch(function() {
       updState.loading = false;
@@ -854,6 +885,7 @@ textarea.input { resize:vertical; min-height:54px; }
       }
       var b=r.data;
       state.isOwner = b.user && b.user.is_owner;
+      state.vkAppId = b.vk_app_id || null;
       $('loading').style.display='none';
       $('app').style.display='block';
       var nm = (b.status && b.status.name) || (b.user && b.user.first_name) || 'XASS';
