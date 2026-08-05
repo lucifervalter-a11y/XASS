@@ -73,6 +73,13 @@ class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["login_ready"])
         self.assertFalse(payload["requirements"]["https"])
 
+    def test_miniapp_contains_one_time_ios_pairing_flow(self) -> None:
+        template = Path("miniapp.php").read_text(encoding="utf-8")
+        self.assertIn("pwa/pair-link", template)
+        self.assertIn("pwaApi('exchange'", template)
+        self.assertIn("#pair=", Path("app/main.py").read_text(encoding="utf-8"))
+        self.assertIn("Для iPhone нужен HTTPS-адрес", Path("app/main.py").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

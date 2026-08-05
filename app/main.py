@@ -53,6 +53,7 @@ from app.services.app_config import (
     set_away_schedule,
     set_quiet_hours_window,
     set_save_mode,
+    set_service_base_url,
     toggle_away_mode,
     toggle_quiet_hours,
 )
@@ -66,6 +67,7 @@ from app.services.pwa_auth import (
     authenticate_telegram_login as pwa_authenticate_login,
     issue_session as issue_pwa_session,
 )
+from app.services.pwa_pairing import PwaPairingError, consume_pwa_pair_token, issue_pwa_pair_token
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.music_card import build_music_card, build_search_links, fallback_music_card
 from app.services.profile_editor import (
@@ -99,7 +101,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -181,6 +183,14 @@ class MiniAgentCommandPayload(BaseModel):
 class MiniAgentPairPayload(BaseModel):
     server_url: str = Field(default="", max_length=512)
     source_name: str = Field(default="", max_length=128)
+
+
+class MiniPwaPairPayload(BaseModel):
+    public_url: str = Field(default="", max_length=512)
+
+
+class PwaPairExchangePayload(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
 
 
 class PwaTelegramLoginPayload(BaseModel):
@@ -718,6 +728,39 @@ async def pwa_login(payload: PwaTelegramLoginPayload, response: Response) -> dic
     return {"ok": True, "user": {"id": user.user_id, "first_name": user.first_name, "username": user.username}}
 
 
+@app.post("/api/pwa/exchange")
+async def pwa_exchange(
+    payload: PwaPairExchangePayload,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        user_id = await consume_pwa_pair_token(session, payload.token)
+    except PwaPairingError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+    if not settings.owner_user_id or user_id != settings.owner_user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ссылка выпущена не для текущего владельца")
+
+    user = MiniAppUser(
+        user_id=user_id,
+        first_name="Владелец",
+        last_name="",
+        username="",
+        is_owner=True,
+    )
+    response.set_cookie(
+        PWA_COOKIE_NAME,
+        issue_pwa_session(user, settings),
+        max_age=PWA_SESSION_AGE_SEC,
+        httponly=True,
+        secure=settings.pwa_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"ok": True}
+
+
 @app.post("/api/pwa/logout")
 async def pwa_logout(response: Response) -> dict[str, bool]:
     response.delete_cookie(PWA_COOKIE_NAME, path="/", secure=settings.pwa_cookie_secure, samesite="lax")
@@ -800,6 +843,7 @@ async def mini_bootstrap(
             "away_schedule_enabled": bool(config.away_schedule_enabled),
             "away_schedule_start": config.away_schedule_start_minute,
             "away_schedule_end": config.away_schedule_end_minute,
+            "service_base_url": config.service_base_url or "",
         },
         "sources": [
             {
@@ -1103,6 +1147,60 @@ async def mini_agent_pair_code(
         "server_url": server_url,
         "connection": connection,
         "connection_file_name": "xass-connect.xass",
+    }
+
+
+@app.post("/api/mini/pwa/pair-link")
+async def mini_pwa_pair_link(
+    request: Request,
+    response: Response,
+    payload: MiniPwaPairPayload | None = None,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    requested_url = (payload.public_url if payload else "").strip()
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",", 1)[0].strip()
+    forwarded_origin = f"{forwarded_proto}://{forwarded_host}" if forwarded_host else ""
+    public_url = next(
+        (
+            normalized
+            for candidate in (requested_url, forwarded_origin, str(request.base_url))
+            if (normalized := normalize_server_origin(candidate)) is not None
+        ),
+        None,
+    )
+    if public_url is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Укажите полный публичный адрес XASS")
+    parsed = urlsplit(public_url)
+    if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Для iPhone нужен HTTPS-адрес")
+
+    config = await get_or_create_app_config(session, settings)
+    if config.service_base_url != public_url:
+        await set_service_base_url(session, config, public_url, user.user_id)
+
+    result = await issue_pwa_pair_token(session, actor_user_id=user.user_id)
+    link = f"{public_url}/miniapp.php?standalone=1#pair={quote(result.token, safe='')}"
+    response.headers["Cache-Control"] = "no-store"
+
+    menu_updated = False
+    if bot_client is not None:
+        try:
+            await bot_client.set_chat_menu_button(
+                menu_button={"type": "web_app", "text": "XASS", "web_app": {"url": f"{public_url}/miniapp.php"}}
+            )
+            menu_updated = True
+        except Exception:
+            logger.warning("Failed to update Mini App menu button after PWA setup", exc_info=True)
+
+    return {
+        "ok": True,
+        "public_url": public_url,
+        "link": link,
+        "expires_at": result.expires_at.isoformat(),
+        "ttl_minutes": result.ttl_minutes,
+        "menu_updated": menu_updated,
     }
 
 

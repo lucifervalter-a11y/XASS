@@ -950,7 +950,6 @@ class TelegramUpdateHandler:
                 keyboard = {
                     "inline_keyboard": [
                         [{"text": "📱 Открыть мини-приложение", "web_app": {"url": webapp_url}}],
-                        [{"text": " Добавить XASS на iPhone", "url": f"{webapp_url}?standalone=1"}],
                         *keyboard["inline_keyboard"],
                     ]
                 }
@@ -1829,7 +1828,6 @@ class TelegramUpdateHandler:
             return {
                 "inline_keyboard": [
                     [{"text": "📱 XASS", "web_app": {"url": url}}],
-                    [{"text": " XASS для iPhone", "url": f"{url}?standalone=1"}],
                     *kb["inline_keyboard"],
                 ]
             }
@@ -1844,7 +1842,6 @@ class TelegramUpdateHandler:
                 "После этого команда /webapp откроет мини-приложение.",
             )
             return
-        standalone_url = f"{url}?standalone=1"
         await self._safe_send(
             chat_id,
             (
@@ -1852,15 +1849,13 @@ class TelegramUpdateHandler:
                 "──────────────────────\n"
                 "Управляйте всем прямо из Telegram: статус, музыка, сервер,\n"
                 "настройки, логи, цитаты и вход через ВКонтакте.\n\n"
-                "Для iPhone откройте вторую кнопку в Safari, затем нажмите\n"
-                "«Поделиться» → «На экран Домой». Ссылка останется доступна внутри XASS.\n\n"
-                "Если вход через Telegram не появляется: @BotFather → /setdomain →\n"
-                f"выберите бота → отправьте только домен {urlsplit(url).netloc}."
+                "Для iPhone откройте внутри XASS: Инструменты →\n"
+                "iPhone и веб-приложение. Укажите HTTPS-адрес и создайте\n"
+                "одноразовую ссылку для Safari — /setdomain для входа не нужен."
             ),
             reply_markup={
                 "inline_keyboard": [
                     [{"text": "📱 Открыть XASS", "web_app": {"url": url}}],
-                    [{"text": " Открыть для iPhone", "url": standalone_url}],
                 ]
             },
         )
