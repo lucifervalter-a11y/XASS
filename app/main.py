@@ -8,7 +8,7 @@ from urllib.parse import quote, urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot_api import TelegramBotClient
@@ -31,6 +31,7 @@ from app.services.agent_commands import (
     enqueue_agent_command,
     latest_agent_commands,
 )
+from app.services.agent_connection import build_connection_profile, normalize_server_origin
 from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.app_config import (
@@ -66,7 +67,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -143,6 +144,11 @@ class MiniQuotePayload(BaseModel):
 class MiniAgentCommandPayload(BaseModel):
     command: str
     payload: dict[str, Any] | None = None
+
+
+class MiniAgentPairPayload(BaseModel):
+    server_url: str = Field(default="", max_length=512)
+    source_name: str = Field(default="", max_length=128)
 
 
 @asynccontextmanager
@@ -588,6 +594,8 @@ async def mini_bootstrap(
 
 @app.post("/api/mini/agents/pair-code")
 async def mini_agent_pair_code(
+    request: Request,
+    payload: MiniAgentPairPayload | None = None,
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
@@ -597,11 +605,46 @@ async def mini_agent_pair_code(
         ttl_minutes=settings.agent_pair_code_ttl_minutes,
         code_length=settings.agent_pair_code_length,
     )
+    config = await get_or_create_app_config(session, settings)
+    requested_server = (payload.server_url if payload else "").strip()
+    if requested_server and normalize_server_origin(requested_server) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid server URL")
+
+    forwarded_origin = ""
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").strip()
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "https").split(",", 1)[0].strip()
+    if forwarded_host:
+        forwarded_origin = f"{forwarded_proto}://{forwarded_host}"
+    server_url = next(
+        (
+            normalized
+            for candidate in (
+                requested_server,
+                config.service_base_url or "",
+                settings.profile_public_url or "",
+                forwarded_origin,
+                str(request.base_url),
+            )
+            if (normalized := normalize_server_origin(candidate)) is not None
+        ),
+        None,
+    )
+    if server_url is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Public server URL is not configured")
+    connection = build_connection_profile(
+        server_url=server_url,
+        pair_code=result.code,
+        expires_at=result.expires_at,
+        source_name=payload.source_name if payload else "",
+    )
     return {
         "ok": True,
         "code": result.code,
         "expires_at": result.expires_at.isoformat(),
         "ttl_minutes": result.ttl_minutes,
+        "server_url": server_url,
+        "connection": connection,
+        "connection_file_name": "xass-connect.json",
     }
 
 

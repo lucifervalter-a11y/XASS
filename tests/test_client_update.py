@@ -10,7 +10,7 @@ from pc_client.client_update import _validate_archive, verify_manifest
 class ClientUpdateTests(unittest.TestCase):
     def test_manifest_signature_rejects_tampering(self) -> None:
         manifest = {
-            "version": "0.4.1",
+            "version": "0.4.2",
             "revision": "a" * 64,
             "sha256": "b" * 64,
             "url": "https://xass.example/agent/update/package",
