@@ -45,6 +45,22 @@ if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
 // Collect headers to forward.
 $forwardHeaders = [];
 
+// Preserve the public origin for PWA readiness diagnostics. The backend is
+// reached over localhost, so without these headers it cannot know that the
+// user actually opened the HTTPS domain.
+$publicHost = isset($_SERVER['HTTP_HOST']) ? trim((string)$_SERVER['HTTP_HOST']) : '';
+if ($publicHost !== '' && preg_match('/^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$/', $publicHost) === 1) {
+    $forwardHeaders[] = 'X-Forwarded-Host: ' . $publicHost;
+}
+$publicProto = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off') ? 'https' : 'http';
+if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+    $candidateProto = strtolower(trim(explode(',', (string)$_SERVER['HTTP_X_FORWARDED_PROTO'])[0]));
+    if (in_array($candidateProto, ['http', 'https'], true)) {
+        $publicProto = $candidateProto;
+    }
+}
+$forwardHeaders[] = 'X-Forwarded-Proto: ' . $publicProto;
+
 if (function_exists('getallheaders')) {
     $allowed = ['content-type', 'x-telegram-init-data', 'x-api-key', 'authorization', 'cookie'];
     foreach (getallheaders() as $name => $val) {

@@ -179,6 +179,7 @@ chmod +x deploy/backup.sh
 - `AGENT_PAIR_CODE_TTL_MINUTES`, `AGENT_PAIR_CODE_LENGTH`
 - `TELEGRAM_WEBHOOK_PATH`, `TELEGRAM_SECRET_TOKEN`, `SETUP_API_KEY`
 - `TELEGRAM_BOT_USERNAME` — username бота без `@` для входа в iPhone/PWA
+- `TELEGRAM_BOT_IDENTITY_CACHE_PATH` — локальный кэш username бота; вход продолжает работать при временной недоступности Telegram `getMe`
 - `PWA_COOKIE_SECURE=true` на публичном HTTPS-сайте
 - `PROFILE_JSON_PATH`, `PROFILE_BACKUPS_DIR`, `PROFILE_AUDIT_LOG_PATH`
 - `PROFILE_AVATARS_DIR`
@@ -262,12 +263,14 @@ chmod +x deploy/backup.sh
 
 `miniapp.php` одновременно работает как Telegram Mini App и устанавливаемая PWA:
 
-1. XASS сам определяет username бота через Telegram. `TELEGRAM_BOT_USERNAME` можно оставить как резервную ручную настройку.
-2. В `@BotFather` откройте `/mybots` → выберите бота → `Bot Settings` → `Domain` (или выполните `/setdomain`) и отправьте только домен без `https://` и без пути.
-3. Отправьте боту `/app`: он покажет отдельную кнопку для Safari. Та же выделенная ссылка всегда есть на главной странице Mini App.
-4. Откройте `https://ваш-домен/miniapp.php?standalone=1` в Safari.
-5. Войдите Telegram-аккаунтом владельца (`OWNER_USER_ID`). Другие аккаунты сервер отклонит.
+1. XASS сам определяет username бота через Telegram и сохраняет его в локальном кэше. `TELEGRAM_BOT_USERNAME` остаётся резервной ручной настройкой.
+2. В `@BotFather` отправьте `/setdomain`, выберите **того же бота, через которого открывается XASS**, и отправьте только домен без `https://`, порта и пути — например `redvps.site`.
+3. Отдельно настройте кнопку Mini App: `/mybots` → нужный бот → `Bot Settings` → `Menu Button` → `Configure menu button`; URL — `https://ваш-домен/miniapp.php`.
+4. Отправьте боту `/app`: он покажет отдельную кнопку для Safari. Та же выделенная ссылка всегда есть на главной странице Mini App.
+5. Откройте `https://ваш-домен/miniapp.php?standalone=1` в Safari и войдите Telegram-аккаунтом владельца (`OWNER_USER_ID`). Другие аккаунты сервер отклонит.
 6. Нажмите «Поделиться» → «На экран Домой».
+
+Важно: Bot API не позволяет приложению проверить, сохранён ли `/setdomain`. Поэтому XASS показывает отдельно только собственную готовность (`BOT_TOKEN`, username бота, `OWNER_USER_ID`, HTTPS) и не выдаёт ложное сообщение «домен не добавлен». Если сам Telegram Login Widget продолжает ругаться на домен, почти всегда `/setdomain` был выполнен для другого бота или был отправлен URL с `https://`/путём вместо чистого домена.
 
 Сессия хранится в подписанной `HttpOnly` cookie; Telegram-подпись и срок `auth_date` проверяются на backend. В режиме разработки по обычному HTTP можно временно задать `PWA_COOKIE_SECURE=false`.
 

@@ -56,6 +56,7 @@ from app.services.app_config import (
     toggle_away_mode,
     toggle_quiet_hours,
 )
+from app.services.bot_identity import load_cached_bot_username, normalize_bot_username, save_cached_bot_username
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
 from app.services.pwa_auth import (
@@ -74,7 +75,7 @@ from app.services.profile_editor import (
     save_profile_with_backup,
     validate_http_url,
 )
-from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes
+from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes, update_quote
 from app.services.restart_notice import clear_restart_notice, get_restart_notice, save_restart_notice
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import (
@@ -98,7 +99,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -169,7 +170,7 @@ class MiniSettingPayload(BaseModel):
 
 
 class MiniQuotePayload(BaseModel):
-    text: str
+    text: str = Field(min_length=1, max_length=2000)
 
 
 class MiniAgentCommandPayload(BaseModel):
@@ -223,12 +224,19 @@ async def _run_bot_post_startup() -> None:
     """Finish Telegram setup without blocking readiness of the HTTP server."""
     if bot_client is None:
         return
-    if not str(getattr(settings, "telegram_bot_username", "") or "").strip() and hasattr(bot_client, "get_me"):
+    identity_cache = Path(getattr(settings, "telegram_bot_identity_cache_path", "./data/telegram_bot_identity.json"))
+    if not normalize_bot_username(getattr(settings, "telegram_bot_username", "")):
+        cached_username = load_cached_bot_username(identity_cache)
+        if cached_username:
+            settings.telegram_bot_username = cached_username
+            logger.info("Telegram bot username restored from local cache: @%s", cached_username)
+    if not normalize_bot_username(getattr(settings, "telegram_bot_username", "")) and hasattr(bot_client, "get_me"):
         try:
             bot_identity = await bot_client.get_me()
-            discovered_username = str(bot_identity.get("username") or "").strip().lstrip("@")
+            discovered_username = normalize_bot_username(bot_identity.get("username"))
             if discovered_username:
                 settings.telegram_bot_username = discovered_username
+                save_cached_bot_username(identity_cache, discovered_username)
                 logger.info("Telegram bot username discovered automatically: @%s", discovered_username)
         except Exception:
             logger.warning("Failed to discover Telegram bot username", exc_info=True)
@@ -657,20 +665,39 @@ async def require_mini_owner(
 @app.get("/api/pwa/config")
 async def pwa_config(request: Request) -> dict[str, Any]:
     session_user = pwa_authenticate_session(request.cookies.get(PWA_COOKIE_NAME, ""), settings)
-    bot_username = settings.telegram_bot_username.strip().lstrip("@")
+    identity_cache = Path(getattr(settings, "telegram_bot_identity_cache_path", "./data/telegram_bot_identity.json"))
+    bot_username = normalize_bot_username(getattr(settings, "telegram_bot_username", ""))
+    if not bot_username:
+        bot_username = load_cached_bot_username(identity_cache)
+        if bot_username:
+            settings.telegram_bot_username = bot_username
     if not bot_username and bot_client is not None and hasattr(bot_client, "get_me"):
         try:
             bot_identity = await asyncio.wait_for(bot_client.get_me(), timeout=3.0)
-            bot_username = str(bot_identity.get("username") or "").strip().lstrip("@")
+            bot_username = normalize_bot_username(bot_identity.get("username"))
             if bot_username:
                 settings.telegram_bot_username = bot_username
+                save_cached_bot_username(identity_cache, bot_username)
         except Exception:
             logger.warning("Could not resolve bot username for PWA login")
+    forwarded_host = str(request.headers.get("x-forwarded-host") or request.url.hostname or "").strip().lower()
+    public_host = forwarded_host.split(",", maxsplit=1)[0].split(":", maxsplit=1)[0]
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "").split(",", maxsplit=1)[0].strip().lower()
+    requirements = {
+        "bot_token": bool(settings.bot_token),
+        "bot_username": bool(bot_username),
+        "owner_user_id": bool(settings.owner_user_id),
+        "https": forwarded_proto == "https" or public_host in {"localhost", "127.0.0.1"},
+    }
+    login_ready = all(requirements.values())
     return {
         "ok": True,
         "authenticated": bool(session_user),
         "bot_username": bot_username,
-        "login_ready": bool(settings.bot_token and bot_username and settings.owner_user_id),
+        "login_ready": login_ready,
+        "domain": public_host,
+        "domain_verification": "telegram_only",
+        "requirements": requirements,
     }
 
 
@@ -1319,6 +1346,18 @@ async def mini_quotes_delete(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Цитата не найдена")
     quotes = load_quotes(Path(settings.quotes_json_path))
     return {"ok": True, "quotes": quotes}
+
+
+@app.put("/api/mini/quotes/{quote_id}")
+async def mini_quotes_update(
+    quote_id: str,
+    payload: MiniQuotePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    updated = update_quote(Path(settings.quotes_json_path), quote_id, payload.text)
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Цитата не найдена или текст пуст")
+    return {"ok": True, "updated": updated, "quotes": load_quotes(Path(settings.quotes_json_path))}
 
 
 @app.get("/api/mini/vk-url")

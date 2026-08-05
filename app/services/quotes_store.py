@@ -98,6 +98,20 @@ def add_quote(path: Path, text: str) -> dict[str, Any] | None:
     return entry
 
 
+def update_quote(path: Path, quote_id: str, text: str) -> dict[str, Any] | None:
+    target = (quote_id or "").strip()
+    clean = (text or "").strip()
+    if not target or not clean:
+        return None
+    quotes = load_quotes(path)
+    for item in quotes:
+        if str(item.get("id")) == target:
+            item["text"] = clean
+            save_quotes(path, quotes)
+            return item
+    return None
+
+
 def delete_quote(path: Path, quote_id: str) -> bool:
     target = (quote_id or "").strip()
     if not target:
