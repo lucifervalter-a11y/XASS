@@ -14,10 +14,29 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Resolve VPS host through DNS-over-HTTPS
+        id: vps
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -euo pipefail
+          if [[ "$SSH_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "host=$SSH_HOST" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ip="$(curl --fail --silent --show-error --retry 3 \
+            --resolve cloudflare-dns.com:443:1.1.1 \
+            -H 'accept: application/dns-json' \
+            "https://cloudflare-dns.com/dns-query?name=${SSH_HOST}&type=A" \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["data"] for item in data.get("Answer", []) if item.get("type") == 1))')"
+          test -n "$ip"
+          echo "host=$ip" >> "$GITHUB_OUTPUT"
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SSH_HOST }}
+          host: ${{ steps.vps.outputs.host }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
