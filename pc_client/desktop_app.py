@@ -40,6 +40,8 @@ from client_update import (
     is_installer_build,
     launch_installer_update,
     launch_update_helper,
+    load_agent_status,
+    write_agent_status,
 )
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 
@@ -107,6 +109,7 @@ class XassDesktop:
         self.config = ensure_minimal_defaults(load_config())
         self.config["desktop_managed"] = True
         self.process: subprocess.Popen[str] | None = None
+        self._agent_started_at = 0.0
         self._start_after_id: str | None = None
         self._closing = False
         self._expected_stop_pids: set[int] = set()
@@ -137,6 +140,7 @@ class XassDesktop:
         self._build_shell()
         self.show_view("overview")
         self.root.after(120, self._drain_logs)
+        self.root.after(450, self._refresh_agent_status)
         self.root.after(220, self._refresh_local_metrics)
         if preview:
             self._set_status("Предпросмотр", ACCENT)
@@ -755,6 +759,7 @@ class XassDesktop:
         environment = os.environ.copy()
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
+        environment["PYTHONUNBUFFERED"] = "1"
         process = subprocess.Popen(
             args,
             cwd=str(DATA_ROOT if is_installer_build() else ROOT),
@@ -767,8 +772,39 @@ class XassDesktop:
             env=environment,
         )
         self.process = process
+        self._agent_started_at = time.time()
+        write_agent_status(
+            "connecting",
+            detail="Ожидание первого heartbeat",
+            process_id=process.pid,
+        )
         self._set_status("Подключение…", AMBER)
         threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+
+    def _refresh_agent_status(self) -> None:
+        if self._closing:
+            return
+        process = self.process
+        if process is not None and process.poll() is None:
+            payload = load_agent_status()
+            try:
+                status_pid = int((payload or {}).get("process_id") or 0)
+                updated_at = float((payload or {}).get("updated_at") or 0)
+            except (TypeError, ValueError):
+                status_pid = 0
+                updated_at = 0
+            if status_pid == process.pid and updated_at >= self._agent_started_at:
+                state = str((payload or {}).get("state") or "").lower()
+                if state == "online":
+                    self._set_status("В сети", GREEN)
+                    self.last_seen_var.set("Последний heartbeat только что")
+                    self.server_state_var.set("Доступен")
+                elif state == "offline":
+                    self._set_status("Нет связи", RED)
+                    detail = str((payload or {}).get("detail") or "Сервер не отвечает")
+                    self.last_seen_var.set(detail[-120:])
+                    self.server_state_var.set("Ошибка")
+        self.root.after(750, self._refresh_agent_status)
 
     def _update_is_running(self, marker: Path) -> bool:
         try:

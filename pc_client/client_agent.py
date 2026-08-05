@@ -26,6 +26,7 @@ from client_update import (
     launch_update_helper,
     load_command_results,
     store_command_result,
+    write_agent_status,
 )
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
@@ -458,9 +459,11 @@ def run_agent(config: dict[str, Any]) -> str:
     source_name = str(config.get("source_name") or socket.gethostname())
     source_type = str(config.get("source_type") or "PC_AGENT")
     trust_env_proxy = bool(config.get("trust_env_proxy", False))
+    write_agent_status("connecting", detail=f"Подключение к {endpoint}")
     print(
         f"[pc-client] endpoint={endpoint} source_name={source_name} "
-        f"source_type={source_type} trust_env_proxy={trust_env_proxy}"
+        f"source_type={source_type} trust_env_proxy={trust_env_proxy}",
+        flush=True,
     )
 
     failed_auto_revision = ""
@@ -487,7 +490,12 @@ def run_agent(config: dict[str, Any]) -> str:
                 msg = f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')}"
                 if body.get("new_source"):
                     msg += " | новый агент зарегистрирован"
-                print(msg)
+                write_agent_status(
+                    "online",
+                    detail=msg,
+                    server_time=str(body.get("server_time") or ""),
+                )
+                print(msg, flush=True)
                 if sent_result_ids:
                     clear_command_results(sent_result_ids)
 
@@ -537,7 +545,9 @@ def run_agent(config: dict[str, Any]) -> str:
                             return update_result
                         failed_auto_revision = revision
             except Exception as exc:
-                print(f"[pc-client] heartbeat failed: {exc}")
+                error = f"[pc-client] heartbeat failed: {exc}"
+                write_agent_status("offline", detail=error)
+                print(error, flush=True)
             time.sleep(interval_sec)
 
 

@@ -44,6 +44,7 @@ def _package_files(client_root: Path) -> list[Path]:
     ignored_names = {
         "config.json",
         ".command-results.json",
+        ".agent-status.json",
         ".update-result.json",
         ".installed-revision",
     }

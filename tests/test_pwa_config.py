@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from fastapi import BackgroundTasks, Response
 from starlette.requests import Request
 
 import app.main as main
@@ -79,6 +81,36 @@ class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pwaApi('exchange'", template)
         self.assertIn("#pair=", Path("app/main.py").read_text(encoding="utf-8"))
         self.assertIn("Для iPhone нужен HTTPS-адрес", Path("app/main.py").read_text(encoding="utf-8"))
+
+    async def test_pair_link_does_not_wait_for_telegram(self) -> None:
+        request = make_request(host="xass.example", proto="https")
+        response = Response()
+        background = BackgroundTasks()
+        config = SimpleNamespace(service_base_url="https://xass.example")
+        issued = SimpleNamespace(
+            token="xpw_test-token-for-background-menu-update",
+            expires_at=datetime.now(timezone.utc),
+            ttl_minutes=10,
+        )
+        fake_bot = SimpleNamespace(set_chat_menu_button=AsyncMock())
+        with (
+            patch.object(main, "bot_client", fake_bot),
+            patch.object(main, "get_or_create_app_config", AsyncMock(return_value=config)),
+            patch.object(main, "issue_pwa_pair_token", AsyncMock(return_value=issued)),
+        ):
+            payload = await main.mini_pwa_pair_link(
+                request=request,
+                response=response,
+                background_tasks=background,
+                payload=main.MiniPwaPairPayload(public_url="https://xass.example"),
+                user=SimpleNamespace(user_id=42),
+                session=SimpleNamespace(),
+            )
+            fake_bot.set_chat_menu_button.assert_not_awaited()
+            self.assertTrue(payload["menu_update_scheduled"])
+            self.assertEqual(len(background.tasks), 1)
+            await background()
+            fake_bot.set_chat_menu_button.assert_awaited_once()
 
 
 if __name__ == "__main__":

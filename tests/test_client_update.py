@@ -17,6 +17,23 @@ from pc_client.client_update import _cache_busted_url, _validate_archive, downlo
 
 
 class ClientUpdateTests(unittest.TestCase):
+    def test_agent_status_round_trip_is_process_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            status_path = Path(raw_root) / ".agent-status.json"
+            with patch.object(client_update, "AGENT_STATUS_PATH", status_path):
+                client_update.write_agent_status(
+                    "online",
+                    detail="heartbeat ok",
+                    server_time="2026-08-06T12:00:00Z",
+                    process_id=4242,
+                )
+                payload = client_update.load_agent_status()
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertEqual(payload["state"], "online")
+            self.assertEqual(payload["process_id"], 4242)
+            self.assertEqual(payload["server_time"], "2026-08-06T12:00:00Z")
+
     def test_manifest_signature_rejects_tampering(self) -> None:
         manifest = {
             "version": "0.4.3",

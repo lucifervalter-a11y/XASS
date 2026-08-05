@@ -101,7 +101,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -313,6 +313,28 @@ async def _restart_after_mini_request(chat_id: int, reason: str) -> None:
         if mode == "systemd" and (os.environ.get("INVOCATION_ID") or os.getppid() == 1):
             os._exit(0)
         clear_restart_notice(settings)
+
+
+async def _update_miniapp_menu_button(public_url: str) -> None:
+    """Update Telegram separately so link creation never waits on its API."""
+    client = bot_client
+    if client is None:
+        return
+    try:
+        await asyncio.wait_for(
+            client.set_chat_menu_button(
+                menu_button={
+                    "type": "web_app",
+                    "text": "XASS",
+                    "web_app": {"url": f"{public_url}/miniapp.php"},
+                }
+            ),
+            timeout=4.0,
+        )
+    except TimeoutError:
+        logger.warning("Timed out updating Mini App menu button after PWA setup")
+    except Exception:
+        logger.warning("Failed to update Mini App menu button after PWA setup", exc_info=True)
 
 
 @asynccontextmanager
@@ -1154,6 +1176,7 @@ async def mini_agent_pair_code(
 async def mini_pwa_pair_link(
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     payload: MiniPwaPairPayload | None = None,
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
@@ -1184,15 +1207,9 @@ async def mini_pwa_pair_link(
     link = f"{public_url}/miniapp.php?standalone=1#pair={quote(result.token, safe='')}"
     response.headers["Cache-Control"] = "no-store"
 
-    menu_updated = False
-    if bot_client is not None:
-        try:
-            await bot_client.set_chat_menu_button(
-                menu_button={"type": "web_app", "text": "XASS", "web_app": {"url": f"{public_url}/miniapp.php"}}
-            )
-            menu_updated = True
-        except Exception:
-            logger.warning("Failed to update Mini App menu button after PWA setup", exc_info=True)
+    menu_update_scheduled = bot_client is not None
+    if menu_update_scheduled:
+        background_tasks.add_task(_update_miniapp_menu_button, public_url)
 
     return {
         "ok": True,
@@ -1200,7 +1217,7 @@ async def mini_pwa_pair_link(
         "link": link,
         "expires_at": result.expires_at.isoformat(),
         "ttl_minutes": result.ttl_minutes,
-        "menu_updated": menu_updated,
+        "menu_update_scheduled": menu_update_scheduled,
     }
 
 

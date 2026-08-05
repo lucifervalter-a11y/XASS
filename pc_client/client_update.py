@@ -26,6 +26,7 @@ VERSION_PATH = RESOURCE_ROOT / "version.json"
 BUILD_INFO_PATH = RESOURCE_ROOT / "build-info.json"
 REVISION_PATH = DATA_ROOT / ".installed-revision"
 RESULTS_PATH = DATA_ROOT / ".command-results.json"
+AGENT_STATUS_PATH = DATA_ROOT / ".agent-status.json"
 UPDATE_ROOT = DATA_ROOT / ".updates"
 UPDATE_MARKER = UPDATE_ROOT / ".in-progress"
 
@@ -51,6 +52,37 @@ def current_revision() -> str:
             return str(payload.get("revision") or "").strip()
         except (OSError, ValueError, TypeError):
             return ""
+
+
+def write_agent_status(
+    state: str,
+    *,
+    detail: str = "",
+    server_time: str = "",
+    process_id: int | None = None,
+) -> None:
+    """Publish agent connectivity for the desktop UI without relying on stdout."""
+    payload = {
+        "state": str(state).strip().lower(),
+        "detail": str(detail)[:1000],
+        "server_time": str(server_time)[:128],
+        "process_id": int(process_id if process_id is not None else os.getpid()),
+        "updated_at": time.time(),
+    }
+    temporary = AGENT_STATUS_PATH.with_name(f"{AGENT_STATUS_PATH.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(AGENT_STATUS_PATH)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+
+
+def load_agent_status() -> dict[str, Any] | None:
+    try:
+        payload = json.loads(AGENT_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _manifest_message(manifest: dict[str, Any]) -> bytes:
