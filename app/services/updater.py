@@ -5,6 +5,7 @@ import logging
 import os
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,10 @@ import httpx
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
+_RELEASE_CACHE_TTL_SEC = 300.0
+_release_cache_at = 0.0
+_release_cache_repo = ""
+_release_cache_value: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -433,38 +438,53 @@ def _log_path(settings: Settings, repo_root: Path) -> Path:
     return repo_root / "data" / "logs" / "update.log"
 
 
+def _remember_release_notes(repo: str, value: dict[str, Any] | None) -> dict[str, Any] | None:
+    global _release_cache_at, _release_cache_repo, _release_cache_value
+    _release_cache_at = time.monotonic()
+    _release_cache_repo = repo
+    _release_cache_value = value
+    return value
+
+
 def get_latest_release_notes(settings: Settings) -> dict[str, Any] | None:
     repo = (settings.github_repo or "").strip()
+    if (
+        repo == _release_cache_repo
+        and _release_cache_at
+        and time.monotonic() - _release_cache_at < _RELEASE_CACHE_TTL_SEC
+    ):
+        return _release_cache_value
     if not repo or "/" not in repo:
-        return None
+        return _remember_release_notes(repo, None)
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     headers = {"Accept": "application/vnd.github+json"}
     token = (settings.github_token or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        with httpx.Client(timeout=15, headers=headers, follow_redirects=True) as client:
+        timeout = httpx.Timeout(6.0, connect=3.0)
+        with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as client:
             response = client.get(url)
     except Exception:
-        return None
+        return _remember_release_notes(repo, None)
     if response.status_code == 404:
-        return None
+        return _remember_release_notes(repo, None)
     if response.status_code >= 400:
         logger.warning("GitHub release API error: %s", response.status_code)
-        return None
+        return _remember_release_notes(repo, None)
     try:
         payload = response.json()
     except Exception:
-        return None
+        return _remember_release_notes(repo, None)
     if not isinstance(payload, dict):
-        return None
-    return {
+        return _remember_release_notes(repo, None)
+    return _remember_release_notes(repo, {
         "tag": str(payload.get("tag_name") or "").strip(),
         "name": str(payload.get("name") or "").strip(),
         "body": str(payload.get("body") or "").strip(),
         "published_at": str(payload.get("published_at") or "").strip(),
         "url": str(payload.get("html_url") or "").strip(),
-    }
+    })
 
 
 def read_changelog_excerpt(*, repo_root: Path | None = None, max_lines: int = 80) -> str | None:
@@ -483,11 +503,11 @@ def read_changelog_excerpt(*, repo_root: Path | None = None, max_lines: int = 80
     return excerpt or None
 
 
-def get_update_status(settings: Settings) -> UpdateStatus:
+def get_update_status(settings: Settings, *, include_release_notes: bool = True) -> UpdateStatus:
     root = _repo_root()
     errors: list[str] = []
-    release = get_latest_release_notes(settings)
-    changelog_excerpt = read_changelog_excerpt(repo_root=root) if release is None else None
+    release = get_latest_release_notes(settings) if include_release_notes else None
+    changelog_excerpt = read_changelog_excerpt(repo_root=root) if include_release_notes and release is None else None
 
     if not _is_git_repo(root):
         branch = (settings.update_branch or "").strip() or "main"

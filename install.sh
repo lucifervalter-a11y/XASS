@@ -201,10 +201,7 @@ setup_venv_and_deps() {
 
   [[ -f "$VENV_DIR/bin/activate" ]] || die "Virtualenv was not created correctly at $VENV_DIR"
 
-  # shellcheck disable=SC1091
-  source "$VENV_DIR/bin/activate"
-  python -m pip install --upgrade pip
-  pip install -r "$PROJECT_ROOT/requirements.txt"
+  "$VENV_DIR/bin/python" "$PROJECT_ROOT/bootstrap_server_dependencies.py"
 }
 
 ensure_env_file() {
@@ -457,9 +454,11 @@ User=${run_user}
 Group=${run_group}
 WorkingDirectory=${PROJECT_ROOT}
 EnvironmentFile=${ENV_FILE}
+Environment=PYTHONUNBUFFERED=1
 ExecStart=${PROJECT_ROOT}/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${port}
 Restart=always
-RestartSec=5
+RestartSec=1s
+TimeoutStopSec=10s
 
 [Install]
 WantedBy=multi-user.target
@@ -470,7 +469,8 @@ EOF
     run_root tee "$agent_service" >/dev/null <<EOF
 [Unit]
 Description=Serverredus Heartbeat Agent (Server)
-After=network.target
+After=network.target serverredus-backend.service
+Wants=serverredus-backend.service
 
 [Service]
 Type=simple
@@ -478,9 +478,11 @@ User=${run_user}
 Group=${run_group}
 WorkingDirectory=${PROJECT_ROOT}
 EnvironmentFile=${ENV_FILE}
+Environment=PYTHONUNBUFFERED=1
 ExecStart=${PROJECT_ROOT}/.venv/bin/python agent/agent.py --server-url http://127.0.0.1:${port} --api-key \${AGENT_API_KEY} --source-name ${server_agent_name} --source-type SERVER_AGENT --interval-sec 30
 Restart=always
-RestartSec=5
+RestartSec=1s
+TimeoutStopSec=5s
 
 [Install]
 WantedBy=multi-user.target
@@ -512,7 +514,8 @@ Group=${run_group}
 WorkingDirectory=${PROJECT_ROOT}
 ExecStart=${AGENT_RUN_SCRIPT}
 Restart=always
-RestartSec=5
+RestartSec=1s
+TimeoutStopSec=5s
 
 [Install]
 WantedBy=multi-user.target

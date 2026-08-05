@@ -145,6 +145,14 @@ sudo systemctl enable --now serverredus-backend
 sudo systemctl enable --now serverredus-agent
 ```
 
+Быстрое обновление установленного сервера:
+
+```bash
+./deploy/update.sh
+```
+
+Скрипт проверяет хеш `requirements.txt`, поэтому не запускает лишний `pip install`, перезапускает backend и ждёт готовность `/health` с шагом 250 мс. Сетевые вызовы Telegram после старта выполняются в фоне и больше не задерживают доступность API.
+
 ## Бэкапы
 
 Минимальный скрипт:

@@ -3037,9 +3037,8 @@ class TelegramUpdateHandler:
             except asyncio.TimeoutError:
                 percent = min(93, percent + 6)
 
-    async def _restart_service_after_delay(self, *, chat_id: int, reason: str, delay_sec: float = 3.0) -> None:
-        await asyncio.sleep(max(0.5, delay_sec))
-        await self._safe_send(chat_id, f"♻️ Перезапуск сервиса ({reason})...")
+    async def _restart_service_after_delay(self, *, chat_id: int, reason: str, delay_sec: float = 0.5) -> None:
+        await asyncio.sleep(max(0.2, delay_sec))
         # Save pending notice before restart attempt; after reboot/startup the app will send success.
         save_restart_notice(self.settings, chat_id=chat_id, reason=reason)
         try:
@@ -3145,34 +3144,6 @@ class TelegramUpdateHandler:
     async def _run_update_flow(self, *, chat_id: int | None, message_id: int | None) -> None:
         if chat_id is None:
             return
-        pre_status = await asyncio.to_thread(get_update_status, self.settings)
-        if pre_status.current is None or pre_status.remote is None:
-            lines = [
-                "❌ Обновление сейчас недоступно.",
-                f"Ветка: {pre_status.branch}",
-                "Причина: нет данных git (HEAD/origin).",
-            ]
-            if pre_status.errors:
-                lines.append("")
-                lines.append("Ошибки:")
-                lines.extend(f"- {err}" for err in pre_status.errors)
-            await self._safe_edit_or_send(
-                chat_id,
-                message_id,
-                "\n".join(lines),
-                self._update_panel_keyboard(pre_status),
-            )
-            return
-
-        if not pre_status.has_updates:
-            await self._safe_edit_or_send(
-                chat_id,
-                message_id,
-                "✅ Обновлений нет. Текущая версия уже актуальна.",
-                self._update_panel_keyboard(pre_status),
-            )
-            return
-
         if self._has_running_update_job(chat_id):
             await self._safe_send(chat_id, "⏳ Обновление уже выполняется. Дождитесь завершения.")
             await self._show_update_panel(chat_id=chat_id, message_id=message_id)
@@ -3237,20 +3208,20 @@ class TelegramUpdateHandler:
                 summary_lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
             await self._safe_send(chat_id, "\n".join(summary_lines))
-            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+            if not update_applied:
+                await self._show_update_panel(chat_id=chat_id, message_id=message_id)
 
-            if log_tail:
+            if log_tail and not update_applied:
                 for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
                     await self._safe_send(chat_id, chunk)
 
             if update_applied and result.restart_required:
-                await self._safe_send(chat_id, "✅ Обновление применено. Возвращаю меню обновления и запускаю перезапуск.")
                 self._schedule_background_task(
                     asyncio.create_task(
                         self._restart_service_after_delay(
                             chat_id=chat_id,
                             reason="после обновления",
-                            delay_sec=3.0,
+                            delay_sec=0.5,
                         )
                     )
                 )
@@ -3316,20 +3287,20 @@ class TelegramUpdateHandler:
             lines.append("♻️ Перезапуск: будет выполнен сразу после отправки отчета.")
 
         await self._safe_send(chat_id, "\n".join(lines))
-        await self._show_update_panel(chat_id=chat_id, message_id=message_id)
+        if not rollback_applied:
+            await self._show_update_panel(chat_id=chat_id, message_id=message_id)
 
-        if log_tail:
+        if log_tail and not rollback_applied:
             for chunk in self._chunk_text(f"Логи обновления (последние строки):\n{log_tail}"):
                 await self._safe_send(chat_id, chunk)
 
         if rollback_applied and result.restart_required:
-            await self._safe_send(chat_id, "✅ Откат применен. Возвращаю меню обновления и запускаю перезапуск.")
             self._schedule_background_task(
                 asyncio.create_task(
                     self._restart_service_after_delay(
                         chat_id=chat_id,
                         reason="после отката",
-                        delay_sec=3.0,
+                        delay_sec=0.5,
                     )
                 )
             )
@@ -4969,5 +4940,4 @@ class TelegramUpdateHandler:
             logger.warning("Не удалось подтвердить callback: %s", exc)
         except Exception:
             logger.warning("Не удалось подтвердить callback", exc_info=True)
-
 

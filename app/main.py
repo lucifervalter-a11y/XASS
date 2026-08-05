@@ -1,12 +1,13 @@
 ﻿import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,10 +54,10 @@ from app.services.monitoring import collect_server_metrics, collect_systemd_stat
 from app.services.music_card import build_music_card, build_search_links
 from app.services.profile_editor import ensure_profile_exists, load_profile, save_profile
 from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes
-from app.services.restart_notice import clear_restart_notice, get_restart_notice
+from app.services.restart_notice import clear_restart_notice, get_restart_notice, save_restart_notice
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
-from app.services.updater import get_update_status, run_update
+from app.services.updater import get_update_status, restart_service, run_update
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
 
@@ -67,7 +68,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -151,6 +152,75 @@ class MiniAgentPairPayload(BaseModel):
     source_name: str = Field(default="", max_length=128)
 
 
+async def _run_bot_post_startup() -> None:
+    """Finish Telegram setup without blocking readiness of the HTTP server."""
+    if bot_client is None:
+        return
+    try:
+        notice = get_restart_notice(settings)
+        if isinstance(notice, dict):
+            reason = str(notice.get("reason") or "перезапуск").strip() or "перезапуск"
+            sent = False
+            for chat_id in _restart_notice_chat_candidates(notice.get("chat_id")):
+                try:
+                    await bot_client.send_message(chat_id, f"✅ Сервис успешно перезапущен ({reason}).")
+                    sent = True
+                    break
+                except Exception:
+                    logger.warning("Failed to deliver restart success notice to chat_id=%s", chat_id)
+            if sent:
+                clear_restart_notice(settings)
+            else:
+                logger.warning("Restart success notice retained for next startup attempt")
+    except Exception:
+        logger.warning("Failed to process restart success notice", exc_info=True)
+
+    try:
+        async with SessionLocal() as session:
+            config = await get_or_create_app_config(session, settings)
+        raw_base = (getattr(config, "service_base_url", None) or "").strip() or (settings.profile_public_url or "").strip()
+        if raw_base:
+            parsed = urlsplit(raw_base)
+            if parsed.scheme and parsed.netloc:
+                miniapp_url = f"{parsed.scheme}://{parsed.netloc}/miniapp.php"
+                await bot_client.set_chat_menu_button(
+                    menu_button={"type": "web_app", "text": "XASS", "web_app": {"url": miniapp_url}}
+                )
+                logger.info("Chat menu button set to %s", miniapp_url)
+    except Exception:
+        logger.warning("Failed to set chat menu button", exc_info=True)
+
+    try:
+        await bot_client.set_my_commands(
+            [
+                {"command": "start", "description": "Панель управления"},
+                {"command": "webapp", "description": "Открыть мини-приложение XASS"},
+                {"command": "status", "description": "Статус heartbeat-источников"},
+                {"command": "server", "description": "Метрики сервера"},
+                {"command": "pc", "description": "Состояние ПК-агентов"},
+                {"command": "update", "description": "Обновление бота и сервиса"},
+                {"command": "help", "description": "Все команды (.muz, .weather…)"},
+            ]
+        )
+        logger.info("Bot commands registered")
+    except Exception:
+        logger.warning("Failed to set bot commands", exc_info=True)
+
+
+async def _restart_after_mini_update(chat_id: int) -> None:
+    # This background task starts only after the HTTP response has been sent.
+    await asyncio.sleep(0.35)
+    save_restart_notice(settings, chat_id=chat_id, reason="после обновления из Mini App")
+    try:
+        await asyncio.to_thread(restart_service, settings)
+    except Exception:
+        logger.exception("Mini App update applied, but service restart command failed")
+        mode = (settings.service_restart_mode or "systemd").strip().lower()
+        if mode == "systemd" and (os.environ.get("INVOCATION_ID") or os.getppid() == 1):
+            os._exit(0)
+        clear_restart_notice(settings)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ensure_data_dirs()
@@ -181,57 +251,7 @@ async def lifespan(_: FastAPI):
         logger.info("Startup mode: webhook")
 
     if bot_client:
-        try:
-            notice = get_restart_notice(settings)
-            if isinstance(notice, dict):
-                reason = str(notice.get("reason") or "перезапуск").strip() or "перезапуск"
-                sent = False
-                for chat_id in _restart_notice_chat_candidates(notice.get("chat_id")):
-                    try:
-                        await bot_client.send_message(
-                            chat_id,
-                            f"✅ Сервис успешно перезапущен ({reason}).",
-                        )
-                        sent = True
-                        break
-                    except Exception:
-                        logger.warning("Failed to deliver restart success notice to chat_id=%s", chat_id)
-                if sent:
-                    clear_restart_notice(settings)
-                else:
-                    logger.warning("Restart success notice retained for next startup attempt")
-        except Exception:
-            logger.warning("Failed to process restart success notice", exc_info=True)
-        try:
-            async with SessionLocal() as _s:
-                _cfg = await get_or_create_app_config(_s, settings)
-            _raw_base = (
-                (getattr(_cfg, "service_base_url", None) or "").strip()
-                or (settings.profile_public_url or "").strip()
-            )
-            if _raw_base:
-                _split = urlsplit(_raw_base)
-                if _split.scheme and _split.netloc:
-                    _miniapp_url = f"{_split.scheme}://{_split.netloc}/miniapp.php"
-                    await bot_client.set_chat_menu_button(
-                        menu_button={"type": "web_app", "text": "XASS", "web_app": {"url": _miniapp_url}}
-                    )
-                    logger.info("Chat menu button set to %s", _miniapp_url)
-        except Exception:
-            logger.warning("Failed to set chat menu button", exc_info=True)
-        try:
-            await bot_client.set_my_commands([
-                {"command": "start", "description": "Панель управления"},
-                {"command": "webapp", "description": "Открыть мини-приложение XASS"},
-                {"command": "status", "description": "Статус heartbeat-источников"},
-                {"command": "server", "description": "Метрики сервера"},
-                {"command": "pc", "description": "Состояние ПК-агентов"},
-                {"command": "update", "description": "Обновление бота и сервиса"},
-                {"command": "help", "description": "Все команды (.muz, .weather…)"},
-            ])
-            logger.info("Bot commands registered")
-        except Exception:
-            logger.warning("Failed to set bot commands", exc_info=True)
+        tasks.append(asyncio.create_task(_run_bot_post_startup()))
     try:
         yield
     finally:
@@ -262,7 +282,7 @@ async def health() -> dict[str, str]:
 @app.get("/api/mini/ping")
 async def mini_ping() -> dict[str, Any]:
     import sys
-    return {"ok": True, "python": sys.version, "status": "backend running"}
+    return {"ok": True, "python": sys.version, "status": "backend running", "app_version": APP_VERSION}
 
 
 @app.post("/agent/pair/claim", response_model=AgentPairClaimResponse)
@@ -917,7 +937,7 @@ async def mini_vk_url(
 async def mini_update_status(
     user: MiniAppUser = Depends(require_mini_owner),
 ) -> dict[str, Any]:
-    upd = await asyncio.to_thread(get_update_status, settings)
+    upd = await asyncio.to_thread(get_update_status, settings, include_release_notes=False)
     def _commit_dict(c: Any) -> dict[str, Any] | None:
         if c is None:
             return None
@@ -935,9 +955,19 @@ async def mini_update_status(
 
 @app.post("/api/mini/run-update")
 async def mini_run_update(
+    background_tasks: BackgroundTasks,
     user: MiniAppUser = Depends(require_mini_owner),
 ) -> dict[str, Any]:
-    result = await asyncio.to_thread(run_update, settings)
+    result = await asyncio.to_thread(run_update, settings, execute_restart=False)
+    update_applied = bool(
+        result.ok
+        and result.before is not None
+        and result.after is not None
+        and result.before.full_hash != result.after.full_hash
+    )
+    restart_scheduled = bool(update_applied and result.restart_required)
+    if restart_scheduled:
+        background_tasks.add_task(_restart_after_mini_update, user.user_id)
     def _commit_dict(c: Any) -> dict[str, Any] | None:
         if c is None:
             return None
@@ -949,6 +979,7 @@ async def mini_run_update(
         "after": _commit_dict(result.after),
         "steps": result.steps,
         "restart_performed": result.restart_performed,
+        "restart_scheduled": restart_scheduled,
         "error": result.error,
     }
 
