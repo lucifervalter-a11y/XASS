@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import socket
 import subprocess
@@ -59,6 +60,9 @@ class XassDesktop:
         self.config = ensure_minimal_defaults(load_config())
         self.config["desktop_managed"] = True
         self.process: subprocess.Popen[str] | None = None
+        self._start_after_id: str | None = None
+        self._closing = False
+        self._expected_stop_pids: set[int] = set()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.history: list[str] = []
         self.current_view = "overview"
@@ -78,7 +82,7 @@ class XassDesktop:
         self._build_shell()
         self.show_view("overview")
         self.root.after(120, self._drain_logs)
-        self.root.after(650, self.start_agent)
+        self._schedule_start(250)
         if minimized:
             self.root.after(900, self.root.iconify)
 
@@ -562,20 +566,25 @@ class XassDesktop:
         messagebox.showinfo("XASS", "Компьютер подключён к серверу")
 
     def start_agent(self) -> None:
+        if self._closing:
+            return
         if self.process and self.process.poll() is None:
             return
         update_marker = ROOT / ".updates" / ".in-progress"
         if update_marker.exists():
             if self._update_is_running(update_marker):
                 self._set_status("Устанавливается обновление…", AMBER)
-                self.root.after(1000, self.start_agent)
+                self._schedule_start(250)
                 return
             update_marker.unlink(missing_ok=True)
         if not self.config.get("server_url") or not self.config.get("api_key"):
             self._set_status("Требуется подключение", AMBER)
             return
         args = [sys.executable, "-u", str(ROOT / "client_agent.py"), "--desktop-managed"]
-        self.process = subprocess.Popen(
+        environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
+        process = subprocess.Popen(
             args,
             cwd=str(ROOT),
             stdout=subprocess.PIPE,
@@ -584,9 +593,11 @@ class XassDesktop:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=environment,
         )
+        self.process = process
         self._set_status("Подключение…", AMBER)
-        threading.Thread(target=self._read_process, daemon=True).start()
+        threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
 
     def _update_is_running(self, marker: Path) -> bool:
         try:
@@ -608,31 +619,58 @@ class XassDesktop:
         except psutil.AccessDenied:
             return time.time() - started_at < 600
 
-    def _read_process(self) -> None:
-        process = self.process
-        if process is None or process.stdout is None:
+    def _read_process(self, process: subprocess.Popen[str]) -> None:
+        if process.stdout is None:
             return
         for line in process.stdout:
             self.log_queue.put(line.rstrip())
         code = process.wait()
-        self.log_queue.put(f"[desktop] agent stopped with code {code}")
-        self.root.after(0, lambda: self._agent_exited(code))
+        if process.pid in self._expected_stop_pids:
+            self.log_queue.put("[desktop] агент остановлен для быстрого перезапуска")
+        else:
+            self.log_queue.put(f"[desktop] agent stopped with code {code}")
+        self.root.after(0, lambda: self._agent_exited(process, code))
 
-    def _agent_exited(self, code: int) -> None:
+    def _agent_exited(self, process: subprocess.Popen[str], code: int) -> None:
+        self._expected_stop_pids.discard(process.pid)
+        if self.process is not process:
+            return
         self.process = None
         self._set_status("Перезапуск…" if code == 75 else "Остановлен", AMBER if code == 75 else RED)
         if code == 75:
-            self.root.after(700, self.start_agent)
+            self._schedule_start(120)
+
+    def _schedule_start(self, delay_ms: int) -> None:
+        if self._closing:
+            return
+        if self._start_after_id is not None:
+            try:
+                self.root.after_cancel(self._start_after_id)
+            except tk.TclError:
+                pass
+        self._start_after_id = self.root.after(delay_ms, self._run_scheduled_start)
+
+    def _run_scheduled_start(self) -> None:
+        self._start_after_id = None
+        self.start_agent()
 
     def stop_agent(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        if self._start_after_id is not None:
+            try:
+                self.root.after_cancel(self._start_after_id)
+            except tk.TclError:
+                pass
+            self._start_after_id = None
+        process = self.process
         self.process = None
+        if process and process.poll() is None:
+            self._expected_stop_pids.add(process.pid)
+            process.terminate()
         self._set_status("Остановлен", RED)
 
     def restart_agent(self) -> None:
         self.stop_agent()
-        self.root.after(800, self.start_agent)
+        self._schedule_start(150)
 
     def check_update(self) -> None:
         if not self.config.get("api_key"):
@@ -665,6 +703,10 @@ class XassDesktop:
         version = str(manifest.get("version") or "")
         if not messagebox.askyesno("XASS", f"Доступна версия {version}. Установить сейчас?"):
             return
+        # Do not let the background agent download the same package in parallel
+        # with a manual update from the desktop UI.
+        self.stop_agent()
+        self._set_status("Скачивание обновления…", AMBER)
 
         def worker() -> None:
             try:
@@ -677,9 +719,13 @@ class XassDesktop:
                 launch_update_helper(stage, manifest, command_id=None, restart_target="desktop", minimized=False)
                 self.root.after(0, self.root.destroy)
             except Exception as exc:
-                self.root.after(0, lambda error=str(exc): messagebox.showerror("XASS", f"Обновление не установлено:\n{error}"))
+                self.root.after(0, lambda error=str(exc): self._update_failed(error))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _update_failed(self, error: str) -> None:
+        messagebox.showerror("XASS", f"Обновление не установлено:\n{error}")
+        self._schedule_start(120)
 
     def _drain_logs(self) -> None:
         try:
@@ -711,6 +757,7 @@ class XassDesktop:
                     widget.configure(state="disabled")
 
     def close(self) -> None:
+        self._closing = True
         self.stop_agent()
         self.root.destroy()
 

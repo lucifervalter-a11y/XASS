@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
+import tempfile
+import threading
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
 
-from pc_client.client_update import _validate_archive, verify_manifest
+import pc_client.client_update as client_update
+from pc_client.client_update import _cache_busted_url, _validate_archive, download_update, verify_manifest
 
 
 class ClientUpdateTests(unittest.TestCase):
     def test_manifest_signature_rejects_tampering(self) -> None:
         manifest = {
-            "version": "0.4.2",
+            "version": "0.4.3",
             "revision": "a" * 64,
             "sha256": "b" * 64,
             "url": "https://xass.example/agent/update/package",
@@ -26,6 +35,58 @@ class ClientUpdateTests(unittest.TestCase):
         with zipfile.ZipFile(payload, "r") as archive:
             with self.assertRaisesRegex(RuntimeError, "unsafe path"):
                 _validate_archive(archive)
+
+    def test_retry_url_preserves_signed_update_location(self) -> None:
+        url = _cache_busted_url("https://xass.example/agent/update/package/rev.zip?channel=stable", "abc123")
+        self.assertEqual(
+            url,
+            "https://xass.example/agent/update/package/rev.zip?channel=stable&download=abc123",
+        )
+
+    def test_parallel_downloads_use_isolated_staging_directories(self) -> None:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("version.json", '{"version":"0.4.3"}')
+        package = payload.getvalue()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(package)))
+                self.end_headers()
+                self.wfile.write(package)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            revision = "a" * 64
+            sha256 = hashlib.sha256(package).hexdigest()
+            url = f"http://127.0.0.1:{server.server_port}/agent/update/package/{revision}.zip"
+            message = f"0.4.3\n{revision}\n{sha256}\n{url}".encode("utf-8")
+            api_key = "agent-secret"
+            manifest = {
+                "version": "0.4.3",
+                "revision": revision,
+                "sha256": sha256,
+                "url": url,
+                "signature": hmac.new(api_key.encode("utf-8"), message, hashlib.sha256).hexdigest(),
+            }
+            with tempfile.TemporaryDirectory() as update_root:
+                with patch.object(client_update, "UPDATE_ROOT", Path(update_root)):
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        stages = list(pool.map(lambda _: download_update(manifest, api_key=api_key), range(2)))
+                self.assertNotEqual(stages[0].parent, stages[1].parent)
+                for stage in stages:
+                    self.assertEqual((stage / "version.json").read_text(encoding="utf-8"), '{"version":"0.4.3"}')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

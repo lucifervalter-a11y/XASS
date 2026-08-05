@@ -137,7 +137,9 @@ def build_update_manifest(
         return None
 
     package = build_agent_package(settings)
-    url = f"{base_url.rstrip('/')}/agent/update/package?revision={package.revision}"
+    # Keep the revision in the path so reverse proxies cannot accidentally
+    # serve a cached ZIP for another revision after ignoring a query string.
+    url = f"{base_url.rstrip('/')}/agent/update/package/{package.revision}.zip"
     current_version = (current_version or "0.0.0").strip()
     current_revision = (current_revision or "").strip()
     available = current_version != package.version or current_revision != package.revision

@@ -13,6 +13,18 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _requirements_digest(requirements: Path) -> str:
+    return hashlib.sha256(requirements.read_bytes()).hexdigest()
+
+
+def _requirements_need_install(target: Path, requirements: Path) -> bool:
+    stamp = target / ".venv" / ".requirements.sha256"
+    try:
+        return stamp.read_text(encoding="utf-8").strip() != _requirements_digest(requirements)
+    except OSError:
+        return True
+
+
 def _wait_for_exit(pid: int, timeout: int = 45) -> None:
     if os.name == "nt":
         synchronize = 0x00100000
@@ -125,16 +137,28 @@ def main() -> int:
             copied.append(relative)
 
         requirements = target / "requirements.txt"
-        if requirements.exists():
+        if requirements.exists() and _requirements_need_install(target, requirements):
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--retries",
+                    "2",
+                    "--timeout",
+                    "30",
+                    "-r",
+                    str(requirements),
+                ],
                 cwd=str(target),
                 check=True,
-                timeout=300,
+                timeout=180,
             )
             stamp = target / ".venv" / ".requirements.sha256"
             if stamp.parent.is_dir():
-                stamp.write_text(hashlib.sha256(requirements.read_bytes()).hexdigest(), encoding="utf-8")
+                stamp.write_text(_requirements_digest(requirements), encoding="utf-8")
         (target / ".installed-revision").write_text(args.revision, encoding="utf-8")
         _write_result(target, args.command_id, True, f"Обновлено до {args.version}")
     except Exception as exc:

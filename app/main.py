@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -375,11 +375,10 @@ async def agent_heartbeat(
     )
 
 
-@app.get("/agent/update/package")
-async def agent_update_package(
-    revision: str = "",
-    session: AsyncSession = Depends(get_session),
-    x_api_key: str | None = Header(default=None),
+async def _agent_update_package_response(
+    revision: str,
+    session: AsyncSession,
+    x_api_key: str | None,
 ) -> FileResponse:
     auth = await authenticate_agent_api_key(
         session,
@@ -394,9 +393,33 @@ async def agent_update_package(
     return FileResponse(
         package.path,
         media_type="application/zip",
-        filename=f"xass-pc-{package.version}.zip",
-        headers={"ETag": package.sha256, "X-XASS-Revision": package.revision},
+        filename=f"xass-pc-{package.version}-{package.revision[:12]}.zip",
+        headers={
+            "ETag": f'"{package.sha256}"',
+            "X-XASS-Revision": package.revision,
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+        },
     )
+
+
+@app.get("/agent/update/package/{revision}.zip")
+async def agent_update_package_by_revision(
+    revision: str,
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+) -> FileResponse:
+    return await _agent_update_package_response(revision, session, x_api_key)
+
+
+@app.get("/agent/update/package")
+async def agent_update_package(
+    revision: str = "",
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+) -> FileResponse:
+    # Compatibility for clients that received a pre-0.4.3 manifest.
+    return await _agent_update_package_response(revision, session, x_api_key)
 
 
 @app.post("/profile/now-playing/external")

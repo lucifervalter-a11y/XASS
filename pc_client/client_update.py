@@ -4,12 +4,15 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 CLIENT_ROOT = Path(__file__).resolve().parent
 VERSION_PATH = CLIENT_ROOT / "version.json"
@@ -90,32 +93,54 @@ def download_update(
     if not url or len(expected_sha) != 64 or not revision:
         raise RuntimeError("update manifest is incomplete")
 
-    stage_root = UPDATE_ROOT / revision[:16]
-    stage_root.mkdir(parents=True, exist_ok=True)
+    # Every downloader gets a private staging directory. The desktop UI and its
+    # background agent can briefly overlap while an old version is restarting;
+    # sharing package.zip made those two writers corrupt each other's download.
+    attempt_id = uuid4().hex
+    stage_root = UPDATE_ROOT / f"{revision[:16]}-{attempt_id[:8]}"
+    stage_root.mkdir(parents=True, exist_ok=False)
     package_path = stage_root / "package.zip"
     extract_path = stage_root / "staged"
-    if progress:
-        progress("Скачивание обновления…")
-    with httpx.Client(timeout=90, trust_env=trust_env, follow_redirects=True) as client:
-        with client.stream("GET", url, headers={"X-Api-Key": api_key}) as response:
-            response.raise_for_status()
-            with package_path.open("wb") as handle:
-                for chunk in response.iter_bytes():
-                    handle.write(chunk)
-    if _sha256(package_path) != expected_sha:
-        raise RuntimeError("update package checksum mismatch")
+    try:
+        with httpx.Client(timeout=90, trust_env=trust_env, follow_redirects=True) as client:
+            for attempt in range(2):
+                if progress:
+                    progress("Скачивание обновления…" if attempt == 0 else "Повторная загрузка обновления…")
+                download_url = url if attempt == 0 else _cache_busted_url(url, attempt_id)
+                headers = {
+                    "X-Api-Key": api_key,
+                    "Accept-Encoding": "identity",
+                    "Cache-Control": "no-cache",
+                }
+                with client.stream("GET", download_url, headers=headers) as response:
+                    response.raise_for_status()
+                    with package_path.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            handle.write(chunk)
+                actual_sha = _sha256(package_path)
+                if actual_sha == expected_sha:
+                    break
+                package_path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError("update package checksum mismatch after retry")
 
-    if extract_path.exists():
-        import shutil
+        extract_path.mkdir(parents=True, exist_ok=False)
+        with zipfile.ZipFile(package_path, "r") as archive:
+            _validate_archive(archive)
+            archive.extractall(extract_path)
+        if progress:
+            progress("Пакет проверен")
+        return extract_path
+    except Exception:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise
 
-        shutil.rmtree(extract_path)
-    extract_path.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(package_path, "r") as archive:
-        _validate_archive(archive)
-        archive.extractall(extract_path)
-    if progress:
-        progress("Пакет проверен")
-    return extract_path
+
+def _cache_busted_url(url: str, token: str) -> str:
+    parsed = urlsplit(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    query.append(("download", token))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
 def launch_update_helper(

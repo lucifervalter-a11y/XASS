@@ -14,7 +14,7 @@ class AgentUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cache:
             settings = SimpleNamespace(agent_update_cache_dir=cache, agent_updates_enabled=True)
             package = build_agent_package(settings)
-            self.assertEqual(package.version, "0.4.2")
+            self.assertEqual(package.version, "0.4.3")
             self.assertEqual(len(package.sha256), 64)
             self.assertGreater(package.size, 0)
             with zipfile.ZipFile(package.path, "r") as archive:
@@ -41,6 +41,7 @@ class AgentUpdateTests(unittest.TestCase):
             self.assertTrue(manifest["available"])
             self.assertEqual(len(str(manifest["signature"])), 64)
             self.assertTrue(str(manifest["url"]).startswith("https://xass.example/agent/update/package"))
+            self.assertTrue(str(manifest["url"]).endswith(f"/{manifest['revision']}.zip"))
 
             current = build_update_manifest(
                 settings,
