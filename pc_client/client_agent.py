@@ -1,7 +1,10 @@
 ﻿import argparse
 import json
+import os
 import platform
 import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +13,15 @@ from urllib.parse import urlsplit
 import httpx
 import psutil
 
+from client_update import (
+    clear_command_results,
+    current_revision,
+    current_version,
+    download_update,
+    launch_update_helper,
+    load_command_results,
+    store_command_result,
+)
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
 
@@ -166,6 +178,9 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
         "active_app": active_app,
         "activity": activity if isinstance(activity, dict) else {},
         "tags": [platform.system(), platform.node()],
+        "agent_version": current_version(),
+        "agent_revision": current_revision(),
+        "command_results": load_command_results(),
     }
     if discord is not None:
         payload["discord"] = discord
@@ -265,6 +280,8 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
         "include_now_playing": bool(existing.get("include_now_playing", True)),
         "include_activity": bool(existing.get("include_activity", True)),
         "trust_env_proxy": bool(existing.get("trust_env_proxy", False)),
+        "auto_update": bool(existing.get("auto_update", True)),
+        "desktop_managed": bool(existing.get("desktop_managed", False)),
     }
     save_config(data)
     print(f"Конфиг сохранен: {CONFIG_PATH}")
@@ -284,6 +301,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-activity", action="store_true")
     parser.add_argument("--trust-env-proxy", action="store_true")
     parser.add_argument("--init-only", action="store_true")
+    parser.add_argument("--no-auto-update", action="store_true")
+    parser.add_argument("--desktop-managed", action="store_true")
     return parser
 
 
@@ -318,6 +337,11 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
     if args.trust_env_proxy:
         config["trust_env_proxy"] = True
         updated = True
+    if args.no_auto_update:
+        config["auto_update"] = False
+        updated = True
+    if args.desktop_managed:
+        config["desktop_managed"] = True
 
     pair_code = (args.pair_code or "").strip()
     if pair_code:
@@ -344,7 +368,46 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
     return config, updated
 
 
-def run_agent(config: dict[str, Any]) -> None:
+def _restart_agent(config: dict[str, Any], command_id: int) -> str:
+    store_command_result(command_id, True, "Агент перезапущен")
+    if config.get("desktop_managed"):
+        return "restart"
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve())],
+        cwd=str(Path(__file__).resolve().parent),
+        creationflags=creationflags,
+    )
+    return "restart"
+
+
+def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
+    try:
+        stage = download_update(
+            manifest,
+            api_key=str(config.get("api_key") or ""),
+            trust_env=bool(config.get("trust_env_proxy", False)),
+            progress=lambda message: print(f"[pc-client] {message}"),
+        )
+        launch_update_helper(
+            stage,
+            manifest,
+            command_id=command_id,
+            restart_target="none" if config.get("desktop_managed") else "agent",
+        )
+        print(
+            f"[pc-client] update staged: {manifest.get('version')} "
+            f"({str(manifest.get('revision') or '')[:12]})"
+        )
+        return "update"
+    except Exception as exc:
+        print(f"[pc-client] update failed: {exc}")
+        if command_id is not None:
+            store_command_result(command_id, False, f"Ошибка обновления: {exc}")
+        return None
+
+
+def run_agent(config: dict[str, Any]) -> str:
     endpoint = f"{config['server_url'].rstrip('/')}/agent/heartbeat"
     headers = {"X-Api-Key": config["api_key"]}
     interval_sec = int(config.get("interval_sec", 30))
@@ -356,9 +419,15 @@ def run_agent(config: dict[str, Any]) -> None:
         f"source_type={source_type} trust_env_proxy={trust_env_proxy}"
     )
 
+    failed_auto_revision = ""
     with httpx.Client(timeout=20, trust_env=trust_env_proxy) as client:
         while True:
             payload = build_payload({**config, "source_name": source_name, "source_type": source_type})
+            sent_result_ids = [
+                int(item.get("id"))
+                for item in payload.get("command_results", [])
+                if str(item.get("id", "")).isdigit()
+            ]
             try:
                 response = client.post(endpoint, headers=headers, json=payload)
                 response.raise_for_status()
@@ -375,6 +444,39 @@ def run_agent(config: dict[str, Any]) -> None:
                 if body.get("new_source"):
                     msg += " | новый агент зарегистрирован"
                 print(msg)
+                if sent_result_ids:
+                    clear_command_results(sent_result_ids)
+
+                manifest = body.get("update") if isinstance(body.get("update"), dict) else None
+                commands = body.get("commands") if isinstance(body.get("commands"), list) else []
+                update_command_id: int | None = None
+                for command in commands:
+                    if not isinstance(command, dict):
+                        continue
+                    try:
+                        command_id = int(command.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    command_name = str(command.get("command") or "").strip().lower()
+                    if command_name == "restart":
+                        return _restart_agent(config, command_id)
+                    if command_name == "update":
+                        update_command_id = command_id
+
+                if update_command_id is not None:
+                    if manifest and manifest.get("available"):
+                        update_result = _apply_update(config, manifest, update_command_id)
+                        if update_result:
+                            return update_result
+                    else:
+                        store_command_result(update_command_id, True, "Версия уже актуальна")
+                elif manifest and manifest.get("available") and bool(config.get("auto_update", True)):
+                    revision = str(manifest.get("revision") or "")
+                    if revision and revision != failed_auto_revision:
+                        update_result = _apply_update(config, manifest, None)
+                        if update_result:
+                            return update_result
+                        failed_auto_revision = revision
             except Exception as exc:
                 print(f"[pc-client] heartbeat failed: {exc}")
             time.sleep(interval_sec)
@@ -395,6 +497,10 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
         config["include_activity"] = True
     if "trust_env_proxy" not in config:
         config["trust_env_proxy"] = False
+    if "auto_update" not in config:
+        config["auto_update"] = True
+    if "desktop_managed" not in config:
+        config["desktop_managed"] = False
     return config
 
 
@@ -423,7 +529,9 @@ def main() -> None:
             print("[pc-client] init-only completed")
             return
 
-        run_agent(config)
+        reason = run_agent(config)
+        if reason in {"update", "restart"}:
+            raise SystemExit(75)
     except KeyboardInterrupt:
         print("\n[pc-client] stopped by user")
     except Exception as exc:

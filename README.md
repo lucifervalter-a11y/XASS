@@ -9,6 +9,9 @@
 - Экспорт логов в CSV.
 - Мониторинг CPU/RAM/DISK/NET/uptime + статусы systemd-сервисов.
 - Edit alerts are sent as formatted cards (old/new/diff + message link) to notify chat.
+- Telegram Mini App с мобильным центром управления, подключением ПК и удалёнными командами.
+- Оконное приложение XASS для Windows (`pc_client/run_agent.bat`).
+- Подписанные автообновления Windows-клиента из актуальной серверной папки `pc_client`.
 
 ## Структура
 
@@ -16,7 +19,11 @@
 - `app/telegram_handler.py` - обработка webhook updates, `/panel`, callbacks.
 - `app/services/message_logging.py` - логирование сообщений/правок/удалений и медиа.
 - `app/services/heartbeat.py` - heartbeat и определение offline.
+- `app/services/agent_commands.py` - очередь команд обновления/перезапуска агентов.
+- `app/services/agent_updates.py` - сборка и подпись пакетов обновления ПК-клиента.
 - `agent/agent.py` - кроссплатформенный агент (Windows/Linux).
+- `pc_client/desktop_app.py` - оконное приложение XASS для Windows.
+- `miniapp.php` - Telegram Mini App.
 
 ## Быстрый старт (локально)
 
@@ -30,6 +37,8 @@
    - `pip install -r requirements.txt`
 4. Запустить backend:
    - `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+
+На Windows всё это можно сделать одной командой: `run_server.bat`. Скрипт при необходимости установит Python 3.12 через `winget`, создаст `.venv`, установит зависимости и запустит backend. На Linux аналогичную подготовку выполняет `install.sh`.
 
 ## Настройка webhook
 

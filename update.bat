@@ -10,9 +10,11 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if exist ".venv\Scripts\python.exe" (
-  echo [INFO] Installing Python requirements...
-  .venv\Scripts\python.exe -m pip install -r requirements.txt
+echo [INFO] Checking Python and backend requirements...
+call run_server.bat --prepare-only
+if errorlevel 1 (
+  echo [ERROR] Dependency preparation failed.
+  exit /b 1
 )
 
 echo [OK] Update complete.

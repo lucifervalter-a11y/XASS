@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,8 +24,15 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import MessageLog
-from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key
+from app.models import HeartbeatSource, MessageLog
+from app.services.agent_commands import (
+    acknowledge_agent_commands,
+    deliver_agent_commands,
+    enqueue_agent_command,
+    latest_agent_commands,
+)
+from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code
+from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.app_config import (
     cycle_save_mode,
     get_or_create_app_config,
@@ -57,6 +65,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+APP_VERSION = "0.4.1"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -128,6 +138,11 @@ class MiniSettingPayload(BaseModel):
 
 class MiniQuotePayload(BaseModel):
     text: str
+
+
+class MiniAgentCommandPayload(BaseModel):
+    command: str
+    payload: dict[str, Any] | None = None
 
 
 @asynccontextmanager
@@ -228,7 +243,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Serverredus Telegram Business Control",
-    version="0.3.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -271,6 +286,7 @@ async def agent_pair_claim(
 @app.post("/agent/heartbeat", response_model=HeartbeatResponse)
 async def agent_heartbeat(
     payload: HeartbeatPayload,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None),
 ) -> HeartbeatResponse:
@@ -285,6 +301,12 @@ async def agent_heartbeat(
     # For per-agent keys we pin source_name on server side to keep identity stable.
     if auth.source_name and payload.source_name != auth.source_name:
         payload = payload.model_copy(update={"source_name": auth.source_name})
+
+    await acknowledge_agent_commands(
+        session,
+        source_name=payload.source_name,
+        results=payload.command_results,
+    )
 
     config = await get_or_create_app_config(session, settings)
     source, recovered, is_new = await process_heartbeat(session, payload)
@@ -319,12 +341,55 @@ async def agent_heartbeat(
                 ),
             )
 
+    commands = await deliver_agent_commands(session, source_name=source.source_name)
+    manifest_base_url = str(request.base_url).rstrip("/")
+    configured_base_url = (config.service_base_url or settings.profile_public_url or "").strip()
+    if configured_base_url:
+        configured_url = urlsplit(configured_base_url)
+        if configured_url.scheme and configured_url.netloc:
+            manifest_base_url = f"{configured_url.scheme}://{configured_url.netloc}"
+    update_manifest = await asyncio.to_thread(
+        build_update_manifest,
+        settings,
+        api_key=(x_api_key or "").strip(),
+        base_url=manifest_base_url,
+        current_version=payload.agent_version,
+        current_revision=payload.agent_revision,
+    )
+
     return HeartbeatResponse(
         ok=True,
         source_name=source.source_name,
         recovered=recovered,
         new_source=is_new,
         server_time=datetime.now(timezone.utc),
+        server_version=APP_VERSION,
+        update=update_manifest,
+        commands=commands,
+    )
+
+
+@app.get("/agent/update/package")
+async def agent_update_package(
+    revision: str = "",
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+) -> FileResponse:
+    auth = await authenticate_agent_api_key(
+        session,
+        api_key=x_api_key,
+        global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    package = await asyncio.to_thread(build_agent_package, settings)
+    if revision and revision != package.revision:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent package changed; refresh manifest")
+    return FileResponse(
+        package.path,
+        media_type="application/zip",
+        filename=f"xass-pc-{package.version}.zip",
+        headers={"ETag": package.sha256, "X-XASS-Revision": package.revision},
     )
 
 
@@ -462,12 +527,14 @@ async def mini_bootstrap(
     config = await get_or_create_app_config(session, settings)
     profile = load_profile(Path(settings.profile_json_path))
     sources = await list_sources(session)
+    latest_commands = await latest_agent_commands(session, [item.source_name for item in sources])
     metrics = collect_server_metrics(top_processes_limit=settings.top_processes_limit)
     services = collect_systemd_statuses(settings.monitored_services)
     quotes = load_quotes(Path(settings.quotes_json_path))
 
     return {
         "ok": True,
+        "app_version": APP_VERSION,
         "user": {
             "id": user.user_id,
             "first_name": user.first_name,
@@ -490,11 +557,25 @@ async def mini_bootstrap(
         },
         "sources": [
             {
+                "id": item.id,
                 "source_name": item.source_name,
                 "source_type": item.source_type,
                 "is_online": item.is_online,
                 "last_seen_at": item.last_seen_at.isoformat() if item.last_seen_at else None,
                 "last_payload": item.last_payload,
+                "agent_version": str((item.last_payload or {}).get("agent_version") or "0.0.0"),
+                "agent_revision": str((item.last_payload or {}).get("agent_revision") or ""),
+                "latest_command": (
+                    {
+                        "id": latest_commands[item.source_name].id,
+                        "command": latest_commands[item.source_name].command,
+                        "status": latest_commands[item.source_name].status,
+                        "created_at": latest_commands[item.source_name].created_at.isoformat(),
+                        "result": latest_commands[item.source_name].result or {},
+                    }
+                    if item.source_name in latest_commands
+                    else None
+                ),
             }
             for item in sources
         ],
@@ -502,6 +583,57 @@ async def mini_bootstrap(
         "services": services,
         "quotes_count": len(quotes),
         "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
+    }
+
+
+@app.post("/api/mini/agents/pair-code")
+async def mini_agent_pair_code(
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    result = await issue_pair_code(
+        session,
+        actor_user_id=user.user_id,
+        ttl_minutes=settings.agent_pair_code_ttl_minutes,
+        code_length=settings.agent_pair_code_length,
+    )
+    return {
+        "ok": True,
+        "code": result.code,
+        "expires_at": result.expires_at.isoformat(),
+        "ttl_minutes": result.ttl_minutes,
+    }
+
+
+@app.post("/api/mini/agents/{source_name}/commands")
+async def mini_agent_command(
+    source_name: str,
+    payload: MiniAgentCommandPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    try:
+        item = await enqueue_agent_command(
+            session,
+            source_name=source.source_name,
+            command=payload.command,
+            payload=payload.payload,
+            actor_user_id=user.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "command": {
+            "id": item.id,
+            "source_name": item.source_name,
+            "command": item.command,
+            "status": item.status,
+            "created_at": item.created_at.isoformat(),
+        },
     }
 
 

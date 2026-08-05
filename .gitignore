@@ -7,3 +7,7 @@ run-agent.sh
 data/
 *.sqlite3
 *.db
+pc_client/config.json
+pc_client/.installed-revision
+pc_client/.command-results.json
+pc_client/.updates/

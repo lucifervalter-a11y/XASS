@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     agent_api_key: str = "change-me-agent-key"
     agent_pair_code_ttl_minutes: int = 15
     agent_pair_code_length: int = 8
+    agent_updates_enabled: bool = True
+    agent_update_cache_dir: str = "./data/agent_packages"
 
     notify_chat_id: int | None = None
     monitored_services: Annotated[list[str], NoDecode] = []

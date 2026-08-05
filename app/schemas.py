@@ -16,6 +16,9 @@ class HeartbeatPayload(BaseModel):
     processes: list[dict[str, Any]] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     discord: dict[str, Any] | None = None
+    agent_version: str = Field(default="0.0.0", max_length=32)
+    agent_revision: str = Field(default="", max_length=128)
+    command_results: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
 
 class HeartbeatResponse(BaseModel):
@@ -24,6 +27,9 @@ class HeartbeatResponse(BaseModel):
     recovered: bool = False
     new_source: bool = False
     server_time: datetime
+    server_version: str = "0.4.1"
+    update: dict[str, Any] | None = None
+    commands: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentPairClaimPayload(BaseModel):

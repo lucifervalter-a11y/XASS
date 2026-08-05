@@ -83,6 +83,21 @@ class AgentCredential(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class AgentCommand(Base):
+    __tablename__ = "agent_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    command: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), index=True, default="pending", nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    requested_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class MessageLog(Base):
     __tablename__ = "message_logs"
     __table_args__ = (UniqueConstraint("chat_id", "telegram_message_id", name="uq_chat_msg_id"),)
