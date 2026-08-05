@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     agent_update_cache_dir: str = "./data/agent_packages"
     agent_installer_path: str = "./data/releases/XASS-Setup.exe"
     agent_installer_metadata_path: str = "./data/releases/XASS-Setup.json"
+    agent_installer_fallback_url: str = "https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe"
 
     notify_chat_id: int | None = None
     monitored_services: Annotated[list[str], NoDecode] = []

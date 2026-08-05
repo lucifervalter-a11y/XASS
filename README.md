@@ -256,6 +256,8 @@ chmod +x deploy/backup.sh
 
 После этого новый установленный XASS становится единственным агентом в автозагрузке.
 
+Если VPS временно недоступен, последнюю стабильную сборку можно скачать напрямую: [XASS-Setup.exe](https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe). Mini App автоматически использует эту ссылку как резервную и не буферизует весь установщик в PHP/WebView.
+
 ## XASS на экране «Домой» iPhone
 
 `miniapp.php` одновременно работает как Telegram Mini App и устанавливаемая PWA:

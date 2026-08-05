@@ -1,5 +1,8 @@
 name: Build Windows agent
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]
@@ -60,3 +63,26 @@ jobs:
           source: "release/XASS-Setup.exe,release/XASS-Setup.json"
           target: "/opt/serverredus/data/releases"
           strip_components: 1
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-windows-installer
+          path: release
+      - name: Publish stable public download
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: agent-latest
+          name: XASS for Windows — latest stable
+          body: |
+            Автоматически собранный стабильный установщик XASS для Windows.
+            Установщик обновляется при каждом выпуске агента и сохраняет рабочую конфигурацию предыдущей версии.
+          files: |
+            release/XASS-Setup.exe
+            release/XASS-Setup.json
+          overwrite_files: true
+          fail_on_unmatched_files: true

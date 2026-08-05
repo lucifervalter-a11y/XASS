@@ -67,8 +67,9 @@ def get_agent_installer(settings: "Settings") -> AgentInstaller | None:
 
 def installer_public_info(settings: "Settings") -> dict[str, object]:
     installer = get_agent_installer(settings)
+    fallback_url = str(getattr(settings, "agent_installer_fallback_url", "") or "").strip()
     if installer is None:
-        return {"available": False, "version": "", "size": 0}
+        return {"available": False, "version": "", "size": 0, "fallback_url": fallback_url}
     return {
         "available": True,
         "version": installer.version,
@@ -76,6 +77,7 @@ def installer_public_info(settings: "Settings") -> dict[str, object]:
         "size": installer.size,
         "file_name": f"XASS-Setup-{installer.version}.exe",
         "download_path": "/api/mini/agent-installer/download",
+        "fallback_url": fallback_url,
     }
 
 
