@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import time
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -74,6 +77,42 @@ def installer_public_info(settings: "Settings") -> dict[str, object]:
         "file_name": f"XASS-Setup-{installer.version}.exe",
         "download_path": "/api/mini/agent-installer/download",
     }
+
+
+def issue_installer_ticket(
+    settings: "Settings",
+    *,
+    user_id: int,
+    ttl_seconds: int = 180,
+) -> str:
+    """Create a short-lived, stateless ticket for a native browser download."""
+    installer = get_agent_installer(settings)
+    if installer is None:
+        raise ValueError("Windows installer is not available yet")
+    expires_at = int(time.time()) + max(30, min(int(ttl_seconds), 900))
+    payload = f"1:{int(user_id)}:{expires_at}:{installer.revision}".encode("utf-8")
+    encoded = urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    secret = (settings.bot_token or settings.setup_api_key or settings.agent_api_key).encode("utf-8")
+    signature = hmac.new(secret, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def verify_installer_ticket(settings: "Settings", ticket: str) -> bool:
+    """Validate expiry, signature and the exact installer revision."""
+    try:
+        encoded, supplied_signature = ticket.strip().split(".", maxsplit=1)
+        secret = (settings.bot_token or settings.setup_api_key or settings.agent_api_key).encode("utf-8")
+        expected_signature = hmac.new(secret, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            return False
+        padded = encoded + "=" * (-len(encoded) % 4)
+        version, user_id, expires_at, revision = urlsafe_b64decode(padded).decode("utf-8").split(":", maxsplit=3)
+        if version != "1" or int(user_id) <= 0 or int(expires_at) < int(time.time()):
+            return False
+        installer = get_agent_installer(settings)
+        return installer is not None and hmac.compare_digest(revision, installer.revision)
+    except (TypeError, ValueError, UnicodeError):
+        return False
 
 
 def build_installer_manifest(

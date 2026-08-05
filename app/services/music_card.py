@@ -116,6 +116,13 @@ def normalize_track_input(text: str) -> str:
         "teamviewer",
         "anydesk",
         "rustdesk",
+        "github.com",
+        " - github",
+        "github - ",
+        "opera gx",
+        "google chrome",
+        "microsoft edge",
+        "mozilla firefox",
     )
     if any(marker in lowered for marker in noisy_substrings):
         return ""
@@ -143,6 +150,22 @@ def split_artist_title(text: str) -> tuple[str, str]:
             if artist and title:
                 return artist, title
     return "", raw
+
+
+def fallback_music_card(query_text: str) -> MusicCard:
+    """Return an immediately searchable card without relying on metadata providers."""
+    normalized = normalize_track_input(query_text)
+    if not normalized:
+        return MusicCard(query="", artist="", title="", album="", artwork_url="", album_url="")
+    artist, title = split_artist_title(normalized)
+    return MusicCard(
+        query=normalized,
+        artist=artist,
+        title=title or normalized,
+        album="",
+        artwork_url="",
+        album_url="",
+    )
 
 
 def _upgrade_artwork_size(url: str) -> str:
@@ -355,7 +378,7 @@ async def build_music_card(query_text: str) -> MusicCard:
     artist_result: dict[str, Any] | None = None
 
     try:
-        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.5, connect=1.5), trust_env=False) as client:
             search_terms: list[str] = [normalized]
             artist_title_hints: list[tuple[str, str]] = []
             if parsed_artist and parsed_title:

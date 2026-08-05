@@ -93,6 +93,10 @@ class TelegramBotClient:
         payload = {"drop_pending_updates": drop_pending_updates}
         return await self._request("deleteWebhook", payload=payload)
 
+    async def get_me(self) -> dict[str, Any]:
+        result = await self._request("getMe")
+        return result if isinstance(result, dict) else {}
+
     async def get_updates(
         self,
         *,

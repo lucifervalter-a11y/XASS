@@ -260,11 +260,12 @@ chmod +x deploy/backup.sh
 
 `miniapp.php` одновременно работает как Telegram Mini App и устанавливаемая PWA:
 
-1. Укажите `TELEGRAM_BOT_USERNAME` в `.env` и перезапустите backend.
-2. В `@BotFather` выполните `/setdomain` для этого бота и укажите публичный HTTPS-домен XASS.
-3. Откройте `https://ваш-домен/miniapp.php?standalone=1` в Safari.
-4. Войдите Telegram-аккаунтом владельца (`OWNER_USER_ID`). Другие аккаунты сервер отклонит.
-5. Нажмите «Поделиться» → «На экран Домой».
+1. XASS сам определяет username бота через Telegram. `TELEGRAM_BOT_USERNAME` можно оставить как резервную ручную настройку.
+2. В `@BotFather` откройте `/mybots` → выберите бота → `Bot Settings` → `Domain` (или выполните `/setdomain`) и отправьте только домен без `https://` и без пути.
+3. Отправьте боту `/app`: он покажет отдельную кнопку для Safari. Та же выделенная ссылка всегда есть на главной странице Mini App.
+4. Откройте `https://ваш-домен/miniapp.php?standalone=1` в Safari.
+5. Войдите Telegram-аккаунтом владельца (`OWNER_USER_ID`). Другие аккаунты сервер отклонит.
+6. Нажмите «Поделиться» → «На экран Домой».
 
 Сессия хранится в подписанной `HttpOnly` cookie; Telegram-подпись и срок `auth_date` проверяются на backend. В режиме разработки по обычному HTTP можно временно задать `PWA_COOKIE_SECURE=false`.
 

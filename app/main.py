@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
@@ -33,7 +34,13 @@ from app.services.agent_commands import (
     latest_agent_commands,
 )
 from app.services.agent_connection import build_connection_profile, normalize_server_origin
-from app.services.agent_installer import build_installer_manifest, get_agent_installer, installer_public_info
+from app.services.agent_installer import (
+    build_installer_manifest,
+    get_agent_installer,
+    installer_public_info,
+    issue_installer_ticket,
+    verify_installer_ticket,
+)
 from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.app_config import (
@@ -59,7 +66,7 @@ from app.services.pwa_auth import (
     issue_session as issue_pwa_session,
 )
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
-from app.services.music_card import build_music_card, build_search_links
+from app.services.music_card import build_music_card, build_search_links, fallback_music_card
 from app.services.profile_editor import (
     ensure_profile_exists,
     load_profile,
@@ -91,7 +98,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -216,6 +223,15 @@ async def _run_bot_post_startup() -> None:
     """Finish Telegram setup without blocking readiness of the HTTP server."""
     if bot_client is None:
         return
+    if not str(getattr(settings, "telegram_bot_username", "") or "").strip() and hasattr(bot_client, "get_me"):
+        try:
+            bot_identity = await bot_client.get_me()
+            discovered_username = str(bot_identity.get("username") or "").strip().lstrip("@")
+            if discovered_username:
+                settings.telegram_bot_username = discovered_username
+                logger.info("Telegram bot username discovered automatically: @%s", discovered_username)
+        except Exception:
+            logger.warning("Failed to discover Telegram bot username", exc_info=True)
     try:
         notice = get_restart_notice(settings)
         if isinstance(notice, dict):
@@ -641,11 +657,20 @@ async def require_mini_owner(
 @app.get("/api/pwa/config")
 async def pwa_config(request: Request) -> dict[str, Any]:
     session_user = pwa_authenticate_session(request.cookies.get(PWA_COOKIE_NAME, ""), settings)
+    bot_username = settings.telegram_bot_username.strip().lstrip("@")
+    if not bot_username and bot_client is not None and hasattr(bot_client, "get_me"):
+        try:
+            bot_identity = await asyncio.wait_for(bot_client.get_me(), timeout=3.0)
+            bot_username = str(bot_identity.get("username") or "").strip().lstrip("@")
+            if bot_username:
+                settings.telegram_bot_username = bot_username
+        except Exception:
+            logger.warning("Could not resolve bot username for PWA login")
     return {
         "ok": True,
         "authenticated": bool(session_user),
-        "bot_username": settings.telegram_bot_username.strip().lstrip("@"),
-        "login_ready": bool(settings.bot_token and settings.telegram_bot_username and settings.owner_user_id),
+        "bot_username": bot_username,
+        "login_ready": bool(settings.bot_token and bot_username and settings.owner_user_id),
     }
 
 
@@ -798,6 +823,25 @@ def _mini_public_profile(profile: dict[str, Any]) -> dict[str, Any]:
     return {key: profile.get(key) for key in fields}
 
 
+def _normalize_saved_avatar_url(value: str) -> str:
+    raw = (value or "").strip().replace("\\", "/")
+    relative = raw.lstrip("/")
+    if relative.startswith("data/avatars/") and ".." not in relative.split("/"):
+        return "/" + relative
+    return validate_http_url(raw, field_name="avatar_url")
+
+
+def _avatar_extension(content_type: str, body: bytes) -> str | None:
+    media_type = (content_type or "").split(";", maxsplit=1)[0].strip().lower()
+    if media_type in {"image/jpeg", "image/jpg"} and body.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if media_type == "image/png" and body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if media_type == "image/webp" and len(body) >= 12 and body.startswith(b"RIFF") and body[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
 @app.get("/api/mini/site")
 async def mini_site(
     user: MiniAppUser = Depends(require_mini_user),
@@ -829,7 +873,7 @@ async def mini_site_profile_save(
                 continue
             links.append({"label": label, "url": validate_http_url(raw_url, field_name="url")})
         telegram_url = validate_http_url(payload.telegram_url, field_name="telegram_url")
-        avatar_url = validate_http_url(payload.avatar_url, field_name="avatar_url")
+        avatar_url = _normalize_saved_avatar_url(payload.avatar_url)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -855,6 +899,49 @@ async def mini_site_profile_save(
         profile_data=profile,
     )
     return {"ok": True, "profile": _mini_public_profile(saved), "changed_fields": changed}
+
+
+@app.post("/api/mini/site/avatar")
+async def mini_site_avatar_upload(
+    request: Request,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите изображение")
+    if len(body) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Аватар должен быть меньше 8 МБ")
+    extension = _avatar_extension(request.headers.get("content-type", ""), body)
+    if extension is None:
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Поддерживаются JPG, PNG и WebP")
+
+    avatars_dir = Path(settings.profile_avatars_dir)
+    avatars_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"avatar-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}.{extension}"
+    destination = avatars_dir / file_name
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(body)
+    temporary.replace(destination)
+
+    resolved_root = Path.cwd().resolve()
+    try:
+        avatar_url = "/" + destination.resolve().relative_to(resolved_root).as_posix()
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Каталог аватаров должен находиться внутри XASS")
+
+    profile_path = Path(settings.profile_json_path)
+    profile = load_profile(profile_path)
+    profile["avatar_url"] = avatar_url
+    saved, _backup, changed = save_profile_with_backup(
+        profile_path=profile_path,
+        backup_dir=Path(settings.profile_backups_dir),
+        audit_log_path=Path(settings.profile_audit_log_path),
+        actor_user_id=user.user_id,
+        action="miniapp_avatar_upload",
+        profile_data=profile,
+        payload={"file_name": file_name, "size": len(body)},
+    )
+    return {"ok": True, "avatar_url": avatar_url, "profile": _mini_public_profile(saved), "changed_fields": changed}
 
 
 @app.post("/api/mini/site/projects")
@@ -1003,6 +1090,28 @@ async def mini_agent_installer_info(
 async def mini_agent_installer_download(
     user: MiniAppUser = Depends(require_mini_owner),
 ) -> FileResponse:
+    return _agent_installer_response()
+
+
+@app.get("/api/mini/agent-installer/ticket")
+async def mini_agent_installer_ticket(
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, object]:
+    try:
+        ticket = issue_installer_ticket(settings, user_id=user.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "expires_in": 180,
+        "download_path": f"/api/agent-installer/download?ticket={quote(ticket, safe='')}",
+    }
+
+
+@app.get("/api/agent-installer/download")
+async def agent_installer_ticket_download(ticket: str = "") -> FileResponse:
+    if not verify_installer_ticket(settings, ticket):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Download link is invalid or expired")
     return _agent_installer_response()
 
 
@@ -1165,7 +1274,10 @@ async def mini_music(
         query = str(profile.get("now_listening_text") or "").strip()
     if not query:
         return {"ok": False, "detail": "Нет трека для поиска"}
-    card = await build_music_card(query)
+    try:
+        card = await asyncio.wait_for(build_music_card(query), timeout=3.0)
+    except Exception:
+        card = fallback_music_card(query)
     links = build_search_links(card)
     return {
         "ok": bool(card.query),

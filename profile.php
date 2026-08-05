@@ -511,38 +511,7 @@ if (!empty($quotePool)) {
 }
 $quotePoolJson = json_encode(array_values($quotePool), JSON_UNESCAPED_UNICODE);
 
-$weatherFromJson = toStringSafe($profile['weather_text'] ?? '');
-$weatherAutoEnabled = toBoolSafe($profile['weather_auto_enabled'] ?? true, true);
 $weatherLocationName = toStringSafe($profile['weather_location_name'] ?? 'Москва', 'Москва');
-$weatherLatitude = toFloatSafe($profile['weather_latitude'] ?? 55.7558, 55.7558);
-$weatherLongitude = toFloatSafe($profile['weather_longitude'] ?? 37.6176, 37.6176);
-$weatherTimezone = toStringSafe($profile['weather_timezone'] ?? 'Europe/Moscow', 'Europe/Moscow');
-$weatherRefreshMinutes = toIntSafe($profile['weather_refresh_minutes'] ?? 60, 60, 10, 720);
-$weatherUpdatedAt = toStringSafe($profile['weather_updated_at'] ?? '');
-$weatherUpdatedTs = $weatherUpdatedAt !== '' ? strtotime($weatherUpdatedAt) : false;
-$weatherStale = ($weatherUpdatedTs === false) || ((time() - $weatherUpdatedTs) > ($weatherRefreshMinutes * 60));
-
-if (
-    $weatherAutoEnabled
-    && (
-        $weatherFromJson === ''
-        || preg_match('/^не указано$/iu', $weatherFromJson) === 1
-        || $weatherStale
-    )
-) {
-    $weatherCachePath = __DIR__ . '/data/weather_cache_profile.json';
-    $autoWeather = getCachedOrFreshWeather(
-        $weatherCachePath,
-        $weatherLocationName,
-        $weatherLatitude,
-        $weatherLongitude,
-        $weatherTimezone,
-        $weatherRefreshMinutes * 60
-    );
-    if (is_string($autoWeather) && $autoWeather !== '') {
-        $profile['weather_text'] = $autoWeather;
-    }
-}
 
 $displayUsername = toStringSafe($profile['username'] ?? '');
 if ($displayUsername === '' || strcasecmp($displayUsername, 'username') === 0) {
@@ -558,7 +527,7 @@ $moreLinks = array_slice($links, 3);
 $nowListeningText = toStringSafe($profile['now_listening_text'] ?? '');
 $noTrack = (
     $nowListeningText === ''
-    || preg_match('/^(не указано|нет данных|сейчас ничего не играет)$/iu', $nowListeningText) === 1
+    || preg_match('/^(не указано|нет данных(?: с пк)?|сейчас ничего не играет|iphone: нет свежих данных|.+: не в сети)$/iu', $nowListeningText) === 1
 );
 $canSearchTrack = !$noTrack;
 $trackQuery = $canSearchTrack ? rawurlencode($nowListeningText) : '';
@@ -568,12 +537,17 @@ $trackSearchLinks = [
     'VK Music' => $canSearchTrack ? "https://vk.com/search?c%5Bq%5D={$trackQuery}&c%5Bsection%5D=audio" : '',
 ];
 
-$weatherText = toStringSafe($profile['weather_text'] ?? '');
+$weatherText = str_replace(['В°C', 'Â°C'], '°C', toStringSafe($profile['weather_text'] ?? ''));
 $weatherParts = array_values(array_filter(
     array_map(static fn(string $part): string => trim($part), explode(',', $weatherText)),
     static fn(string $part): bool => $part !== ''
 ));
 $weatherMainLine = $weatherParts[0] ?? ($weatherText !== '' ? $weatherText : 'Погода обновляется...');
+$weatherMainLine = preg_replace(
+    '/^' . preg_quote($weatherLocationName, '/') . '\s*:\s*/iu',
+    '',
+    $weatherMainLine
+) ?: $weatherMainLine;
 $weatherDetails = array_slice($weatherParts, 1, 4);
 $weatherIcon = weatherIconFromText($weatherText !== '' ? $weatherText : $weatherMainLine);
 $telegramLabel = $displayUsername !== '' ? "t.me/{$displayUsername}" : 'Открыть Telegram';
@@ -1315,6 +1289,9 @@ if (is_readable($siteProjectsPath)) {
         .xnav a:hover { color: white; }
         .xhero { min-height: 620px; display: grid; grid-template-columns: minmax(0, .9fr) minmax(480px, 1.1fr); align-items: center; border-bottom: 1px solid #202124; overflow: hidden; }
         .xhero-copy { position: relative; z-index: 2; padding: 80px 0; }
+        .xhero-person { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
+        .xhero-avatar { width: 88px; height: 88px; border-radius: 50%; object-fit: cover; border: 1px solid #383842; box-shadow: 0 0 0 7px rgba(45, 79, 255, .08); }
+        .xhero-name { margin-top: 7px; color: #d9d9df; font-size: 18px; letter-spacing: -.03em; }
         .xeyebrow { color: #72727a; font: 11px/1.3 "JetBrains Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
         .xhero h1 { max-width: 640px; margin: 18px 0; font-size: clamp(48px, 6.5vw, 90px); line-height: .96; letter-spacing: -.065em; font-weight: 400; }
         .xhero p { max-width: 520px; color: #a3a3aa; font-size: 16px; line-height: 1.75; }
@@ -1347,6 +1324,7 @@ if (is_readable($siteProjectsPath)) {
             .xnav-links a:nth-child(2), .xnav-links a:nth-child(3) { display: none; }
             .xhero { min-height: auto; grid-template-columns: 1fr; padding-top: 34px; }
             .xhero-copy { padding: 45px 0 0; }
+            .xhero-avatar { width: 72px; height: 72px; }
             .xhero h1 { font-size: clamp(44px, 13vw, 72px); }
             .xhero-logo { grid-row: 2; width: 124%; transform: translate(-4%, -2%); margin: -3% 0 -10%; }
             .xsection { padding: 70px 0; }
@@ -1371,7 +1349,12 @@ if (is_readable($siteProjectsPath)) {
 
     <section class="xhero" id="about">
         <div class="xhero-copy">
-            <div class="xeyebrow">Личный сайт · <?= escapeHtml($displayUsername !== '' ? '@' . $displayUsername : 'XASS') ?></div>
+            <div class="xhero-person">
+                <?php if (toStringSafe($profile['avatar_url'] ?? '') !== ''): ?>
+                    <img class="xhero-avatar" src="<?= escapeHtml(toStringSafe($profile['avatar_url'])) ?>" alt="Аватар <?= escapeHtml($profile['name']) ?>">
+                <?php endif; ?>
+                <div><div class="xeyebrow">Личный сайт · <?= escapeHtml($displayUsername !== '' ? '@' . $displayUsername : 'XASS') ?></div><div class="xhero-name"><?= escapeHtml($profile['name']) ?></div></div>
+            </div>
             <h1><?= escapeHtml($profile['title']) ?></h1>
             <p><?= nl2br(escapeHtml($profile['bio'])) ?></p>
         </div>

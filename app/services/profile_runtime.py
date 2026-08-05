@@ -225,7 +225,7 @@ async def _fetch_weather_text(
     weather_code_raw = current.get("weather_code")
     weather_code = int(weather_code_raw) if isinstance(weather_code_raw, (int, float)) else -1
 
-    parts = [f"{location_name}: {temperature}В°C", _weather_code_to_ru(weather_code)]
+    parts = [f"{location_name}: {temperature}°C", _weather_code_to_ru(weather_code)]
     if apparent:
         parts.append(f"ощущается как {apparent}°C")
     if wind:
@@ -345,8 +345,10 @@ async def sync_profile_now_playing_from_heartbeat(
             current_updated_at is None
             or (now - current_updated_at) >= timedelta(minutes=stale_minutes)
         )
+        # Keep the last track sent by the iPhone shortcut. Freshness is metadata,
+        # not a reason to destroy a valid user-provided value.
         new_text = current_text or "Сейчас ничего не играет"
-        if is_stale:
+        if is_stale and not current_text:
             new_text = "iPhone: нет свежих данных"
         if new_text != current_text:
             profile["now_listening_text"] = new_text
@@ -364,10 +366,6 @@ async def sync_profile_now_playing_from_heartbeat(
         if source is not None:
             payload = source.last_payload or {}
             now_playing = _to_clean_text(payload.get("now_playing"))
-            activity = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
-            activity_title = _to_clean_text(activity.get("title")) if isinstance(activity, dict) else ""
-            activity_text = _to_clean_text(activity.get("text")) if isinstance(activity, dict) else ""
-            active_app = _to_clean_text(payload.get("active_app"))
             now_playing_last_seen = _parse_iso_datetime(payload.get("now_playing_last_seen_at"))
             age_sec = int((now - _ensure_utc(source.last_seen_at)).total_seconds())
             is_stale = age_sec > max(60, heartbeat_timeout_minutes * 60)
@@ -380,16 +378,9 @@ async def sync_profile_now_playing_from_heartbeat(
             if normalized_now_playing and source.is_online and not is_stale and not now_playing_stale:
                 new_text = normalized_now_playing
             elif source.is_online and not is_stale:
-                fallback = ""
-                for candidate in (activity_title, active_app, activity_text):
-                    normalized_candidate = normalize_track_input(candidate)
-                    if normalized_candidate:
-                        fallback = normalized_candidate
-                        break
-                if fallback:
-                    new_text = fallback
-                else:
-                    new_text = "Сейчас ничего не играет"
+                # Active windows are activity data, never music metadata. Falling
+                # back to them made Opera/GitHub tabs appear as songs.
+                new_text = "Сейчас ничего не играет"
             else:
                 new_text = f"{source.source_name}: не в сети"
 
@@ -488,5 +479,4 @@ async def sync_profile_weather(settings: Settings, *, force: bool = False) -> bo
     profile["weather_updated_at"] = now.isoformat()
     save_profile(profile_path, profile)
     return True
-
 

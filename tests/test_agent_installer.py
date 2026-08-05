@@ -15,7 +15,12 @@ if str(CLIENT_ROOT) not in sys.path:
     sys.path.insert(0, str(CLIENT_ROOT))
 
 from app.services.agent_commands import ALLOWED_AGENT_COMMANDS
-from app.services.agent_installer import build_installer_manifest, get_agent_installer
+from app.services.agent_installer import (
+    build_installer_manifest,
+    get_agent_installer,
+    issue_installer_ticket,
+    verify_installer_ticket,
+)
 import client_agent
 import client_update
 from client_update import verify_manifest
@@ -63,6 +68,34 @@ class AgentInstallerTests(unittest.TestCase):
                 agent_installer_metadata_path=str(metadata_path),
             )
             self.assertIsNone(get_agent_installer(settings))
+
+    def test_short_lived_download_ticket_is_bound_to_installer_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            installer_path = root / "XASS-Setup.exe"
+            installer_path.write_bytes(b"MZ-ticket-test")
+            sha256 = hashlib.sha256(installer_path.read_bytes()).hexdigest()
+            metadata_path = root / "XASS-Setup.json"
+            metadata_path.write_text(
+                json.dumps({"version": "0.8.0", "revision": "rev-080", "sha256": sha256}),
+                encoding="utf-8",
+            )
+            settings = SimpleNamespace(
+                agent_installer_path=str(installer_path),
+                agent_installer_metadata_path=str(metadata_path),
+                bot_token="ticket-secret",
+                setup_api_key="setup-secret",
+                agent_api_key="agent-secret",
+            )
+            ticket = issue_installer_ticket(settings, user_id=42)
+            self.assertTrue(verify_installer_ticket(settings, ticket))
+            self.assertFalse(verify_installer_ticket(settings, ticket + "tampered"))
+
+            metadata_path.write_text(
+                json.dumps({"version": "0.8.1", "revision": "rev-081", "sha256": sha256}),
+                encoding="utf-8",
+            )
+            self.assertFalse(verify_installer_ticket(settings, ticket))
 
     @unittest.skipUnless(sys.platform == "win32", "Windows updater test")
     def test_updater_is_copied_outside_the_install_directory(self) -> None:

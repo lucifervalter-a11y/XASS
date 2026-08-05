@@ -37,9 +37,35 @@ BROWSER_SUFFIXES = (
     "google chrome",
     "microsoft edge",
     "opera",
+    "opera gx",
     "mozilla firefox",
     "яндекс браузер",
 )
+
+WEB_PAGE_MARKERS = (
+    "github",
+    "gitlab",
+    "stack overflow",
+    "chatgpt",
+    "reddit",
+    "docs.google",
+    "notion",
+)
+
+BROWSER_APP_MARKERS = ("chrome", "msedge", "edge", "opera", "firefox", "browser")
+
+
+def _is_probable_non_music_session(row: dict[str, Any]) -> bool:
+    artist = str(row.get("artist") or "").strip()
+    title = str(row.get("title") or "").strip()
+    album = str(row.get("album") or "").strip()
+    app = str(row.get("app") or "").strip()
+    combined = " ".join((artist, title, album, app)).lower()
+    if any(marker in combined for marker in WEB_PAGE_MARKERS):
+        return True
+    browser_session = any(marker in app.lower() for marker in BROWSER_APP_MARKERS)
+    known_music = any(marker in combined for marker in MUSIC_WINDOW_MARKERS)
+    return browser_session and not artist and not known_music
 
 
 def _run_powershell(command: str, timeout_sec: int = 8) -> tuple[str, str]:
@@ -149,7 +175,7 @@ def debug_windows_media_sessions() -> list[dict[str, Any]]:
 
 
 def _windows_now_playing() -> str | None:
-    sessions = _collect_windows_media_sessions()
+    sessions = [row for row in _collect_windows_media_sessions() if not _is_probable_non_music_session(row)]
     if not sessions:
         return None
 
@@ -196,6 +222,8 @@ def _extract_track_from_window_title(title: str | None, process_name: str | None
     if any(marker in lower_title for marker in WINDOW_TITLE_NOISE_MARKERS):
         return None
     if any(marker in lower_proc for marker in WINDOW_TITLE_NOISE_MARKERS):
+        return None
+    if any(marker in lower_title for marker in WEB_PAGE_MARKERS):
         return None
 
     normalized = re.sub(r"\s+", " ", raw).strip(" -|")

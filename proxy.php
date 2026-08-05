@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-// Reverse proxy to FastAPI backend using file_get_contents (no curl needed).
+// Reverse proxy to FastAPI backend using PHP streams (no curl needed).
 // Always returns HTTP 200 so nginx does not intercept the response.
 // Real HTTP status is in the _s field of the JSON envelope.
 
@@ -76,7 +76,7 @@ foreach ($serverMap as $key => $headerName) {
     }
 }
 
-// Build stream context for file_get_contents.
+// Build stream context for the backend request.
 $opts = [
     'http' => [
         'method'        => $method,
@@ -88,6 +88,53 @@ $opts = [
 ];
 
 $context      = stream_context_create($opts);
+
+// Installers can be tens of megabytes. Stream them chunk-by-chunk so PHP and
+// the Telegram WebView do not have to buffer the full executable in memory.
+if ($binaryMode) {
+    $responseStream = @fopen($url, 'rb', false, $context);
+    if ($responseStream === false) {
+        proxy_error(502, 'Backend unavailable: could not connect to ' . $url);
+    }
+    $responseHeaders = $http_response_header ?? [];
+    $httpCode = 200;
+    $contentType = 'application/octet-stream';
+    $contentDisposition = 'attachment; filename="XASS-Setup.exe"';
+    $contentLength = '';
+    if (!empty($responseHeaders) && preg_match('#HTTP/\S+\s+(\d+)#', $responseHeaders[0], $m)) {
+        $httpCode = (int)$m[1];
+    }
+    foreach ($responseHeaders as $headerLine) {
+        if (stripos($headerLine, 'Content-Type:') === 0) {
+            $contentType = trim(substr($headerLine, strlen('Content-Type:')));
+        } elseif (stripos($headerLine, 'Content-Disposition:') === 0) {
+            $contentDisposition = trim(substr($headerLine, strlen('Content-Disposition:')));
+        } elseif (stripos($headerLine, 'Content-Length:') === 0) {
+            $contentLength = trim(substr($headerLine, strlen('Content-Length:')));
+        }
+    }
+    header('Content-Type: ' . $contentType);
+    header('Content-Disposition: ' . $contentDisposition);
+    if ($contentLength !== '') {
+        header('Content-Length: ' . $contentLength);
+    }
+    header('Cache-Control: private, no-store');
+    header('X-XASS-Status: ' . $httpCode);
+    while (!feof($responseStream)) {
+        $chunk = fread($responseStream, 1024 * 1024);
+        if ($chunk === false) {
+            break;
+        }
+        echo $chunk;
+        if (ob_get_level() > 0) {
+            @ob_flush();
+        }
+        flush();
+    }
+    fclose($responseStream);
+    exit;
+}
+
 $responseBody = @file_get_contents($url, false, $context);
 
 if ($responseBody === false) {
@@ -101,25 +148,6 @@ if (!empty($http_response_header)) {
     if (preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
         $httpCode = (int)$m[1];
     }
-}
-
-if ($binaryMode) {
-    $contentType = 'application/octet-stream';
-    $contentDisposition = 'attachment; filename="XASS-Setup.exe"';
-    foreach ($http_response_header as $headerLine) {
-        if (stripos($headerLine, 'Content-Type:') === 0) {
-            $contentType = trim(substr($headerLine, strlen('Content-Type:')));
-        } elseif (stripos($headerLine, 'Content-Disposition:') === 0) {
-            $contentDisposition = trim(substr($headerLine, strlen('Content-Disposition:')));
-        }
-    }
-    header('Content-Type: ' . $contentType);
-    header('Content-Disposition: ' . $contentDisposition);
-    header('Content-Length: ' . strlen((string)$responseBody));
-    header('Cache-Control: private, no-store');
-    header('X-XASS-Status: ' . $httpCode);
-    echo (string)$responseBody;
-    exit;
 }
 
 if ($passthroughMode) {
