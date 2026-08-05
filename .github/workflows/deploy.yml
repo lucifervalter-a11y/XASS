@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: xass-production
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -20,17 +24,4 @@ jobs:
           script: |
             set -e
             cd /opt/serverredus
-
-            echo "=== git pull ==="
-            git fetch --prune origin main
-            git pull --ff-only origin main
-
-            echo "=== pip install ==="
-            .venv/bin/pip install -r requirements.txt --quiet
-
-            echo "=== restart ==="
-            sudo systemctl restart serverredus-backend
-            sudo systemctl restart serverredus-agent || true
-
-            echo "=== status ==="
-            systemctl is-active serverredus-backend
+            bash deploy/update.sh
