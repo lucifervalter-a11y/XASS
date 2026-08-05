@@ -64,6 +64,8 @@ class Settings(BaseSettings):
 
     telegram_webhook_path: str = "change-me-webhook-path"
     telegram_secret_token: str = ""
+    telegram_bot_username: str = ""
+    pwa_cookie_secure: bool = True
     setup_api_key: str = "change-me-setup-key"
     agent_api_key: str = "change-me-agent-key"
     agent_pair_code_ttl_minutes: int = 15

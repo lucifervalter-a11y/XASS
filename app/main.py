@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +51,13 @@ from app.services.app_config import (
 )
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
+from app.services.pwa_auth import (
+    COOKIE_NAME as PWA_COOKIE_NAME,
+    SESSION_AGE_SEC as PWA_SESSION_AGE_SEC,
+    authenticate_session as pwa_authenticate_session,
+    authenticate_telegram_login as pwa_authenticate_login,
+    issue_session as issue_pwa_session,
+)
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.music_card import build_music_card, build_search_links
 from app.services.profile_editor import (
@@ -84,7 +91,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -166,6 +173,16 @@ class MiniAgentCommandPayload(BaseModel):
 class MiniAgentPairPayload(BaseModel):
     server_url: str = Field(default="", max_length=512)
     source_name: str = Field(default="", max_length=128)
+
+
+class PwaTelegramLoginPayload(BaseModel):
+    id: int
+    first_name: str = Field(default="", max_length=128)
+    last_name: str = Field(default="", max_length=128)
+    username: str = Field(default="", max_length=128)
+    photo_url: str = Field(default="", max_length=1000)
+    auth_date: int
+    hash: str = Field(min_length=64, max_length=64)
 
 
 class MiniSiteProfilePayload(BaseModel):
@@ -600,21 +617,59 @@ async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
 
 
 async def require_mini_user(
+    request: Request,
     x_telegram_init_data: str | None = Header(default=None),
 ) -> MiniAppUser:
     user = miniapp_authenticate(x_telegram_init_data or "", settings)
+    if user is None:
+        user = pwa_authenticate_session(request.cookies.get(PWA_COOKIE_NAME, ""), settings)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Telegram authentication")
     return user
 
 
 async def require_mini_owner(
+    request: Request,
     x_telegram_init_data: str | None = Header(default=None),
 ) -> MiniAppUser:
-    user = await require_mini_user(x_telegram_init_data)
+    user = await require_mini_user(request, x_telegram_init_data)
     if not user.is_owner:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner only")
     return user
+
+
+@app.get("/api/pwa/config")
+async def pwa_config(request: Request) -> dict[str, Any]:
+    session_user = pwa_authenticate_session(request.cookies.get(PWA_COOKIE_NAME, ""), settings)
+    return {
+        "ok": True,
+        "authenticated": bool(session_user),
+        "bot_username": settings.telegram_bot_username.strip().lstrip("@"),
+        "login_ready": bool(settings.bot_token and settings.telegram_bot_username and settings.owner_user_id),
+    }
+
+
+@app.post("/api/pwa/login")
+async def pwa_login(payload: PwaTelegramLoginPayload, response: Response) -> dict[str, Any]:
+    user = pwa_authenticate_login(payload.model_dump(exclude_unset=True), settings)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Telegram login is invalid or this account is not the owner")
+    response.set_cookie(
+        PWA_COOKIE_NAME,
+        issue_pwa_session(user, settings),
+        max_age=PWA_SESSION_AGE_SEC,
+        httponly=True,
+        secure=settings.pwa_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True, "user": {"id": user.user_id, "first_name": user.first_name, "username": user.username}}
+
+
+@app.post("/api/pwa/logout")
+async def pwa_logout(response: Response) -> dict[str, bool]:
+    response.delete_cookie(PWA_COOKIE_NAME, path="/", secure=settings.pwa_cookie_secure, samesite="lax")
+    return {"ok": True}
 
 
 def _now_source_label(value: str) -> str:

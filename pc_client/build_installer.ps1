@@ -88,6 +88,7 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --add-data "$(Join-Path $ClientRoot 'version.json');." `
     --add-data "$BuildInfo;." `
     --add-data "$(Join-Path $ClientRoot 'assets\xass.ico');assets" `
+    --add-data "$(Join-Path $ClientRoot 'assets\xass-icon.png');assets" `
     --distpath $DistRoot `
     --workpath $WorkRoot `
     --specpath $WorkRoot `
@@ -108,6 +109,21 @@ $UpdaterWorkRoot = Join-Path $WorkRoot "updater"
     --specpath $UpdaterWorkRoot `
     (Join-Path $ClientRoot "installer_helper.py")
 if ($LASTEXITCODE -ne 0) { throw "XASSUpdater build failed with exit code $LASTEXITCODE" }
+
+$MigratorWorkRoot = Join-Path $WorkRoot "migrator"
+& $BuildPython -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --name XASSMigrator `
+    --hide-console hide-early `
+    --icon (Join-Path $ClientRoot "assets\xass.ico") `
+    --version-file $VersionInfo `
+    --distpath (Join-Path $DistRoot "XASS") `
+    --workpath $MigratorWorkRoot `
+    --specpath $MigratorWorkRoot `
+    (Join-Path $ClientRoot "legacy_migration.py")
+if ($LASTEXITCODE -ne 0) { throw "XASSMigrator build failed with exit code $LASTEXITCODE" }
 
 $IsccCandidates = @(
     (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),

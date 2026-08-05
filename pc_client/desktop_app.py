@@ -96,6 +96,13 @@ class XassDesktop:
                 self.root.iconbitmap(default=str(icon_path))
             except tk.TclError:
                 pass
+        self.brand_image: tk.PhotoImage | None = None
+        brand_path = _resource_path("assets/xass-icon.png")
+        if brand_path.is_file():
+            try:
+                self.brand_image = tk.PhotoImage(file=str(brand_path)).subsample(8, 8)
+            except tk.TclError:
+                self.brand_image = None
 
         self.config = ensure_minimal_defaults(load_config())
         self.config["desktop_managed"] = True
@@ -196,9 +203,13 @@ class XassDesktop:
 
         brand = tk.Frame(self.sidebar, bg=SIDEBAR)
         brand.pack(fill="x", padx=24, pady=(27, 38))
-        tk.Label(brand, text="XASS", bg=SIDEBAR, fg=TEXT, font=("Segoe UI Semibold", 25)).pack(anchor="w")
+        if self.brand_image is not None:
+            tk.Label(brand, image=self.brand_image, bg=SIDEBAR, borderwidth=0).pack(side="left", padx=(0, 12))
+        brand_copy = tk.Frame(brand, bg=SIDEBAR)
+        brand_copy.pack(side="left", anchor="center")
+        tk.Label(brand_copy, text="XASS", bg=SIDEBAR, fg=TEXT, font=("Segoe UI Semibold", 25)).pack(anchor="w")
         tk.Label(
-            brand,
+            brand_copy,
             text="DESKTOP AGENT",
             bg=SIDEBAR,
             fg=MUTED,

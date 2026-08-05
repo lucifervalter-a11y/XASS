@@ -8,14 +8,15 @@ declare(strict_types=1);
 $BACKEND = 'http://127.0.0.1:8000';
 
 $binaryMode = isset($_GET['_binary']) && (string)$_GET['_binary'] === '1';
-if (!$binaryMode) {
+$passthroughMode = isset($_GET['_passthrough']) && (string)$_GET['_passthrough'] === '1';
+if (!$binaryMode && !$passthroughMode) {
     header('Content-Type: application/json; charset=utf-8');
 }
 http_response_code(200);
 
 function proxy_error(int $status, string $detail): void {
-    global $binaryMode;
-    if ($binaryMode) {
+    global $binaryMode, $passthroughMode;
+    if ($binaryMode || $passthroughMode) {
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: private, no-store');
         header('X-XASS-Status: ' . $status);
@@ -45,7 +46,7 @@ if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
 $forwardHeaders = [];
 
 if (function_exists('getallheaders')) {
-    $allowed = ['content-type', 'x-telegram-init-data', 'x-api-key', 'authorization'];
+    $allowed = ['content-type', 'x-telegram-init-data', 'x-api-key', 'authorization', 'cookie'];
     foreach (getallheaders() as $name => $val) {
         if (in_array(strtolower((string)$name), $allowed, true)) {
             $forwardHeaders[] = $name . ': ' . $val;
@@ -58,6 +59,7 @@ $serverMap = [
     'HTTP_X_TELEGRAM_INIT_DATA' => 'X-Telegram-Init-Data',
     'HTTP_X_API_KEY'            => 'X-Api-Key',
     'HTTP_AUTHORIZATION'        => 'Authorization',
+    'HTTP_COOKIE'               => 'Cookie',
     'HTTP_CONTENT_TYPE'         => 'Content-Type',
     'CONTENT_TYPE'              => 'Content-Type',
 ];
@@ -116,6 +118,23 @@ if ($binaryMode) {
     header('Content-Length: ' . strlen((string)$responseBody));
     header('Cache-Control: private, no-store');
     header('X-XASS-Status: ' . $httpCode);
+    echo (string)$responseBody;
+    exit;
+}
+
+if ($passthroughMode) {
+    $contentType = 'application/json; charset=utf-8';
+    foreach ($http_response_header as $headerLine) {
+        if (stripos($headerLine, 'Content-Type:') === 0) {
+            $contentType = trim(substr($headerLine, strlen('Content-Type:')));
+        } elseif (stripos($headerLine, 'Set-Cookie:') === 0) {
+            header($headerLine, false);
+        }
+    }
+    header('Content-Type: ' . $contentType);
+    header('Cache-Control: private, no-store');
+    header('X-XASS-Status: ' . $httpCode);
+    http_response_code($httpCode);
     echo (string)$responseBody;
     exit;
 }

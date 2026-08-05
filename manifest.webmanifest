@@ -1,0 +1,27 @@
+{
+  "id": "/miniapp.php?standalone=1",
+  "name": "XASS — личный центр управления",
+  "short_name": "XASS",
+  "description": "Сервер, музыка, Windows-агенты и сайт владельца XASS.",
+  "lang": "ru",
+  "start_url": "/miniapp.php?standalone=1",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {
+      "src": "/assets/xass-app-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/assets/xass-app-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

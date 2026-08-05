@@ -178,6 +178,8 @@ chmod +x deploy/backup.sh
 - `AGENT_API_KEY`
 - `AGENT_PAIR_CODE_TTL_MINUTES`, `AGENT_PAIR_CODE_LENGTH`
 - `TELEGRAM_WEBHOOK_PATH`, `TELEGRAM_SECRET_TOKEN`, `SETUP_API_KEY`
+- `TELEGRAM_BOT_USERNAME` — username бота без `@` для входа в iPhone/PWA
+- `PWA_COOKIE_SECURE=true` на публичном HTTPS-сайте
 - `PROFILE_JSON_PATH`, `PROFILE_BACKUPS_DIR`, `PROFILE_AUDIT_LOG_PATH`
 - `PROFILE_AVATARS_DIR`
 - `PROFILE_PUBLIC_URL` (опционально, для кнопки/ссылки в предпросмотре)
@@ -242,6 +244,29 @@ chmod +x deploy/backup.sh
 3. Ввести IP/URL сервера, код привязки из `/agents` и имя ПК (или Enter).
 4. Сервер зарегистрирует ПК и при первом подключении отправит подсказку с командой переименования:
    - `/pcname <старое_имя> <новое_имя>`
+
+### Переход со старого агента на установщик
+
+Установщик 0.7+ запускает `XASSMigrator.exe` до первого старта приложения. Мигратор:
+
+- останавливает старые `desktop_app.py` / `client_agent.py` только в известных папках XASS;
+- переносит рабочий `pc_client/config.json` в `%LOCALAPPDATA%\XASS\config.json`, если новый конфиг ещё не создан;
+- удаляет старый `ServerredusPCAgent.vbs` и старые служебные файлы обновления;
+- сохраняет исходники и исходный конфиг старой папки как резервную копию.
+
+После этого новый установленный XASS становится единственным агентом в автозагрузке.
+
+## XASS на экране «Домой» iPhone
+
+`miniapp.php` одновременно работает как Telegram Mini App и устанавливаемая PWA:
+
+1. Укажите `TELEGRAM_BOT_USERNAME` в `.env` и перезапустите backend.
+2. В `@BotFather` выполните `/setdomain` для этого бота и укажите публичный HTTPS-домен XASS.
+3. Откройте `https://ваш-домен/miniapp.php?standalone=1` в Safari.
+4. Войдите Telegram-аккаунтом владельца (`OWNER_USER_ID`). Другие аккаунты сервер отклонит.
+5. Нажмите «Поделиться» → «На экран Домой».
+
+Сессия хранится в подписанной `HttpOnly` cookie; Telegram-подпись и срок `auth_date` проверяются на backend. В режиме разработки по обычному HTTP можно временно задать `PWA_COOKIE_SECURE=false`.
 
 ## Away + активность ПК
 

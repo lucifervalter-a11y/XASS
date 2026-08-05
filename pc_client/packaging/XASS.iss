@@ -53,6 +53,12 @@ Name: "autostart"; Description: "Запускать XASS при входе в Wi
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
+Type: files; Name: "{app}\XASS.exe"
+Type: files; Name: "{app}\XASSUpdater.exe"
+Type: files; Name: "{app}\XASSMigrator.exe"
+
 [Icons]
 Name: "{group}\XASS"; Filename: "{app}\XASS.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\XASS"; Filename: "{app}\XASS.exe"; WorkingDir: "{app}"; Tasks: desktopicon
@@ -65,4 +71,5 @@ Root: HKCU; Subkey: "Software\Classes\XASS.Connection\DefaultIcon"; ValueType: s
 Root: HKCU; Subkey: "Software\Classes\XASS.Connection\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\XASS.exe"" ""%1"""
 
 [Run]
+Filename: "{app}\XASSMigrator.exe"; Parameters: "--quiet"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
 Filename: "{app}\XASS.exe"; Description: "Запустить XASS"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent

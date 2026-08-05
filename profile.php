@@ -591,6 +591,25 @@ $discordUpdatedAt = toStringSafe($profile['discord_updated_at'] ?? '');
 $discordUpdatedTs = $discordUpdatedAt !== '' ? strtotime($discordUpdatedAt) : false;
 $discordFresh = $discordUpdatedTs !== false && (time() - $discordUpdatedTs) < 300;
 $showDiscordOnline = $discordActive && $discordFresh;
+
+$siteProjects = [];
+$siteProjectsPath = getenv('PROJECTS_JSON_PATH');
+if (!$siteProjectsPath) {
+    $siteProjectsPath = __DIR__ . '/data/projects.json';
+}
+if (is_readable($siteProjectsPath)) {
+    $rawSiteProjects = file_get_contents($siteProjectsPath);
+    $decodedSiteProjects = is_string($rawSiteProjects) ? json_decode($rawSiteProjects, true) : null;
+    $candidateProjects = is_array($decodedSiteProjects) ? ($decodedSiteProjects['projects'] ?? $decodedSiteProjects) : [];
+    if (is_array($candidateProjects)) {
+        foreach ($candidateProjects as $project) {
+            if (!is_array($project) || trim((string)($project['title'] ?? '')) === '') {
+                continue;
+            }
+            $siteProjects[] = $project;
+        }
+    }
+}
 ?>
 <!doctype html>
 <html lang="ru">
@@ -1283,9 +1302,140 @@ $showDiscordOnline = $discordActive && $discordFresh;
             .page { width: calc(100% - 14px); }
             .headline { font-size: 24px; }
         }
+
+        /* 0.7 editorial public site */
+        .page, .orb { display: none !important; }
+        body { background: #000; color: #f4f4f5; font-family: Manrope, "Segoe UI", sans-serif; }
+        .xsite { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+        .xnav { height: 78px; display: flex; align-items: center; border-bottom: 1px solid #202124; }
+        .xbrand { display: flex; align-items: center; gap: 11px; font-size: 19px; font-weight: 600; letter-spacing: -.04em; }
+        .xbrand img { width: 29px; height: 29px; object-fit: contain; }
+        .xnav-links { display: flex; gap: 30px; margin-left: auto; }
+        .xnav a { color: #a3a3aa; text-decoration: none; font-size: 12px; }
+        .xnav a:hover { color: white; }
+        .xhero { min-height: 620px; display: grid; grid-template-columns: minmax(0, .9fr) minmax(480px, 1.1fr); align-items: center; border-bottom: 1px solid #202124; overflow: hidden; }
+        .xhero-copy { position: relative; z-index: 2; padding: 80px 0; }
+        .xeyebrow { color: #72727a; font: 11px/1.3 "JetBrains Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
+        .xhero h1 { max-width: 640px; margin: 18px 0; font-size: clamp(48px, 6.5vw, 90px); line-height: .96; letter-spacing: -.065em; font-weight: 400; }
+        .xhero p { max-width: 520px; color: #a3a3aa; font-size: 16px; line-height: 1.75; }
+        .xhero-logo { width: 680px; max-width: none; justify-self: center; transform: translateX(-1%); filter: saturate(1.12) contrast(1.03); }
+        .xsection { padding: 96px 0; border-bottom: 1px solid #202124; }
+        .xsection-head { display: grid; grid-template-columns: 300px 1fr; gap: 40px; margin-bottom: 48px; }
+        .xsection h2 { font-size: clamp(36px, 5vw, 68px); line-height: 1; font-weight: 400; letter-spacing: -.055em; }
+        .xsection-intro { max-width: 610px; color: #8f8f97; line-height: 1.75; align-self: end; }
+        .xmusic { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); border-top: 1px solid #202124; }
+        .xnow { padding: 32px 32px 32px 0; border-right: 1px solid #202124; }
+        .xnow-value { margin-top: 18px; font-size: clamp(25px, 3vw, 42px); line-height: 1.15; letter-spacing: -.04em; }
+        .xmusic-links { padding: 20px 0 20px 32px; }
+        .xlink-row, .xproject-row, .xcontact-row { min-height: 66px; display: flex; align-items: center; gap: 20px; border-bottom: 1px solid #202124; color: #eee; text-decoration: none; }
+        .xlink-row:first-child, .xproject-row:first-child, .xcontact-row:first-child { border-top: 1px solid #202124; }
+        .xarrow { margin-left: auto; color: #606068; font-size: 11px; text-transform: uppercase; }
+        .xproject-row { display: grid; grid-template-columns: 70px minmax(160px, .7fr) minmax(220px, 1.4fr) auto; padding: 18px 0; min-height: 88px; }
+        .xproject-year, .xproject-desc { color: #777780; font-size: 12px; }
+        .xproject-title { font-size: 20px; letter-spacing: -.03em; }
+        .xweather-panel { display: grid; grid-template-columns: minmax(260px, .75fr) minmax(360px, 1.25fr); border-top: 1px solid #202124; border-bottom: 1px solid #202124; }
+        .xweather-main { padding: 38px 38px 38px 0; border-right: 1px solid #202124; }
+        .xweather-main strong { display: block; margin-top: 14px; font-size: clamp(36px, 5vw, 70px); line-height: 1; letter-spacing: -.06em; font-weight: 400; }
+        .xweather-detail { padding: 38px 0 38px 38px; color: #9999a1; line-height: 1.8; }
+        .xcontacts { margin-left: min(31vw, 360px); }
+        .xcontact-row { font-size: 20px; min-height: 74px; }
+        .xfooter { min-height: 150px; display: flex; align-items: center; color: #606068; font-size: 11px; }
+        .xfooter span:last-child { margin-left: auto; }
+        @media (max-width: 820px) {
+            .xsite { width: min(100% - 28px, 680px); }
+            .xnav-links { gap: 14px; }
+            .xnav-links a:nth-child(2), .xnav-links a:nth-child(3) { display: none; }
+            .xhero { min-height: auto; grid-template-columns: 1fr; padding-top: 34px; }
+            .xhero-copy { padding: 45px 0 0; }
+            .xhero h1 { font-size: clamp(44px, 13vw, 72px); }
+            .xhero-logo { grid-row: 2; width: 124%; transform: translate(-4%, -2%); margin: -3% 0 -10%; }
+            .xsection { padding: 70px 0; }
+            .xsection-head { grid-template-columns: 1fr; gap: 18px; }
+            .xmusic, .xweather-panel { grid-template-columns: 1fr; }
+            .xnow, .xweather-main { padding: 28px 0; border-right: 0; border-bottom: 1px solid #202124; }
+            .xmusic-links, .xweather-detail { padding: 28px 0; }
+            .xproject-row { grid-template-columns: 48px 1fr auto; }
+            .xproject-desc { grid-column: 2 / -1; }
+            .xcontacts { margin-left: 0; }
+        }
     </style>
 </head>
 <body>
+<main class="xsite">
+    <nav class="xnav">
+        <div class="xbrand"><img src="/assets/xass-app-icon-192.png" alt=""><span>XASS</span></div>
+        <div class="xnav-links">
+            <a href="#about">Обо мне</a><a href="#music">Музыка</a><a href="#weather">Погода</a><a href="#projects">Проекты</a><a href="#contacts">Контакты</a>
+        </div>
+    </nav>
+
+    <section class="xhero" id="about">
+        <div class="xhero-copy">
+            <div class="xeyebrow">Личный сайт · <?= escapeHtml($displayUsername !== '' ? '@' . $displayUsername : 'XASS') ?></div>
+            <h1><?= escapeHtml($profile['title']) ?></h1>
+            <p><?= nl2br(escapeHtml($profile['bio'])) ?></p>
+        </div>
+        <img class="xhero-logo" src="/assets/xass-hero-glass.png" alt="Стеклянный логотип XASS">
+    </section>
+
+    <section class="xsection" id="music">
+        <div class="xsection-head"><h2>Музыка</h2><p class="xsection-intro">Текущий трек с ПК, iPhone или VK. Даже когда источник молчит, поиск по музыкальным сервисам остаётся доступным.</p></div>
+        <div class="xmusic">
+            <div class="xnow"><div class="xeyebrow">Сейчас играет</div><div class="xnow-value"><?= escapeHtml($noTrack ? 'Нет свежих данных' : $nowListeningText) ?></div></div>
+            <div class="xmusic-links">
+                <?php if ($canSearchTrack): ?>
+                    <?php foreach ([
+                        'Apple Music' => "https://music.apple.com/search?term={$trackQuery}",
+                        'Яндекс Музыка' => "https://music.yandex.ru/search?text={$trackQuery}",
+                        'VK Music' => "https://vk.com/audio?section=search&q={$trackQuery}",
+                        'Shazam' => "https://www.shazam.com/search/{$trackQuery}",
+                        'Google' => "https://www.google.com/search?q={$trackQuery}",
+                    ] as $service => $url): ?>
+                        <a class="xlink-row" href="<?= escapeHtml($url) ?>" target="_blank" rel="noopener"><span><?= escapeHtml($service) ?></span><span class="xarrow">Открыть ↗</span></a>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <div class="xlink-row"><span style="color:#777780">Источник ещё не прислал композицию</span></div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </section>
+
+    <section class="xsection" id="weather">
+        <div class="xsection-head"><h2>Погода</h2><p class="xsection-intro">Отдельная живая сводка. Она больше не смешивается с контактами и ссылками.</p></div>
+        <div class="xweather-panel"><div class="xweather-main"><div class="xeyebrow"><?= escapeHtml($weatherLabel) ?></div><strong><?= escapeHtml($weatherMainLine) ?></strong></div><div class="xweather-detail"><?= escapeHtml(!empty($weatherDetails) ? implode(' · ', $weatherDetails) : 'Сводка обновляется автоматически') ?></div></div>
+    </section>
+
+    <section class="xsection" id="projects">
+        <div class="xsection-head"><h2>Проекты</h2><p class="xsection-intro">Выбранные рабочие системы и эксперименты.</p></div>
+        <div>
+            <?php if (!empty($siteProjects)): ?>
+                <?php foreach (array_slice($siteProjects, 0, 6) as $project): ?>
+                    <?php
+                        $years = is_array($project['years'] ?? null) ? $project['years'] : [];
+                        $yearLabel = trim((string)($years['from'] ?? ''));
+                        if (($years['to'] ?? '') !== '' && (string)$years['to'] !== $yearLabel) $yearLabel .= '—' . (string)$years['to'];
+                        $projectUrl = trim((string)($project['url'] ?? '')) ?: $projectsPageUrl;
+                    ?>
+                    <a class="xproject-row" href="<?= escapeHtml($projectUrl) ?>" target="_blank" rel="noopener"><span class="xproject-year"><?= escapeHtml($yearLabel) ?></span><span class="xproject-title"><?= escapeHtml((string)$project['title']) ?></span><span class="xproject-desc"><?= escapeHtml((string)($project['description'] ?? $project['subtitle'] ?? '')) ?></span><span class="xarrow">Смотреть ↗</span></a>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <a class="xproject-row" href="<?= escapeHtml($projectsPageUrl) ?>"><span class="xproject-year">—</span><span class="xproject-title">Все проекты</span><span class="xproject-desc">Открыть архив проектов</span><span class="xarrow">Смотреть ↗</span></a>
+            <?php endif; ?>
+        </div>
+    </section>
+
+    <section class="xsection" id="contacts">
+        <div class="xsection-head"><h2>Контакты</h2><p class="xsection-intro">Только способы связи. Погода находится выше в собственном разделе.</p></div>
+        <div class="xcontacts">
+            <?php if (toStringSafe($profile['telegram_url'] ?? '') !== ''): ?><a class="xcontact-row" href="<?= escapeHtml($profile['telegram_url']) ?>" target="_blank" rel="noopener"><span>Telegram</span><span class="xarrow">Написать ↗</span></a><?php endif; ?>
+            <?php foreach ($links as $link): ?>
+                <?php $contactUrl = toStringSafe($link['url'] ?? ''); $contactLabel = toStringSafe($link['label'] ?? 'Ссылка'); if ($contactUrl === '') continue; ?>
+                <a class="xcontact-row" href="<?= escapeHtml($contactUrl) ?>" target="_blank" rel="noopener"><span><?= escapeHtml($contactLabel) ?></span><span class="xarrow">Открыть ↗</span></a>
+            <?php endforeach; ?>
+        </div>
+    </section>
+    <footer class="xfooter"><span>© <?= date('Y') ?> <?= escapeHtml($profile['name']) ?></span><span><?= escapeHtml($profile['quote']) ?></span></footer>
+</main>
 <div class="orb orb-1" aria-hidden="true"></div>
 <div class="orb orb-2" aria-hidden="true"></div>
 <div class="orb orb-3" aria-hidden="true"></div>
