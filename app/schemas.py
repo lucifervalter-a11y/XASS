@@ -27,7 +27,7 @@ class HeartbeatResponse(BaseModel):
     recovered: bool = False
     new_source: bool = False
     server_time: datetime
-    server_version: str = "0.4.4"
+    server_version: str = "0.5.0"
     update: dict[str, Any] | None = None
     commands: list[dict[str, Any]] = Field(default_factory=list)
 

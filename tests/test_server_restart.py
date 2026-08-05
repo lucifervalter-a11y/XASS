@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,6 +108,58 @@ class ServerStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["restart_scheduled"])
         self.assertFalse(payload["restart_performed"])
         self.assertEqual(len(background.tasks), 1)
+
+    async def test_manual_restart_is_scheduled_after_response(self) -> None:
+        background = BackgroundTasks()
+        user = MiniAppUser(1, "A", "", "a", True)
+        payload = await main.mini_restart(background, user)
+        self.assertTrue(payload["restart_scheduled"])
+        self.assertEqual(len(background.tasks), 1)
+
+
+class SiteManagementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owner_can_save_profile_and_project(self) -> None:
+        user = MiniAppUser(1, "A", "", "a", True)
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            fake_settings = SimpleNamespace(
+                profile_json_path=str(root / "profile.json"),
+                profile_backups_dir=str(root / "backups"),
+                profile_audit_log_path=str(root / "profile-audit.jsonl"),
+                projects_json_path=str(root / "projects.json"),
+                projects_backups_dir=str(root / "project-backups"),
+                projects_audit_log_path=str(root / "project-audit.jsonl"),
+                profile_public_url="https://xass.example/profile.php",
+            )
+            profile_payload = main.MiniSiteProfilePayload(
+                name="XASS",
+                title="Системы, которые остаются живыми.",
+                bio="Рабочее описание",
+                username="owner",
+                telegram_url="https://t.me/owner",
+                stack=["Python", "FastAPI"],
+                links=[{"label": "GitHub", "url": "https://github.com/example"}],
+            )
+            project_payload = main.MiniSiteProjectPayload(
+                title="XASS",
+                description="Control center",
+                status="working",
+                year_from=2025,
+                year_to=2026,
+                tags=["Python", "Telegram"],
+                featured=True,
+            )
+            with patch.object(main, "settings", fake_settings):
+                saved_profile = await main.mini_site_profile_save(profile_payload, user)
+                saved_project = await main.mini_site_project_save(project_payload, user)
+                snapshot = await main.mini_site(user)
+            self.assertTrue(saved_profile["ok"])
+            self.assertEqual(saved_profile["profile"]["name"], "XASS")
+            self.assertTrue(saved_project["ok"])
+            self.assertEqual(saved_project["project"]["status"], "working")
+            self.assertEqual(snapshot["public_url"], "https://xass.example/profile.php")
+            self.assertTrue((root / "profile-audit.jsonl").is_file())
+            self.assertTrue((root / "project-audit.jsonl").is_file())
 
 
 class UpdateStatusTests(unittest.TestCase):

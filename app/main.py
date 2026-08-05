@@ -52,11 +52,26 @@ from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbe
 from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.music_card import build_music_card, build_search_links
-from app.services.profile_editor import ensure_profile_exists, load_profile, save_profile
+from app.services.profile_editor import (
+    ensure_profile_exists,
+    load_profile,
+    save_profile,
+    save_profile_with_backup,
+    validate_http_url,
+)
 from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes
 from app.services.restart_notice import clear_restart_notice, get_restart_notice, save_restart_notice
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
-from app.services.projects_store import ensure_projects_exists, ensure_site_config_exists
+from app.services.projects_store import (
+    append_audit_log as append_projects_audit_log,
+    backup_json_file,
+    create_project_id,
+    ensure_projects_exists,
+    ensure_site_config_exists,
+    load_projects,
+    normalize_project,
+    save_projects,
+)
 from app.services.updater import get_update_status, restart_service, run_update
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
@@ -68,7 +83,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.5.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -152,6 +167,33 @@ class MiniAgentPairPayload(BaseModel):
     source_name: str = Field(default="", max_length=128)
 
 
+class MiniSiteProfilePayload(BaseModel):
+    name: str = Field(default="", max_length=120)
+    title: str = Field(default="", max_length=180)
+    bio: str = Field(default="", max_length=1200)
+    username: str = Field(default="", max_length=80)
+    telegram_url: str = Field(default="", max_length=500)
+    avatar_url: str = Field(default="", max_length=500)
+    quote: str = Field(default="", max_length=500)
+    stack: list[str] = Field(default_factory=list, max_length=24)
+    links: list[dict[str, str]] = Field(default_factory=list, max_length=16)
+
+
+class MiniSiteProjectPayload(BaseModel):
+    id: str = Field(default="", max_length=100)
+    title: str = Field(default="", max_length=160)
+    subtitle: str = Field(default="", max_length=240)
+    description: str = Field(default="", max_length=2000)
+    url: str = Field(default="", max_length=500)
+    status: str = Field(default="dev", max_length=32)
+    year_from: int = Field(default_factory=lambda: datetime.now(timezone.utc).year, ge=1970, le=2100)
+    year_to: int = Field(default_factory=lambda: datetime.now(timezone.utc).year, ge=1970, le=2100)
+    tags: list[str] = Field(default_factory=list, max_length=24)
+    featured: bool = False
+    cover_type: str = Field(default="image", max_length=16)
+    cover_src: str = Field(default="", max_length=1000)
+
+
 async def _run_bot_post_startup() -> None:
     """Finish Telegram setup without blocking readiness of the HTTP server."""
     if bot_client is None:
@@ -207,10 +249,10 @@ async def _run_bot_post_startup() -> None:
         logger.warning("Failed to set bot commands", exc_info=True)
 
 
-async def _restart_after_mini_update(chat_id: int) -> None:
+async def _restart_after_mini_request(chat_id: int, reason: str) -> None:
     # This background task starts only after the HTTP response has been sent.
     await asyncio.sleep(0.35)
-    save_restart_notice(settings, chat_id=chat_id, reason="после обновления из Mini App")
+    save_restart_notice(settings, chat_id=chat_id, reason=reason)
     try:
         await asyncio.to_thread(restart_service, settings)
     except Exception:
@@ -635,6 +677,161 @@ async def mini_bootstrap(
     }
 
 
+def _mini_public_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "name",
+        "title",
+        "bio",
+        "username",
+        "telegram_url",
+        "avatar_url",
+        "quote",
+        "stack",
+        "links",
+        "now_listening_text",
+        "weather_text",
+    )
+    return {key: profile.get(key) for key in fields}
+
+
+@app.get("/api/mini/site")
+async def mini_site(
+    user: MiniAppUser = Depends(require_mini_user),
+) -> dict[str, Any]:
+    profile = load_profile(Path(settings.profile_json_path))
+    projects = load_projects(Path(settings.projects_json_path))
+    return {
+        "ok": True,
+        "profile": _mini_public_profile(profile),
+        "projects": projects,
+        "public_url": (settings.profile_public_url or "").strip(),
+        "can_edit": user.is_owner,
+    }
+
+
+@app.post("/api/mini/site/profile")
+async def mini_site_profile_save(
+    payload: MiniSiteProfilePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    profile_path = Path(settings.profile_json_path)
+    profile = load_profile(profile_path)
+    links: list[dict[str, str]] = []
+    try:
+        for item in payload.links:
+            label = str(item.get("label") or "").strip()[:60]
+            raw_url = str(item.get("url") or "").strip()
+            if not label or not raw_url:
+                continue
+            links.append({"label": label, "url": validate_http_url(raw_url, field_name="url")})
+        telegram_url = validate_http_url(payload.telegram_url, field_name="telegram_url")
+        avatar_url = validate_http_url(payload.avatar_url, field_name="avatar_url")
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    profile.update(
+        {
+            "name": payload.name.strip(),
+            "title": payload.title.strip(),
+            "bio": payload.bio.strip(),
+            "username": payload.username.strip().lstrip("@"),
+            "telegram_url": telegram_url,
+            "avatar_url": avatar_url,
+            "quote": payload.quote.strip(),
+            "stack": [str(item).strip()[:60] for item in payload.stack if str(item).strip()],
+            "links": links,
+        }
+    )
+    saved, _backup, changed = save_profile_with_backup(
+        profile_path=profile_path,
+        backup_dir=Path(settings.profile_backups_dir),
+        audit_log_path=Path(settings.profile_audit_log_path),
+        actor_user_id=user.user_id,
+        action="miniapp_profile_save",
+        profile_data=profile,
+    )
+    return {"ok": True, "profile": _mini_public_profile(saved), "changed_fields": changed}
+
+
+@app.post("/api/mini/site/projects")
+async def mini_site_project_save(
+    payload: MiniSiteProjectPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    if not payload.title.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Название проекта обязательно")
+    projects_path = Path(settings.projects_json_path)
+    projects = load_projects(projects_path)
+    project_id = payload.id.strip()
+    existing_ids = {str(item.get("id") or "") for item in projects}
+    if not project_id:
+        project_id = create_project_id(payload.title, existing_ids)
+    project = normalize_project(
+        {
+            "id": project_id,
+            "title": payload.title,
+            "subtitle": payload.subtitle,
+            "description": payload.description,
+            "url": payload.url,
+            "status": payload.status,
+            "years": {"from": payload.year_from, "to": payload.year_to},
+            "tags": payload.tags,
+            "featured": payload.featured,
+            "cover": {"type": payload.cover_type, "src": payload.cover_src},
+            "sort": next(
+                (int(item.get("sort") or 100) for item in projects if str(item.get("id")) == project_id),
+                100 + len(projects) * 10,
+            ),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        fallback_id=project_id,
+    )
+    replaced = False
+    for index, item in enumerate(projects):
+        if str(item.get("id")) == project_id:
+            projects[index] = project
+            replaced = True
+            break
+    if not replaced:
+        projects.append(project)
+    if project["featured"]:
+        for item in projects:
+            item["featured"] = str(item.get("id")) == project_id
+
+    backup = backup_json_file(projects_path, Path(settings.projects_backups_dir), "projects")
+    saved = save_projects(projects_path, projects)
+    append_projects_audit_log(
+        Path(settings.projects_audit_log_path),
+        user.user_id,
+        "miniapp_project_save",
+        {"project_id": project_id, "created": not replaced, "backup_path": str(backup) if backup else None},
+    )
+    return {"ok": True, "project": next(item for item in saved if item["id"] == project_id), "projects": saved}
+
+
+@app.delete("/api/mini/site/projects/{project_id}")
+async def mini_site_project_delete(
+    project_id: str,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    projects_path = Path(settings.projects_json_path)
+    projects = load_projects(projects_path)
+    remaining = [item for item in projects if str(item.get("id")) != project_id]
+    if len(remaining) == len(projects):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Проект не найден")
+    if remaining and not any(bool(item.get("featured")) for item in remaining):
+        remaining[0]["featured"] = True
+    backup = backup_json_file(projects_path, Path(settings.projects_backups_dir), "projects")
+    saved = save_projects(projects_path, remaining)
+    append_projects_audit_log(
+        Path(settings.projects_audit_log_path),
+        user.user_id,
+        "miniapp_project_delete",
+        {"project_id": project_id, "backup_path": str(backup) if backup else None},
+    )
+    return {"ok": True, "projects": saved}
+
+
 @app.post("/api/mini/agents/pair-code")
 async def mini_agent_pair_code(
     request: Request,
@@ -967,7 +1164,7 @@ async def mini_run_update(
     )
     restart_scheduled = bool(update_applied and result.restart_required)
     if restart_scheduled:
-        background_tasks.add_task(_restart_after_mini_update, user.user_id)
+        background_tasks.add_task(_restart_after_mini_request, user.user_id, "после обновления из Mini App")
     def _commit_dict(c: Any) -> dict[str, Any] | None:
         if c is None:
             return None
@@ -982,6 +1179,15 @@ async def mini_run_update(
         "restart_scheduled": restart_scheduled,
         "error": result.error,
     }
+
+
+@app.post("/api/mini/restart")
+async def mini_restart(
+    background_tasks: BackgroundTasks,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    background_tasks.add_task(_restart_after_mini_request, user.user_id, "по команде из Mini App")
+    return {"ok": True, "restart_scheduled": True}
 
 
 @app.get("/server/metrics", dependencies=[Depends(require_setup_api_key)])
