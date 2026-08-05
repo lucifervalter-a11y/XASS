@@ -19,6 +19,7 @@ jobs:
         shell: bash
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_FALLBACK_IP: 51.250.80.137
         run: |
           set -euo pipefail
           if [[ "$SSH_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -26,11 +27,13 @@ jobs:
             exit 0
           fi
           ip="$(curl --fail --silent --show-error --retry 3 \
-            --resolve cloudflare-dns.com:443:1.1.1 \
             -H 'accept: application/dns-json' \
             "https://cloudflare-dns.com/dns-query?name=${SSH_HOST}&type=A" \
-            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(item["data"] for item in data.get("Answer", []) if item.get("type") == 1))')"
-          test -n "$ip"
+            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next((item["data"] for item in data.get("Answer", []) if item.get("type") == 1), ""))')" || true
+          if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::DNS lookup failed for ${SSH_HOST}; using the verified VPS fallback IP"
+            ip="$SSH_FALLBACK_IP"
+          fi
           echo "host=$ip" >> "$GITHUB_OUTPUT"
 
       - name: Deploy via SSH
