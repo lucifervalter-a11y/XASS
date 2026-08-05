@@ -40,7 +40,7 @@ def _version(client_root: Path) -> str:
 
 
 def _package_files(client_root: Path) -> list[Path]:
-    ignored_parts = {".venv", ".updates", "__pycache__"}
+    ignored_parts = {".venv", ".build-venv", ".updates", "build", "dist", "__pycache__"}
     ignored_names = {
         "config.json",
         ".command-results.json",
@@ -54,7 +54,7 @@ def _package_files(client_root: Path) -> list[Path]:
         relative = path.relative_to(client_root)
         if any(part in ignored_parts for part in relative.parts):
             continue
-        if path.name in ignored_names or path.suffix.lower() == ".pyc":
+        if path.name in ignored_names or path.suffix.lower() == ".pyc" or ".generated." in path.name:
             continue
         result.append(path)
     return sorted(result, key=lambda item: item.relative_to(client_root).as_posix())

@@ -10,9 +10,10 @@
 - Мониторинг CPU/RAM/DISK/NET/uptime + статусы systemd-сервисов.
 - Edit alerts are sent as formatted cards (old/new/diff + message link) to notify chat.
 - Telegram Mini App с мобильным центром управления, подключением ПК и удалёнными командами.
-- Оконное приложение XASS для Windows (`pc_client/run_agent.bat`).
+- Полноценное приложение XASS для Windows с установщиком, меню «Пуск», автозапуском и ассоциацией файлов `.xass`.
 - Подписанные автообновления Windows-клиента из актуальной серверной папки `pc_client`.
-- Подключение Windows-клиента одним файлом `xass-connect.json` с адресом сервера и короткоживущим pair-code.
+- Подключение Windows-клиента одним файлом `xass-connect.xass` с адресом сервера и короткоживущим pair-code.
+- Скачивание установщика и удалённая блокировка Windows из Telegram Mini App.
 
 ## Структура
 
@@ -24,6 +25,7 @@
 - `app/services/agent_updates.py` - сборка и подпись пакетов обновления ПК-клиента.
 - `agent/agent.py` - кроссплатформенный агент (Windows/Linux).
 - `pc_client/desktop_app.py` - оконное приложение XASS для Windows.
+- `pc_client/build_installer.ps1` - воспроизводимая сборка приложения и Windows-установщика.
 - `miniapp.php` - Telegram Mini App.
 
 ## Быстрый старт (локально)

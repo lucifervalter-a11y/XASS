@@ -15,11 +15,23 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 CLIENT_ROOT = Path(__file__).resolve().parent
-VERSION_PATH = CLIENT_ROOT / "version.json"
-REVISION_PATH = CLIENT_ROOT / ".installed-revision"
-RESULTS_PATH = CLIENT_ROOT / ".command-results.json"
-UPDATE_ROOT = CLIENT_ROOT / ".updates"
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", CLIENT_ROOT))
+DATA_ROOT = (
+    Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "XASS"
+    if getattr(sys, "frozen", False)
+    else CLIENT_ROOT
+)
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+VERSION_PATH = RESOURCE_ROOT / "version.json"
+BUILD_INFO_PATH = RESOURCE_ROOT / "build-info.json"
+REVISION_PATH = DATA_ROOT / ".installed-revision"
+RESULTS_PATH = DATA_ROOT / ".command-results.json"
+UPDATE_ROOT = DATA_ROOT / ".updates"
 UPDATE_MARKER = UPDATE_ROOT / ".in-progress"
+
+
+def is_installer_build() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
 
 def current_version() -> str:
@@ -34,7 +46,11 @@ def current_revision() -> str:
     try:
         return REVISION_PATH.read_text(encoding="utf-8").strip()
     except OSError:
-        return ""
+        try:
+            payload = json.loads(BUILD_INFO_PATH.read_text(encoding="utf-8"))
+            return str(payload.get("revision") or "").strip()
+        except (OSError, ValueError, TypeError):
+            return ""
 
 
 def _manifest_message(manifest: dict[str, Any]) -> bytes:
@@ -141,6 +157,78 @@ def _cache_busted_url(url: str, token: str) -> str:
     query = parse_qsl(parsed.query, keep_blank_values=True)
     query.append(("download", token))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def download_installer_update(
+    manifest: dict[str, Any],
+    *,
+    api_key: str,
+    trust_env: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    import httpx
+
+    if not is_installer_build():
+        raise RuntimeError("installer update is only supported by the installed XASS app")
+    if not verify_manifest(manifest, api_key):
+        raise RuntimeError("installer manifest signature is invalid")
+    url = str(manifest.get("url") or "").strip()
+    expected_sha = str(manifest.get("sha256") or "").strip().lower()
+    version = str(manifest.get("version") or "").strip()
+    revision = str(manifest.get("revision") or "").strip()
+    if not url or len(expected_sha) != 64 or not version or not revision:
+        raise RuntimeError("installer manifest is incomplete")
+
+    UPDATE_ROOT.mkdir(parents=True, exist_ok=True)
+    target = UPDATE_ROOT / f"XASS-Setup-{version}-{revision[:12]}.exe"
+    temporary = target.with_suffix(".download")
+    temporary.unlink(missing_ok=True)
+    if progress:
+        progress("Скачивание установщика XASS…")
+    try:
+        with httpx.Client(timeout=180, trust_env=trust_env, follow_redirects=True) as client:
+            with client.stream(
+                "GET",
+                url,
+                headers={"X-Api-Key": api_key, "Accept-Encoding": "identity", "Cache-Control": "no-cache"},
+            ) as response:
+                response.raise_for_status()
+                with temporary.open("wb") as handle:
+                    for chunk in response.iter_bytes():
+                        handle.write(chunk)
+        if _sha256(temporary) != expected_sha:
+            raise RuntimeError("installer checksum mismatch")
+        temporary.replace(target)
+        if progress:
+            progress("Установщик проверен")
+        return target
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def launch_installer_update(installer_path: Path, *, wait_pid: int | None = None) -> None:
+    if not is_installer_build() or os.name != "nt":
+        raise RuntimeError("installer update requires the installed Windows app")
+    bundled_helper = Path(sys.executable).with_name("XASSUpdater.exe")
+    if not bundled_helper.is_file():
+        raise RuntimeError("XASS update helper is missing")
+    helper_root = UPDATE_ROOT / "helpers"
+    helper_root.mkdir(parents=True, exist_ok=True)
+    for stale_helper in helper_root.glob("XASSUpdater-*.exe"):
+        try:
+            stale_helper.unlink()
+        except OSError:
+            pass
+    detached_helper = helper_root / f"XASSUpdater-{uuid4().hex}.exe"
+    shutil.copy2(bundled_helper, detached_helper)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(
+        [str(detached_helper), "--installer", str(installer_path), "--wait-pid", str(wait_pid or os.getppid())],
+        cwd=str(installer_path.parent),
+        creationflags=creationflags,
+        close_fds=True,
+    )
 
 
 def launch_update_helper(

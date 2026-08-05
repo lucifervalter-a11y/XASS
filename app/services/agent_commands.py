@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AgentCommand
 
-ALLOWED_AGENT_COMMANDS = {"update", "restart"}
+ALLOWED_AGENT_COMMANDS = {"update", "restart", "lock"}
 
 
 def _now_utc() -> datetime:

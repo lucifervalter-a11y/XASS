@@ -1,0 +1,62 @@
+name: Build Windows agent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pc_client/**"
+      - "app/services/agent_installer.py"
+      - ".github/workflows/windows-agent.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: xass-windows-agent
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pc_client/requirements.txt
+            pc_client/build-requirements.txt
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: powershell
+        run: .\pc_client\build_installer.ps1 -SkipToolInstall
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-windows-installer
+          path: |
+            pc_client/dist/installer/XASS-Setup.exe
+            pc_client/dist/installer/XASS-Setup.json
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-installer:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-windows-installer
+          path: release
+      - name: Publish installer to XASS server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "release/XASS-Setup.exe,release/XASS-Setup.json"
+          target: "/opt/serverredus/data/releases"
+          strip_components: 1

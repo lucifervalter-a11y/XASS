@@ -33,6 +33,7 @@ from app.services.agent_commands import (
     latest_agent_commands,
 )
 from app.services.agent_connection import build_connection_profile, normalize_server_origin
+from app.services.agent_installer import build_installer_manifest, get_agent_installer, installer_public_info
 from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.app_config import (
@@ -83,7 +84,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -423,7 +424,15 @@ async def agent_heartbeat(
         base_url=manifest_base_url,
         current_version=payload.agent_version,
         current_revision=payload.agent_revision,
-    )
+    ) if payload.agent_distribution != "installer" else None
+    installer_manifest = await asyncio.to_thread(
+        build_installer_manifest,
+        settings,
+        api_key=(x_api_key or "").strip(),
+        base_url=manifest_base_url,
+        current_version=payload.agent_version,
+        current_revision=payload.agent_revision,
+    ) if payload.agent_distribution == "installer" else None
 
     return HeartbeatResponse(
         ok=True,
@@ -433,6 +442,7 @@ async def agent_heartbeat(
         server_time=datetime.now(timezone.utc),
         server_version=APP_VERSION,
         update=update_manifest,
+        installer_update=installer_manifest,
         commands=commands,
     )
 
@@ -482,6 +492,44 @@ async def agent_update_package(
 ) -> FileResponse:
     # Compatibility for clients that received a pre-0.4.3 manifest.
     return await _agent_update_package_response(revision, session, x_api_key)
+
+
+def _agent_installer_response() -> FileResponse:
+    installer = get_agent_installer(settings)
+    if installer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Windows installer is not available yet")
+    return FileResponse(
+        installer.path,
+        media_type="application/vnd.microsoft.portable-executable",
+        filename=f"XASS-Setup-{installer.version}.exe",
+        headers={
+            "ETag": f'"{installer.sha256}"',
+            "X-XASS-Version": installer.version,
+            "X-XASS-Revision": installer.revision,
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.get("/agent/installer/{revision}.exe")
+async def agent_installer_download(
+    revision: str,
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+) -> FileResponse:
+    auth = await authenticate_agent_api_key(
+        session,
+        api_key=x_api_key,
+        global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    installer = get_agent_installer(settings)
+    if installer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Windows installer is not available yet")
+    if revision != installer.revision:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Installer changed; refresh manifest")
+    return _agent_installer_response()
 
 
 @app.post("/profile/now-playing/external")
@@ -672,6 +720,7 @@ async def mini_bootstrap(
         ],
         "metrics": metrics,
         "services": services,
+        "windows_installer": installer_public_info(settings),
         "quotes_count": len(quotes),
         "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
     }
@@ -884,8 +933,22 @@ async def mini_agent_pair_code(
         "ttl_minutes": result.ttl_minutes,
         "server_url": server_url,
         "connection": connection,
-        "connection_file_name": "xass-connect.json",
+        "connection_file_name": "xass-connect.xass",
     }
+
+
+@app.get("/api/mini/agent-installer")
+async def mini_agent_installer_info(
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, object]:
+    return {"ok": True, **installer_public_info(settings)}
+
+
+@app.get("/api/mini/agent-installer/download")
+async def mini_agent_installer_download(
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> FileResponse:
+    return _agent_installer_response()
 
 
 @app.post("/api/mini/agents/{source_name}/commands")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
+import platform
 import queue
 import socket
 import subprocess
@@ -28,35 +30,72 @@ from client_agent import (
     normalize_server_url,
     save_config,
 )
-from client_update import current_revision, current_version, download_update, launch_update_helper
+from client_update import (
+    DATA_ROOT,
+    UPDATE_MARKER,
+    current_revision,
+    current_version,
+    download_installer_update,
+    download_update,
+    is_installer_build,
+    launch_installer_update,
+    launch_update_helper,
+)
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 
 ROOT = Path(__file__).resolve().parent
-BG = "#000000"
-SIDEBAR = "#05070a"
-CARD = "#090d12"
-CARD_HOVER = "#111822"
-FIELD = "#0b1017"
-LINE = "#27303a"
-TEXT = "#f5f7fb"
-MUTED = "#929baa"
-ACCENT = "#2878ff"
-ACCENT_HOVER = "#1f68df"
-VIOLET = "#7457ff"
-GREEN = "#45d982"
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+BG = "#070708"
+SIDEBAR = "#0b0b0c"
+CARD = "#111214"
+CARD_HOVER = "#17191d"
+FIELD = "#101114"
+LINE = "#2b2d31"
+TEXT = "#f4f4f5"
+MUTED = "#9c9ca3"
+ACCENT = "#3b82f6"
+ACCENT_HOVER = "#2f73df"
+VIOLET = "#3b82f6"
+GREEN = "#61c554"
 AMBER = "#efb65c"
 RED = "#f36b76"
+
+
+def _configure_windows_process() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XASS.Desktop.Agent")
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def _resource_path(relative: str) -> Path:
+    return RESOURCE_ROOT / relative
 
 
 class XassDesktop:
     def __init__(self, root: tk.Tk, *, minimized: bool = False, preview: bool = False) -> None:
         self.root = root
-        self.root.title("XASS — Desktop Agent Preview" if preview else "XASS — Desktop Agent")
-        self.root.geometry("1240x800")
-        self.root.minsize(1040, 680)
+        self.root.title("XASS — предпросмотр" if preview else "XASS")
+        self.root.geometry("1360x840")
+        self.root.minsize(1080, 700)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.option_add("*Font", ("Segoe UI", 10))
+        icon_path = _resource_path("assets/xass.ico")
+        if icon_path.is_file():
+            try:
+                self.root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
 
         self.config = ensure_minimal_defaults(load_config())
         self.config["desktop_managed"] = True
@@ -77,11 +116,15 @@ class XassDesktop:
         self.connection_var = tk.StringVar(value="Остановлен")
         self.last_seen_var = tk.StringVar(value="Heartbeat ещё не получен")
         self.server_state_var = tk.StringVar(value="Не проверен")
-        self.import_status_var = tk.StringVar(value="Выберите файл, скачанный в Telegram Mini App")
+        self.import_status_var = tk.StringVar(value="Выберите файл .xass, скачанный в Telegram Mini App")
         self.status_color = AMBER
         self.cpu_var = tk.StringVar(value="—")
         self.memory_var = tk.StringVar(value="—")
         self.disk_var = tk.StringVar(value="—")
+        self.memory_detail_var = tk.StringVar(value="—")
+        self.disk_detail_var = tk.StringVar(value="—")
+        self.uptime_var = tk.StringVar(value="—")
+        self.local_time_var = tk.StringVar(value="—")
         self.metric_bars: dict[str, tuple[tk.Canvas, int]] = {}
 
         self._build_shell()
@@ -147,7 +190,7 @@ class XassDesktop:
         shell = tk.Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=218, highlightbackground=LINE, highlightthickness=1)
+        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=286, highlightbackground=LINE, highlightthickness=1)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
@@ -163,10 +206,10 @@ class XassDesktop:
         ).pack(anchor="w", pady=(2, 0))
 
         for key, label in (
-            ("overview", "⌂   Обзор"),
-            ("connection", "⛓   Подключение"),
-            ("logs", "◉   События"),
-            ("settings", "⚙   Настройки"),
+            ("overview", "Обзор"),
+            ("connection", "Подключение"),
+            ("logs", "События"),
+            ("settings", "Настройки"),
         ):
             button = tk.Button(
                 self.sidebar,
@@ -273,89 +316,118 @@ class XassDesktop:
         return card
 
     def _build_overview(self) -> None:
-        self._header("Обзор", "Агент, локальные ресурсы и соединение с XASS")
+        self._header("Этот компьютер", "Агент XASS, локальные ресурсы и соединение")
         self.metric_bars = {}
 
-        top = tk.Frame(self.content, bg=BG)
-        top.pack(fill="x")
-        top.columnconfigure(0, weight=5, uniform="top")
-        top.columnconfigure(1, weight=3, uniform="top")
+        identity = tk.Frame(self.content, bg=BG)
+        identity.pack(fill="x", pady=(3, 18))
+        identity.columnconfigure(0, weight=3)
+        identity.columnconfigure(1, weight=2)
 
-        hero = self._card(top, padding=24)
-        hero.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        hero.columnconfigure(1, weight=1)
-        seal = tk.Canvas(hero, width=168, height=168, bg=CARD, highlightthickness=0)
-        seal.grid(row=0, column=0, rowspan=3, sticky="w", padx=(0, 26))
-        seal.create_oval(10, 10, 158, 158, outline="#17396e", width=3)
-        seal.create_oval(23, 23, 145, 145, outline="#245cae", width=2)
-        seal.create_polygon(84, 42, 119, 57, 116, 103, 84, 128, 52, 103, 49, 57, outline=ACCENT, fill="#09172d", width=3)
-        seal.create_text(84, 84, text="✓", fill=ACCENT, font=("Segoe UI Semibold", 31))
-        status_line = tk.Frame(hero, bg=CARD)
-        status_line.grid(row=0, column=1, sticky="sw")
-        self.hero_dot = tk.Label(status_line, text="●", bg=CARD, fg=self.status_color, font=("Segoe UI", 14))
+        primary = tk.Frame(identity, bg=BG)
+        primary.grid(row=0, column=0, sticky="nsew")
+        computer = tk.Canvas(primary, width=150, height=118, bg=BG, highlightthickness=0)
+        computer.pack(side="left", padx=(8, 30))
+        computer.create_rectangle(25, 15, 125, 82, outline=TEXT, width=3)
+        computer.create_line(75, 82, 75, 101, fill=TEXT, width=3)
+        computer.create_line(49, 102, 101, 102, fill=TEXT, width=3)
+        computer.create_oval(72, 46, 78, 52, fill=ACCENT, outline=ACCENT)
+        copy = tk.Frame(primary, bg=BG)
+        copy.pack(side="left", fill="y", pady=(10, 0))
+        tk.Label(copy, text=self.name_var.get(), bg=BG, fg=TEXT, font=("Segoe UI Semibold", 24)).pack(anchor="w")
+        status_line = tk.Frame(copy, bg=BG)
+        status_line.pack(anchor="w", pady=(12, 0))
+        self.hero_dot = tk.Label(status_line, text="●", bg=BG, fg=self.status_color, font=("Segoe UI", 12))
         self.hero_dot.pack(side="left")
-        tk.Label(status_line, textvariable=self.connection_var, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 22)).pack(side="left", padx=(9, 0))
-        tk.Label(hero, text=self.name_var.get(), bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).grid(row=1, column=1, sticky="sw", pady=(8, 0))
-        details = tk.Frame(hero, bg=CARD)
-        details.grid(row=2, column=1, sticky="new", pady=(4, 0))
-        tk.Label(details, text=self.server_var.get(), bg=CARD, fg=MUTED, font=("Cascadia Mono", 9)).pack(anchor="w")
-        tk.Label(details, textvariable=self.last_seen_var, bg=CARD, fg="#c0c8d3", font=("Segoe UI", 9)).pack(anchor="w", pady=(12, 0))
-        actions = tk.Frame(hero, bg=CARD)
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(24, 0))
-        if self.config.get("api_key"):
-            self._button(actions, "Проверить обновление", self.check_update, kind="ghost").pack(side="left")
-            self._button(actions, "Перезапустить агент", self.restart_agent).pack(side="left", padx=(10, 0))
-        else:
-            self._button(actions, "Подключить компьютер", lambda: self.show_view("connection"), kind="primary").pack(side="left")
+        tk.Label(status_line, textvariable=self.connection_var, bg=BG, fg=GREEN, font=("Segoe UI Semibold", 13)).pack(side="left", padx=(8, 0))
+        channel = "TLS-соединение" if self.server_var.get().lower().startswith("https://") else "Канал с персональным API-ключом"
+        tk.Label(copy, text=channel, bg=BG, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(8, 0))
 
-        metrics = self._card(top, padding=20)
-        metrics.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        tk.Label(metrics, text="РЕСУРСЫ ПК", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w", pady=(0, 8))
-        self._metric_row(metrics, "CPU", self.cpu_var, ACCENT, "cpu")
-        self._metric_row(metrics, "Память", self.memory_var, VIOLET, "memory")
-        self._metric_row(metrics, "Диск", self.disk_var, ACCENT, "disk")
+        system_info = tk.Frame(identity, bg=BG)
+        system_info.grid(row=0, column=1, sticky="nsew", padx=(28, 0))
+        self._connection_row(system_info, "Имя компьютера", socket.gethostname())
+        self._connection_row(system_info, "Пользователь", os.environ.get("USERNAME") or "—")
+        self._connection_row(system_info, "ОС", f"Windows {platform.release()}" if os.name == "nt" else platform.system())
+        self._connection_row(system_info, "Время работы", self.uptime_var)
+        self._connection_row(system_info, "Локальное время", self.local_time_var)
 
-        bottom = tk.Frame(self.content, bg=BG)
-        bottom.pack(fill="both", expand=True, pady=(14, 0))
-        bottom.columnconfigure(0, weight=5, uniform="bottom")
-        bottom.columnconfigure(1, weight=3, uniform="bottom")
-        bottom.rowconfigure(0, weight=1)
+        tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
+        middle = tk.Frame(self.content, bg=BG)
+        middle.pack(fill="x", pady=22)
+        middle.columnconfigure(0, weight=1, uniform="middle")
+        middle.columnconfigure(1, weight=1, uniform="middle")
 
-        events = self._card(bottom, padding=20)
-        events.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        tk.Label(events, text="Последние события", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w", pady=(0, 12))
-        self.overview_log = ScrolledText(events, height=9, bg=CARD, fg="#a8b2c0", insertbackground=TEXT, relief="flat", borderwidth=0, font=("Cascadia Mono", 9), padx=0, pady=0)
+        resources = tk.Frame(middle, bg=BG)
+        resources.grid(row=0, column=0, sticky="nsew", padx=(18, 40))
+        tk.Label(resources, text="Локальные ресурсы", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
+        self._metric_row(resources, "CPU", self.cpu_var, ACCENT, "cpu")
+        self._metric_row(resources, "Память", self.memory_var, ACCENT, "memory", self.memory_detail_var)
+        self._metric_row(resources, "Диск", self.disk_var, ACCENT, "disk", self.disk_detail_var)
+
+        connection = tk.Frame(middle, bg=BG, highlightbackground=LINE, highlightthickness=0)
+        connection.grid(row=0, column=1, sticky="nsew", padx=(40, 18))
+        tk.Label(connection, text="Подключение", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
+        server = normalize_server_url(self.server_var.get())
+        protocol = "TLS" if server.lower().startswith("https://") else "HTTP"
+        self._connection_row(connection, "Сервер", server)
+        self._connection_row(connection, "Протокол", protocol)
+        self._connection_row(connection, "Статус", self.server_state_var, GREEN)
+        self._connection_row(connection, "Версия клиента", current_version())
+        self._connection_row(connection, "Автообновления", "Включены (подписанные)" if self.auto_update_var.get() else "Выключены", GREEN if self.auto_update_var.get() else AMBER)
+
+        tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
+        events_head = tk.Frame(self.content, bg=BG)
+        events_head.pack(fill="x", pady=(18, 10))
+        tk.Label(events_head, text="Последние события", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
+        self._button(events_head, "Открыть все события", lambda: self.show_view("logs"), kind="ghost").pack(side="right")
+        self.overview_log = ScrolledText(
+            self.content,
+            height=8,
+            bg=BG,
+            fg="#c7c9ce",
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightbackground=LINE,
+            highlightthickness=1,
+            font=("Cascadia Mono", 9),
+            padx=18,
+            pady=13,
+        )
         self.overview_log.pack(fill="both", expand=True)
         for line in self.history[-120:]:
             self.overview_log.insert("end", line + "\n")
         self.overview_log.see("end")
 
-        connection = self._card(bottom, padding=20)
-        connection.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        tk.Label(connection, text="Подключение", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w", pady=(0, 12))
-        self._connection_row(connection, "Адрес сервера", self.server_var.get())
-        self._connection_row(connection, "Имя источника", self.name_var.get())
-        self._connection_row(connection, "Версия", f"{current_version()} · {(current_revision()[:10] or 'local')}")
-        self._connection_row(connection, "Обновления", "Автоматически" if self.auto_update_var.get() else "Вручную", GREEN if self.auto_update_var.get() else AMBER)
-        self._button(connection, "Открыть подключение", lambda: self.show_view("connection"), kind="ghost").pack(fill="x", side="bottom", pady=(16, 0))
-
-    def _metric_row(self, parent: tk.Misc, label: str, value: tk.StringVar, color: str, key: str) -> None:
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=9)
-        head = tk.Frame(row, bg=CARD)
+    def _metric_row(
+        self,
+        parent: tk.Misc,
+        label: str,
+        value: tk.StringVar,
+        color: str,
+        key: str,
+        detail: tk.StringVar | None = None,
+    ) -> None:
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=10)
+        head = tk.Frame(row, bg=BG)
         head.pack(fill="x")
-        tk.Label(head, text=label, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
-        tk.Label(head, textvariable=value, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 15)).pack(side="right")
-        track = tk.Canvas(row, height=6, bg="#20262e", highlightthickness=0)
-        track.pack(fill="x", pady=(9, 5))
-        bar = track.create_rectangle(0, 0, 0, 6, fill=color, outline=color)
+        tk.Label(head, text=label, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
+        tk.Label(head, textvariable=value, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="right")
+        track = tk.Canvas(row, height=5, bg="#2b2d31", highlightthickness=0)
+        track.pack(fill="x", pady=(8, 3))
+        bar = track.create_rectangle(0, 0, 0, 5, fill=color, outline=color)
         self.metric_bars[key] = (track, bar)
+        if detail is not None:
+            tk.Label(row, textvariable=detail, bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="e")
 
-    def _connection_row(self, parent: tk.Misc, label: str, value: str, color: str = TEXT) -> None:
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=9)
-        tk.Label(row, text=label, bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
-        tk.Label(row, text=value, bg=CARD, fg=color, font=("Segoe UI Semibold", 9), wraplength=190).pack(side="right")
+    def _connection_row(self, parent: tk.Misc, label: str, value: str | tk.StringVar, color: str = TEXT) -> None:
+        parent_bg = str(parent.cget("bg"))
+        row = tk.Frame(parent, bg=parent_bg)
+        row.pack(fill="x", pady=6)
+        tk.Label(row, text=label, bg=parent_bg, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
+        options: dict[str, Any] = {"textvariable": value} if isinstance(value, tk.StringVar) else {"text": value}
+        tk.Label(row, bg=parent_bg, fg=color, font=("Segoe UI Semibold", 9), wraplength=260, **options).pack(side="right")
 
     def _refresh_local_metrics(self) -> None:
         try:
@@ -367,6 +439,16 @@ class XassDesktop:
             self.cpu_var.set(f"{values['cpu']:.0f}%")
             self.memory_var.set(f"{values['memory']:.0f}%")
             self.disk_var.set(f"{values['disk']:.0f}%")
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage("C:\\" if os.name == "nt" else "/")
+            self.memory_detail_var.set(f"{memory.used / (1024**3):.1f} / {memory.total / (1024**3):.1f} ГБ")
+            self.disk_detail_var.set(f"{disk.used / (1024**3):.0f} / {disk.total / (1024**3):.0f} ГБ")
+            uptime = max(0, int(time.time() - psutil.boot_time()))
+            days, remainder = divmod(uptime, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes = remainder // 60
+            self.uptime_var.set(f"{days} д. {hours} ч. {minutes} мин.")
+            self.local_time_var.set(datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
             for key, percent in values.items():
                 item = self.metric_bars.get(key)
                 if not item:
@@ -545,16 +627,19 @@ class XassDesktop:
         selected = filedialog.askopenfilename(
             parent=self.root,
             title="Выберите файл подключения XASS",
-            filetypes=(("XASS connection", "*.json"), ("Все файлы", "*.*")),
+            filetypes=(("Подключение XASS", "*.xass *.json"), ("Все файлы", "*.*")),
         )
         if not selected:
             return
+        self.import_connection_path(Path(selected))
+
+    def import_connection_path(self, selected: Path) -> None:
         try:
-            profile = load_connection_file(Path(selected))
+            profile = load_connection_file(selected)
         except ValueError as exc:
             messagebox.showerror("XASS", str(exc))
             return
-        self._apply_connection_profile(profile, Path(selected).name)
+        self._apply_connection_profile(profile, selected.name)
 
     def paste_connection(self) -> None:
         try:
@@ -641,7 +726,7 @@ class XassDesktop:
             return
         if self.process and self.process.poll() is None:
             return
-        update_marker = ROOT / ".updates" / ".in-progress"
+        update_marker = UPDATE_MARKER
         if update_marker.exists():
             if self._update_is_running(update_marker):
                 self._set_status("Устанавливается обновление…", AMBER)
@@ -651,13 +736,17 @@ class XassDesktop:
         if not self.config.get("server_url") or not self.config.get("api_key"):
             self._set_status("Требуется подключение", AMBER)
             return
-        args = [sys.executable, "-u", str(ROOT / "client_agent.py"), "--desktop-managed"]
+        args = (
+            [sys.executable, "--agent", "--desktop-managed"]
+            if is_installer_build()
+            else [sys.executable, "-u", str(ROOT / "client_agent.py"), "--desktop-managed"]
+        )
         environment = os.environ.copy()
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
         process = subprocess.Popen(
             args,
-            cwd=str(ROOT),
+            cwd=str(DATA_ROOT if is_installer_build() else ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -707,6 +796,11 @@ class XassDesktop:
         if self.process is not process:
             return
         self.process = None
+        if code == 76:
+            self._set_status("Установка обновления…", AMBER)
+            self._closing = True
+            self.root.after(120, self.root.destroy)
+            return
         self._set_status("Перезапуск…" if code == 75 else "Остановлен", AMBER if code == 75 else RED)
         if code == 75:
             self._schedule_start(120)
@@ -760,7 +854,8 @@ class XassDesktop:
                     )
                     response.raise_for_status()
                     data = response.json()
-                manifest = data.get("update") if isinstance(data, dict) else None
+                manifest_key = "installer_update" if is_installer_build() else "update"
+                manifest = data.get(manifest_key) if isinstance(data, dict) else None
                 if not isinstance(manifest, dict) or not manifest.get("available"):
                     self.root.after(0, lambda: messagebox.showinfo("XASS", "Установлена актуальная версия"))
                     return
@@ -781,13 +876,22 @@ class XassDesktop:
 
         def worker() -> None:
             try:
-                stage = download_update(
-                    manifest,
-                    api_key=str(self.config.get("api_key")),
-                    trust_env=bool(self.config.get("trust_env_proxy", False)),
-                    progress=lambda message: self.log_queue.put(message),
-                )
-                launch_update_helper(stage, manifest, command_id=None, restart_target="desktop", minimized=False)
+                if is_installer_build():
+                    installer = download_installer_update(
+                        manifest,
+                        api_key=str(self.config.get("api_key")),
+                        trust_env=bool(self.config.get("trust_env_proxy", False)),
+                        progress=lambda message: self.log_queue.put(message),
+                    )
+                    launch_installer_update(installer, wait_pid=os.getpid())
+                else:
+                    stage = download_update(
+                        manifest,
+                        api_key=str(self.config.get("api_key")),
+                        trust_env=bool(self.config.get("trust_env_proxy", False)),
+                        progress=lambda message: self.log_queue.put(message),
+                    )
+                    launch_update_helper(stage, manifest, command_id=None, restart_target="desktop", minimized=False)
                 self.root.after(0, self.root.destroy)
             except Exception as exc:
                 self.root.after(0, lambda error=str(exc): self._update_failed(error))
@@ -834,12 +938,23 @@ class XassDesktop:
 
 
 def main() -> None:
+    if "--agent" in sys.argv:
+        sys.argv = [sys.argv[0], *[arg for arg in sys.argv[1:] if arg != "--agent"]]
+        from client_agent import main as agent_main
+
+        agent_main()
+        return
     parser = argparse.ArgumentParser(description="XASS desktop PC agent")
     parser.add_argument("--minimized", action="store_true")
     parser.add_argument("--preview", action="store_true", help="show the interface without starting the agent")
+    parser.add_argument("connection_file", nargs="?", help="XASS connection profile to import")
     args = parser.parse_args()
+    _configure_windows_process()
     root = tk.Tk()
-    XassDesktop(root, minimized=args.minimized, preview=args.preview)
+    app = XassDesktop(root, minimized=args.minimized, preview=args.preview)
+    if args.connection_file:
+        profile_path = Path(args.connection_file).expanduser().resolve()
+        root.after(350, lambda: app.import_connection_path(profile_path))
     root.mainloop()
 
 

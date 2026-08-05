@@ -1,4 +1,5 @@
 ﻿import argparse
+import ctypes
 import json
 import os
 import platform
@@ -14,10 +15,14 @@ import httpx
 import psutil
 
 from client_update import (
+    DATA_ROOT,
     clear_command_results,
     current_revision,
     current_version,
+    download_installer_update,
     download_update,
+    is_installer_build,
+    launch_installer_update,
     launch_update_helper,
     load_command_results,
     store_command_result,
@@ -25,7 +30,7 @@ from client_update import (
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+CONFIG_PATH = DATA_ROOT / "config.json"
 
 
 def _disk_path() -> str:
@@ -180,6 +185,7 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
         "tags": [platform.system(), platform.node()],
         "agent_version": current_version(),
         "agent_revision": current_revision(),
+        "agent_distribution": "installer" if is_installer_build() else "source",
         "command_results": load_command_results(),
     }
     if discord is not None:
@@ -381,6 +387,24 @@ def _restart_agent(config: dict[str, Any], command_id: int) -> str:
     return "restart"
 
 
+def _lock_workstation(command_id: int) -> None:
+    if os.name != "nt":
+        store_command_result(command_id, False, "Блокировка доступна только на Windows")
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.LockWorkStation.argtypes = []
+        user32.LockWorkStation.restype = ctypes.c_bool
+        if not user32.LockWorkStation():
+            error = ctypes.get_last_error()
+            raise OSError(error, "LockWorkStation failed")
+        store_command_result(command_id, True, "Экран Windows заблокирован")
+        print("[pc-client] Windows workstation locked")
+    except Exception as exc:
+        store_command_result(command_id, False, f"Не удалось заблокировать Windows: {exc}")
+        print(f"[pc-client] lock failed: {exc}")
+
+
 def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
     try:
         stage = download_update(
@@ -404,6 +428,26 @@ def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: 
         print(f"[pc-client] update failed: {exc}")
         if command_id is not None:
             store_command_result(command_id, False, f"Ошибка обновления: {exc}")
+        return None
+
+
+def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
+    try:
+        installer = download_installer_update(
+            manifest,
+            api_key=str(config.get("api_key") or ""),
+            trust_env=bool(config.get("trust_env_proxy", False)),
+            progress=lambda message: print(f"[pc-client] {message}"),
+        )
+        if command_id is not None:
+            store_command_result(command_id, True, f"Запущена установка XASS {manifest.get('version')}")
+        launch_installer_update(installer)
+        print(f"[pc-client] installer update staged: {manifest.get('version')}")
+        return "installer_update"
+    except Exception as exc:
+        print(f"[pc-client] installer update failed: {exc}")
+        if command_id is not None:
+            store_command_result(command_id, False, f"Ошибка обновления установщика: {exc}")
         return None
 
 
@@ -448,6 +492,7 @@ def run_agent(config: dict[str, Any]) -> str:
                     clear_command_results(sent_result_ids)
 
                 manifest = body.get("update") if isinstance(body.get("update"), dict) else None
+                installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
                 commands = body.get("commands") if isinstance(body.get("commands"), list) else []
                 update_command_id: int | None = None
                 for command in commands:
@@ -458,18 +503,32 @@ def run_agent(config: dict[str, Any]) -> str:
                     except (TypeError, ValueError):
                         continue
                     command_name = str(command.get("command") or "").strip().lower()
+                    if command_name == "lock":
+                        _lock_workstation(command_id)
+                        continue
                     if command_name == "restart":
                         return _restart_agent(config, command_id)
                     if command_name == "update":
                         update_command_id = command_id
 
                 if update_command_id is not None:
-                    if manifest and manifest.get("available"):
+                    if is_installer_build() and installer_manifest and installer_manifest.get("available"):
+                        update_result = _apply_installer_update(config, installer_manifest, update_command_id)
+                        if update_result:
+                            return update_result
+                    elif not is_installer_build() and manifest and manifest.get("available"):
                         update_result = _apply_update(config, manifest, update_command_id)
                         if update_result:
                             return update_result
                     else:
                         store_command_result(update_command_id, True, "Версия уже актуальна")
+                elif is_installer_build() and installer_manifest and installer_manifest.get("available") and bool(config.get("auto_update", True)):
+                    revision = str(installer_manifest.get("revision") or "")
+                    if revision and revision != failed_auto_revision:
+                        update_result = _apply_installer_update(config, installer_manifest, None)
+                        if update_result:
+                            return update_result
+                        failed_auto_revision = revision
                 elif manifest and manifest.get("available") and bool(config.get("auto_update", True)):
                     revision = str(manifest.get("revision") or "")
                     if revision and revision != failed_auto_revision:
@@ -532,6 +591,8 @@ def main() -> None:
         reason = run_agent(config)
         if reason in {"update", "restart"}:
             raise SystemExit(75)
+        if reason == "installer_update":
+            raise SystemExit(76)
     except KeyboardInterrupt:
         print("\n[pc-client] stopped by user")
     except Exception as exc:

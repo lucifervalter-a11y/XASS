@@ -11,3 +11,7 @@ pc_client/config.json
 pc_client/.installed-revision
 pc_client/.command-results.json
 pc_client/.updates/
+pc_client/.build-venv/
+pc_client/build/
+pc_client/dist/
+pc_client/packaging/*.generated.*

@@ -7,10 +7,21 @@ declare(strict_types=1);
 
 $BACKEND = 'http://127.0.0.1:8000';
 
-header('Content-Type: application/json; charset=utf-8');
+$binaryMode = isset($_GET['_binary']) && (string)$_GET['_binary'] === '1';
+if (!$binaryMode) {
+    header('Content-Type: application/json; charset=utf-8');
+}
 http_response_code(200);
 
 function proxy_error(int $status, string $detail): void {
+    global $binaryMode;
+    if ($binaryMode) {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: private, no-store');
+        header('X-XASS-Status: ' . $status);
+        echo json_encode(['ok' => false, 'detail' => $detail]);
+        exit;
+    }
     echo json_encode(['_s' => $status, '_b' => json_encode(['ok' => false, 'detail' => $detail])]);
     exit;
 }
@@ -88,6 +99,25 @@ if (!empty($http_response_header)) {
     if (preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
         $httpCode = (int)$m[1];
     }
+}
+
+if ($binaryMode) {
+    $contentType = 'application/octet-stream';
+    $contentDisposition = 'attachment; filename="XASS-Setup.exe"';
+    foreach ($http_response_header as $headerLine) {
+        if (stripos($headerLine, 'Content-Type:') === 0) {
+            $contentType = trim(substr($headerLine, strlen('Content-Type:')));
+        } elseif (stripos($headerLine, 'Content-Disposition:') === 0) {
+            $contentDisposition = trim(substr($headerLine, strlen('Content-Disposition:')));
+        }
+    }
+    header('Content-Type: ' . $contentType);
+    header('Content-Disposition: ' . $contentDisposition);
+    header('Content-Length: ' . strlen((string)$responseBody));
+    header('Cache-Control: private, no-store');
+    header('X-XASS-Status: ' . $httpCode);
+    echo (string)$responseBody;
+    exit;
 }
 
 echo json_encode(['_s' => $httpCode, '_b' => (string)$responseBody]);
