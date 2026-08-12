@@ -93,7 +93,10 @@ def panel_text() -> str:
         "/start  — панель управления\n"
         "/status — статус heartbeat\n"
         "/server — метрики сервера\n"
-        "/pc     — состояние ПК"
+        "/pc     — состояние ПК\n"
+        "/chats  — сохранённые переписки\n"
+        "/deleted — удалённые сообщения\n"
+        "/archive — локальный архив на ПК"
     )
 
 
@@ -122,6 +125,8 @@ def dot_commands_help_text() -> str:
         "Статус: /status\n"
         "Сервер: /server\n"
         "ПК:     /pc"
+        "\nАрхив переписок: /chats и /deleted"
+        "\nХранение медиа на ПК: /archive"
     )
 
 

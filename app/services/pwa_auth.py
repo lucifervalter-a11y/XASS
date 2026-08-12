@@ -14,6 +14,7 @@ from app.services.miniapp import MiniAppUser
 
 MAX_LOGIN_AGE_SEC = 10 * 60
 SESSION_AGE_SEC = 30 * 24 * 60 * 60
+ACTION_PROOF_AGE_SEC = 2 * 60
 COOKIE_NAME = "xass_pwa"
 
 
@@ -109,3 +110,29 @@ def authenticate_session(token: str, settings: Settings, *, now: int | None = No
         username=str(payload.get("username") or ""),
         is_owner=True,
     )
+
+
+def issue_action_proof(user_id: int, purpose: str, settings: Settings, *, now: int | None = None) -> str:
+    issued_at = int(time.time() if now is None else now)
+    payload = {"v": 1, "id": int(user_id), "purpose": str(purpose), "iat": issued_at, "exp": issued_at + ACTION_PROOF_AGE_SEC}
+    encoded = _b64_encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    signature = hmac.new(_session_secret(settings), b"action." + encoded.encode("ascii"), hashlib.sha256).digest()
+    return f"{encoded}.{_b64_encode(signature)}"
+
+
+def verify_action_proof(token: str, user_id: int, purpose: str, settings: Settings, *, now: int | None = None) -> bool:
+    try:
+        encoded, received_signature = token.split(".", 1)
+        expected = hmac.new(_session_secret(settings), b"action." + encoded.encode("ascii"), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64_decode(received_signature)):
+            return False
+        payload = json.loads(_b64_decode(encoded))
+        current = int(time.time() if now is None else now)
+        return bool(
+            int(payload.get("v") or 0) == 1
+            and int(payload.get("id") or 0) == int(user_id)
+            and str(payload.get("purpose") or "") == str(purpose)
+            and current < int(payload.get("exp") or 0)
+        )
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+        return False

@@ -44,6 +44,7 @@ from client_update import (
     write_agent_status,
 )
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
+from archive_store import archive_root, archive_status, conversation_rows
 
 ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
@@ -123,6 +124,8 @@ class XassDesktop:
         self.pair_var = tk.StringVar()
         self.interval_var = tk.StringVar(value=str(self.config.get("interval_sec") or 30))
         self.auto_update_var = tk.BooleanVar(value=bool(self.config.get("auto_update", True)))
+        self.archive_folder_var = tk.StringVar(value=str(self.config.get("archive_folder") or archive_root(self.config)))
+        self.archive_state_var = tk.StringVar(value="Локальный архив ещё не синхронизирован")
         self.connection_var = tk.StringVar(value="Остановлен")
         self.last_seen_var = tk.StringVar(value="Heartbeat ещё не получен")
         self.server_state_var = tk.StringVar(value="Не проверен")
@@ -224,6 +227,7 @@ class XassDesktop:
             ("overview", "Обзор"),
             ("connection", "Подключение"),
             ("logs", "События"),
+            ("archive", "Архив сообщений"),
             ("settings", "Настройки"),
         ):
             button = tk.Button(
@@ -285,6 +289,8 @@ class XassDesktop:
             self._build_connection()
         elif name == "logs":
             self._build_logs()
+        elif name == "archive":
+            self._build_archive()
         elif name == "settings":
             self._build_settings()
         else:
@@ -576,6 +582,8 @@ class XassDesktop:
         check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
         check.pack(anchor="w", pady=(6, 14))
         self._field(runtime, "Интервал heartbeat, секунд", self.interval_var)
+        self._field(runtime, "Папка локального архива", self.archive_folder_var)
+        self._button(runtime, "Выбрать папку архива", self.choose_archive_folder, kind="ghost").pack(fill="x", pady=(9, 0))
         self._button(runtime, "Сохранить настройки", self.save_settings, kind="primary").pack(fill="x", pady=(20, 0))
 
         maintenance = self._card(columns, padding=23)
@@ -612,6 +620,69 @@ class XassDesktop:
             self.full_log.insert("end", line + "\n")
         self.full_log.configure(state="disabled")
 
+    def _build_archive(self) -> None:
+        self._header("Архив сообщений", "Тексты и медиа хранятся локально на этом компьютере")
+        status = archive_status(self.config)
+        summary = self._card(self.content, padding=18)
+        summary.pack(fill="x", pady=(0, 14))
+        tk.Label(summary, text="ЛОКАЛЬНОЕ ХРАНИЛИЩЕ", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        self.archive_state_var.set(
+            f"Папка: {status.get('folder')}\nСинхронизировано событий: {status.get('cursor', 0)} · "
+            f"Индекс: {int(status.get('database_size', 0)) / 1024:.1f} КБ"
+        )
+        tk.Label(summary, textvariable=self.archive_state_var, bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 10)).pack(anchor="w", pady=(9, 12))
+        actions = tk.Frame(summary, bg=CARD)
+        actions.pack(fill="x")
+        self._button(actions, "Открыть папку", self.open_archive_folder, kind="primary").pack(side="left")
+        self._button(actions, "Выбрать другую", self.choose_archive_folder, kind="secondary").pack(side="left", padx=(9, 0))
+
+        self.archive_messages = ScrolledText(
+            self.content,
+            bg=CARD,
+            fg="#d8dce4",
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightbackground=LINE,
+            highlightthickness=1,
+            font=("Segoe UI", 10),
+            padx=18,
+            pady=14,
+        )
+        self.archive_messages.pack(fill="both", expand=True)
+        rows = conversation_rows(self.config, 500)
+        for row in reversed(rows):
+            timestamp = str(row.get("message_date") or row.get("updated_at") or "").replace("T", " ")[:16]
+            title = row.get("chat_title") or row.get("from_username") or row.get("chat_id")
+            marker = "  [УДАЛЕНО]" if row.get("deleted") else ""
+            direction = "→" if row.get("direction") == "outgoing" else "←"
+            text = str(row.get("text_content") or "Медиа / сообщение без текста").replace("\n", " ")
+            media = f"  · файлов: {row.get('media_count')}" if row.get("media_count") else ""
+            self.archive_messages.insert("end", f"{timestamp}  {direction} {title}{marker}{media}\n{text}\n\n")
+        if not rows:
+            self.archive_messages.insert("end", "Архив пуст. Включите этот компьютер как цель хранения в XASS Mini App.")
+        self.archive_messages.configure(state="disabled")
+
+    def choose_archive_folder(self) -> None:
+        selected = filedialog.askdirectory(parent=self.root, title="Папка локального архива XASS", initialdir=str(archive_root(self.config)))
+        if not selected:
+            return
+        self.archive_folder_var.set(selected)
+        self.config["archive_folder"] = selected
+        save_config(self.config)
+        self._log(f"Папка архива: {selected}")
+        self.restart_agent()
+        if self.current_view == "archive":
+            self.show_view("archive")
+
+    def open_archive_folder(self) -> None:
+        folder = archive_root(self.config)
+        folder.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            os.startfile(str(folder))
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+
     def _clear_log_view(self) -> None:
         if hasattr(self, "full_log") and self.full_log.winfo_exists():
             self.full_log.configure(state="normal")
@@ -631,6 +702,7 @@ class XassDesktop:
                 "source_type": "PC_AGENT",
                 "interval_sec": interval,
                 "auto_update": self.auto_update_var.get(),
+                "archive_folder": self.archive_folder_var.get().strip(),
                 "desktop_managed": True,
             }
         )

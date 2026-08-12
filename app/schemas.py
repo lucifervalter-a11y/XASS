@@ -20,6 +20,8 @@ class HeartbeatPayload(BaseModel):
     agent_revision: str = Field(default="", max_length=128)
     agent_distribution: str = Field(default="source", max_length=32)
     command_results: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    archive_cursor: int = Field(default=0, ge=0)
+    archive_status: dict[str, Any] = Field(default_factory=dict)
 
 
 class HeartbeatResponse(BaseModel):
@@ -28,10 +30,12 @@ class HeartbeatResponse(BaseModel):
     recovered: bool = False
     new_source: bool = False
     server_time: datetime
-    server_version: str = "0.9.2"
+    server_version: str = "0.10.0"
     update: dict[str, Any] | None = None
     installer_update: dict[str, Any] | None = None
     commands: list[dict[str, Any]] = Field(default_factory=list)
+    archive_enabled: bool = False
+    archive_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentPairClaimPayload(BaseModel):

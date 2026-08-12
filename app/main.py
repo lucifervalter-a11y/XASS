@@ -9,7 +9,7 @@ from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,7 +26,7 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import HeartbeatSource, MessageLog
+from app.models import HeartbeatSource, MediaAsset, MessageLog, MessageRevision
 from app.services.agent_commands import (
     acknowledge_agent_commands,
     deliver_agent_commands,
@@ -34,6 +34,7 @@ from app.services.agent_commands import (
     latest_agent_commands,
 )
 from app.services.agent_connection import build_connection_profile, normalize_server_origin
+from app.services.agent_archive import archive_events_after, archive_summary, archive_target_map, is_archive_target, set_archive_target
 from app.services.agent_installer import (
     build_installer_manifest,
     get_agent_installer,
@@ -66,6 +67,17 @@ from app.services.pwa_auth import (
     authenticate_session as pwa_authenticate_session,
     authenticate_telegram_login as pwa_authenticate_login,
     issue_session as issue_pwa_session,
+    issue_action_proof,
+    verify_action_proof,
+)
+from app.services.passkeys import (
+    authentication_options as passkey_authentication_options,
+    complete_authentication as passkey_complete_authentication,
+    complete_registration as passkey_complete_registration,
+    count_credentials as passkey_count_credentials,
+    list_credentials as passkey_list_credentials,
+    registration_options as passkey_registration_options,
+    transaction_owner as passkey_transaction_owner,
 )
 from app.services.pwa_pairing import PwaPairingError, consume_pwa_pair_token, issue_pwa_pair_token
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
@@ -94,14 +106,14 @@ from app.services.updater import get_update_status, restart_service, run_update
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.10.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -178,6 +190,11 @@ class MiniQuotePayload(BaseModel):
 class MiniAgentCommandPayload(BaseModel):
     command: str
     payload: dict[str, Any] | None = None
+    action_proof: str = Field(default="", max_length=2048)
+
+
+class MiniArchiveTargetPayload(BaseModel):
+    enabled: bool
 
 
 class MiniAgentPairPayload(BaseModel):
@@ -201,6 +218,16 @@ class PwaTelegramLoginPayload(BaseModel):
     photo_url: str = Field(default="", max_length=1000)
     auth_date: int
     hash: str = Field(min_length=64, max_length=64)
+
+
+class PasskeyStartPayload(BaseModel):
+    purpose: str = Field(default="login", max_length=300)
+
+
+class PasskeyCompletePayload(BaseModel):
+    transaction: str = Field(min_length=20, max_length=256)
+    credential: dict[str, Any]
+    name: str = Field(default="", max_length=120)
 
 
 class MiniSiteProfilePayload(BaseModel):
@@ -292,6 +319,9 @@ async def _run_bot_post_startup() -> None:
                 {"command": "status", "description": "Статус heartbeat-источников"},
                 {"command": "server", "description": "Метрики сервера"},
                 {"command": "pc", "description": "Состояние ПК-агентов"},
+                {"command": "chats", "description": "Сохранённые переписки"},
+                {"command": "deleted", "description": "Удалённые сообщения"},
+                {"command": "archive", "description": "Локальный архив на ПК"},
                 {"command": "update", "description": "Обновление бота и сервиса"},
                 {"command": "help", "description": "Все команды (.muz, .weather…)"},
             ]
@@ -484,6 +514,12 @@ async def agent_heartbeat(
             )
 
     commands = await deliver_agent_commands(session, source_name=source.source_name)
+    archive_enabled = await is_archive_target(session, source.source_name)
+    archive_events = (
+        await archive_events_after(session, cursor=payload.archive_cursor, limit=100)
+        if archive_enabled
+        else []
+    )
     manifest_base_url = str(request.base_url).rstrip("/")
     configured_base_url = (config.service_base_url or settings.profile_public_url or "").strip()
     if configured_base_url:
@@ -517,7 +553,78 @@ async def agent_heartbeat(
         update=update_manifest,
         installer_update=installer_manifest,
         commands=commands,
+        archive_enabled=archive_enabled,
+        archive_events=archive_events,
     )
+
+
+@app.get("/agent/archive/media/{asset_id}")
+async def agent_archive_media(
+    asset_id: int,
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+    x_xass_source: str | None = Header(default=None),
+) -> StreamingResponse:
+    auth = await authenticate_agent_api_key(
+        session,
+        api_key=x_api_key,
+        global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    requested_source = str(x_xass_source or "").strip()
+    if auth.source_name and requested_source and requested_source != auth.source_name:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
+    source_name = str(auth.source_name or requested_source).strip()
+    if not source_name or not await is_archive_target(session, source_name):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Archive is disabled for this agent")
+    asset = await session.get(MediaAsset, asset_id)
+    if asset is None or not asset.archive_allowed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media is not enabled for local archive")
+    return await _telegram_media_response(asset, session)
+
+
+async def _telegram_media_response(
+    asset: MediaAsset | None,
+    session: AsyncSession,
+    *,
+    inline: bool = False,
+) -> StreamingResponse:
+    if asset is None or not asset.file_id or not bot_client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media is unavailable")
+    try:
+        telegram_file = await bot_client.get_file(asset.file_id)
+    except Exception as exc:
+        logger.warning("Could not refresh Telegram media path for asset %s: %s", asset.id, exc)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media is unavailable") from exc
+    file_path = str(telegram_file.get("file_path") or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media is unavailable")
+    asset.telegram_file_path = file_path
+    await session.commit()
+    file_url = f"{bot_client.file_url}/{file_path.lstrip('/')}"
+    try:
+        upstream = await bot_client.client.send(
+            bot_client.client.build_request("GET", file_url),
+            stream=True,
+        )
+        upstream.raise_for_status()
+    except Exception as exc:
+        logger.warning("Could not open Telegram media stream for asset %s: %s", asset.id, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Telegram media stream is unavailable") from exc
+
+    async def stream() -> Any:
+        try:
+            async for chunk in upstream.aiter_bytes(1024 * 256):
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    media_type = asset.mime_type or "application/octet-stream"
+    headers = {"Cache-Control": "private, no-store"}
+    if inline:
+        headers["Content-Disposition"] = f'inline; filename="xass-media-{asset.id}"'
+    return StreamingResponse(stream(), media_type=media_type, headers=headers)
 
 
 async def _agent_update_package_response(
@@ -694,6 +801,14 @@ async def require_mini_owner(
     return user
 
 
+def _public_origin(request: Request) -> tuple[str, str]:
+    forwarded_host = str(request.headers.get("x-forwarded-host") or request.url.hostname or "").split(",", 1)[0].strip()
+    host = forwarded_host.split(":", 1)[0]
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",", 1)[0].strip().lower()
+    origin = f"{forwarded_proto}://{forwarded_host}"
+    return host, origin
+
+
 @app.get("/api/pwa/config")
 async def pwa_config(request: Request) -> dict[str, Any]:
     session_user = pwa_authenticate_session(request.cookies.get(PWA_COOKIE_NAME, ""), settings)
@@ -722,6 +837,8 @@ async def pwa_config(request: Request) -> dict[str, Any]:
         "https": forwarded_proto == "https" or public_host in {"localhost", "127.0.0.1"},
     }
     login_ready = all(requirements.values())
+    async with SessionLocal() as passkey_session:
+        passkey_count = await passkey_count_credentials(passkey_session, settings.owner_user_id) if settings.owner_user_id else 0
     return {
         "ok": True,
         "authenticated": bool(session_user),
@@ -730,6 +847,8 @@ async def pwa_config(request: Request) -> dict[str, Any]:
         "domain": public_host,
         "domain_verification": "telegram_only",
         "requirements": requirements,
+        "passkey_available": bool(passkey_count),
+        "passkey_count": passkey_count,
     }
 
 
@@ -789,6 +908,109 @@ async def pwa_logout(response: Response) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.post("/api/pwa/passkeys/login/options")
+async def pwa_passkey_login_options(
+    request: Request,
+    payload: PasskeyStartPayload,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    rp_id, origin = _public_origin(request)
+    try:
+        result = await passkey_authentication_options(
+            session,
+            owner_user_id=settings.owner_user_id,
+            rp_id=rp_id,
+            origin=origin,
+            purpose=(payload.purpose or "login").strip() or "login",
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.post("/api/pwa/passkeys/login/verify")
+async def pwa_passkey_login_verify(
+    payload: PasskeyCompletePayload,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        credential, purpose = await passkey_complete_authentication(
+            session,
+            transaction=payload.transaction,
+            credential=payload.credential,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+    user = MiniAppUser(
+        user_id=credential.owner_user_id,
+        first_name="Владелец",
+        last_name="",
+        username="",
+        is_owner=True,
+    )
+    if purpose == "login":
+        response.set_cookie(
+            PWA_COOKIE_NAME,
+            issue_pwa_session(user, settings),
+            max_age=PWA_SESSION_AGE_SEC,
+            httponly=True,
+            secure=settings.pwa_cookie_secure,
+            samesite="lax",
+            path="/",
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "ok": True,
+        "purpose": purpose,
+        "action_proof": issue_action_proof(user.user_id, purpose, settings) if purpose != "login" else "",
+    }
+
+
+@app.post("/api/pwa/passkeys/register/options")
+async def pwa_passkey_register_options(
+    request: Request,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    rp_id, origin = _public_origin(request)
+    try:
+        result = await passkey_registration_options(
+            session,
+            owner_user_id=user.user_id,
+            owner_name=user.first_name or user.username or "Владелец XASS",
+            rp_id=rp_id,
+            origin=origin,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.post("/api/pwa/passkeys/register/verify")
+async def pwa_passkey_register_verify(
+    payload: PasskeyCompletePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        transaction_owner = passkey_transaction_owner(payload.transaction, "register")
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if transaction_owner != user.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owner mismatch")
+    try:
+        credential = await passkey_complete_registration(
+            session,
+            transaction=payload.transaction,
+            credential=payload.credential,
+            name=payload.name,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"ok": True, "credential": {"id": credential.id, "name": credential.name}}
+
+
 def _now_source_label(value: str) -> str:
     return {"pc_agent": "PC", "iphone": "iPhone", "vk": "VK"}.get(value, value or "pc_agent")
 
@@ -839,6 +1061,9 @@ async def mini_bootstrap(
     profile = load_profile(Path(settings.profile_json_path))
     sources = await list_sources(session)
     latest_commands = await latest_agent_commands(session, [item.source_name for item in sources])
+    archive_targets = await archive_target_map(session)
+    archive = await archive_summary(session)
+    passkeys = await passkey_list_credentials(session, user.user_id) if user.is_owner else []
     metrics = collect_server_metrics(top_processes_limit=settings.top_processes_limit)
     services = collect_systemd_statuses(settings.monitored_services)
     quotes = load_quotes(Path(settings.quotes_json_path))
@@ -888,6 +1113,7 @@ async def mini_bootstrap(
                     if item.source_name in latest_commands
                     else None
                 ),
+                "archive_enabled": bool(archive_targets.get(item.source_name) and archive_targets[item.source_name].enabled),
             }
             for item in sources
         ],
@@ -895,6 +1121,17 @@ async def mini_bootstrap(
         "services": services,
         "windows_installer": installer_public_info(settings),
         "quotes_count": len(quotes),
+        "archive": archive,
+        "passkeys": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "created_at": item.created_at.isoformat(),
+                "last_used_at": item.last_used_at.isoformat() if item.last_used_at else None,
+                "backed_up": bool(item.backed_up),
+            }
+            for item in passkeys
+        ],
         "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
     }
 
@@ -1261,12 +1498,23 @@ async def agent_installer_ticket_download(ticket: str = "") -> FileResponse:
 async def mini_agent_command(
     source_name: str,
     payload: MiniAgentCommandPayload,
+    x_telegram_init_data: str | None = Header(default=None),
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    telegram_user = miniapp_authenticate(x_telegram_init_data or "", settings)
+    if payload.command in {"lock", "restart"} and telegram_user is None:
+        purpose = f"agent:{payload.command}:{source.source_name}"
+        if await passkey_count_credentials(session, user.user_id) and not verify_action_proof(
+            payload.action_proof,
+            user.user_id,
+            purpose,
+            settings,
+        ):
+            raise HTTPException(status_code=status.HTTP_428_PRECONDITION_REQUIRED, detail="Подтвердите действие через Face ID / Passkey")
     try:
         item = await enqueue_agent_command(
             session,
@@ -1287,6 +1535,25 @@ async def mini_agent_command(
             "created_at": item.created_at.isoformat(),
         },
     }
+
+
+@app.post("/api/mini/agents/{source_name}/archive")
+async def mini_agent_archive_target(
+    source_name: str,
+    payload: MiniArchiveTargetPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        target = await set_archive_target(
+            session,
+            source_name=source_name,
+            enabled=payload.enabled,
+            actor_user_id=user.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"ok": True, "source_name": target.source_name, "enabled": bool(target.enabled)}
 
 
 @app.post("/api/mini/setting")
@@ -1403,6 +1670,116 @@ async def mini_logs(
         for row in rows
     ]
     return {"ok": True, "logs": logs}
+
+
+@app.get("/api/mini/conversations")
+async def mini_conversations(
+    user: MiniAppUser = Depends(require_mini_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    summary_rows = (
+        await session.execute(
+            select(
+                MessageLog.chat_id,
+                func.count(MessageLog.id),
+                func.sum(case((MessageLog.deleted.is_(True), 1), else_=0)),
+                func.max(MessageLog.id),
+            )
+            .group_by(MessageLog.chat_id)
+            .order_by(func.max(MessageLog.id).desc())
+        )
+    ).all()
+    latest_ids = [int(row[3]) for row in summary_rows if row[3] is not None]
+    latest_rows = list(await session.scalars(select(MessageLog).where(MessageLog.id.in_(latest_ids)))) if latest_ids else []
+    latest_by_id = {row.id: row for row in latest_rows}
+    chats: list[dict[str, Any]] = []
+    for source_chat_id, message_count, deleted_count, latest_id in summary_rows:
+        latest = latest_by_id.get(int(latest_id))
+        if latest is None:
+            continue
+        chats.append(
+            {
+                "chat_id": source_chat_id,
+                "title": latest.chat_title or latest.from_username or str(source_chat_id),
+                "chat_type": latest.chat_type,
+                "count": int(message_count or 0),
+                "deleted": int(deleted_count or 0),
+                "last_text": (latest.text_content or "Медиа / сообщение без текста")[:160],
+                "last_date": (latest.message_date or latest.created_at).isoformat(),
+            }
+        )
+    return {"ok": True, "chats": chats, "archive": await archive_summary(session)}
+
+
+@app.get("/api/mini/conversations/{chat_id}")
+async def mini_conversation_messages(
+    chat_id: int,
+    user: MiniAppUser = Depends(require_mini_user),
+    session: AsyncSession = Depends(get_session),
+    limit: int = 100,
+    before: int = 0,
+    deleted_only: bool = False,
+) -> dict[str, Any]:
+    query = select(MessageLog).where(MessageLog.chat_id == chat_id)
+    if before > 0:
+        query = query.where(MessageLog.id < before)
+    if deleted_only:
+        query = query.where(MessageLog.deleted.is_(True))
+    bounded = max(1, min(limit, 200))
+    fetched = list(await session.scalars(query.order_by(MessageLog.id.desc()).limit(bounded + 1)))
+    has_more = len(fetched) > bounded
+    rows = fetched[:bounded]
+    messages: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        revisions = list(
+            await session.scalars(
+                select(MessageRevision).where(MessageRevision.message_id == row.id).order_by(MessageRevision.id.asc())
+            )
+        )
+        assets = list(
+            await session.scalars(
+                select(MediaAsset).where(
+                    MediaAsset.message_id == row.id,
+                    MediaAsset.archive_allowed.is_(True),
+                )
+            )
+        )
+        messages.append(
+            {
+                "id": row.id,
+                "telegram_message_id": row.telegram_message_id,
+                "chat_id": row.chat_id,
+                "chat_title": row.chat_title or "",
+                "from_username": row.from_username or "",
+                "direction": row.direction,
+                "text": row.text_content or "",
+                "deleted": bool(row.deleted),
+                "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+                "edited": row.edited_at is not None,
+                "date": (row.message_date or row.created_at).isoformat(),
+                "revisions": [
+                    {"event": item.event_type, "text": item.text_content or "", "date": item.created_at.isoformat()}
+                    for item in revisions
+                ],
+                "media": [
+                    {"id": asset.id, "type": asset.media_type, "mime_type": asset.mime_type or "", "size": asset.file_size}
+                    for asset in assets
+                ],
+            }
+        )
+    return {"ok": True, "chat_id": chat_id, "messages": messages, "has_more": has_more}
+
+
+@app.get("/api/mini/media/{asset_id}")
+async def mini_conversation_media(
+    asset_id: int,
+    user: MiniAppUser = Depends(require_mini_user),
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    asset = await session.get(MediaAsset, asset_id)
+    if asset is None or not asset.archive_allowed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media is not enabled in the current save mode")
+    return await _telegram_media_response(asset, session, inline=True)
 
 
 @app.get("/api/mini/music")

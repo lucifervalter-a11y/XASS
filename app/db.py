@@ -35,6 +35,16 @@ async def init_db() -> None:
 def _apply_runtime_migrations(connection) -> None:
     inspector = inspect(connection)
     tables = set(inspector.get_table_names())
+    if "media_assets" in tables:
+        media_columns = {item["name"] for item in inspector.get_columns("media_assets")}
+        if "archive_allowed" not in media_columns:
+            connection.execute(text("ALTER TABLE media_assets ADD COLUMN archive_allowed BOOLEAN NOT NULL DEFAULT FALSE"))
+            connection.execute(
+                text(
+                    "UPDATE media_assets SET archive_allowed = TRUE "
+                    "WHERE telegram_file_path IS NOT NULL OR local_path IS NOT NULL"
+                )
+            )
     if "app_config" not in tables:
         return
 

@@ -96,6 +96,17 @@ class AgentCredential(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class AgentArchiveTarget(Base):
+    __tablename__ = "agent_archive_targets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_name: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class AgentCommand(Base):
     __tablename__ = "agent_commands"
 
@@ -169,10 +180,28 @@ class MediaAsset(Base):
     telegram_file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     local_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     download_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    archive_allowed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     message: Mapped[MessageLog] = relationship(back_populates="media_assets")
+
+
+class PasskeyCredential(Base):
+    __tablename__ = "passkey_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    credential_id: Mapped[str] = mapped_column(String(512), unique=True, index=True, nullable=False)
+    public_key: Mapped[str] = mapped_column(Text, nullable=False)
+    sign_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    name: Mapped[str] = mapped_column(String(120), default="Устройство", nullable=False)
+    transports: Mapped[list[str]] = mapped_column(JSON, default=list)
+    device_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    backed_up: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class AdminAction(Base):

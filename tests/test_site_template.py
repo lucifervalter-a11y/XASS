@@ -37,6 +37,11 @@ class SiteTemplateTests(unittest.TestCase):
         self.assertLess(len(entry), 200)
         self.assertIn("require __DIR__ . '/site.php';", entry)
 
+    def test_projects_without_url_do_not_open_legacy_archive(self) -> None:
+        self.assertNotIn("xass_text($project['url'] ?? '', '/projects.php')", self.source)
+        self.assertIn("project-row-static", self.source)
+        self.assertNotIn('class="project-row" href="/projects.php"', self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

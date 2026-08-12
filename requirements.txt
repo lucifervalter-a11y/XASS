@@ -8,3 +8,4 @@ pydantic-settings==2.10.1
 httpx==0.28.1
 psutil==7.0.0
 tzdata==2025.2
+webauthn==3.0.0

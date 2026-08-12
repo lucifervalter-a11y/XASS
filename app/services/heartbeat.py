@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import AgentCredential, AppConfig, HeartbeatSource
+from app.models import AgentArchiveTarget, AgentCredential, AppConfig, HeartbeatSource
 from app.schemas import HeartbeatPayload
 
 logger = logging.getLogger(__name__)
@@ -148,9 +148,12 @@ async def rename_source(session: AsyncSession, current_name: str, new_name: str)
     if existing_credential is not None and existing_credential.source_name != current_name:
         return None
     credential = await session.scalar(select(AgentCredential).where(AgentCredential.source_name == current_name))
+    archive_target = await session.scalar(select(AgentArchiveTarget).where(AgentArchiveTarget.source_name == current_name))
     source.source_name = new_name
     if credential is not None:
         credential.source_name = new_name
+    if archive_target is not None:
+        archive_target.source_name = new_name
     await session.commit()
     await session.refresh(source)
     return source
@@ -161,8 +164,11 @@ async def delete_source_by_id(session: AsyncSession, source_id: int) -> Heartbea
     if source is None:
         return None
     credential = await session.scalar(select(AgentCredential).where(AgentCredential.source_name == source.source_name))
+    archive_target = await session.scalar(select(AgentArchiveTarget).where(AgentArchiveTarget.source_name == source.source_name))
     if credential is not None:
         await session.delete(credential)
+    if archive_target is not None:
+        await session.delete(archive_target)
     await session.delete(source)
     await session.commit()
     return source

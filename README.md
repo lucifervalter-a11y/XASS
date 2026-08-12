@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img alt="Server 0.9.2" src="https://img.shields.io/badge/server-0.9.2-3b82f6?style=flat-square">
+  <img alt="Server 0.10.0" src="https://img.shields.io/badge/server-0.10.0-3b82f6?style=flat-square">
   <img alt="Windows agent 0.8.1" src="https://img.shields.io/badge/Windows_agent-0.8.1-2563eb?style=flat-square&logo=windows11&logoColor=white">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-111827?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-059669?style=flat-square&logo=fastapi&logoColor=white">
@@ -55,10 +55,10 @@ XASS объединяет персонального Telegram Business‑бот�
 
 | Поверхность | Что умеет |
 |---|---|
-| Telegram | Business‑бот, журнал сообщений и правок, медиа, автоответ «Не в сети», тихие часы, уведомления и команды владельца |
-| Mini App | Метрики, агенты, логи, настройки, обновление сервера, скачивание Windows‑клиента, блокировка ПК и управление сайтом |
-| Windows | Нативное приложение, автозапуск, CPU/RAM/Disk, now playing, активное приложение, однофайловая привязка и автообновления |
-| iPhone / PWA | Одноразовый защищённый вход, установка на экран «Домой», управление без повторной авторизации Telegram |
+| Telegram | Business‑бот, полные переписки, история правок и удалений, уведомления и команды владельца |
+| Mini App | Метрики и подробная статистика агентов, переписки, настройки, локальные архивы, блокировка ПК и управление сайтом |
+| Windows | Нативное приложение, автозапуск, CPU/RAM/Disk, локальный архив сообщений и медиа, однофайловая привязка и автообновления |
+| iPhone / PWA | Вход и подтверждение опасных действий через Face ID / Passkey, установка на экран «Домой» |
 | Публичный сайт | Профиль, проекты, цитаты, аватары, контакты, погода и музыка с раздельными зонами интерфейса |
 | Backend | FastAPI, heartbeat, PostgreSQL/SQLite, очередь команд, экспорт, резервные копии и контроль состояния сервисов |
 
@@ -67,8 +67,16 @@ XASS объединяет персонального Telegram Business‑бот�
 - Подключение ПК одноразовым кодом или файлом `xass-connect.xass`.
 - Отдельный API‑ключ для каждого устройства.
 - Удалённые команды: обновить агент, перезапустить, заблокировать Windows.
+- Одинаковое подтверждение команд в Telegram и standalone PWA; при настроенном Passkey блокировка и перезапуск требуют биометрию устройства.
 - Подписанные манифесты обновлений и проверка SHA‑256 перед установкой.
 - Локальный статус соединения, не зависящий от буферизации журнала процесса.
+
+### Переписки и локальный архив
+
+- Mini App показывает диалоги, удалённые сообщения, правки и доступные превью медиа; в боте есть `/chats`, `/chat`, `/deleted` и `/archive`.
+- При `SAVE_FULL` сервер хранит индекс и Telegram `file_id`, но не сохраняет байты медиа на диск VPS.
+- В Mini App можно выбрать один или несколько ПК‑агентов для архива. Каждый выбранный агент сохраняет SQLite‑индекс и файлы в выбранную в Windows‑приложении папку.
+- Telegram сообщает об удалении только для Business‑переписок, доступных подключённому бизнес‑боту. Обычный Bot API не присылает произвольные удаления из чужих чатов.
 
 ### Музыка и активность
 
@@ -94,7 +102,8 @@ flowchart LR
     WIN[Windows Agent] -->|heartbeat + results| API
     SRV[Server Agent] -->|metrics| API
     API --> DB[(PostgreSQL / SQLite)]
-    API --> STORE[(Media + JSON content)]
+    API --> INDEX[(Message index)]
+    API -->|media stream, no VPS copy| WIN
     API --> SITE[Public profile + projects]
     API -->|commands| WIN
     API -->|notifications| TG

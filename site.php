@@ -61,6 +61,7 @@ function xass_icon(string $name, string $class = ''): string
         'github' => '<svg ' . $attrs . '><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3.2-.4 6.5-1.6 6.5-7A5.4 5.4 0 0 0 19 3.8 5 5 0 0 0 18.9.1S17.7-.3 15 1.6a13.4 13.4 0 0 0-7 0C5.3-.3 4.1.1 4.1.1A5 5 0 0 0 4 3.8a5.4 5.4 0 0 0-1.5 3.7c0 5.4 3.3 6.6 6.5 7A4.8 4.8 0 0 0 8 18v4"/><path d="M8 19c-3 .9-3-1.5-4-2"/></svg>',
         'steam' => '<svg ' . $attrs . '><path d="M8.6 16.8 5 15.3a3 3 0 1 1-1.8 3.4"/><circle cx="15.5" cy="8.5" r="4.5"/><circle cx="5.5" cy="18" r="2.5"/><path d="m7.7 16.6 4.6-4.5"/></svg>',
         'link' => '<svg ' . $attrs . '><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.1-1.1"/></svg>',
+        'minus' => '<svg ' . $attrs . '><path d="M5 12h14"/></svg>',
         default => '<svg ' . $attrs . '><circle cx="12" cy="12" r="9"/></svg>',
     };
 }
@@ -300,6 +301,9 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
         .project-list { border-top: 1px solid var(--line); }
         .project-row { min-height: 116px; display: grid; grid-template-columns: 90px minmax(180px,.7fr) minmax(240px,1.2fr) 120px 38px; gap: 24px; align-items: center; border-bottom: 1px solid var(--line); color: inherit; text-decoration: none; transition: padding .35s var(--ease), background .3s; }
         .project-row:hover { padding-inline: 14px; background: linear-gradient(90deg, rgba(55,109,255,.055), transparent 64%); }
+        .project-row-static { cursor: default; }
+        .project-row-static:hover { padding-inline: 0; background: transparent; }
+        .project-row-static:hover svg { transform: none; color: #69717e; }
         .project-year, .project-description, .project-status { color: #737985; font-size: 12px; }
         .project-title { font-size: clamp(19px,2vw,27px); letter-spacing: -.035em; }
         .project-status { color: var(--blue-soft); font: 9px/1.4 "JetBrains Mono", monospace; text-transform: uppercase; letter-spacing: .06em; }
@@ -475,9 +479,10 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
                     $from = xass_text($years['from'] ?? '');
                     $to = xass_text($years['to'] ?? '');
                     $year = $from !== '' && $to !== '' && $to !== $from ? $from . '—' . $to : ($from ?: $to);
-                    $url = xass_text($project['url'] ?? '', '/projects.php');
-                ?><a class="project-row" href="<?= xass_escape($url) ?>"<?= str_starts_with($url, 'http') ? ' target="_blank" rel="noopener"' : '' ?>><span class="project-year"><?= xass_escape($year ?: '—') ?></span><span class="project-title"><?= xass_escape($project['title']) ?></span><span class="project-description"><?= xass_escape($project['description'] ?? $project['subtitle'] ?? '') ?></span><span class="project-status"><?= xass_escape($project['status'] ?? 'В работе') ?></span><?= xass_icon('arrow-up-right') ?></a><?php endforeach; else: ?>
-                    <a class="project-row" href="/projects.php"><span class="project-year">—</span><span class="project-title">Архив проектов</span><span class="project-description">Проекты появятся здесь после публикации в панели XASS.</span><span class="project-status">Открыть</span><?= xass_icon('arrow-up-right') ?></a>
+                    $url = xass_text($project['url'] ?? '');
+                    $tag = $url !== '' ? 'a' : 'div';
+                ?><<?= $tag ?> class="project-row<?= $url === '' ? ' project-row-static' : '' ?>"<?= $url !== '' ? ' href="' . xass_escape($url) . '" target="_blank" rel="noopener"' : ' aria-label="У проекта пока нет внешней ссылки"' ?>><span class="project-year"><?= xass_escape($year ?: '—') ?></span><span class="project-title"><?= xass_escape($project['title']) ?></span><span class="project-description"><?= xass_escape($project['description'] ?? $project['subtitle'] ?? '') ?></span><span class="project-status"><?= xass_escape($project['status'] ?? 'В работе') ?></span><?= $url !== '' ? xass_icon('arrow-up-right') : xass_icon('minus') ?></<?= $tag ?>><?php endforeach; else: ?>
+                    <div class="project-row project-row-static" aria-label="Опубликованных проектов пока нет"><span class="project-year">—</span><span class="project-title">Проекты готовятся</span><span class="project-description">Опубликованные работы появятся здесь после добавления в панели XASS.</span><span class="project-status">Скоро</span><?= xass_icon('minus') ?></div>
                 <?php endif; ?>
             </div>
         </div>

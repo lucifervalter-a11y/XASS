@@ -7,7 +7,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot_api import TelegramBotClient
 from app.enums import MessageEventType, SaveMode
 from app.models import AppConfig, MediaAsset, MessageLog, MessageRevision
-from app.storage import build_media_path
 
 CREATE_KEYS = ("message", "business_message", "channel_post")
 EDIT_KEYS = ("edited_message", "edited_business_message", "edited_channel_post")
@@ -155,43 +154,38 @@ async def _store_media(
     save_mode: SaveMode,
 ) -> None:
     for media_item in media_items:
-        existing = await session.scalar(
+        asset = await session.scalar(
             select(MediaAsset).where(
                 MediaAsset.message_id == message.id,
                 MediaAsset.file_id == media_item["file_id"],
             )
         )
-        if existing:
-            continue
-
-        asset = MediaAsset(
-            message_id=message.id,
-            media_type=media_item["media_type"],
-            file_id=media_item["file_id"],
-            file_unique_id=media_item.get("file_unique_id"),
-            mime_type=media_item.get("mime_type"),
-            file_size=media_item.get("file_size"),
-        )
-        session.add(asset)
-        await session.flush()
+        if asset is None:
+            asset = MediaAsset(
+                message_id=message.id,
+                media_type=media_item["media_type"],
+                file_id=media_item["file_id"],
+                file_unique_id=media_item.get("file_unique_id"),
+                mime_type=media_item.get("mime_type"),
+                file_size=media_item.get("file_size"),
+            )
+            session.add(asset)
+            await session.flush()
 
         if save_mode != SaveMode.SAVE_FULL or not bot_client:
             continue
+        asset.archive_allowed = True
 
         try:
             tg_file = await bot_client.get_file(media_item["file_id"])
             file_path = tg_file.get("file_path")
             if not file_path:
                 continue
-            local_path = build_media_path(
-                chat_id=message.chat_id,
-                message_id=message.telegram_message_id,
-                file_id=media_item["file_id"],
-                source_file_path=file_path,
-            )
-            await bot_client.download_file(file_path, local_path)
             asset.telegram_file_path = file_path
-            asset.local_path = str(local_path)
+            # Media is intentionally not persisted on the VPS. Selected PC
+            # agents fetch it directly from Telegram and write to their local
+            # archive folder.
+            asset.local_path = None
             if tg_file.get("file_size"):
                 asset.file_size = tg_file["file_size"]
         except Exception as exc:

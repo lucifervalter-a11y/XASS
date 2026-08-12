@@ -46,6 +46,7 @@ class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "settings", settings),
                 patch.object(main, "bot_client", None),
                 patch.object(main, "pwa_authenticate_session", return_value=None),
+                patch.object(main, "passkey_count_credentials", AsyncMock(return_value=0)),
             ):
                 payload = await main.pwa_config(make_request(host="xass.example", proto="https"))
 
@@ -69,6 +70,7 @@ class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "settings", settings),
                 patch.object(main, "bot_client", None),
                 patch.object(main, "pwa_authenticate_session", return_value=None),
+                patch.object(main, "passkey_count_credentials", AsyncMock(return_value=0)),
             ):
                 payload = await main.pwa_config(make_request(host="xass.example", proto="http"))
 

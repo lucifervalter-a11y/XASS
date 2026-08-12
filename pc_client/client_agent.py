@@ -30,6 +30,7 @@ from client_update import (
 )
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
+from archive_store import apply_archive_events, archive_cursor, archive_status
 
 CONFIG_PATH = DATA_ROOT / "config.json"
 
@@ -188,6 +189,8 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
         "agent_revision": current_revision(),
         "agent_distribution": "installer" if is_installer_build() else "source",
         "command_results": load_command_results(),
+        "archive_cursor": archive_cursor(config),
+        "archive_status": archive_status(config),
     }
     if discord is not None:
         payload["discord"] = discord
@@ -502,6 +505,13 @@ def run_agent(config: dict[str, Any]) -> str:
                 manifest = body.get("update") if isinstance(body.get("update"), dict) else None
                 installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
                 commands = body.get("commands") if isinstance(body.get("commands"), list) else []
+                archive_result = apply_archive_events(config, body, client=client, headers=headers)
+                if archive_result.get("saved"):
+                    print(
+                        f"[pc-client] archive saved={archive_result['saved']} "
+                        f"cursor={archive_result['cursor']} errors={archive_result.get('errors', 0)}",
+                        flush=True,
+                    )
                 update_command_id: int | None = None
                 for command in commands:
                     if not isinstance(command, dict):
@@ -548,7 +558,7 @@ def run_agent(config: dict[str, Any]) -> str:
                 error = f"[pc-client] heartbeat failed: {exc}"
                 write_agent_status("offline", detail=error)
                 print(error, flush=True)
-            time.sleep(interval_sec)
+            time.sleep(min(interval_sec, 5) if config.get("archive_enabled") else interval_sec)
 
 
 def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
@@ -570,6 +580,10 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
         config["auto_update"] = True
     if "desktop_managed" not in config:
         config["desktop_managed"] = False
+    if "archive_folder" not in config:
+        config["archive_folder"] = ""
+    if "archive_enabled" not in config:
+        config["archive_enabled"] = False
     return config
 
 

@@ -10,6 +10,8 @@ from app.services.pwa_auth import (
     authenticate_session,
     authenticate_telegram_login,
     issue_session,
+    issue_action_proof,
+    verify_action_proof,
 )
 
 
@@ -79,6 +81,12 @@ class PwaAuthTests(unittest.TestCase):
         )
         self.assertIsNone(authenticate_session(token, changed_owner, now=101))
         self.assertIsNone(authenticate_session(token + "x", self.settings, now=101))
+
+    def test_action_proof_is_short_lived_and_purpose_bound(self) -> None:
+        proof = issue_action_proof(42, "agent:lock:Home PC", self.settings, now=100)
+        self.assertTrue(verify_action_proof(proof, 42, "agent:lock:Home PC", self.settings, now=101))
+        self.assertFalse(verify_action_proof(proof, 42, "agent:restart:Home PC", self.settings, now=101))
+        self.assertFalse(verify_action_proof(proof, 42, "agent:lock:Home PC", self.settings, now=400))
 
 
 if __name__ == "__main__":

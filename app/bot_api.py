@@ -230,6 +230,28 @@ class TelegramBotClient:
             payload["caption"] = caption
         return await self._request("sendDocument", payload=payload)
 
+    async def send_media_by_file_id(
+        self,
+        chat_id: int,
+        file_id: str,
+        media_type: str,
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        telegram_type = (media_type or "document").strip().lower()
+        method_and_field = {
+            "photo": ("sendPhoto", "photo"),
+            "video": ("sendVideo", "video"),
+            "voice": ("sendVoice", "voice"),
+            "video_note": ("sendVideoNote", "video_note"),
+            "audio": ("sendAudio", "audio"),
+            "document": ("sendDocument", "document"),
+        }
+        method, field = method_and_field.get(telegram_type, method_and_field["document"])
+        payload: dict[str, Any] = {"chat_id": chat_id, field: file_id}
+        if caption and telegram_type != "video_note":
+            payload["caption"] = caption
+        return await self._request(method, payload=payload)
+
     async def delete_message(self, chat_id: int, message_id: int) -> bool:
         result = await self._request("deleteMessage", payload={"chat_id": chat_id, "message_id": message_id})
         return bool(result)
