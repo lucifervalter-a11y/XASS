@@ -30,7 +30,7 @@ def _requirements_need_install(target: Path, requirements: Path) -> bool:
         return True
 
 
-def _wait_for_exit(pid: int, timeout: int = 45) -> None:
+def _wait_for_exit(pid: int, timeout: int = 20) -> bool:
     if os.name == "nt":
         synchronize = 0x00100000
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -42,20 +42,20 @@ def _wait_for_exit(pid: int, timeout: int = 45) -> None:
         kernel32.CloseHandle.restype = ctypes.c_int
         handle = kernel32.OpenProcess(synchronize, False, pid)
         if not handle:
-            return
+            return True
         try:
-            kernel32.WaitForSingleObject(handle, max(0, timeout) * 1000)
+            return kernel32.WaitForSingleObject(handle, max(0, timeout) * 1000) == 0
         finally:
             kernel32.CloseHandle(handle)
-        return
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             os.kill(pid, 0)
         except OSError:
-            return
+            return True
         time.sleep(0.5)
+    return False
 
 
 def _safe_files(stage: Path) -> list[Path]:
@@ -110,6 +110,9 @@ def _health_check(target: Path, expected_version: str) -> None:
         check=False,
         timeout=60,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
     )
     if completed.returncode != 0:
         raise RuntimeError("updated runtime health-check failed: " + (completed.stderr or "compile error")[-500:])
@@ -130,9 +133,9 @@ def _write_result(target: Path, command_id: int | None, ok: bool, message: str) 
     result_path.write_text(json.dumps(rows[-50:], ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _restart(target: Path, restart_target: str, minimized: bool) -> None:
+def _restart(target: Path, restart_target: str, minimized: bool) -> subprocess.Popen[bytes] | None:
     if restart_target == "none":
-        return
+        return None
     if restart_target == "desktop":
         args = [sys.executable, str(target / "desktop_app.py")]
         if minimized:
@@ -140,7 +143,38 @@ def _restart(target: Path, restart_target: str, minimized: bool) -> None:
     else:
         args = [sys.executable, str(target / "client_agent.py")]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" and minimized else 0
-    subprocess.Popen(args, cwd=str(target), creationflags=creationflags)
+    return subprocess.Popen(args, cwd=str(target), creationflags=creationflags)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.updating")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_update_state(path: Path, phase: str, message: str, **details: object) -> None:
+    payload = {
+        "pid": os.getpid(),
+        "phase": phase,
+        "message": message,
+        "updated_at": time.time(),
+        **details,
+    }
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_update_result(target: Path, ok: bool, message: str, **details: object) -> None:
+    result = target / ".updates" / ".last-result.json"
+    _write_update_state(result, "done" if ok else "rollback", message, ok=ok, finished_at=time.time(), **details)
 
 
 def main() -> int:
@@ -162,16 +196,20 @@ def main() -> int:
         marker.unlink(missing_ok=True)
         return 2
     try:
-        _wait_for_exit(args.pid)
+        if not _wait_for_exit(args.pid):
+            raise RuntimeError(f"process {args.pid} still blocks the update after 20 seconds")
     except Exception:
         marker.unlink(missing_ok=True)
         return 2
 
     backup = target / ".updates" / f"backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     backup.mkdir(parents=True, exist_ok=True)
+    revision_path = target / ".installed-revision"
+    previous_revision = revision_path.read_bytes() if revision_path.is_file() else None
     copied: list[Path] = []
     created: list[Path] = []
     try:
+        _write_update_state(marker, "installing", "Копирование новой версии", version=args.version, revision=args.revision)
         previous_managed = _managed_files(target / MANAGED_FILES_NAME)
         next_managed = _managed_files(stage / MANAGED_FILES_NAME)
         for source in _safe_files(stage):
@@ -184,7 +222,7 @@ def main() -> int:
             else:
                 created.append(relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+            _atomic_copy(source, destination)
             copied.append(relative)
 
         for relative in sorted(previous_managed - next_managed, key=lambda item: item.as_posix(), reverse=True):
@@ -216,10 +254,12 @@ def main() -> int:
                 cwd=str(target),
                 check=True,
                 timeout=180,
+                env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
             )
             stamp = target / ".venv" / ".requirements.sha256"
             if stamp.parent.is_dir():
                 stamp.write_text(_requirements_digest(requirements), encoding="utf-8")
+        _write_update_state(marker, "health-check", "Проверка новой версии", version=args.version, revision=args.revision)
         _health_check(target, args.version)
         (target / ".installed-revision").write_text(args.revision, encoding="utf-8")
         _write_result(target, args.command_id, True, f"Обновлено до {args.version}")
@@ -229,23 +269,55 @@ def main() -> int:
             destination = target / relative
             if saved.exists():
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(saved, destination)
+                _atomic_copy(saved, destination)
         for relative in reversed(created):
             destination = target / relative
             if destination.is_file():
                 destination.unlink()
+        if previous_revision is None:
+            revision_path.unlink(missing_ok=True)
+        else:
+            revision_path.write_bytes(previous_revision)
         _write_result(target, args.command_id, False, f"Ошибка обновления: {exc}")
+        _write_update_result(target, False, f"Ошибка обновления: {exc}", version=args.version, revision=args.revision)
         marker.unlink(missing_ok=True)
         _restart(target, args.restart_target, args.minimized)
         return 1
 
     shutil.rmtree(stage.parent, ignore_errors=True)
     backups = sorted((target / ".updates").glob("backup-*"), reverse=True)
-    for old_backup in backups[3:]:
+    for old_backup in backups[1:]:
         if old_backup.is_dir():
             shutil.rmtree(old_backup, ignore_errors=True)
+    _write_update_state(marker, "restarting", "Запуск новой версии", version=args.version, revision=args.revision)
+    restarted = _restart(target, args.restart_target, args.minimized)
+    if restarted is not None:
+        try:
+            restarted.wait(timeout=3)
+            for relative in reversed(copied):
+                saved = backup / relative
+                destination = target / relative
+                if saved.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    _atomic_copy(saved, destination)
+            for relative in reversed(created):
+                destination = target / relative
+                if destination.is_file():
+                    destination.unlink()
+            if previous_revision is None:
+                revision_path.unlink(missing_ok=True)
+            else:
+                revision_path.write_bytes(previous_revision)
+            _restart(target, args.restart_target, args.minimized)
+            _write_update_result(target, False, "Новая версия завершилась сразу после запуска", version=args.version)
+            marker.unlink(missing_ok=True)
+            return 1
+        except subprocess.TimeoutExpired:
+            pass
+    if backup.is_dir():
+        shutil.rmtree(backup, ignore_errors=True)
+    _write_update_result(target, True, f"Обновлено до {args.version}", version=args.version, revision=args.revision)
     marker.unlink(missing_ok=True)
-    _restart(target, args.restart_target, args.minimized)
     return 0
 
 

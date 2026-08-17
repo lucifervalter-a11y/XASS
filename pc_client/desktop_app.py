@@ -6,20 +6,36 @@ import json
 import os
 import platform
 import queue
+import re
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from tkinter.scrolledtext import ScrolledText
+from tkinter import ttk
 from typing import Any, Callable
 
 import httpx
 import psutil
+
+try:
+    import pystray
+    from PIL import Image
+except ImportError:  # Source checkout can still run before optional UI deps are installed.
+    pystray = None
+    Image = None
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
 
 from client_agent import (
     build_payload,
@@ -33,6 +49,7 @@ from client_agent import (
 from client_update import (
     DATA_ROOT,
     UPDATE_MARKER,
+    UPDATE_RESULT,
     current_revision,
     current_version,
     download_installer_update,
@@ -41,10 +58,17 @@ from client_update import (
     launch_installer_update,
     launch_update_helper,
     load_agent_status,
+    load_update_state,
+    update_in_progress,
+    update_operation,
     write_agent_status,
 )
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 from archive_store import archive_root, archive_status, cleanup_archive, conversation_rows
+try:
+    from runtime_state import acquire_single_instance, append_log, configure_utf8_logging, read_log_tail
+except ModuleNotFoundError:
+    from pc_client.runtime_state import acquire_single_instance, append_log, configure_utf8_logging, read_log_tail
 
 ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
@@ -64,6 +88,35 @@ AMBER = "#efb65c"
 RED = "#f36b76"
 
 
+class DarkScrolledText(tk.Frame):
+    """Text widget with a themeable, dark scrollbar."""
+
+    def __init__(self, parent: tk.Misc, **options: Any) -> None:
+        background = str(options.get("bg") or CARD)
+        super().__init__(parent, bg=background, highlightthickness=0, borderwidth=0)
+        self.text = tk.Text(self, **options)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview, style="XASS.Vertical.TScrollbar")
+        self.text.configure(yscrollcommand=self.vbar.set)
+        self.vbar.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+    def insert(self, *args: Any, **kwargs: Any) -> Any:
+        return self.text.insert(*args, **kwargs)
+
+    def delete(self, *args: Any, **kwargs: Any) -> Any:
+        return self.text.delete(*args, **kwargs)
+
+    def see(self, *args: Any, **kwargs: Any) -> Any:
+        return self.text.see(*args, **kwargs)
+
+    def configure(self, cnf: Any = None, **kwargs: Any) -> Any:
+        if not hasattr(self, "text"):
+            return super().configure(cnf, **kwargs)
+        return self.text.configure(cnf, **kwargs)
+
+    config = configure
+
+
 def _configure_windows_process() -> None:
     if os.name != "nt":
         return
@@ -72,12 +125,15 @@ def _configure_windows_process() -> None:
     except Exception:
         pass
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
-            pass
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
 
 
 def _resource_path(relative: str) -> Path:
@@ -88,11 +144,38 @@ class XassDesktop:
     def __init__(self, root: tk.Tk, *, minimized: bool = False, preview: bool = False) -> None:
         self.root = root
         self.root.title("XASS — предпросмотр" if preview else "XASS")
-        self.root.geometry("1360x840")
-        self.root.minsize(1080, 700)
+        screen_width = max(960, self.root.winfo_screenwidth())
+        screen_height = max(700, self.root.winfo_screenheight())
+        width = min(1360, max(980, screen_width - 140))
+        height = min(840, max(660, screen_height - 120))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(900, 620)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.option_add("*Font", ("Segoe UI", 10))
+        self.root.option_add("*Scrollbar.background", CARD_HOVER)
+        self.root.option_add("*Scrollbar.troughColor", BG)
+        self.root.option_add("*Scrollbar.activeBackground", ACCENT)
+        self.root.option_add("*Scrollbar.borderWidth", 0)
+        self.root.option_add("*Scrollbar.width", 11)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "XASS.Vertical.TScrollbar",
+            gripcount=0,
+            background=CARD_HOVER,
+            darkcolor=CARD_HOVER,
+            lightcolor=CARD_HOVER,
+            troughcolor=BG,
+            bordercolor=BG,
+            arrowcolor=MUTED,
+            relief="flat",
+            width=11,
+        )
+        style.map("XASS.Vertical.TScrollbar", background=[("active", ACCENT)])
         icon_path = _resource_path("assets/xass.ico")
         if icon_path.is_file():
             try:
@@ -110,9 +193,16 @@ class XassDesktop:
         self.config = ensure_minimal_defaults(load_config())
         self.config["desktop_managed"] = True
         self.process: subprocess.Popen[str] | None = None
+        self.external_agent_pid = 0
         self._agent_started_at = 0.0
         self._start_after_id: str | None = None
         self._closing = False
+        self._hidden_to_tray = False
+        self._restart_failures: list[float] = []
+        self._update_checking = False
+        self._archive_cancel = threading.Event()
+        self._archive_moving = False
+        self.tray_icon: Any | None = None
         self._expected_stop_pids: set[int] = set()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.history: list[str] = []
@@ -130,6 +220,11 @@ class XassDesktop:
         self.archive_state_var = tk.StringVar(value="Локальный архив ещё не синхронизирован")
         self.connection_var = tk.StringVar(value="Остановлен")
         self.last_seen_var = tk.StringVar(value="Heartbeat ещё не получен")
+        self.latency_var = tk.StringVar(value="—")
+        self.agent_version_var = tk.StringVar(value=current_version())
+        self.agent_pid_var = tk.StringVar(value="—")
+        self.update_state_var = tk.StringVar(value="Готово к проверке")
+        self.last_error_var = tk.StringVar(value="Ошибок нет")
         self.server_state_var = tk.StringVar(value="Не проверен")
         self.import_status_var = tk.StringVar(value="Выберите файл .xass, скачанный в Telegram Mini App")
         self.status_color = AMBER
@@ -143,9 +238,11 @@ class XassDesktop:
         self.metric_bars: dict[str, tuple[tk.Canvas, int]] = {}
 
         self._build_shell()
+        self._setup_tray()
         self.show_view("overview")
         self.root.after(120, self._drain_logs)
         self.root.after(450, self._refresh_agent_status)
+        self.root.after(700, self._refresh_update_status)
         self.root.after(220, self._refresh_local_metrics)
         if preview:
             self._set_status("Предпросмотр", ACCENT)
@@ -154,7 +251,7 @@ class XassDesktop:
         else:
             self._schedule_start(250)
         if minimized:
-            self.root.after(900, self.root.iconify)
+            self.root.after(900, self.close)
 
     def _button(
         self,
@@ -202,11 +299,18 @@ class XassDesktop:
             highlightthickness=1,
         )
 
+    @staticmethod
+    def _style_scrolled_text(widget: DarkScrolledText) -> None:
+        try:
+            widget.vbar.configure(style="XASS.Vertical.TScrollbar")
+        except (AttributeError, tk.TclError):
+            pass
+
     def _build_shell(self) -> None:
         shell = tk.Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=286, highlightbackground=LINE, highlightthickness=1)
+        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=244, highlightbackground=LINE, highlightthickness=1)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
@@ -228,9 +332,10 @@ class XassDesktop:
         for key, label in (
             ("overview", "Обзор"),
             ("connection", "Подключение"),
-            ("logs", "События"),
-            ("archive", "Архив сообщений"),
+            ("archive", "Архив"),
+            ("updates", "Обновления"),
             ("settings", "Настройки"),
+            ("diagnostics", "Диагностика"),
         ):
             button = tk.Button(
                 self.sidebar,
@@ -275,8 +380,30 @@ class XassDesktop:
 
         body = tk.Frame(shell, bg=BG)
         body.pack(side="left", fill="both", expand=True)
-        self.content = tk.Frame(body, bg=BG)
-        self.content.pack(fill="both", expand=True, padx=28, pady=24)
+        self.body_canvas = tk.Canvas(body, bg=BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(
+            body,
+            orient="vertical",
+            command=self.body_canvas.yview,
+            style="XASS.Vertical.TScrollbar",
+        )
+        self.body_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.body_canvas.pack(side="left", fill="both", expand=True)
+        self.content = tk.Frame(self.body_canvas, bg=BG, padx=28, pady=24)
+        self.content_window = self.body_canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._on_content_configure)
+        self.body_canvas.bind("<Configure>", self._on_canvas_configure)
+        self.body_canvas.bind("<MouseWheel>", self._on_mousewheel)
+
+    def _on_content_configure(self, _event: tk.Event[Any]) -> None:
+        self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: tk.Event[Any]) -> None:
+        self.body_canvas.itemconfigure(self.content_window, width=max(1, event.width))
+
+    def _on_mousewheel(self, event: tk.Event[Any]) -> None:
+        self.body_canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _clear_content(self) -> None:
         for widget in self.content.winfo_children():
@@ -289,14 +416,17 @@ class XassDesktop:
         self._clear_content()
         if name == "connection":
             self._build_connection()
-        elif name == "logs":
-            self._build_logs()
         elif name == "archive":
             self._build_archive()
+        elif name == "updates":
+            self._build_updates()
         elif name == "settings":
             self._build_settings()
+        elif name == "diagnostics":
+            self._build_diagnostics()
         else:
             self._build_overview()
+        self.body_canvas.yview_moveto(0)
 
     def _header(self, title: str, subtitle: str) -> None:
         top = tk.Frame(self.content, bg=BG)
@@ -395,15 +525,19 @@ class XassDesktop:
         self._connection_row(connection, "Сервер", server)
         self._connection_row(connection, "Протокол", protocol)
         self._connection_row(connection, "Статус", self.server_state_var, GREEN)
-        self._connection_row(connection, "Версия клиента", current_version())
+        self._connection_row(connection, "Версия приложения", current_version())
+        self._connection_row(connection, "Версия агента", self.agent_version_var)
+        self._connection_row(connection, "Задержка", self.latency_var)
+        self._connection_row(connection, "Последний heartbeat", self.last_seen_var)
+        self._connection_row(connection, "Обновление", self.update_state_var)
         self._connection_row(connection, "Автообновления", "Включены (подписанные)" if self.auto_update_var.get() else "Выключены", GREEN if self.auto_update_var.get() else AMBER)
 
         tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
         events_head = tk.Frame(self.content, bg=BG)
         events_head.pack(fill="x", pady=(18, 10))
         tk.Label(events_head, text="Последние события", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
-        self._button(events_head, "Открыть все события", lambda: self.show_view("logs"), kind="ghost").pack(side="right")
-        self.overview_log = ScrolledText(
+        self._button(events_head, "Открыть диагностику", lambda: self.show_view("diagnostics"), kind="ghost").pack(side="right")
+        self.overview_log = DarkScrolledText(
             self.content,
             height=8,
             bg=BG,
@@ -418,6 +552,7 @@ class XassDesktop:
             pady=13,
         )
         self.overview_log.pack(fill="both", expand=True)
+        self._style_scrolled_text(self.overview_log)
         for line in self.history[-120:]:
             self.overview_log.insert("end", line + "\n")
         self.overview_log.see("end")
@@ -540,6 +675,9 @@ class XassDesktop:
             wraplength=285,
             font=("Segoe UI", 8),
         ).pack(side="left", padx=(8, 0), fill="x", expand=True)
+        if DND_FILES is not None and hasattr(quick, "drop_target_register"):
+            quick.drop_target_register(DND_FILES)
+            quick.dnd_bind("<<Drop>>", self._drop_connection_file)
 
         manual = self._card(columns, padding=23)
         manual.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -601,12 +739,172 @@ class XassDesktop:
         self._button(maintenance, "Проверить обновление", self.check_update, kind="ghost").pack(fill="x", pady=(22, 9))
         self._button(maintenance, "Перезапустить агент", self.restart_agent).pack(fill="x")
 
+    def _build_updates(self) -> None:
+        self._header("Обновления", "Проверка, загрузка, установка и автоматический откат")
+        state = load_update_state()
+        result: dict[str, Any] = {}
+        try:
+            loaded = json.loads(UPDATE_RESULT.read_text(encoding="utf-8"))
+            result = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError, TypeError):
+            pass
+        card = self._card(self.content, padding=22)
+        card.pack(fill="x", pady=(0, 16))
+        tk.Label(card, text="СОСТОЯНИЕ ОБНОВЛЕНИЯ", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(card, textvariable=self.update_state_var, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(10, 4))
+        message = str(state.get("message") or result.get("message") or "Обновление ещё не запускалось")
+        tk.Label(card, text=message, bg=CARD, fg=MUTED, justify="left", wraplength=760, font=("Segoe UI", 10)).pack(anchor="w")
+        details = tk.Frame(card, bg=CARD)
+        details.pack(fill="x", pady=(18, 0))
+        self._connection_row(details, "Текущая версия", current_version())
+        self._connection_row(details, "Ревизия", current_revision()[:16] or "локальная")
+        self._connection_row(details, "Канал", "stable")
+        self._connection_row(details, "Автообновления", "включены" if self.auto_update_var.get() else "выключены")
+        self._connection_row(details, "Последний итог", "успешно" if result.get("ok") else ("ошибка / откат" if result else "—"))
+        actions = tk.Frame(card, bg=CARD)
+        actions.pack(fill="x", pady=(20, 0))
+        self.update_button = self._button(actions, "Проверить обновление", self.check_update, kind="primary")
+        self.update_button.pack(side="left")
+        self._button(actions, "Перезапустить только агент", self.restart_agent, kind="secondary").pack(side="left", padx=(10, 0))
+
+        safety = self._card(self.content, padding=20)
+        safety.pack(fill="x")
+        tk.Label(safety, text="КАК XASS ОБНОВЛЯЕТСЯ", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(
+            safety,
+            text=(
+                "Manifest подписывается персональным ключом агента. Клиент проверяет revision, размер и SHA-256 "
+                "скачанного файла, запускает внешний helper, сохраняет config.json и архив. Если новая версия "
+                "не проходит локальный health-check или завершается сразу после запуска, предыдущая версия возвращается автоматически."
+            ),
+            bg=CARD,
+            fg=MUTED,
+            justify="left",
+            wraplength=850,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(10, 0))
+
+    def _build_diagnostics(self) -> None:
+        self._header("Диагностика", "Безопасный статус GUI, агента, сети и updater")
+        card = self._card(self.content, padding=21)
+        card.pack(fill="x", pady=(0, 14))
+        columns = tk.Frame(card, bg=CARD)
+        columns.pack(fill="x")
+        left = tk.Frame(columns, bg=CARD)
+        right = tk.Frame(columns, bg=CARD)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 24))
+        right.pack(side="left", fill="both", expand=True)
+        self._connection_row(left, "GUI", "работает")
+        self._connection_row(left, "Агент", self.connection_var)
+        self._connection_row(left, "PID агента", self.agent_pid_var)
+        self._connection_row(left, "Версия", current_version())
+        self._connection_row(left, "Путь установки", str(Path(sys.executable).resolve()))
+        self._connection_row(right, "Конфигурация", str(DATA_ROOT / "config.json"))
+        self._connection_row(right, "Архив", str(archive_root(self.config)))
+        self._connection_row(right, "Endpoint", f"{str(self.config.get('server_url') or '').rstrip('/')}/agent/heartbeat")
+        self._connection_row(right, "Heartbeat", self.last_seen_var)
+        self._connection_row(right, "Updater", self.update_state_var)
+        self._connection_row(right, "Последняя ошибка", self.last_error_var, RED if self.last_error_var.get() != "Ошибок нет" else GREEN)
+        actions = tk.Frame(card, bg=CARD)
+        actions.pack(fill="x", pady=(20, 0))
+        self._button(actions, "Проверить соединение", self.check_connection, kind="primary").pack(side="left")
+        self._button(actions, "Перезапустить агент", self.restart_agent, kind="secondary").pack(side="left", padx=(9, 0))
+        self._button(actions, "Экспорт отчёта", self.export_diagnostics, kind="ghost").pack(side="right")
+
+        self.full_log = DarkScrolledText(
+            self.content,
+            height=15,
+            bg=CARD,
+            fg="#9cadbf",
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightbackground=LINE,
+            highlightthickness=1,
+            font=("Cascadia Mono", 9),
+            padx=16,
+            pady=14,
+        )
+        self.full_log.pack(fill="both", expand=True)
+        self._style_scrolled_text(self.full_log)
+        rows = self.history[-300:] or read_log_tail(300)
+        for line in rows:
+            self.full_log.insert("end", line + "\n")
+        self.full_log.configure(state="disabled")
+
+    def check_connection(self) -> None:
+        self._set_status("Проверка связи…", AMBER)
+
+        def worker() -> None:
+            try:
+                server = discover_backend_url(str(self.config.get("server_url") or self.server_var.get()))
+                with httpx.Client(timeout=10, trust_env=bool(self.config.get("trust_env_proxy", False))) as client:
+                    response = client.get(f"{server.rstrip('/')}/health")
+                    response.raise_for_status()
+                self.root.after(0, lambda: self._connection_checked(True, f"Сервер доступен: {server}"))
+            except Exception as exc:
+                self.root.after(0, lambda error=str(exc): self._connection_checked(False, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _connection_checked(self, ok: bool, detail: str) -> None:
+        if ok:
+            self.server_state_var.set("Доступен")
+            self._set_status("В сети", GREEN)
+            self._log(detail)
+        else:
+            self.server_state_var.set("Ошибка")
+            self.last_error_var.set(detail[-240:])
+            self._set_status("Нет связи", RED)
+            messagebox.showerror("XASS", f"Проверка соединения не пройдена:\n{detail}")
+
+    @staticmethod
+    def _redact_log(line: str) -> str:
+        value = re.sub(r"(?i)(x-api-key|api[_-]?key|token|password)(\s*[:=]\s*)\S+", r"\1\2[скрыто]", str(line))
+        return re.sub(r"\b(?:iph_|agt_|pair_)[A-Za-z0-9_-]{12,}\b", "[скрыто]", value)
+
+    def export_diagnostics(self) -> None:
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Сохранить отчёт XASS",
+            defaultextension=".json",
+            filetypes=(("JSON", "*.json"),),
+            initialfile=f"xass-diagnostics-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
+        )
+        if not selected:
+            return
+        status = load_agent_status() or {}
+        report = {
+            "created_at": datetime.now().astimezone().isoformat(),
+            "app_version": current_version(),
+            "agent_version": status.get("agent_version") or current_version(),
+            "revision": current_revision(),
+            "gui_pid": os.getpid(),
+            "agent_pid": status.get("process_id"),
+            "install_path": str(Path(sys.executable).resolve()),
+            "config_path": str(DATA_ROOT / "config.json"),
+            "archive_path": str(archive_root(self.config)),
+            "server_endpoint": f"{str(self.config.get('server_url') or '').rstrip('/')}/agent/heartbeat",
+            "heartbeat_state": status.get("state"),
+            "heartbeat_updated_at": status.get("updated_at"),
+            "latency_ms": status.get("latency_ms"),
+            "last_error": status.get("last_error") or "",
+            "updater": load_update_state(),
+            "logs": [self._redact_log(line) for line in (self.history[-100:] or read_log_tail(100))],
+        }
+        try:
+            Path(selected).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("XASS", f"Не удалось сохранить отчёт:\n{exc}")
+            return
+        messagebox.showinfo("XASS", "Диагностический отчёт сохранён без ключей и приватных сообщений.")
+
     def _build_logs(self) -> None:
         self._header("Журнал событий", "Heartbeat, команды сервера и установка обновлений")
         toolbar = tk.Frame(self.content, bg=BG)
         toolbar.pack(fill="x", pady=(0, 10))
         self._button(toolbar, "Очистить экран", self._clear_log_view, kind="ghost").pack(side="right")
-        self.full_log = ScrolledText(
+        self.full_log = DarkScrolledText(
             self.content,
             bg=CARD,
             fg="#9cadbf",
@@ -620,6 +918,7 @@ class XassDesktop:
             pady=14,
         )
         self.full_log.pack(fill="both", expand=True)
+        self._style_scrolled_text(self.full_log)
         for line in self.history[-500:]:
             self.full_log.insert("end", line + "\n")
         self.full_log.configure(state="disabled")
@@ -644,9 +943,12 @@ class XassDesktop:
         actions.pack(fill="x")
         self._button(actions, "Открыть папку", self.open_archive_folder, kind="primary").pack(side="left")
         self._button(actions, "Выбрать другую", self.choose_archive_folder, kind="secondary").pack(side="left", padx=(9, 0))
+        self._button(actions, "Тест записи", self.test_archive_folder, kind="ghost").pack(side="left", padx=(9, 0))
         self._button(actions, "Очистить медиа", self.cleanup_archive_files, kind="ghost").pack(side="left", padx=(9, 0))
+        if self._archive_moving:
+            self._button(actions, "Отменить перенос", self._archive_cancel.set, kind="danger").pack(side="right")
 
-        self.archive_messages = ScrolledText(
+        self.archive_messages = DarkScrolledText(
             self.content,
             bg=CARD,
             fg="#d8dce4",
@@ -660,6 +962,7 @@ class XassDesktop:
             pady=14,
         )
         self.archive_messages.pack(fill="both", expand=True)
+        self._style_scrolled_text(self.archive_messages)
         rows = conversation_rows(self.config, 500)
         for row in reversed(rows):
             timestamp = str(row.get("message_date") or row.get("updated_at") or "").replace("T", " ")[:16]
@@ -681,10 +984,87 @@ class XassDesktop:
         selected = filedialog.askdirectory(parent=self.root, title="Папка локального архива XASS", initialdir=str(archive_root(self.config)))
         if not selected:
             return
-        self.archive_folder_var.set(selected)
-        self.config["archive_folder"] = selected
+        destination = Path(selected).expanduser().resolve()
+        try:
+            free = self._validate_archive_folder(destination)
+        except OSError as exc:
+            messagebox.showerror("XASS", f"В выбранную папку нельзя записывать:\n{exc}")
+            return
+        source = archive_root(self.config).resolve()
+        has_archive = source != destination and source.is_dir() and any(source.iterdir())
+        if has_archive and messagebox.askyesno(
+            "XASS",
+            "Скопировать существующий архив в новую папку? Исходные данные останутся на месте до успешной проверки.",
+            parent=self.root,
+        ):
+            self._start_archive_transfer(source, destination)
+            return
+        self._finish_archive_folder_change(destination, free)
+
+    def _validate_archive_folder(self, folder: Path) -> int:
+        folder.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".xass-write-test-", dir=folder)
+        try:
+            os.write(descriptor, "Проверка XASS".encode("utf-8"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            Path(temporary).unlink(missing_ok=True)
+        return shutil.disk_usage(folder).free
+
+    def test_archive_folder(self) -> None:
+        try:
+            free = self._validate_archive_folder(archive_root(self.config))
+        except OSError as exc:
+            messagebox.showerror("XASS", f"Ошибка тестовой записи:\n{exc}")
+            return
+        messagebox.showinfo("XASS", f"Запись работает. Свободно {free / (1024 ** 3):.1f} ГБ.")
+
+    def _start_archive_transfer(self, source: Path, destination: Path) -> None:
+        if self._archive_moving:
+            return
+        self._archive_moving = True
+        self._archive_cancel.clear()
+        self.archive_state_var.set("Подготовка безопасного переноса…")
+
+        def worker() -> None:
+            try:
+                files = [path for path in source.rglob("*") if path.is_file()]
+                total = sum(path.stat().st_size for path in files)
+                copied = 0
+                for item in files:
+                    if self._archive_cancel.is_set():
+                        raise InterruptedError("перенос отменён")
+                    relative = item.relative_to(source)
+                    target = destination / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_name(target.name + ".xass-copying")
+                    try:
+                        shutil.copy2(item, temporary)
+                        if temporary.stat().st_size != item.stat().st_size:
+                            raise OSError(f"не удалось проверить {relative}")
+                        os.replace(temporary, target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    copied += item.stat().st_size
+                    percent = int(copied * 100 / total) if total else 100
+                    self.root.after(0, lambda p=percent: self.archive_state_var.set(f"Перенос архива: {p}%"))
+                free = self._validate_archive_folder(destination)
+                self.root.after(0, lambda: self._finish_archive_folder_change(destination, free))
+            except InterruptedError:
+                self.root.after(0, lambda: self.archive_state_var.set("Перенос отменён. Исходный архив не изменён."))
+            except Exception as exc:
+                self.root.after(0, lambda error=str(exc): messagebox.showerror("XASS", f"Не удалось перенести архив:\n{error}"))
+            finally:
+                self._archive_moving = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_archive_folder_change(self, destination: Path, free: int) -> None:
+        self.archive_folder_var.set(str(destination))
+        self.config["archive_folder"] = str(destination)
         save_config(self.config)
-        self._log(f"Папка архива: {selected}")
+        self._log(f"Папка архива: {destination} · свободно {free / (1024 ** 3):.1f} ГБ")
         self.restart_agent()
         if self.current_view == "archive":
             self.show_view("archive")
@@ -743,11 +1123,21 @@ class XassDesktop:
         selected = filedialog.askopenfilename(
             parent=self.root,
             title="Выберите файл подключения XASS",
-            filetypes=(("Подключение XASS", "*.xass *.json"), ("Все файлы", "*.*")),
+            filetypes=(("Подключение XASS", "*.xass *.xass-connect *.json"), ("Все файлы", "*.*")),
         )
         if not selected:
             return
         self.import_connection_path(Path(selected))
+
+    def _drop_connection_file(self, event: Any) -> None:
+        try:
+            paths = self.root.tk.splitlist(str(event.data))
+        except (tk.TclError, AttributeError):
+            paths = (str(getattr(event, "data", "")),)
+        selected = next((Path(item) for item in paths if str(item).strip()), None)
+        if selected is None:
+            return
+        self.import_connection_path(selected.expanduser().resolve())
 
     def import_connection_path(self, selected: Path) -> None:
         try:
@@ -842,6 +1232,18 @@ class XassDesktop:
             return
         if self.process and self.process.poll() is None:
             return
+        existing_status = load_agent_status() or {}
+        try:
+            existing_pid = int(existing_status.get("process_id") or 0)
+            existing = psutil.Process(existing_pid) if existing_pid > 0 else None
+            command = " ".join(existing.cmdline()).casefold() if existing is not None else ""
+            if existing is not None and existing.is_running() and "--agent" in command:
+                self.external_agent_pid = existing_pid
+                self.agent_pid_var.set(str(existing_pid))
+                self._set_status("В сети" if existing_status.get("state") == "online" else "Подключение…", GREEN if existing_status.get("state") == "online" else AMBER)
+                return
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+            self.external_agent_pid = 0
         update_marker = UPDATE_MARKER
         if update_marker.exists():
             if self._update_is_running(update_marker):
@@ -861,17 +1263,23 @@ class XassDesktop:
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
-        process = subprocess.Popen(
-            args,
-            cwd=str(DATA_ROOT if is_installer_build() else ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=environment,
-        )
+        try:
+            process = subprocess.Popen(
+                args,
+                cwd=str(DATA_ROOT if is_installer_build() else ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=environment,
+            )
+        except OSError as exc:
+            self.last_error_var.set(str(exc))
+            self._set_status("Агент не запущен", RED)
+            self._log(f"[desktop] не удалось запустить агент: {exc}")
+            return
         self.process = process
         self._agent_started_at = time.time()
         write_agent_status(
@@ -886,7 +1294,8 @@ class XassDesktop:
         if self._closing:
             return
         process = self.process
-        if process is not None and process.poll() is None:
+        active_pid = process.pid if process is not None and process.poll() is None else self.external_agent_pid
+        if active_pid:
             payload = load_agent_status()
             try:
                 status_pid = int((payload or {}).get("process_id") or 0)
@@ -894,18 +1303,52 @@ class XassDesktop:
             except (TypeError, ValueError):
                 status_pid = 0
                 updated_at = 0
-            if status_pid == process.pid and updated_at >= self._agent_started_at:
+            if status_pid == active_pid and (self.external_agent_pid or updated_at >= self._agent_started_at):
                 state = str((payload or {}).get("state") or "").lower()
+                self.agent_pid_var.set(str(status_pid))
+                self.agent_version_var.set(str((payload or {}).get("agent_version") or current_version()))
+                latency = float((payload or {}).get("latency_ms") or 0)
+                self.latency_var.set(f"{latency:.0f} мс" if latency > 0 else "—")
+                age = max(0, int(time.time() - updated_at))
+                self.last_seen_var.set("только что" if age < 3 else f"{age} сек. назад")
                 if state == "online":
                     self._set_status("В сети", GREEN)
-                    self.last_seen_var.set("Последний heartbeat только что")
+                    self._restart_failures.clear()
                     self.server_state_var.set("Доступен")
+                    self.last_error_var.set("Ошибок нет")
                 elif state == "offline":
                     self._set_status("Нет связи", RED)
                     detail = str((payload or {}).get("detail") or "Сервер не отвечает")
-                    self.last_seen_var.set(detail[-120:])
+                    self.last_error_var.set(str((payload or {}).get("last_error") or detail)[-240:])
                     self.server_state_var.set("Ошибка")
         self.root.after(750, self._refresh_agent_status)
+
+    def _refresh_update_status(self) -> None:
+        if self._closing:
+            return
+        state = load_update_state()
+        phase = str(state.get("phase") or "")
+        labels = {
+            "checking": "Проверка обновления",
+            "downloading": "Скачивание",
+            "verifying": "Проверка пакета",
+            "installing": "Установка",
+            "restarting": "Перезапуск",
+            "health-check": "Проверка запуска",
+        }
+        if state and update_in_progress():
+            message = str(state.get("message") or labels.get(phase) or "Обновление выполняется")
+            self.update_state_var.set(message)
+        else:
+            try:
+                result = json.loads(UPDATE_RESULT.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                result = {}
+            if isinstance(result, dict) and result:
+                self.update_state_var.set(str(result.get("message") or ("Готово" if result.get("ok") else "Ошибка")))
+            elif not self._update_checking:
+                self.update_state_var.set("Готово к проверке")
+        self.root.after(700, self._refresh_update_status)
 
     def _update_is_running(self, marker: Path) -> bool:
         try:
@@ -947,11 +1390,21 @@ class XassDesktop:
         if code == 76:
             self._set_status("Установка обновления…", AMBER)
             self._closing = True
-            self.root.after(120, self.root.destroy)
+            self.root.after(120, self._destroy_for_update)
             return
         self._set_status("Перезапуск…" if code == 75 else "Остановлен", AMBER if code == 75 else RED)
         if code == 75:
             self._schedule_start(120)
+            return
+        now = time.time()
+        self._restart_failures = [stamp for stamp in self._restart_failures if now - stamp < 300]
+        self._restart_failures.append(now)
+        if len(self._restart_failures) <= 4 and not self._closing:
+            delay = min(15_000, 750 * (2 ** (len(self._restart_failures) - 1)))
+            self._set_status(f"Восстановление через {delay // 1000 + 1} сек.", AMBER)
+            self._schedule_start(delay)
+        else:
+            self.last_error_var.set(f"Агент завершился с кодом {code}; автоперезапуск остановлен")
 
     def _schedule_start(self, delay_ms: int) -> None:
         if self._closing:
@@ -967,7 +1420,7 @@ class XassDesktop:
         self._start_after_id = None
         self.start_agent()
 
-    def stop_agent(self) -> None:
+    def stop_agent(self) -> subprocess.Popen[str] | None:
         if self._start_after_id is not None:
             try:
                 self.root.after_cancel(self._start_after_id)
@@ -979,16 +1432,51 @@ class XassDesktop:
         if process and process.poll() is None:
             self._expected_stop_pids.add(process.pid)
             process.terminate()
+        if self.external_agent_pid:
+            try:
+                psutil.Process(self.external_agent_pid).terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
+            self.external_agent_pid = 0
         self._set_status("Остановлен", RED)
+        return process
 
     def restart_agent(self) -> None:
-        self.stop_agent()
-        self._schedule_start(150)
+        external_pid = self.external_agent_pid
+        process = self.stop_agent()
+        self._set_status("Быстрый перезапуск…", AMBER)
+
+        def worker() -> None:
+            if process and process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if external_pid:
+                try:
+                    psutil.Process(external_pid).wait(timeout=5)
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired, psutil.AccessDenied):
+                    pass
+            self.root.after(0, lambda: self._schedule_start(80))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def check_update(self) -> None:
         if not self.config.get("api_key"):
             messagebox.showwarning("XASS", "Сначала подключите компьютер")
             return
+        if self._update_checking or update_in_progress():
+            messagebox.showinfo("XASS", "Проверка или установка обновления уже выполняется")
+            return
+        self._update_checking = True
+        self.update_state_var.set("Проверка обновления…")
+        button = getattr(self, "update_button", None)
+        if button and button.winfo_exists():
+            button.configure(state="disabled", text="Проверка…")
 
         def worker() -> None:
             try:
@@ -1005,13 +1493,29 @@ class XassDesktop:
                 manifest_key = "installer_update" if is_installer_build() else "update"
                 manifest = data.get(manifest_key) if isinstance(data, dict) else None
                 if not isinstance(manifest, dict) or not manifest.get("available"):
-                    self.root.after(0, lambda: messagebox.showinfo("XASS", "Установлена актуальная версия"))
+                    self.root.after(0, lambda: self._update_checked(None, ""))
                     return
-                self.root.after(0, lambda: self._confirm_update(manifest))
+                self.root.after(0, lambda: self._update_checked(manifest, ""))
             except Exception as exc:
-                self.root.after(0, lambda error=str(exc): messagebox.showerror("XASS", f"Не удалось проверить обновление:\n{error}"))
+                self.root.after(0, lambda error=str(exc): self._update_checked(None, error))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _update_checked(self, manifest: dict[str, Any] | None, error: str) -> None:
+        self._update_checking = False
+        button = getattr(self, "update_button", None)
+        if button and button.winfo_exists():
+            button.configure(state="normal", text="Проверить обновление")
+        if error:
+            self.update_state_var.set("Ошибка проверки")
+            self.last_error_var.set(error[-240:])
+            messagebox.showerror("XASS", f"Не удалось проверить обновление:\n{error}")
+            return
+        if manifest is None:
+            self.update_state_var.set("Установлена актуальная версия")
+            messagebox.showinfo("XASS", "Установлена актуальная версия")
+            return
+        self._confirm_update(manifest)
 
     def _confirm_update(self, manifest: dict[str, Any]) -> None:
         version = str(manifest.get("version") or "")
@@ -1021,32 +1525,49 @@ class XassDesktop:
         # with a manual update from the desktop UI.
         self.stop_agent()
         self._set_status("Скачивание обновления…", AMBER)
+        self.update_state_var.set("Скачивание обновления…")
 
         def worker() -> None:
             try:
-                if is_installer_build():
-                    installer = download_installer_update(
-                        manifest,
-                        api_key=str(self.config.get("api_key")),
-                        trust_env=bool(self.config.get("trust_env_proxy", False)),
-                        progress=lambda message: self.log_queue.put(message),
-                    )
-                    launch_installer_update(installer, wait_pid=os.getpid())
-                else:
-                    stage = download_update(
-                        manifest,
-                        api_key=str(self.config.get("api_key")),
-                        trust_env=bool(self.config.get("trust_env_proxy", False)),
-                        progress=lambda message: self.log_queue.put(message),
-                    )
-                    launch_update_helper(stage, manifest, command_id=None, restart_target="desktop", minimized=False)
-                self.root.after(0, self.root.destroy)
+                version = str(manifest.get("version") or "")
+                revision = str(manifest.get("revision") or "")
+                with update_operation(version, revision) as operation:
+                    def report(message: str) -> None:
+                        self.log_queue.put(message)
+                        operation.phase("downloading", message)
+
+                    if is_installer_build():
+                        installer = download_installer_update(
+                            manifest,
+                            api_key=str(self.config.get("api_key")),
+                            trust_env=bool(self.config.get("trust_env_proxy", False)),
+                            progress=report,
+                        )
+                        operation.phase("verifying", "Установщик проверен")
+                        launch_installer_update(
+                            installer,
+                            wait_pid=os.getpid(),
+                            expected_version=version,
+                            expected_revision=revision,
+                        )
+                    else:
+                        stage = download_update(
+                            manifest,
+                            api_key=str(self.config.get("api_key")),
+                            trust_env=bool(self.config.get("trust_env_proxy", False)),
+                            progress=report,
+                        )
+                        operation.phase("verifying", "Пакет проверен")
+                        launch_update_helper(stage, manifest, command_id=None, restart_target="desktop", minimized=False)
+                self.root.after(0, self._destroy_for_update)
             except Exception as exc:
                 self.root.after(0, lambda error=str(exc): self._update_failed(error))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_failed(self, error: str) -> None:
+        self.update_state_var.set("Ошибка обновления")
+        self.last_error_var.set(error[-240:])
         messagebox.showerror("XASS", f"Обновление не установлено:\n{error}")
         self._schedule_start(120)
 
@@ -1060,14 +1581,16 @@ class XassDesktop:
 
     def _log(self, line: str) -> None:
         stamped = f"{datetime.now().strftime('%H:%M:%S')}  {line}"
+        append_log(stamped)
         self.history.append(stamped)
         self.history = self.history[-1000:]
         if "[pc-client] ok" in line:
             self._set_status("В сети", GREEN)
             self.last_seen_var.set("Последний heartbeat только что")
             self.server_state_var.set("Доступен")
-        elif "Скачивание" in line and "%" in line:
+        elif "Скачивание" in line or "Повторная загрузка" in line:
             self._set_status(line.strip(), AMBER)
+            self.update_state_var.set(line.strip())
         elif "heartbeat failed" in line:
             self._set_status("Нет связи", RED)
             self.last_seen_var.set(line[-120:])
@@ -1081,9 +1604,63 @@ class XassDesktop:
                 if attr == "full_log":
                     widget.configure(state="disabled")
 
+    def _setup_tray(self) -> None:
+        if pystray is None or Image is None:
+            return
+        icon_path = _resource_path("assets/xass-icon.png")
+        if not icon_path.is_file():
+            return
+        try:
+            image = Image.open(icon_path).convert("RGBA")
+            menu = pystray.Menu(
+                pystray.MenuItem("Открыть XASS", lambda _icon, _item: self.root.after(0, self._show_from_tray), default=True),
+                pystray.MenuItem("Проверить соединение", lambda _icon, _item: self.root.after(0, self.check_connection)),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Выйти", lambda _icon, _item: self.root.after(0, self.exit_application)),
+            )
+            self.tray_icon = pystray.Icon("XASS", image, "XASS", menu)
+            self.tray_icon.run_detached()
+        except Exception as exc:
+            self.tray_icon = None
+            self._log(f"[desktop] системный трей недоступен: {exc}")
+
+    def _show_from_tray(self) -> None:
+        self._hidden_to_tray = False
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
     def close(self) -> None:
+        # Closing the window keeps the background agent alive. A deliberate exit
+        # remains available from the tray menu.
+        self._hidden_to_tray = True
+        if self.tray_icon is not None:
+            self.root.withdraw()
+            self._log("[desktop] окно скрыто в трей; агент продолжает работу")
+        else:
+            self.root.iconify()
+
+    def _destroy_for_update(self) -> None:
+        self._closing = True
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.root.destroy()
+
+    def exit_application(self) -> None:
         self._closing = True
         self.stop_agent()
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         self.root.destroy()
 
 
@@ -1098,6 +1675,11 @@ def main() -> None:
                 payload = json.loads(config_path.read_text(encoding="utf-8"))
                 if not isinstance(payload, dict):
                     raise ValueError("config.json is invalid")
+            if "--expected-version" in sys.argv:
+                index = sys.argv.index("--expected-version")
+                expected = sys.argv[index + 1]
+                if version != expected:
+                    raise ValueError(f"expected {expected}, got {version}")
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             raise SystemExit(1)
         raise SystemExit(0)
@@ -1107,18 +1689,25 @@ def main() -> None:
 
         agent_main()
         return
+    configure_utf8_logging()
     parser = argparse.ArgumentParser(description="XASS desktop PC agent")
     parser.add_argument("--minimized", action="store_true")
     parser.add_argument("--preview", action="store_true", help="show the interface without starting the agent")
     parser.add_argument("connection_file", nargs="?", help="XASS connection profile to import")
     args = parser.parse_args()
     _configure_windows_process()
-    root = tk.Tk()
-    app = XassDesktop(root, minimized=args.minimized, preview=args.preview)
-    if args.connection_file:
-        profile_path = Path(args.connection_file).expanduser().resolve()
-        root.after(350, lambda: app.import_connection_path(profile_path))
-    root.mainloop()
+    instance = acquire_single_instance("XASS-desktop-GUI")
+    if instance is None:
+        return
+    try:
+        root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
+        app = XassDesktop(root, minimized=args.minimized, preview=args.preview)
+        if args.connection_file:
+            profile_path = Path(args.connection_file).expanduser().resolve()
+            root.after(350, lambda: app.import_connection_path(profile_path))
+        root.mainloop()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":

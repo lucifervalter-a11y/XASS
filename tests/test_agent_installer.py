@@ -146,6 +146,10 @@ class AgentInstallerTests(unittest.TestCase):
             update_root = root / "updates"
             with patch.object(client_update, "is_installer_build", return_value=True), patch.object(
                 client_update, "UPDATE_ROOT", update_root
+            ), patch.object(
+                client_update, "UPDATE_MARKER", update_root / ".in-progress"
+            ), patch.object(
+                client_update, "UPDATE_RESULT", update_root / ".last-result.json"
             ), patch.object(client_update.sys, "executable", str(installed_exe)), patch.object(
                 client_update, "uuid4", return_value=SimpleNamespace(hex="fixed")
             ), patch.object(client_update.subprocess, "Popen") as popen:

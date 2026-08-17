@@ -1,2 +1,5 @@
 httpx==0.28.1
 psutil==7.0.0
+Pillow==11.3.0
+pystray==0.19.5
+tkinterdnd2==0.4.3

@@ -32,7 +32,125 @@ class ClientUpdateTests(unittest.TestCase):
             _write_stream_with_progress(Response(), destination, label="Скачивание обновления", progress=updates.append)
             self.assertEqual(destination.read_bytes(), b"1234567890")
             self.assertEqual(updates[0], "Скачивание обновления 0%")
-            self.assertEqual(updates[-1], "Скачивание обновления 100%")
+            self.assertEqual(updates[-1], "Скачивание обновления 100% · 10 / 10 байт")
+
+    def test_interrupted_download_is_rejected_by_actual_byte_count(self) -> None:
+        class Response:
+            headers = {"content-length": "10"}
+
+            @staticmethod
+            def iter_bytes():
+                yield b"123"
+
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "partial.bin"
+            with self.assertRaisesRegex(RuntimeError, "download interrupted"):
+                _write_stream_with_progress(Response(), destination, label="Скачивание", progress=None)
+
+    def test_checksum_retry_fetches_a_fresh_cache_busted_package(self) -> None:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("version.json", '{"version":"0.12.0"}')
+        package = payload.getvalue()
+        corrupt = b"x" * len(package)
+
+        class Handler(BaseHTTPRequestHandler):
+            requests = 0
+
+            def do_GET(self) -> None:  # noqa: N802
+                Handler.requests += 1
+                body = corrupt if Handler.requests == 1 else package
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            revision = "f" * 64
+            sha256 = hashlib.sha256(package).hexdigest()
+            url = f"http://127.0.0.1:{server.server_port}/package.zip"
+            api_key = "agent-secret"
+            message = f"0.12.0\n{revision}\n{sha256}\n{url}".encode("utf-8")
+            manifest = {
+                "version": "0.12.0",
+                "revision": revision,
+                "sha256": sha256,
+                "size": len(package),
+                "url": url,
+                "signature": hmac.new(api_key.encode(), message, hashlib.sha256).hexdigest(),
+            }
+            with tempfile.TemporaryDirectory() as update_root, patch.object(
+                client_update, "UPDATE_ROOT", Path(update_root)
+            ):
+                stage = download_update(manifest, api_key=api_key)
+                self.assertTrue((stage / "version.json").is_file())
+            self.assertEqual(Handler.requests, 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_manifest_size_mismatch_never_installs_package(self) -> None:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("version.json", '{"version":"0.12.0"}')
+        package = payload.getvalue()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(package)))
+                self.end_headers()
+                self.wfile.write(package)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            revision = "e" * 64
+            sha256 = hashlib.sha256(package).hexdigest()
+            url = f"http://127.0.0.1:{server.server_port}/package.zip"
+            api_key = "agent-secret"
+            message = f"0.12.0\n{revision}\n{sha256}\n{url}".encode("utf-8")
+            manifest = {
+                "version": "0.12.0",
+                "revision": revision,
+                "sha256": sha256,
+                "size": len(package) + 1,
+                "url": url,
+                "signature": hmac.new(api_key.encode(), message, hashlib.sha256).hexdigest(),
+            }
+            with tempfile.TemporaryDirectory() as update_root, patch.object(
+                client_update, "UPDATE_ROOT", Path(update_root)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "size mismatch"):
+                    download_update(manifest, api_key=api_key)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_update_operation_lock_rejects_parallel_install(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            with patch.object(client_update, "UPDATE_ROOT", root), patch.object(
+                client_update, "UPDATE_MARKER", root / ".in-progress"
+            ), patch.object(client_update, "UPDATE_LOCK", root / ".operation.lock"), patch.object(
+                client_update, "UPDATE_RESULT", root / ".last-result.json"
+            ):
+                with client_update.update_operation("0.12.0", "a" * 64):
+                    with self.assertRaisesRegex(RuntimeError, "уже выполняется"):
+                        with client_update.update_operation("0.12.1", "b" * 64):
+                            pass
 
     def test_agent_status_round_trip_is_process_bound(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

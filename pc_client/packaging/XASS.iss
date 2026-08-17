@@ -73,3 +73,22 @@ Root: HKCU; Subkey: "Software\Classes\XASS.Connection\shell\open\command"; Value
 [Run]
 Filename: "{app}\XASSMigrator.exe"; Parameters: "--quiet"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
 Filename: "{app}\XASS.exe"; Description: "Запустить XASS"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+var
+  DeleteUserData: Boolean;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    DeleteUserData :=
+      MsgBox(
+        'Удалить локальную конфигурацию, журнал и архив XASS?' + #13#10 + #13#10 +
+        'Выберите «Нет», чтобы сохранить привязку и архив для следующей установки.',
+        mbConfirmation,
+        MB_YESNO
+      ) = IDYES;
+
+  if (CurUninstallStep = usPostUninstall) and DeleteUserData then
+    DelTree(ExpandConstant('{localappdata}\XASS'), True, True, True);
+end;

@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import platform
+import random
 import socket
 import subprocess
 import sys
@@ -26,13 +27,19 @@ from client_update import (
     launch_update_helper,
     load_command_results,
     store_command_result,
+    update_operation,
     write_agent_status,
 )
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
 from archive_store import apply_archive_events, archive_cursor, archive_root, archive_status, cleanup_archive
+try:
+    from runtime_state import acquire_single_instance, atomic_write_json, configure_utf8_logging, load_json_object
+except ModuleNotFoundError:
+    from pc_client.runtime_state import acquire_single_instance, atomic_write_json, configure_utf8_logging, load_json_object
 
 CONFIG_PATH = DATA_ROOT / "config.json"
+PROCESSED_COMMANDS_PATH = DATA_ROOT / ".processed-commands.json"
 _last_heartbeat_latency_ms = 0.0
 _last_heartbeat_error = ""
 _last_heartbeat_error_at = ""
@@ -126,13 +133,31 @@ def discover_backend_url(server_url: str) -> str:
 
 
 def load_config() -> dict[str, Any]:
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    return {}
+    return load_json_object(CONFIG_PATH, restore_backup=True)
 
 
 def save_config(data: dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(CONFIG_PATH, data, backup=True)
+
+
+def _processed_commands() -> dict[str, Any]:
+    payload = load_json_object(PROCESSED_COMMANDS_PATH)
+    rows = payload.get("commands")
+    return {str(key): value for key, value in rows.items() if isinstance(value, dict)} if isinstance(rows, dict) else {}
+
+
+def command_was_processed(command_id: int) -> bool:
+    return str(int(command_id)) in _processed_commands()
+
+
+def mark_command_processed(command_id: int, command_name: str) -> None:
+    rows = _processed_commands()
+    rows[str(int(command_id))] = {
+        "command": str(command_name)[:64],
+        "processed_at": time.time(),
+    }
+    ordered = sorted(rows.items(), key=lambda item: float((item[1] or {}).get("processed_at") or 0))[-250:]
+    atomic_write_json(PROCESSED_COMMANDS_PATH, {"commands": dict(ordered)}, backup=False)
 
 
 def collect_metrics(include_processes: bool, top_n: int = 5) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -473,18 +498,26 @@ def _open_archive_folder(config: dict[str, Any], command_id: int) -> None:
 
 def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
     try:
-        stage = download_update(
-            manifest,
-            api_key=str(config.get("api_key") or ""),
-            trust_env=bool(config.get("trust_env_proxy", False)),
-            progress=lambda message: print(f"[pc-client] {message}"),
-        )
-        launch_update_helper(
-            stage,
-            manifest,
-            command_id=command_id,
-            restart_target="none" if config.get("desktop_managed") else "agent",
-        )
+        version = str(manifest.get("version") or "")
+        revision = str(manifest.get("revision") or "")
+        with update_operation(version, revision) as operation:
+            def report(message: str) -> None:
+                print(f"[pc-client] {message}", flush=True)
+                operation.phase("downloading", message)
+
+            stage = download_update(
+                manifest,
+                api_key=str(config.get("api_key") or ""),
+                trust_env=bool(config.get("trust_env_proxy", False)),
+                progress=report,
+            )
+            operation.phase("verifying", "Пакет проверен")
+            launch_update_helper(
+                stage,
+                manifest,
+                command_id=command_id,
+                restart_target="none" if config.get("desktop_managed") else "agent",
+            )
         print(
             f"[pc-client] update staged: {manifest.get('version')} "
             f"({str(manifest.get('revision') or '')[:12]})"
@@ -499,15 +532,28 @@ def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: 
 
 def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
     try:
-        installer = download_installer_update(
-            manifest,
-            api_key=str(config.get("api_key") or ""),
-            trust_env=bool(config.get("trust_env_proxy", False)),
-            progress=lambda message: print(f"[pc-client] {message}"),
-        )
-        if command_id is not None:
-            store_command_result(command_id, True, f"Запущена установка XASS {manifest.get('version')}")
-        launch_installer_update(installer)
+        version = str(manifest.get("version") or "")
+        revision = str(manifest.get("revision") or "")
+        with update_operation(version, revision) as operation:
+            def report(message: str) -> None:
+                print(f"[pc-client] {message}", flush=True)
+                operation.phase("downloading", message)
+
+            installer = download_installer_update(
+                manifest,
+                api_key=str(config.get("api_key") or ""),
+                trust_env=bool(config.get("trust_env_proxy", False)),
+                progress=report,
+            )
+            operation.phase("verifying", "Установщик проверен")
+            if command_id is not None:
+                store_command_result(command_id, True, f"Запущена установка XASS {manifest.get('version')}")
+            launch_installer_update(
+                installer,
+                wait_pid=os.getpid(),
+                expected_version=version,
+                expected_revision=revision,
+            )
         print(f"[pc-client] installer update staged: {manifest.get('version')}")
         return "installer_update"
     except Exception as exc:
@@ -533,8 +579,12 @@ def run_agent(config: dict[str, Any]) -> str:
     )
 
     failed_auto_revision = ""
+    consecutive_failures = 0
+    sleep_seconds = 0.0
     with httpx.Client(timeout=20, trust_env=trust_env_proxy) as client:
         while True:
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
             payload = build_payload({**config, "source_name": source_name, "source_type": source_type})
             sent_result_ids = [
                 int(item.get("id"))
@@ -566,14 +616,25 @@ def run_agent(config: dict[str, Any]) -> str:
                     "online",
                     detail=msg,
                     server_time=str(body.get("server_time") or ""),
+                    latency_ms=round(_last_heartbeat_latency_ms, 1),
+                    agent_version=current_version(),
+                    server_version=_last_server_version,
+                    last_error="",
                 )
                 print(msg, flush=True)
+                consecutive_failures = 0
+                sleep_seconds = float(min(interval_sec, 5) if config.get("archive_enabled") else interval_sec)
+                commands = body.get("commands") if isinstance(body.get("commands"), list) else []
                 if sent_result_ids:
-                    clear_command_results(sent_result_ids)
+                    still_pending = {
+                        int(command.get("id"))
+                        for command in commands
+                        if isinstance(command, dict) and str(command.get("id", "")).isdigit()
+                    }
+                    clear_command_results([item for item in sent_result_ids if item not in still_pending])
 
                 manifest = body.get("update") if isinstance(body.get("update"), dict) else None
                 installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
-                commands = body.get("commands") if isinstance(body.get("commands"), list) else []
                 archive_result = apply_archive_events(config, body, client=client, headers=headers)
                 if archive_result.get("saved"):
                     print(
@@ -591,6 +652,11 @@ def run_agent(config: dict[str, Any]) -> str:
                         continue
                     command_name = str(command.get("command") or "").strip().lower()
                     command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+                    if command_was_processed(command_id):
+                        continue
+                    # Persist before execution. If the process dies after a power or
+                    # lock command, the same server delivery cannot execute it twice.
+                    mark_command_processed(command_id, command_name)
                     if command_name == "lock":
                         _lock_workstation(command_id)
                         continue
@@ -639,6 +705,8 @@ def run_agent(config: dict[str, Any]) -> str:
                         return _restart_agent(config, command_id)
                     if command_name == "update":
                         update_command_id = command_id
+                        continue
+                    store_command_result(command_id, False, f"Неизвестная команда агента: {command_name or 'empty'}")
 
                 if update_command_id is not None:
                     if is_installer_build() and installer_manifest and installer_manifest.get("available"):
@@ -669,9 +737,18 @@ def run_agent(config: dict[str, Any]) -> str:
                 error = f"[pc-client] heartbeat failed: {exc}"
                 _last_heartbeat_error = str(exc)[:1000]
                 _last_heartbeat_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                write_agent_status("offline", detail=error)
+                write_agent_status(
+                    "offline",
+                    detail=error,
+                    latency_ms=round(_last_heartbeat_latency_ms, 1),
+                    agent_version=current_version(),
+                    server_version=_last_server_version,
+                    last_error=str(exc)[:1000],
+                )
                 print(error, flush=True)
-            time.sleep(min(interval_sec, 5) if config.get("archive_enabled") else interval_sec)
+                consecutive_failures += 1
+                base_delay = min(90.0, 3.0 * (2 ** min(consecutive_failures - 1, 5)))
+                sleep_seconds = base_delay + random.uniform(0.0, min(3.0, base_delay * 0.2))
 
 
 def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
@@ -700,7 +777,7 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
-def main() -> None:
+def _run_main() -> None:
     try:
         args = build_arg_parser().parse_args()
         config = ensure_minimal_defaults(load_config())
@@ -736,6 +813,19 @@ def main() -> None:
         print(f"[pc-client] error: {exc}")
         print("[pc-client] hint: проверьте --server-url (должен вести на backend API), pair-code и доступность /health")
         raise SystemExit(1)
+
+
+def main() -> None:
+    if "--desktop-managed" not in sys.argv:
+        configure_utf8_logging()
+    instance = acquire_single_instance("XASS-background-agent")
+    if instance is None:
+        print("[pc-client] агент уже запущен; второй экземпляр не создан", flush=True)
+        return
+    try:
+        _run_main()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":
