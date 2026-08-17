@@ -44,7 +44,7 @@ from client_update import (
     write_agent_status,
 )
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
-from archive_store import archive_root, archive_status, conversation_rows
+from archive_store import archive_root, archive_status, cleanup_archive, conversation_rows
 
 ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
@@ -125,6 +125,8 @@ class XassDesktop:
         self.interval_var = tk.StringVar(value=str(self.config.get("interval_sec") or 30))
         self.auto_update_var = tk.BooleanVar(value=bool(self.config.get("auto_update", True)))
         self.archive_folder_var = tk.StringVar(value=str(self.config.get("archive_folder") or archive_root(self.config)))
+        self.archive_max_gb_var = tk.StringVar(value=str(self.config.get("archive_max_gb") or ""))
+        self.archive_retention_days_var = tk.StringVar(value=str(self.config.get("archive_retention_days") or ""))
         self.archive_state_var = tk.StringVar(value="Локальный архив ещё не синхронизирован")
         self.connection_var = tk.StringVar(value="Остановлен")
         self.last_seen_var = tk.StringVar(value="Heartbeat ещё не получен")
@@ -584,6 +586,8 @@ class XassDesktop:
         self._field(runtime, "Интервал heartbeat, секунд", self.interval_var)
         self._field(runtime, "Папка локального архива", self.archive_folder_var)
         self._button(runtime, "Выбрать папку архива", self.choose_archive_folder, kind="ghost").pack(fill="x", pady=(9, 0))
+        self._field(runtime, "Лимит архива, ГБ (пусто — без лимита)", self.archive_max_gb_var)
+        self._field(runtime, "Хранить медиа, дней (пусто — бессрочно)", self.archive_retention_days_var)
         self._button(runtime, "Сохранить настройки", self.save_settings, kind="primary").pack(fill="x", pady=(20, 0))
 
         maintenance = self._card(columns, padding=23)
@@ -640,6 +644,7 @@ class XassDesktop:
         actions.pack(fill="x")
         self._button(actions, "Открыть папку", self.open_archive_folder, kind="primary").pack(side="left")
         self._button(actions, "Выбрать другую", self.choose_archive_folder, kind="secondary").pack(side="left", padx=(9, 0))
+        self._button(actions, "Очистить медиа", self.cleanup_archive_files, kind="ghost").pack(side="left", padx=(9, 0))
 
         self.archive_messages = ScrolledText(
             self.content,
@@ -692,6 +697,17 @@ class XassDesktop:
         else:
             subprocess.Popen(["xdg-open", str(folder)])
 
+    def cleanup_archive_files(self) -> None:
+        if not messagebox.askyesno(
+            "XASS",
+            "Удалить локальные медиафайлы архива? Тексты сообщений останутся. Это действие нельзя отменить.",
+            parent=self.root,
+        ):
+            return
+        result = cleanup_archive(self.config, force=True)
+        self._log(f"Очищено локальных файлов: {result['removed_files']}, освобождено: {result['freed_bytes']} байт")
+        self.show_view("archive")
+
     def _clear_log_view(self) -> None:
         if hasattr(self, "full_log") and self.full_log.winfo_exists():
             self.full_log.configure(state="normal")
@@ -701,8 +717,10 @@ class XassDesktop:
     def save_settings(self) -> None:
         try:
             interval = max(5, int(self.interval_var.get().strip()))
+            max_gb = max(0.0, float(self.archive_max_gb_var.get().strip() or 0))
+            retention_days = max(0, int(self.archive_retention_days_var.get().strip() or 0))
         except ValueError:
-            messagebox.showerror("XASS", "Интервал должен быть числом")
+            messagebox.showerror("XASS", "Интервал, лимит и срок хранения должны быть числами")
             return
         self.config.update(
             {
@@ -712,6 +730,8 @@ class XassDesktop:
                 "interval_sec": interval,
                 "auto_update": self.auto_update_var.get(),
                 "archive_folder": self.archive_folder_var.get().strip(),
+                "archive_max_gb": max_gb,
+                "archive_retention_days": retention_days,
                 "desktop_managed": True,
             }
         )

@@ -30,7 +30,7 @@ from client_update import (
 )
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
-from archive_store import apply_archive_events, archive_cursor, archive_status
+from archive_store import apply_archive_events, archive_cursor, archive_root, archive_status, cleanup_archive
 
 CONFIG_PATH = DATA_ROOT / "config.json"
 _last_heartbeat_latency_ms = 0.0
@@ -200,6 +200,13 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
         "last_error": _last_heartbeat_error,
         "last_error_at": _last_heartbeat_error_at,
         "server_version_seen": _last_server_version,
+        "system": {
+            "platform": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "hostname": platform.node(),
+        },
     }
     if discord is not None:
         payload["discord"] = discord
@@ -418,6 +425,52 @@ def _lock_workstation(command_id: int) -> None:
         print(f"[pc-client] lock failed: {exc}")
 
 
+def _sleep_workstation(command_id: int) -> None:
+    if os.name != "nt":
+        store_command_result(command_id, False, "Сон доступен только на Windows")
+        return
+    try:
+        powrprof = ctypes.WinDLL("PowrProf", use_last_error=True)
+        suspend = powrprof.SetSuspendState
+        suspend.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
+        suspend.restype = ctypes.c_bool
+        if not suspend(False, True, False):
+            raise OSError(ctypes.get_last_error(), "SetSuspendState failed")
+        store_command_result(command_id, True, "Windows переведена в сон")
+    except Exception as exc:
+        store_command_result(command_id, False, f"Не удалось перевести Windows в сон: {exc}")
+
+
+def _power_command(command_id: int, *, reboot: bool, delay_sec: int) -> None:
+    if os.name != "nt":
+        store_command_result(command_id, False, "Команда питания доступна только на Windows")
+        return
+    delay = max(0, min(int(delay_sec), 3600))
+    action = "/r" if reboot else "/s"
+    label = "перезагружена" if reboot else "выключена"
+    try:
+        subprocess.Popen(
+            ["shutdown.exe", action, "/t", str(delay), "/d", "p:0:0"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        store_command_result(command_id, True, f"Windows будет {label} через {delay} сек.")
+    except OSError as exc:
+        store_command_result(command_id, False, f"Не удалось выполнить команду питания: {exc}")
+
+
+def _open_archive_folder(config: dict[str, Any], command_id: int) -> None:
+    if os.name != "nt":
+        store_command_result(command_id, False, "Открытие папки доступно только в Windows-приложении")
+        return
+    try:
+        folder = archive_root(config)
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))
+        store_command_result(command_id, True, f"Папка архива открыта: {folder}")
+    except OSError as exc:
+        store_command_result(command_id, False, f"Не удалось открыть папку архива: {exc}")
+
+
 def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
     try:
         stage = download_update(
@@ -537,8 +590,50 @@ def run_agent(config: dict[str, Any]) -> str:
                     except (TypeError, ValueError):
                         continue
                     command_name = str(command.get("command") or "").strip().lower()
+                    command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
                     if command_name == "lock":
                         _lock_workstation(command_id)
+                        continue
+                    if command_name == "sleep":
+                        _sleep_workstation(command_id)
+                        continue
+                    if command_name in {"reboot", "shutdown"}:
+                        _power_command(
+                            command_id,
+                            reboot=command_name == "reboot",
+                            delay_sec=int(command_payload.get("delay_sec") or 0),
+                        )
+                        continue
+                    if command_name == "ping":
+                        store_command_result(
+                            command_id,
+                            True,
+                            f"Соединение активно, задержка {_last_heartbeat_latency_ms:.0f} мс",
+                            {"latency_ms": round(_last_heartbeat_latency_ms, 1)},
+                        )
+                        continue
+                    if command_name == "open_archive":
+                        _open_archive_folder(config, command_id)
+                        continue
+                    if command_name == "cleanup_archive":
+                        result = cleanup_archive(config, force=True)
+                        store_command_result(
+                            command_id,
+                            True,
+                            f"Локальный архив очищен: {result['removed_files']} файлов",
+                            result,
+                        )
+                        continue
+                    if command_name == "check_update":
+                        update_info = installer_manifest if is_installer_build() else manifest
+                        available = bool(update_info and update_info.get("available"))
+                        version = str((update_info or {}).get("version") or current_version())
+                        store_command_result(
+                            command_id,
+                            True,
+                            f"Доступно обновление {version}" if available else "Версия уже актуальна",
+                            {"available": available, "version": version},
+                        )
                         continue
                     if command_name == "restart":
                         return _restart_agent(config, command_id)

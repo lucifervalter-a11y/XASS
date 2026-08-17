@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from pc_client import archive_store
@@ -24,8 +25,10 @@ class FakeResponse:
 class FakeClient:
     def __init__(self) -> None:
         self.headers = {}
+        self.calls = 0
 
     def stream(self, *_args, **_kwargs):
+        self.calls += 1
         self.headers = dict(_kwargs.get("headers") or {})
         return FakeResponse()
 
@@ -68,6 +71,7 @@ class AgentArchiveTests(unittest.TestCase):
                                 "type": "photo",
                                 "mime_type": "image/jpeg",
                                 "file_name": "photo.jpg",
+                                "file_unique_id": "telegram-unique-photo",
                                 "download_path": "/agent/archive/media/8",
                             }
                         ],
@@ -84,6 +88,25 @@ class AgentArchiveTests(unittest.TestCase):
             self.assertEqual(rows[0]["media_count"], 1)
             self.assertEqual(client.headers["X-XASS-Source"], "Home PC")
             self.assertTrue(any((Path(raw_root) / "media").rglob("*.jpg")))
+            connection = sqlite3.connect(Path(raw_root) / archive_store.DB_FILE)
+            checksum, unique_id = connection.execute("SELECT checksum,file_unique_id FROM media WHERE asset_id=8").fetchone()
+            connection.close()
+            self.assertEqual(len(checksum), 64)
+            self.assertEqual(unique_id, "telegram-unique-photo")
+
+            duplicate = {**payload["archive_events"][0], "event_id": 11, "message_id": 5, "telegram_message_id": 100}
+            duplicate["media"] = [{**duplicate["media"][0], "id": 9}]
+            archive_store.apply_archive_events(
+                config,
+                {"archive_enabled": True, "archive_events": [duplicate]},
+                client=client,
+                headers={},
+            )
+            self.assertEqual(client.calls, 1, "file_unique_id must avoid a duplicate download")
+            self.assertEqual(len(list((Path(raw_root) / "media").rglob("*.jpg"))), 1)
+            cleaned = archive_store.cleanup_archive(config, force=True)
+            self.assertEqual(cleaned["removed_files"], 1)
+            self.assertFalse(any((Path(raw_root) / "media").rglob("*.jpg")))
 
     def test_media_failure_keeps_cursor_and_publishes_retry_status(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

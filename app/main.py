@@ -1,4 +1,5 @@
 ﻿import asyncio
+import ipaddress
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
+import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -26,11 +28,14 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import HeartbeatSource, MediaAsset, MessageLog, MessageRevision
+from app.models import AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
 from app.services.agent_commands import (
+    DANGEROUS_AGENT_COMMANDS,
     acknowledge_agent_commands,
+    cancel_agent_command,
     deliver_agent_commands,
     enqueue_agent_command,
+    list_agent_commands,
     latest_agent_commands,
 )
 from app.services.agent_connection import build_connection_profile, normalize_server_origin
@@ -42,11 +47,12 @@ from app.services.agent_installer import (
     issue_installer_ticket,
     verify_installer_ticket,
 )
-from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code
+from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code, revoke_active_pair_codes
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.app_config import (
     cycle_save_mode,
     get_or_create_app_config,
+    list_admin_actions,
     list_recent_admin_actions,
     log_admin_action,
     parse_time_range,
@@ -61,6 +67,7 @@ from app.services.app_config import (
     toggle_quiet_hours,
 )
 from app.services.bot_identity import load_cached_bot_username, normalize_bot_username, save_cached_bot_username
+from app.services.backup_crypto import decrypt_backup, encrypt_backup
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
 from app.services.message_logging import forwarded_from_label
@@ -71,6 +78,7 @@ from app.services.pwa_auth import (
     authenticate_telegram_login as pwa_authenticate_login,
     issue_session as issue_pwa_session,
     issue_action_proof,
+    rotate_session_generation,
     verify_action_proof,
 )
 from app.services.passkeys import (
@@ -80,12 +88,24 @@ from app.services.passkeys import (
     count_credentials as passkey_count_credentials,
     delete_credential as passkey_delete_credential,
     list_credentials as passkey_list_credentials,
+    rename_credential as passkey_rename_credential,
     registration_options as passkey_registration_options,
     transaction_owner as passkey_transaction_owner,
 )
 from app.services.pwa_pairing import PwaPairingError, consume_pwa_pair_token, issue_pwa_pair_token
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.music_card import build_music_card, build_search_links, fallback_music_card
+from app.services.notifications import (
+    EVENT_TYPES as NOTIFICATION_EVENT_TYPES,
+    emit_notification,
+    list_notifications,
+    list_preferences as list_notification_preferences,
+    mark_all_read as mark_all_notifications_read,
+    notification_json,
+    save_preference as save_notification_preference,
+    set_notification_status,
+    unread_notification_count,
+)
 from app.services.profile_editor import (
     ensure_profile_exists,
     load_profile,
@@ -94,12 +114,14 @@ from app.services.profile_editor import (
     save_profile_with_backup,
     validate_http_url,
 )
-from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes, normalize_quotes, save_quotes, update_quote
+from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes, move_quote, normalize_quotes, save_quotes, update_quote
 from app.services.qr_codes import connection_profile_svg
 from app.services.restart_notice import clear_restart_notice, get_restart_notice, save_restart_notice
 from app.services.scenarios_store import all_scenarios, delete_scenario, find_scenario, normalize_scenarios, save_scenarios, upsert_scenario
+from app.services.scenario_runner import execute_scenario, finish_scenario, scenario_is_dangerous, try_start_scenario
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import (
+    SITE_WIDGETS,
     append_audit_log as append_projects_audit_log,
     backup_json_file,
     create_project_id,
@@ -107,13 +129,15 @@ from app.services.projects_store import (
     ensure_site_config_exists,
     load_projects,
     load_site_config,
+    move_sort,
     normalize_project,
     normalize_projects,
     normalize_site_config,
     save_projects,
     save_site_config,
 )
-from app.services.updater import get_update_status, restart_service, run_update
+from app.services.updater import get_update_status, restart_service, rollback as rollback_update, run_update
+from app.services.web_push import push_configured, remove_subscription as remove_web_push_subscription, save_subscription as save_web_push_subscription
 from app.storage import ensure_data_dirs
 from app.telegram_handler import TelegramUpdateHandler
 
@@ -124,7 +148,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.12.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -198,14 +222,44 @@ class MiniQuotePayload(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
+class MiniMovePayload(BaseModel):
+    direction: str = Field(pattern="^(up|down)$")
+
+
 class MiniAgentCommandPayload(BaseModel):
-    command: str
+    command: str = Field(min_length=1, max_length=32)
     payload: dict[str, Any] | None = None
     action_proof: str = Field(default="", max_length=2048)
 
 
 class MiniArchiveTargetPayload(BaseModel):
     enabled: bool
+
+
+class MiniConversationPinPayload(BaseModel):
+    pinned: bool
+
+
+class MiniNotificationPreferencePayload(BaseModel):
+    event_type: str = Field(min_length=1, max_length=96)
+    channels: list[str] = Field(default_factory=list, max_length=3)
+    priority: str = Field(default="normal", max_length=16)
+    quiet_hours: bool = True
+
+
+class MiniPushSubscriptionPayload(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+    expirationTime: int | None = None
+    keys: dict[str, str]
+
+
+class MiniPushUnsubscribePayload(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+
+
+class MiniDiagnosticActionPayload(BaseModel):
+    action: str = Field(min_length=1, max_length=64)
+    source_name: str = Field(default="", max_length=128)
 
 
 class MiniAgentPairPayload(BaseModel):
@@ -241,6 +295,10 @@ class PasskeyCompletePayload(BaseModel):
     name: str = Field(default="", max_length=120)
 
 
+class MiniPasskeyNamePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
 class MiniConfigBundlePayload(BaseModel):
     bundle_format: str = Field(alias="format", min_length=1, max_length=32)
     version: int = Field(ge=1, le=1)
@@ -250,12 +308,30 @@ class MiniConfigBundlePayload(BaseModel):
     quotes: list[Any] = Field(default_factory=list, max_length=500)
     settings: dict[str, Any] = Field(default_factory=dict)
     scenarios: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    notifications: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    agents: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
+    archive: dict[str, Any] = Field(default_factory=dict)
+
+
+class MiniConfigExportPayload(BaseModel):
+    passphrase: str = Field(min_length=8, max_length=256)
+
+
+class MiniEncryptedConfigPayload(BaseModel):
+    passphrase: str = Field(min_length=8, max_length=256)
+    bundle: dict[str, Any]
 
 
 class MiniScenarioPayload(BaseModel):
     id: str = Field(default="", max_length=64)
     name: str = Field(min_length=1, max_length=120)
-    actions: list[str] = Field(min_length=1, max_length=4)
+    icon: str = Field(default="bolt", max_length=32)
+    color: str = Field(default="#376dff", max_length=7)
+    devices: list[str] = Field(default_factory=list, max_length=100)
+    actions: list[str] = Field(min_length=1, max_length=12)
+    delay_sec: int = Field(default=0, ge=0, le=3600)
+    schedule: str = Field(default="", max_length=64)
+    enabled: bool = True
 
 
 async def _require_pwa_action_proof(
@@ -297,6 +373,43 @@ def _config_settings_snapshot(config: Any) -> dict[str, Any]:
     }
 
 
+def _backup_profile_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
+    excluded = {"iphone_hook_key", "vk_access_token"}
+    return {key: value for key, value in profile.items() if key not in excluded}
+
+
+async def _build_config_bundle(session: AsyncSession) -> dict[str, Any]:
+    config = await get_or_create_app_config(session, settings)
+    sources = await list_sources(session)
+    archive_targets = await archive_target_map(session)
+    return {
+        "format": "xass-config",
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "app_version": APP_VERSION,
+        "profile": _backup_profile_snapshot(load_profile(Path(settings.profile_json_path))),
+        "projects": load_projects(Path(settings.projects_json_path)),
+        "site_config": load_site_config(Path(settings.site_config_json_path)),
+        "quotes": load_quotes(Path(settings.quotes_json_path)),
+        "settings": _config_settings_snapshot(config),
+        "scenarios": [item for item in all_scenarios(Path(settings.scenarios_json_path)) if not item.get("builtin")],
+        "notifications": await list_notification_preferences(session),
+        "agents": [
+            {
+                "source_name": item.source_name,
+                "source_type": item.source_type,
+                "archive_enabled": bool(
+                    archive_targets.get(item.source_name) and archive_targets[item.source_name].enabled
+                ),
+            }
+            for item in sources
+        ],
+        "archive": {
+            "targets": [name for name, item in archive_targets.items() if item.enabled],
+        },
+    }
+
+
 def _minute_or_none(value: Any) -> int | None:
     if value in {None, ""}:
         return None
@@ -335,7 +448,19 @@ class MiniSiteProjectPayload(BaseModel):
 
 class MiniSiteConfigPayload(BaseModel):
     accent_color: str = Field(default="#376dff", min_length=7, max_length=7)
-    widgets: list[str] = Field(default_factory=list, max_length=6)
+    widgets: list[str] = Field(default_factory=lambda: list(SITE_WIDGETS), max_length=6)
+
+
+def _safe_ip_prefix(request: Request) -> str:
+    raw = str(request.headers.get("x-forwarded-for") or (request.client.host if request.client else ""))
+    candidate = raw.split(",", 1)[0].strip()
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return "unknown"
+    if address.version == 4:
+        return str(ipaddress.ip_network(f"{address}/24", strict=False))
+    return str(ipaddress.ip_network(f"{address}/64", strict=False))
 
 
 async def _run_bot_post_startup() -> None:
@@ -567,7 +692,32 @@ async def agent_heartbeat(
     if isinstance(payload.discord, dict) and payload.discord:
         update_profile_discord(settings, payload.discord)
 
-    if is_new and bot_client:
+    new_policy: dict[str, Any] = {"channels": []}
+    recovered_policy: dict[str, Any] = {"channels": [], "quiet_hours": True}
+    if is_new:
+        _, new_policy = await emit_notification(
+            session,
+            event_type="agent_connected",
+            title="Подключён новый агент",
+            message=f"{source.source_name} · {source.source_type}",
+            device=source.source_name,
+            details={"source_type": source.source_type},
+            dedup_key=f"agent-connected:{source.source_name}",
+            cooldown_sec=86400,
+        )
+    if recovered:
+        _, recovered_policy = await emit_notification(
+            session,
+            event_type="agent_recovered",
+            title=f"{source.source_name} снова в сети",
+            message=f"Heartbeat восстановлен: {source.last_seen_at.isoformat()}",
+            device=source.source_name,
+            details={"source_type": source.source_type},
+            dedup_key=f"agent-recovered:{source.source_name}:{source.last_seen_at.date()}",
+            cooldown_sec=300,
+        )
+
+    if is_new and bot_client and "telegram" in new_policy["channels"]:
         chat_id = _notify_chat_id(config.notify_chat_id)
         if chat_id:
             await bot_client.send_message(
@@ -581,7 +731,10 @@ async def agent_heartbeat(
                 ),
             )
 
-    if recovered and bot_client and not is_quiet_hours(config, settings):
+    recovered_telegram = "telegram" in recovered_policy["channels"] and (
+        not recovered_policy.get("quiet_hours") or not is_quiet_hours(config, settings)
+    )
+    if recovered and bot_client and recovered_telegram:
         chat_id = _notify_chat_id(config.notify_chat_id)
         if chat_id:
             await bot_client.send_message(
@@ -623,6 +776,18 @@ async def agent_heartbeat(
         current_version=payload.agent_version,
         current_revision=payload.agent_revision,
     ) if payload.agent_distribution == "installer" else None
+    available_manifest = installer_manifest if payload.agent_distribution == "installer" else update_manifest
+    if available_manifest and available_manifest.get("available"):
+        await emit_notification(
+            session,
+            event_type="update_available",
+            title="Доступно обновление агента",
+            message=f"Для {source.source_name} доступна версия {available_manifest.get('version') or 'новее'}",
+            device=source.source_name,
+            details={"version": available_manifest.get("version"), "revision": available_manifest.get("revision")},
+            dedup_key=f"update-available:{source.source_name}:{available_manifest.get('revision') or available_manifest.get('version')}",
+            cooldown_sec=86400,
+        )
 
     return HeartbeatResponse(
         ok=True,
@@ -934,9 +1099,25 @@ async def pwa_config(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/pwa/login")
-async def pwa_login(payload: PwaTelegramLoginPayload, response: Response) -> dict[str, Any]:
+async def pwa_login(
+    payload: PwaTelegramLoginPayload,
+    response: Response,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
     user = pwa_authenticate_login(payload.model_dump(exclude_unset=True), settings)
     if user is None:
+        await emit_notification(
+            session,
+            event_type="auth_failed",
+            title="Неудачная попытка входа",
+            message="Telegram Login Widget не прошёл проверку",
+            priority="high",
+            requires_action=True,
+            details={"ip_prefix": _safe_ip_prefix(request)},
+            dedup_key=f"auth-failed:{_safe_ip_prefix(request)}",
+            cooldown_sec=300,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Telegram login is invalid or this account is not the owner")
     response.set_cookie(
         PWA_COOKIE_NAME,
@@ -946,6 +1127,21 @@ async def pwa_login(payload: PwaTelegramLoginPayload, response: Response) -> dic
         secure=settings.pwa_cookie_secure,
         samesite="lax",
         path="/",
+    )
+    await emit_notification(
+        session,
+        event_type="new_login",
+        title="Новый вход в XASS",
+        message="Выполнен вход через Telegram",
+        details={"source": "pwa", "ip_prefix": _safe_ip_prefix(request)},
+        dedup_key=f"login:telegram:{_safe_ip_prefix(request)}",
+        cooldown_sec=300,
+    )
+    await log_admin_action(
+        session,
+        user.user_id,
+        "pwa_login",
+        {"channel": "pwa", "ip_prefix": _safe_ip_prefix(request), "result": "success"},
     )
     return {"ok": True, "user": {"id": user.user_id, "first_name": user.first_name, "username": user.username}}
 
@@ -989,6 +1185,32 @@ async def pwa_logout(response: Response) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.post("/api/pwa/logout-all")
+async def pwa_logout_all(
+    response: Response,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    await _require_pwa_action_proof(
+        session=session,
+        user=user,
+        telegram_init_data=x_telegram_init_data or "",
+        action_proof=x_xass_action_proof or "",
+        purpose="sessions:logout-all",
+    )
+    generation = rotate_session_generation(settings)
+    response.delete_cookie(PWA_COOKIE_NAME, path="/", secure=settings.pwa_cookie_secure, samesite="lax")
+    await log_admin_action(
+        session,
+        user.user_id,
+        "sessions_revoked",
+        {"channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa"},
+    )
+    return {"ok": True, "generation": generation}
+
+
 @app.post("/api/pwa/passkeys/login/options")
 async def pwa_passkey_login_options(
     request: Request,
@@ -1013,6 +1235,7 @@ async def pwa_passkey_login_options(
 async def pwa_passkey_login_verify(
     payload: PasskeyCompletePayload,
     response: Response,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
@@ -1039,6 +1262,21 @@ async def pwa_passkey_login_verify(
             secure=settings.pwa_cookie_secure,
             samesite="lax",
             path="/",
+        )
+        await emit_notification(
+            session,
+            event_type="new_login",
+            title="Новый вход в XASS",
+            message=f"Вход через {credential.name}",
+            details={"source": "passkey", "credential_id": credential.id, "ip_prefix": _safe_ip_prefix(request)},
+            dedup_key=f"login:passkey:{credential.id}:{_safe_ip_prefix(request)}",
+            cooldown_sec=300,
+        )
+        await log_admin_action(
+            session,
+            credential.owner_user_id,
+            "pwa_login",
+            {"channel": "passkey", "credential_id": credential.id, "ip_prefix": _safe_ip_prefix(request)},
         )
     response.headers["Cache-Control"] = "no-store"
     return {
@@ -1089,6 +1327,48 @@ async def pwa_passkey_register_verify(
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await emit_notification(
+        session,
+        event_type="passkey_registered",
+        title="Добавлен новый Passkey",
+        message=credential.name,
+        details={"credential_id": credential.id, "device_type": credential.device_type or ""},
+        dedup_key=f"passkey:{credential.id}",
+        cooldown_sec=0,
+    )
+    await log_admin_action(
+        session,
+        user.user_id,
+        "passkey_registered",
+        {"credential_id": credential.id, "name": credential.name, "channel": "pwa"},
+    )
+    return {"ok": True, "credential": {"id": credential.id, "name": credential.name}}
+
+
+@app.put("/api/mini/passkeys/{credential_id}")
+async def mini_passkey_rename(
+    credential_id: int,
+    payload: MiniPasskeyNamePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        credential = await passkey_rename_credential(
+            session,
+            owner_user_id=user.user_id,
+            credential_id=credential_id,
+            name=payload.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if credential is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Passkey не найден")
+    await log_admin_action(
+        session,
+        user.user_id,
+        "passkey_renamed",
+        {"credential_id": credential.id, "name": credential.name},
+    )
     return {"ok": True, "credential": {"id": credential.id, "name": credential.name}}
 
 
@@ -1164,6 +1444,378 @@ def _build_mini_status(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _public_site_status(public_url: str) -> dict[str, Any]:
+    url = (public_url or "").strip()
+    if not url:
+        return {"status": "not_configured", "available": False, "url": "", "latency_ms": None}
+    if not urlsplit(url).path.strip("/"):
+        url = url.rstrip("/") + "/profile.php"
+    started = asyncio.get_running_loop().time()
+    try:
+        async with httpx.AsyncClient(timeout=3, follow_redirects=True, trust_env=False) as client:
+            response = await client.get(url)
+        latency = round((asyncio.get_running_loop().time() - started) * 1000, 1)
+        return {
+            "status": "online" if response.status_code < 500 else "error",
+            "available": response.status_code < 500,
+            "url": url,
+            "http_status": response.status_code,
+            "latency_ms": latency,
+        }
+    except (httpx.HTTPError, OSError) as exc:
+        return {
+            "status": "offline",
+            "available": False,
+            "url": url,
+            "latency_ms": None,
+            "error": type(exc).__name__,
+        }
+
+
+def _agent_attention(payload: dict[str, Any], *, is_online: bool, latest_version: str) -> tuple[list[str], bool]:
+    reasons: list[str] = []
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    archive = payload.get("archive_status") if isinstance(payload.get("archive_status"), dict) else {}
+    version = str(payload.get("agent_version") or "0.0.0")
+    requires_update = bool(latest_version and latest_version != "0.0.0" and version != latest_version)
+    if not is_online:
+        reasons.append("offline")
+    for key, threshold, label in (
+        ("cpu_percent", 95, "high_cpu"),
+        ("ram_used_percent", 95, "high_ram"),
+        ("disk_used_percent", 92, "low_disk"),
+    ):
+        try:
+            if float(metrics.get(key) or 0) >= threshold:
+                reasons.append(label)
+        except (TypeError, ValueError):
+            continue
+    if str(payload.get("last_error") or "").strip():
+        reasons.append("agent_error")
+    if str(archive.get("last_error") or "").strip():
+        reasons.append("archive_error")
+    if requires_update:
+        reasons.append("update_available")
+    return reasons, requires_update
+
+
+def _admin_action_json(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "actor_user_id": item.actor_user_id,
+        "action": item.action,
+        "payload": item.payload if isinstance(item.payload, dict) else {},
+        "created_at": item.created_at.isoformat(),
+    }
+
+
+@app.get("/api/mini/audit")
+async def mini_audit(
+    limit: int = 50,
+    action: str = "",
+    source: str = "",
+    result: str = "",
+    device: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        created_from = datetime.fromisoformat(date_from) if date_from else None
+        created_to = datetime.fromisoformat(date_to) if date_to else None
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный период журнала") from exc
+    rows = await list_admin_actions(
+        session,
+        limit=limit,
+        action=action,
+        source=source,
+        result=result,
+        device=device,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    return {"ok": True, "items": [_admin_action_json(item) for item in rows]}
+
+
+@app.get("/api/mini/notifications")
+async def mini_notifications(
+    status_filter: str = "",
+    limit: int = 50,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    rows = await list_notifications(session, status=status_filter, limit=limit)
+    return {
+        "ok": True,
+        "items": [notification_json(item) for item in rows],
+        "unread_count": await unread_notification_count(session),
+        "preferences": await list_notification_preferences(session),
+        "event_types": list(NOTIFICATION_EVENT_TYPES),
+        "push_supported": push_configured(settings),
+        "push_public_key": settings.pwa_vapid_public_key if push_configured(settings) else "",
+    }
+
+
+@app.post("/api/mini/notifications/read-all")
+async def mini_notifications_read_all(
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
+    del user
+    await mark_all_notifications_read(session)
+    return {"ok": True}
+
+
+@app.post("/api/mini/notifications/{notification_id}/read")
+async def mini_notification_read(
+    notification_id: int,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    item = await set_notification_status(session, notification_id, "read")
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Уведомление не найдено")
+    return {"ok": True, "item": notification_json(item)}
+
+
+@app.delete("/api/mini/notifications/{notification_id}")
+async def mini_notification_hide(
+    notification_id: int,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
+    del user
+    item = await set_notification_status(session, notification_id, "hidden")
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Уведомление не найдено")
+    return {"ok": True}
+
+
+@app.put("/api/mini/notifications/preferences")
+async def mini_notification_preference_save(
+    payload: MiniNotificationPreferencePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        saved = await save_notification_preference(
+            session,
+            event_type=payload.event_type,
+            channels=payload.channels,
+            priority=payload.priority,
+            quiet_hours=payload.quiet_hours,
+            actor_user_id=user.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await log_admin_action(
+        session,
+        user.user_id,
+        "notification_preference_saved",
+        {"event_type": saved["event_type"], "channels": saved["channels"], "priority": saved["priority"]},
+    )
+    return {"ok": True, "preference": saved}
+
+
+@app.post("/api/mini/push/subscribe")
+async def mini_push_subscribe(
+    payload: MiniPushSubscriptionPayload,
+    request: Request,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    if not push_configured(settings):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Web Push ещё не настроен на сервере")
+    try:
+        item = await save_web_push_subscription(
+            session,
+            owner_user_id=user.user_id,
+            payload=payload.model_dump(),
+            user_agent=request.headers.get("user-agent", ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await log_admin_action(session, user.user_id, "push_subscription_saved", {"subscription_id": item.id, "source": "pwa"})
+    return {"ok": True, "subscription_id": item.id}
+
+
+@app.delete("/api/mini/push/subscribe")
+async def mini_push_unsubscribe(
+    payload: MiniPushUnsubscribePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    removed = await remove_web_push_subscription(session, owner_user_id=user.user_id, endpoint=payload.endpoint)
+    await log_admin_action(session, user.user_id, "push_subscription_removed", {"removed": removed, "source": "pwa"})
+    return {"ok": True, "removed": removed}
+
+
+@app.get("/api/mini/diagnostics")
+async def mini_diagnostics(
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    database_ok = False
+    try:
+        database_ok = bool(await session.scalar(select(1)))
+    except Exception as exc:
+        logger.warning("Diagnostics database check failed: %s", type(exc).__name__)
+    config = await get_or_create_app_config(session, settings)
+    public_site = await _public_site_status((settings.profile_public_url or config.service_base_url or "").strip())
+    sources = await list_sources(session)
+    archive = await archive_summary(session)
+    update_status = await asyncio.to_thread(get_update_status, settings, include_release_notes=False)
+    config_issues: list[str] = []
+    if not settings.owner_user_id:
+        config_issues.append("OWNER_USER_ID не настроен")
+    if not settings.bot_token:
+        config_issues.append("BOT_TOKEN не настроен")
+    if settings.setup_api_key.startswith("change-me"):
+        config_issues.append("SETUP_API_KEY использует значение по умолчанию")
+    if settings.agent_api_key.startswith("change-me"):
+        config_issues.append("AGENT_API_KEY использует значение по умолчанию")
+    recent = await list_recent_admin_actions(session, 100)
+    last_errors = [
+        {
+            "action": item.action,
+            "error": str((item.payload or {}).get("error") or (item.payload or {}).get("message") or "")[:500],
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in recent
+        if isinstance(item.payload, dict)
+        and ((item.payload.get("result") in {"failed", "error"}) or item.payload.get("error"))
+    ][:20]
+    metrics = collect_server_metrics(top_processes_limit=0)
+    return {
+        "ok": True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "app_version": APP_VERSION,
+        "connection": public_site,
+        "database": {"available": database_ok, "status": "online" if database_ok else "error"},
+        "telegram": {
+            "mode": "polling" if settings.use_polling else "webhook",
+            "configured": bool(settings.bot_token),
+            "webhook_path_configured": bool(settings.telegram_webhook_path and "change-me" not in settings.telegram_webhook_path),
+        },
+        "background_tasks": {
+            "offline_monitor": "enabled",
+            "weather_sync": "enabled",
+            "telegram_updates": "polling" if settings.use_polling else "webhook",
+        },
+        "archive": {**archive, "online_targets": sum(1 for item in sources if item.is_online)},
+        "updates": {
+            "branch": update_status.branch,
+            "has_updates": update_status.has_updates,
+            "errors": update_status.errors,
+        },
+        "storage": {
+            "disk_used_percent": metrics.get("disk_used_percent"),
+            "disk_free_gb": round(float(metrics.get("disk_total_gb") or 0) - float(metrics.get("disk_used_gb") or 0), 2),
+        },
+        "configuration": {"ok": not config_issues, "issues": config_issues},
+        "last_errors": last_errors,
+    }
+
+
+@app.post("/api/mini/diagnostics/test-notification")
+async def mini_diagnostics_test_notification(
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    item, _ = await emit_notification(
+        session,
+        event_type="high_load",
+        title="Тест XASS",
+        message="Центр уведомлений работает",
+        details={"source": "diagnostics"},
+        cooldown_sec=0,
+    )
+    await log_admin_action(session, user.user_id, "diagnostic_notification_test", {})
+    return {"ok": True, "notification": notification_json(item) if item else None}
+
+
+@app.post("/api/mini/diagnostics/action")
+async def mini_diagnostic_action(
+    payload: MiniDiagnosticActionPayload,
+    background_tasks: BackgroundTasks,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    action = payload.action.strip().lower()
+    dangerous = action in {"restart_backend", "rollback_update"}
+    if dangerous:
+        await _require_pwa_action_proof(
+            session=session,
+            user=user,
+            telegram_init_data=x_telegram_init_data or "",
+            action_proof=x_xass_action_proof or "",
+            purpose=f"diagnostics:{action}",
+        )
+    result: dict[str, Any] = {"action": action}
+    if action == "check_migrations":
+        await init_db()
+        result["message"] = "Схема базы проверена"
+    elif action == "clear_update_cache":
+        cache_root = Path(settings.agent_update_cache_dir).resolve()
+        removed = 0
+        if cache_root.is_dir():
+            for candidate in cache_root.rglob("*.tmp"):
+                resolved = candidate.resolve()
+                if resolved.is_file() and resolved.is_relative_to(cache_root):
+                    resolved.unlink(missing_ok=True)
+                    removed += 1
+        result.update({"message": "Временный кэш очищен", "removed": removed})
+    elif action == "test_agent":
+        source = await session.scalar(
+            select(HeartbeatSource).where(HeartbeatSource.source_name == payload.source_name.strip())
+        )
+        if source is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Агент не найден")
+        command = await enqueue_agent_command(
+            session,
+            source_name=source.source_name,
+            command="ping",
+            payload={"diagnostic": True},
+            actor_user_id=user.user_id,
+        )
+        result.update({"message": "Тестовая команда поставлена в очередь", "command_id": command.id})
+    elif action == "restart_backend":
+        background_tasks.add_task(restart_service, settings)
+        result["message"] = "Перезапуск backend запланирован после ответа"
+    elif action == "rollback_update":
+        rollback_result = await asyncio.to_thread(rollback_update, settings, execute_restart=False)
+        result.update({"message": "Откат выполнен" if rollback_result.ok else "Откат не выполнен", "ok": rollback_result.ok, "error": rollback_result.error})
+        await emit_notification(
+            session,
+            event_type="update_rollback",
+            title="Обновление откачено" if rollback_result.ok else "Не удалось откатить обновление",
+            message="Восстановлена предыдущая версия XASS" if rollback_result.ok else (rollback_result.error or "Резервная копия недоступна"),
+            priority="high" if rollback_result.ok else "critical",
+            requires_action=not rollback_result.ok,
+            details={"ok": rollback_result.ok},
+            dedup_key=f"update-rollback:{datetime.now(timezone.utc).strftime('%Y%m%d%H')}",
+            cooldown_sec=3600,
+        )
+        if rollback_result.ok:
+            background_tasks.add_task(_restart_after_mini_request, user.user_id, "после отката обновления")
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Неизвестное действие диагностики")
+    await log_admin_action(
+        session,
+        user.user_id,
+        "diagnostic_action",
+        {"action": action, "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa", "result": "success" if result.get("ok", True) else "failure"},
+    )
+    return {"ok": True, **result}
+
+
 @app.get("/api/mini/bootstrap")
 async def mini_bootstrap(
     user: MiniAppUser = Depends(require_mini_user),
@@ -1180,6 +1832,46 @@ async def mini_bootstrap(
     metrics = collect_server_metrics(top_processes_limit=settings.top_processes_limit)
     services = collect_systemd_statuses(settings.monitored_services)
     quotes = load_quotes(Path(settings.quotes_json_path))
+    windows_installer = installer_public_info(settings)
+    latest_agent_version = str(windows_installer.get("version") or "0.0.0")
+    public_site = await _public_site_status((settings.profile_public_url or config.service_base_url or "").strip())
+    source_rows: list[dict[str, Any]] = []
+    for item in sources:
+        last_payload = item.last_payload if isinstance(item.last_payload, dict) else {}
+        attention_reasons, requires_update = _agent_attention(
+            last_payload,
+            is_online=bool(item.is_online),
+            latest_version=latest_agent_version,
+        )
+        source_rows.append(
+            {
+                "id": item.id,
+                "source_name": item.source_name,
+                "source_type": item.source_type,
+                "is_online": item.is_online,
+                "last_seen_at": item.last_seen_at.isoformat() if item.last_seen_at else None,
+                "went_offline_at": item.went_offline_at.isoformat() if item.went_offline_at else None,
+                "last_payload": last_payload,
+                "agent_version": str(last_payload.get("agent_version") or "0.0.0"),
+                "agent_revision": str(last_payload.get("agent_revision") or ""),
+                "system": last_payload.get("system") if isinstance(last_payload.get("system"), dict) else {},
+                "requires_update": requires_update,
+                "requires_attention": bool(attention_reasons),
+                "attention_reasons": attention_reasons,
+                "latest_command": (
+                    {
+                        "id": latest_commands[item.source_name].id,
+                        "command": latest_commands[item.source_name].command,
+                        "status": latest_commands[item.source_name].status,
+                        "created_at": latest_commands[item.source_name].created_at.isoformat(),
+                        "result": latest_commands[item.source_name].result or {},
+                    }
+                    if item.source_name in latest_commands
+                    else None
+                ),
+                "archive_enabled": bool(archive_targets.get(item.source_name) and archive_targets[item.source_name].enabled),
+            }
+        )
 
     return {
         "ok": True,
@@ -1205,36 +1897,23 @@ async def mini_bootstrap(
             "away_schedule_end": config.away_schedule_end_minute,
             "service_base_url": config.service_base_url or "",
         },
-        "sources": [
-            {
-                "id": item.id,
-                "source_name": item.source_name,
-                "source_type": item.source_type,
-                "is_online": item.is_online,
-                "last_seen_at": item.last_seen_at.isoformat() if item.last_seen_at else None,
-                "last_payload": item.last_payload,
-                "agent_version": str((item.last_payload or {}).get("agent_version") or "0.0.0"),
-                "agent_revision": str((item.last_payload or {}).get("agent_revision") or ""),
-                "latest_command": (
-                    {
-                        "id": latest_commands[item.source_name].id,
-                        "command": latest_commands[item.source_name].command,
-                        "status": latest_commands[item.source_name].status,
-                        "created_at": latest_commands[item.source_name].created_at.isoformat(),
-                        "result": latest_commands[item.source_name].result or {},
-                    }
-                    if item.source_name in latest_commands
-                    else None
-                ),
-                "archive_enabled": bool(archive_targets.get(item.source_name) and archive_targets[item.source_name].enabled),
-            }
-            for item in sources
-        ],
+        "sources": source_rows,
         "metrics": metrics,
         "services": services,
-        "windows_installer": installer_public_info(settings),
+        "system_status": {
+            "backend": {"status": "online", "available": True, "version": APP_VERSION},
+            "database": {"status": "online", "available": True},
+            "telegram_bot": {
+                "status": "online" if bot_client is not None else "not_configured",
+                "available": bot_client is not None,
+            },
+            "public_site": public_site,
+            "interface": {"status": "online", "available": True, "version": APP_VERSION},
+        },
+        "windows_installer": windows_installer,
         "quotes_count": len(quotes),
         "archive": archive,
+        "notifications_unread": await unread_notification_count(session) if user.is_owner else 0,
         "passkeys": [
             {
                 "id": item.id,
@@ -1245,15 +1924,7 @@ async def mini_bootstrap(
             }
             for item in passkeys
         ],
-        "admin_actions": [
-            {
-                "id": item.id,
-                "action": item.action,
-                "payload": item.payload or {},
-                "created_at": item.created_at.isoformat(),
-            }
-            for item in admin_actions
-        ],
+        "admin_actions": [_admin_action_json(item) for item in admin_actions],
         "scenarios": all_scenarios(Path(settings.scenarios_json_path)),
         "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
     }
@@ -1480,6 +2151,87 @@ async def mini_site_project_save(
     return {"ok": True, "project": next(item for item in saved if item["id"] == project_id), "projects": saved}
 
 
+@app.post("/api/mini/site/projects/{project_id}/move")
+async def mini_site_project_move(
+    project_id: str,
+    payload: MiniMovePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    projects_path = Path(settings.projects_json_path)
+    projects = load_projects(projects_path)
+    if not any(str(item.get("id")) == project_id for item in projects):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Проект не найден")
+    backup = backup_json_file(projects_path, Path(settings.projects_backups_dir), "projects")
+    saved = save_projects(projects_path, move_sort(projects, project_id, payload.direction))
+    append_projects_audit_log(
+        Path(settings.projects_audit_log_path),
+        user.user_id,
+        "miniapp_project_move",
+        {"project_id": project_id, "direction": payload.direction, "backup_path": str(backup) if backup else None},
+    )
+    return {"ok": True, "projects": saved}
+
+
+@app.post("/api/mini/site/projects/{project_id}/cover")
+async def mini_site_project_cover_upload(
+    project_id: str,
+    request: Request,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    projects_path = Path(settings.projects_json_path)
+    projects = load_projects(projects_path)
+    project = next((item for item in projects if str(item.get("id")) == project_id), None)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Проект не найден")
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите изображение")
+    if len(body) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Обложка должна быть меньше 10 МБ")
+    extension = _avatar_extension(request.headers.get("content-type", ""), body)
+    if extension is None:
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Поддерживаются JPG, PNG и WebP")
+
+    covers_dir = Path(settings.projects_assets_dir)
+    covers_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"{project_id}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}.{extension}"
+    destination = covers_dir / file_name
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(body)
+    temporary.replace(destination)
+    try:
+        cover_url = "/" + destination.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError as exc:
+        temporary.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Каталог обложек должен находиться внутри XASS",
+        ) from exc
+
+    project["cover"] = {"type": "image", "src": cover_url}
+    project["updated_at"] = datetime.now(timezone.utc).isoformat()
+    backup = backup_json_file(projects_path, Path(settings.projects_backups_dir), "projects")
+    saved = save_projects(projects_path, projects)
+    append_projects_audit_log(
+        Path(settings.projects_audit_log_path),
+        user.user_id,
+        "miniapp_project_cover_upload",
+        {
+            "project_id": project_id,
+            "file_name": file_name,
+            "size": len(body),
+            "backup_path": str(backup) if backup else None,
+        },
+    )
+    return {
+        "ok": True,
+        "cover_url": cover_url,
+        "project": next(item for item in saved if item["id"] == project_id),
+        "projects": saved,
+    }
+
+
 @app.delete("/api/mini/site/projects/{project_id}")
 async def mini_site_project_delete(
     project_id: str,
@@ -1515,6 +2267,21 @@ async def mini_agent_pair_code(
         actor_user_id=user.user_id,
         ttl_minutes=settings.agent_pair_code_ttl_minutes,
         code_length=settings.agent_pair_code_length,
+    )
+    await emit_notification(
+        session,
+        event_type="pair_code_created",
+        title="Создан код привязки агента",
+        message=f"Действует {result.ttl_minutes} мин.",
+        details={"expires_at": result.expires_at, "code_hint": result.code[:2] + "…"},
+        dedup_key=f"pair-code:{result.expires_at.isoformat()}",
+        cooldown_sec=0,
+    )
+    await log_admin_action(
+        session,
+        user.user_id,
+        "agent_pair_code_created",
+        {"channel": "telegram" if request.headers.get("x-telegram-init-data") else "pwa", "expires_at": result.expires_at},
     )
     config = await get_or_create_app_config(session, settings)
     requested_server = (payload.server_url if payload else "").strip()
@@ -1558,6 +2325,16 @@ async def mini_agent_pair_code(
         "qr_svg": connection_profile_svg(connection),
         "connection_file_name": "xass-connect.xass",
     }
+
+
+@app.post("/api/mini/agents/pair-code/revoke")
+async def mini_agent_pair_code_revoke(
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    revoked = await revoke_active_pair_codes(session)
+    await log_admin_action(session, user.user_id, "agent_pair_code_revoked", {"revoked": revoked})
+    return {"ok": True, "revoked": revoked}
 
 
 @app.post("/api/mini/pwa/pair-link")
@@ -1680,8 +2457,9 @@ async def mini_scenario_run(
     scenario = find_scenario(Path(settings.scenarios_json_path), scenario_id)
     if scenario is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Сценарий не найден")
-    actions = [str(item) for item in scenario.get("actions") or []]
-    if any(item in {"lock_all", "update_all"} for item in actions):
+    if not bool(scenario.get("enabled", True)):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Сценарий выключен")
+    if scenario_is_dangerous(scenario):
         await _require_pwa_action_proof(
             session=session,
             user=user,
@@ -1689,51 +2467,49 @@ async def mini_scenario_run(
             action_proof=x_xass_action_proof or "",
             purpose=f"scenario:{scenario_id}",
         )
-    config = await get_or_create_app_config(session, settings)
-    if "away_on" in actions:
-        config.away_mode_enabled = True
-        config.away_until_at = None
-    if "quiet_on" in actions:
-        config.quiet_hours_enabled = True
-    config.updated_by_user_id = user.user_id
-    await session.commit()
+    if not try_start_scenario(scenario_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Этот сценарий уже выполняется")
+    try:
+        config = await get_or_create_app_config(session, settings)
+        execution = await execute_scenario(
+            session,
+            scenario=scenario,
+            config=config,
+            actor_user_id=user.user_id,
+        )
+        await log_admin_action(
+            session,
+            user.user_id,
+            "scenario_run",
+            {
+                "scenario_id": scenario_id,
+                "actions": scenario.get("actions") or [],
+                "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa",
+                "commands": len(execution["commands"]),
+                "skipped_offline": execution["skipped_offline"],
+                "steps": execution["steps"],
+            },
+        )
+        return {"ok": True, "scenario": scenario, **execution}
+    finally:
+        finish_scenario(scenario_id)
 
-    command_names = [
-        command
-        for action, command in (("update_all", "update"), ("lock_all", "lock"))
-        if action in actions
-    ]
-    commands: list[dict[str, Any]] = []
-    skipped_offline: list[str] = []
-    if command_names:
-        for source in await list_sources(session):
-            if "PC" not in str(source.source_type or "").upper():
-                continue
-            if not source.is_online:
-                skipped_offline.append(source.source_name)
-                continue
-            for command_name in command_names:
-                command = await enqueue_agent_command(
-                    session,
-                    source_name=source.source_name,
-                    command=command_name,
-                    payload={},
-                    actor_user_id=user.user_id,
-                )
-                commands.append({"id": command.id, "source_name": command.source_name, "command": command.command})
-    await log_admin_action(
-        session,
-        user.user_id,
-        "scenario_run",
-        {
-            "scenario_id": scenario_id,
-            "actions": actions,
-            "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa",
-            "commands": len(commands),
-            "skipped_offline": skipped_offline,
-        },
-    )
-    return {"ok": True, "scenario": scenario, "commands": commands, "skipped_offline": skipped_offline}
+
+@app.get("/api/mini/scenarios/{scenario_id}/history")
+async def mini_scenario_history(
+    scenario_id: str,
+    limit: int = 20,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    rows = await list_admin_actions(session, limit=max(20, min(limit * 5, 200)), action="scenario_run")
+    history = [
+        _admin_action_json(item)
+        for item in rows
+        if isinstance(item.payload, dict) and str(item.payload.get("scenario_id") or "") == scenario_id
+    ][: max(1, min(limit, 50))]
+    return {"ok": True, "scenario_id": scenario_id, "history": history}
 
 
 @app.get("/api/agent-installer/download")
@@ -1754,20 +2530,30 @@ async def mini_agent_command(
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
-    if payload.command in {"lock", "restart"}:
+    command_name = payload.command.strip().lower()
+    command_payload = payload.payload if isinstance(payload.payload, dict) else {}
+    if command_name in {"reboot", "shutdown"}:
+        try:
+            delay_sec = int(command_payload.get("delay_sec") or 0)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Задержка должна быть числом секунд") from exc
+        if delay_sec < 0 or delay_sec > 3600:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Задержка должна быть от 0 до 3600 секунд")
+        command_payload["delay_sec"] = delay_sec
+    if command_name in DANGEROUS_AGENT_COMMANDS:
         await _require_pwa_action_proof(
             session=session,
             user=user,
             telegram_init_data=x_telegram_init_data or "",
             action_proof=payload.action_proof,
-            purpose=f"agent:{payload.command}:{source.source_name}",
+            purpose=f"agent:{command_name}:{source.source_name}",
         )
     try:
         item = await enqueue_agent_command(
             session,
             source_name=source.source_name,
-            command=payload.command,
-            payload=payload.payload,
+            command=command_name,
+            payload=command_payload,
             actor_user_id=user.user_id,
         )
     except ValueError as exc:
@@ -1794,6 +2580,93 @@ async def mini_agent_command(
             "created_at": item.created_at.isoformat(),
         },
     }
+
+
+@app.get("/api/mini/agents/{source_name}/commands")
+async def mini_agent_commands(
+    source_name: str,
+    limit: int = 30,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Агент не найден")
+    rows = await list_agent_commands(session, source_name=source.source_name, limit=limit)
+    return {
+        "ok": True,
+        "commands": [
+            {
+                "id": item.id,
+                "command": item.command,
+                "status": item.status,
+                "payload": item.payload or {},
+                "result": item.result or {},
+                "created_at": item.created_at.isoformat(),
+                "not_before_at": item.not_before_at.isoformat() if item.not_before_at else None,
+                "delivered_at": item.delivered_at.isoformat() if item.delivered_at else None,
+                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+                "can_cancel": item.status == "pending",
+            }
+            for item in rows
+        ],
+    }
+
+
+@app.get("/api/mini/agents/{source_name}/history")
+async def mini_agent_state_history(
+    source_name: str,
+    limit: int = 48,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Агент не найден")
+    rows = list(
+        await session.scalars(
+            select(AgentStateSnapshot)
+            .where(AgentStateSnapshot.source_name == source.source_name)
+            .order_by(AgentStateSnapshot.id.desc())
+            .limit(max(1, min(limit, 200)))
+        )
+    )
+    return {
+        "ok": True,
+        "history": [
+            {
+                "id": item.id,
+                "is_online": bool(item.is_online),
+                "metrics": item.metrics or {},
+                "agent_version": item.agent_version,
+                "last_error": item.last_error or "",
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in rows
+        ],
+    }
+
+
+@app.delete("/api/mini/agents/{source_name}/commands/{command_id}")
+async def mini_agent_command_cancel(
+    source_name: str,
+    command_id: int,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    item = await cancel_agent_command(
+        session,
+        source_name=source_name,
+        command_id=command_id,
+        actor_user_id=user.user_id,
+    )
+    if item is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Команда уже доставлена, выполнена или не существует",
+        )
+    return {"ok": True, "command_id": item.id, "status": item.status}
 
 
 @app.post("/api/mini/agents/{source_name}/archive")
@@ -1951,11 +2824,29 @@ async def mini_conversations(
     latest_ids = [int(row[3]) for row in summary_rows if row[3] is not None]
     latest_rows = list(await session.scalars(select(MessageLog).where(MessageLog.id.in_(latest_ids)))) if latest_ids else []
     latest_by_id = {row.id: row for row in latest_rows}
+    pinned_chat_ids = set(await session.scalars(select(PinnedConversation.chat_id)))
     chats: list[dict[str, Any]] = []
     for source_chat_id, message_count, deleted_count, latest_id in summary_rows:
         latest = latest_by_id.get(int(latest_id))
         if latest is None:
             continue
+        edited_count = int(
+            await session.scalar(
+                select(func.count(MessageLog.id)).where(
+                    MessageLog.chat_id == source_chat_id,
+                    MessageLog.edited_at.is_not(None),
+                )
+            )
+            or 0
+        )
+        media_count = int(
+            await session.scalar(
+                select(func.count(MediaAsset.id))
+                .join(MessageLog, MessageLog.id == MediaAsset.message_id)
+                .where(MessageLog.chat_id == source_chat_id, MediaAsset.archive_allowed.is_(True))
+            )
+            or 0
+        )
         chats.append(
             {
                 "chat_id": source_chat_id,
@@ -1963,11 +2854,32 @@ async def mini_conversations(
                 "chat_type": latest.chat_type,
                 "count": int(message_count or 0),
                 "deleted": int(deleted_count or 0),
+                "edited": edited_count,
+                "media": media_count,
+                "pinned": int(source_chat_id) in pinned_chat_ids,
                 "last_text": (latest.text_content or "Медиа / сообщение без текста")[:160],
                 "last_date": (latest.message_date or latest.created_at).isoformat(),
             }
         )
+    chats.sort(key=lambda item: item["last_date"], reverse=True)
+    chats.sort(key=lambda item: not item["pinned"])
     return {"ok": True, "chats": chats, "archive": await archive_summary(session)}
+
+
+@app.post("/api/mini/conversations/{chat_id}/pin")
+async def mini_conversation_pin(
+    chat_id: int,
+    payload: MiniConversationPinPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    existing = await session.scalar(select(PinnedConversation).where(PinnedConversation.chat_id == chat_id))
+    if payload.pinned and existing is None:
+        session.add(PinnedConversation(chat_id=chat_id, pinned_by_user_id=user.user_id))
+    elif not payload.pinned and existing is not None:
+        await session.delete(existing)
+    await session.commit()
+    return {"ok": True, "chat_id": chat_id, "pinned": payload.pinned}
 
 
 @app.get("/api/mini/conversations/{chat_id}/avatar")
@@ -2032,12 +2944,18 @@ async def mini_conversation_messages(
     limit: int = 100,
     before: int = 0,
     deleted_only: bool = False,
+    edited_only: bool = False,
+    media_only: bool = False,
 ) -> dict[str, Any]:
     query = select(MessageLog).where(MessageLog.chat_id == chat_id)
     if before > 0:
         query = query.where(MessageLog.id < before)
     if deleted_only:
         query = query.where(MessageLog.deleted.is_(True))
+    if edited_only:
+        query = query.where(MessageLog.edited_at.is_not(None))
+    if media_only:
+        query = query.where(MessageLog.media_assets.any(MediaAsset.archive_allowed.is_(True)))
     bounded = max(1, min(limit, 200))
     fetched = list(await session.scalars(query.order_by(MessageLog.id.desc()).limit(bounded + 1)))
     has_more = len(fetched) > bounded
@@ -2080,6 +2998,12 @@ async def mini_conversation_messages(
                 "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
                 "edited": row.edited_at is not None,
                 "forwarded_from": forwarded_from_label(row.raw_event if isinstance(row.raw_event, dict) else {}),
+                "reactions": (
+                    row.raw_event.get("_xass_reactions", [])
+                    if isinstance(row.raw_event, dict) and isinstance(row.raw_event.get("_xass_reactions"), list)
+                    else []
+                ),
+                "media_group_id": str((row.raw_event or {}).get("media_group_id") or "") if isinstance(row.raw_event, dict) else "",
                 "reply": (
                     {
                         "telegram_message_id": replies[row.reply_to_message_id].telegram_message_id,
@@ -2173,6 +3097,20 @@ async def mini_quotes_delete(
     return {"ok": True, "quotes": quotes}
 
 
+@app.post("/api/mini/quotes/{quote_id}/move")
+async def mini_quotes_move(
+    quote_id: str,
+    payload: MiniMovePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    del user
+    try:
+        quotes = move_quote(Path(settings.quotes_json_path), quote_id, payload.direction)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"ok": True, "quotes": quotes}
+
+
 @app.put("/api/mini/quotes/{quote_id}")
 async def mini_quotes_update(
     quote_id: str,
@@ -2190,18 +3128,52 @@ async def mini_config_export(
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    config = await get_or_create_app_config(session, settings)
+    return await _build_config_bundle(session)
+
+
+@app.post("/api/mini/config/export-encrypted")
+async def mini_config_export_encrypted(
+    payload: MiniConfigExportPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    bundle = await _build_config_bundle(session)
+    encrypted = await asyncio.to_thread(encrypt_backup, bundle, payload.passphrase)
+    await log_admin_action(session, user.user_id, "config_exported", {"encrypted": True})
+    return encrypted
+
+
+@app.post("/api/mini/config/preview")
+async def mini_config_preview(
+    payload: MiniEncryptedConfigPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    try:
+        decrypted = await asyncio.to_thread(decrypt_backup, payload.bundle, payload.passphrase)
+        candidate = MiniConfigBundlePayload.model_validate(decrypted)
+        projects = normalize_projects(candidate.projects)
+        quotes = normalize_quotes(candidate.quotes)
+        scenarios = normalize_scenarios(candidate.scenarios)
+        normalize_profile(candidate.profile)
+        normalize_site_config(candidate.site_config)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    current_bundle = await _build_config_bundle(session)
     return {
-        "format": "xass-config",
-        "version": 1,
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "app_version": APP_VERSION,
-        "profile": load_profile(Path(settings.profile_json_path)),
-        "projects": load_projects(Path(settings.projects_json_path)),
-        "site_config": load_site_config(Path(settings.site_config_json_path)),
-        "quotes": load_quotes(Path(settings.quotes_json_path)),
-        "settings": _config_settings_snapshot(config),
-        "scenarios": [item for item in all_scenarios(Path(settings.scenarios_json_path)) if not item.get("builtin")],
+        "ok": True,
+        "preview": {
+            "profile": True,
+            "projects": {"current": len(current_bundle["projects"]), "incoming": len(projects)},
+            "quotes": {"current": len(current_bundle["quotes"]), "incoming": len(quotes)},
+            "scenarios": {"current": len(current_bundle["scenarios"]), "incoming": len(scenarios)},
+            "notification_rules": len(candidate.notifications),
+            "archive_targets": len(candidate.archive.get("targets") or []),
+            "agents_are_informational": len(candidate.agents),
+            "incompatible": [],
+            "secrets_preserved": True,
+        },
     }
 
 
@@ -2223,7 +3195,10 @@ async def mini_config_restore(
         purpose="config:restore",
     )
     try:
+        current_profile = load_profile(Path(settings.profile_json_path))
         restored_profile = normalize_profile(payload.profile)
+        for secret_field in ("iphone_hook_key", "vk_access_token"):
+            restored_profile[secret_field] = current_profile.get(secret_field, "")
         restored_projects = normalize_projects(payload.projects)
         restored_site_config = normalize_site_config(payload.site_config)
         restored_quotes = normalize_quotes(payload.quotes)
@@ -2264,6 +3239,36 @@ async def mini_config_restore(
     save_quotes(quotes_path, restored_quotes)
     save_scenarios(Path(settings.scenarios_json_path), restored_scenarios)
 
+    restored_notification_rules = 0
+    for item in payload.notifications:
+        if not isinstance(item, dict):
+            continue
+        try:
+            await save_notification_preference(
+                session,
+                event_type=str(item.get("event_type") or ""),
+                channels=[str(channel) for channel in item.get("channels") or []],
+                priority=str(item.get("priority") or "normal"),
+                quiet_hours=bool(item.get("quiet_hours", True)),
+                actor_user_id=user.user_id,
+            )
+            restored_notification_rules += 1
+        except ValueError:
+            continue
+
+    restored_archive_targets = 0
+    for source_name in payload.archive.get("targets") if isinstance(payload.archive.get("targets"), list) else []:
+        try:
+            await set_archive_target(
+                session,
+                source_name=str(source_name),
+                enabled=True,
+                actor_user_id=user.user_id,
+            )
+            restored_archive_targets += 1
+        except ValueError:
+            continue
+
     config = await get_or_create_app_config(session, settings)
     config.save_mode = restored_mode
     config.heartbeat_timeout_minutes = timeout_minutes
@@ -2290,7 +3295,39 @@ async def mini_config_restore(
             "quotes_backup": str(quotes_backup) if quotes_backup else None,
         },
     )
-    return {"ok": True, "restored": {"profile": True, "projects": len(restored_projects), "quotes": len(restored_quotes)}}
+    return {
+        "ok": True,
+        "restored": {
+            "profile": True,
+            "projects": len(restored_projects),
+            "quotes": len(restored_quotes),
+            "scenarios": len(restored_scenarios),
+            "notification_rules": restored_notification_rules,
+            "archive_targets": restored_archive_targets,
+        },
+    }
+
+
+@app.post("/api/mini/config/restore-encrypted")
+async def mini_config_restore_encrypted(
+    payload: MiniEncryptedConfigPayload,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        decrypted = await asyncio.to_thread(decrypt_backup, payload.bundle, payload.passphrase)
+        candidate = MiniConfigBundlePayload.model_validate(decrypted)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return await mini_config_restore(
+        candidate,
+        x_xass_action_proof=x_xass_action_proof,
+        x_telegram_init_data=x_telegram_init_data,
+        user=user,
+        session=session,
+    )
 
 
 @app.get("/api/mini/vk-url")

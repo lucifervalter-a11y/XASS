@@ -88,6 +88,9 @@ foreach (is_array($widgetPayload) ? $widgetPayload : $allowedWidgets as $widget)
         $visibleWidgets[] = $widget;
     }
 }
+if ($visibleWidgets === []) {
+    $visibleWidgets = $allowedWidgets;
+}
 $widgetVisible = static fn(string $name): bool => in_array($name, $visibleWidgets, true);
 
 $projectPayload = xass_json($projectsPath, []);

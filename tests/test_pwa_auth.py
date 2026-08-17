@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import tempfile
 import time
 import unittest
 
@@ -11,6 +12,7 @@ from app.services.pwa_auth import (
     authenticate_telegram_login,
     issue_session,
     issue_action_proof,
+    rotate_session_generation,
     verify_action_proof,
 )
 
@@ -87,6 +89,17 @@ class PwaAuthTests(unittest.TestCase):
         self.assertTrue(verify_action_proof(proof, 42, "agent:lock:Home PC", self.settings, now=101))
         self.assertFalse(verify_action_proof(proof, 42, "agent:restart:Home PC", self.settings, now=101))
         self.assertFalse(verify_action_proof(proof, 42, "agent:lock:Home PC", self.settings, now=400))
+
+    def test_force_logout_invalidates_existing_sessions_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.settings.pwa_session_generation_path = f"{directory}/generation"
+            user = authenticate_telegram_login(signed_login(self.settings.bot_token, 42), self.settings)
+            old_token = issue_session(user, self.settings, now=100)
+            self.assertIsNotNone(authenticate_session(old_token, self.settings, now=101))
+            self.assertEqual(rotate_session_generation(self.settings), 1)
+            self.assertIsNone(authenticate_session(old_token, self.settings, now=101))
+            new_token = issue_session(user, self.settings, now=102)
+            self.assertIsNotNone(authenticate_session(new_token, self.settings, now=103))
 
 
 if __name__ == "__main__":

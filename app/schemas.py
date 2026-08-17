@@ -25,6 +25,7 @@ class HeartbeatPayload(BaseModel):
     last_error: str = Field(default="", max_length=1000)
     last_error_at: str = Field(default="", max_length=64)
     server_version_seen: str = Field(default="", max_length=32)
+    system: dict[str, Any] = Field(default_factory=dict)
 
 
 class HeartbeatResponse(BaseModel):

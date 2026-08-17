@@ -194,6 +194,8 @@ def normalize_site_config(raw: Any) -> dict[str, Any]:
         name = _to_text(item).lower()
         if name in SITE_WIDGETS and name not in widgets:
             widgets.append(name)
+    if not widgets:
+        widgets = list(SITE_WIDGETS)
     return {
         "projects_background": {"type": bg_type, "src": bg_src},
         "accent_color": accent_color,

@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     telegram_bot_username: str = ""
     telegram_bot_identity_cache_path: str = "./data/telegram_bot_identity.json"
     pwa_cookie_secure: bool = True
+    pwa_session_generation_path: str = "./data/pwa_session_generation"
+    pwa_vapid_public_key: str = ""
+    pwa_vapid_private_key: str = ""
+    pwa_vapid_subject: str = "mailto:admin@localhost"
     setup_api_key: str = "change-me-setup-key"
     agent_api_key: str = "change-me-agent-key"
     agent_pair_code_ttl_minutes: int = 15

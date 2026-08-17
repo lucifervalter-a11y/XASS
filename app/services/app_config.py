@@ -1,5 +1,6 @@
 ﻿from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
@@ -525,6 +526,96 @@ async def list_recent_admin_actions(session: AsyncSession, limit: int = 20) -> l
     return list(result)
 
 
+_AUDIT_SENSITIVE_KEYS = {
+    "access_token",
+    "api_key",
+    "authorization",
+    "bot_token",
+    "cookie",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "session_token",
+    "token",
+    "x_api_key",
+}
+
+
+def sanitize_audit_payload(value: Any, *, depth: int = 0) -> Any:
+    """Return a bounded JSON-safe audit value with credentials removed."""
+    if depth >= 6:
+        return "[truncated]"
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:100]:
+            key = str(raw_key)[:128]
+            normalized = key.lower().replace("-", "_")
+            if normalized in _AUDIT_SENSITIVE_KEYS or normalized.endswith(
+                ("_token", "_password", "_secret", "_private_key")
+            ):
+                cleaned[key] = "[redacted]"
+            else:
+                cleaned[key] = sanitize_audit_payload(raw_value, depth=depth + 1)
+        return cleaned
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_audit_payload(item, depth=depth + 1) for item in list(value)[:100]]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value[:2000] if isinstance(value, str) else value
+    return str(value)[:2000]
+
+
+def prepare_audit_payload(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    safe_payload = sanitize_audit_payload(payload or {})
+    if not isinstance(safe_payload, dict):
+        safe_payload = {"value": safe_payload}
+    safe_payload.setdefault("operation_id", uuid4().hex)
+    safe_payload.setdefault("result", "success")
+    safe_payload.setdefault("source", str(safe_payload.get("channel") or "server"))
+    return safe_payload
+
+
+async def list_admin_actions(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+    action: str = "",
+    source: str = "",
+    result: str = "",
+    device: str = "",
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+) -> list[AdminAction]:
+    scan_limit = max(1, min(max(int(limit), 1) * 5, 500))
+    statement = select(AdminAction).order_by(AdminAction.id.desc()).limit(scan_limit)
+    if action.strip():
+        statement = statement.where(AdminAction.action == action.strip())
+    if created_from is not None:
+        statement = statement.where(AdminAction.created_at >= created_from)
+    if created_to is not None:
+        statement = statement.where(AdminAction.created_at <= created_to)
+    rows = list(await session.scalars(statement))
+    source_filter = source.strip().lower()
+    result_filter = result.strip().lower()
+    device_filter = device.strip().lower()
+
+    def matches(item: AdminAction) -> bool:
+        item_payload = item.payload if isinstance(item.payload, dict) else {}
+        if source_filter and str(item_payload.get("source") or item_payload.get("channel") or "").lower() != source_filter:
+            return False
+        if result_filter and str(item_payload.get("result") or item_payload.get("status") or "").lower() != result_filter:
+            return False
+        if device_filter and device_filter not in str(
+            item_payload.get("source_name") or item_payload.get("device") or ""
+        ).lower():
+            return False
+        return True
+
+    return [item for item in rows if matches(item)][: max(1, min(int(limit), 200))]
+
+
 async def log_admin_action(
     session: AsyncSession,
     actor_user_id: int,
@@ -534,7 +625,7 @@ async def log_admin_action(
     entry = AdminAction(
         actor_user_id=actor_user_id,
         action=action,
-        payload=payload or {},
+        payload=prepare_audit_payload(payload),
     )
     session.add(entry)
     await session.commit()

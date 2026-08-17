@@ -7,10 +7,35 @@
   "start_url": "/miniapp.php?standalone=1",
   "scope": "/",
   "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
   "orientation": "portrait-primary",
   "background_color": "#000000",
   "theme_color": "#000000",
+  "categories": ["utilities", "productivity"],
+  "prefer_related_applications": false,
+  "shortcuts": [
+    {"name": "Устройства", "short_name": "Устройства", "url": "/miniapp.php?standalone=1#tools"},
+    {"name": "Музыка", "short_name": "Музыка", "url": "/miniapp.php?standalone=1#music"}
+  ],
   "icons": [
+    {
+      "src": "/assets/xass-app-icon-96.png",
+      "sizes": "96x96",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/xass-app-icon-144.png",
+      "sizes": "144x144",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/xass-app-icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    },
     {
       "src": "/assets/xass-app-icon-192.png",
       "sizes": "192x192",

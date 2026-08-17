@@ -6,12 +6,35 @@ from pathlib import Path
 from typing import Any
 
 
-ALLOWED_ACTIONS = {"lock_all", "away_on", "quiet_on", "update_all"}
+ALLOWED_ACTIONS = {
+    "lock_all",
+    "away_on",
+    "away_off",
+    "quiet_on",
+    "quiet_off",
+    "update_all",
+    "check_all",
+}
 BUILTIN_SCENARIOS = [
-    {"id": "away", "name": "Ушёл", "actions": ["away_on", "lock_all"], "builtin": True},
-    {"id": "night", "name": "Ночь", "actions": ["quiet_on", "lock_all"], "builtin": True},
-    {"id": "lock-all", "name": "Заблокировать все ПК", "actions": ["lock_all"], "builtin": True},
+    {"id": "away", "name": "Ушёл", "icon": "door", "color": "#376dff", "actions": ["away_on", "lock_all"]},
+    {"id": "returned", "name": "Вернулся", "icon": "home", "color": "#38c986", "actions": ["away_off", "quiet_off", "check_all"]},
+    {"id": "night", "name": "Ночь", "icon": "moon", "color": "#745cff", "actions": ["quiet_on", "lock_all"]},
+    {"id": "work", "name": "Работа", "icon": "briefcase", "color": "#2e91ff", "actions": ["away_off", "quiet_off", "check_all"]},
+    {"id": "lock-all", "name": "Заблокировать все ПК", "icon": "lock", "color": "#ff6673", "actions": ["lock_all"]},
+    {"id": "update-all", "name": "Обновить все агенты", "icon": "update", "color": "#4e82ff", "actions": ["update_all"]},
+    {"id": "check-all", "name": "Проверить все устройства", "icon": "pulse", "color": "#38c986", "actions": ["check_all"]},
 ]
+for _builtin in BUILTIN_SCENARIOS:
+    _builtin.update(
+        {
+            "builtin": True,
+            "devices": [],
+            "steps": [{"action": action} for action in _builtin["actions"]],
+            "delay_sec": 0,
+            "schedule": "",
+            "enabled": True,
+        }
+    )
 
 
 def _scenario_id(value: object, fallback: str = "scenario") -> str:
@@ -27,14 +50,46 @@ def normalize_scenario(raw: Any, *, fallback_id: str) -> dict[str, Any] | None:
     if not name:
         return None
     scenario_id = _scenario_id(raw.get("id"), fallback_id)
+    raw_steps = raw.get("steps") if isinstance(raw.get("steps"), list) else []
+    raw_actions = raw.get("actions") if isinstance(raw.get("actions"), list) else []
+    if raw_steps:
+        raw_actions = [item.get("action") for item in raw_steps if isinstance(item, dict)]
     actions = []
-    for action in raw.get("actions") if isinstance(raw.get("actions"), list) else []:
+    for action in raw_actions:
         clean = str(action or "").strip().lower()
         if clean in ALLOWED_ACTIONS and clean not in actions:
             actions.append(clean)
     if not actions:
         return None
-    return {"id": scenario_id, "name": name, "actions": actions, "builtin": False}
+    devices: list[str] = []
+    for device in raw.get("devices") if isinstance(raw.get("devices"), list) else []:
+        clean_device = str(device or "").strip()[:128]
+        if clean_device and clean_device not in devices:
+            devices.append(clean_device)
+    icon = re.sub(r"[^a-z0-9_-]", "", str(raw.get("icon") or "bolt").lower())[:32] or "bolt"
+    color = str(raw.get("color") or "#376dff").strip().lower()
+    if not re.fullmatch(r"#[0-9a-f]{6}", color):
+        color = "#376dff"
+    try:
+        delay_sec = max(0, min(int(raw.get("delay_sec") or 0), 3600))
+    except (TypeError, ValueError):
+        delay_sec = 0
+    schedule = str(raw.get("schedule") or "").strip()[:64]
+    if schedule and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule):
+        schedule = ""
+    return {
+        "id": scenario_id,
+        "name": name,
+        "icon": icon,
+        "color": color,
+        "devices": devices,
+        "actions": actions,
+        "steps": [{"action": action} for action in actions],
+        "delay_sec": delay_sec,
+        "schedule": schedule,
+        "enabled": bool(raw.get("enabled", True)),
+        "builtin": False,
+    }
 
 
 def normalize_scenarios(raw: Any) -> list[dict[str, Any]]:

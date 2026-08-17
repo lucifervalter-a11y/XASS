@@ -128,6 +128,30 @@ async def delete_credential(
     return credential
 
 
+async def rename_credential(
+    session: AsyncSession,
+    *,
+    owner_user_id: int,
+    credential_id: int,
+    name: str,
+) -> PasskeyCredential | None:
+    credential = await session.scalar(
+        select(PasskeyCredential).where(
+            PasskeyCredential.id == int(credential_id),
+            PasskeyCredential.owner_user_id == int(owner_user_id),
+        )
+    )
+    if credential is None:
+        return None
+    clean_name = str(name or "").strip()[:120]
+    if not clean_name:
+        raise ValueError("Введите название устройства")
+    credential.name = clean_name
+    await session.commit()
+    await session.refresh(credential)
+    return credential
+
+
 async def registration_options(
     session: AsyncSession,
     *,

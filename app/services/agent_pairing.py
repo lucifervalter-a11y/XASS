@@ -148,6 +148,19 @@ async def issue_pair_code(
     return PairCodeIssueResult(code=code, expires_at=expires_at, ttl_minutes=ttl)
 
 
+async def revoke_active_pair_codes(session: AsyncSession) -> int:
+    now = _now_utc()
+    rows = list(
+        await session.scalars(select(AgentPairCode).where(AgentPairCode.is_active.is_(True)))
+    )
+    for item in rows:
+        item.is_active = False
+        item.updated_at = now
+    if rows:
+        await session.commit()
+    return len(rows)
+
+
 async def claim_pair_code_and_issue_key(
     session: AsyncSession,
     *,

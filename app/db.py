@@ -34,6 +34,7 @@ async def init_db() -> None:
 
 def _apply_runtime_migrations(connection) -> None:
     inspector = inspect(connection)
+    datetime_type = "TIMESTAMP WITH TIME ZONE" if connection.dialect.name == "postgresql" else "DATETIME"
     tables = set(inspector.get_table_names())
     if "media_assets" in tables:
         media_columns = {item["name"] for item in inspector.get_columns("media_assets")}
@@ -45,6 +46,10 @@ def _apply_runtime_migrations(connection) -> None:
                     "WHERE telegram_file_path IS NOT NULL OR local_path IS NOT NULL"
                 )
             )
+    if "agent_commands" in tables:
+        command_columns = {item["name"] for item in inspector.get_columns("agent_commands")}
+        if "not_before_at" not in command_columns:
+            connection.execute(text(f"ALTER TABLE agent_commands ADD COLUMN not_before_at {datetime_type}"))
     if "app_config" not in tables:
         return
 
@@ -60,7 +65,7 @@ def _apply_runtime_migrations(connection) -> None:
     if "quiet_hours_end_minute" not in columns:
         migration_sql.append("ALTER TABLE app_config ADD COLUMN quiet_hours_end_minute INTEGER")
     if "away_until_at" not in columns:
-        migration_sql.append("ALTER TABLE app_config ADD COLUMN away_until_at DATETIME")
+        migration_sql.append(f"ALTER TABLE app_config ADD COLUMN away_until_at {datetime_type}")
     if "away_schedule_enabled" not in columns:
         migration_sql.append("ALTER TABLE app_config ADD COLUMN away_schedule_enabled BOOLEAN NOT NULL DEFAULT FALSE")
     if "away_schedule_start_minute" not in columns:

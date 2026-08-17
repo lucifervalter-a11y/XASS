@@ -392,6 +392,58 @@ async def mark_deleted_messages(
         )
 
 
+def _reaction_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    reaction_type = str(item.get("type") or "")
+    if reaction_type == "emoji":
+        return str(item.get("emoji") or "")[:32]
+    if reaction_type == "custom_emoji":
+        return f"custom:{str(item.get('custom_emoji_id') or '')[:64]}"
+    if reaction_type == "paid":
+        return "⭐"
+    return reaction_type[:32]
+
+
+async def store_message_reaction(session: AsyncSession, payload: dict[str, Any]) -> None:
+    chat = payload.get("chat") if isinstance(payload.get("chat"), dict) else {}
+    chat_id = _to_int_or_none(chat.get("id"))
+    message_id = _to_int_or_none(payload.get("message_id"))
+    if chat_id is None or message_id is None:
+        return
+    message = await _get_message_log(session, chat_id, message_id)
+    if message is None:
+        return
+    actor = payload.get("user") if isinstance(payload.get("user"), dict) else payload.get("actor_chat") or {}
+    actor_id = str(actor.get("id") or actor.get("username") or actor.get("title") or "unknown")
+    reactions = [_reaction_text(item) for item in payload.get("new_reaction") or []]
+    reactions = [item for item in reactions if item]
+    raw_event = dict(message.raw_event) if isinstance(message.raw_event, dict) else {}
+    history = list(raw_event.get("_xass_reaction_events") or [])[-99:]
+    history.append(
+        {
+            "actor": actor_id[:128],
+            "reactions": reactions,
+            "date": _ts_to_datetime(payload.get("date")).isoformat()
+            if payload.get("date")
+            else datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    current_by_actor: dict[str, list[str]] = {}
+    for event in history:
+        if isinstance(event, dict):
+            current_by_actor[str(event.get("actor") or "unknown")] = [
+                str(item) for item in event.get("reactions") or []
+            ]
+    raw_event["_xass_reaction_events"] = history
+    raw_event["_xass_reactions"] = [
+        {"actor": key, "reaction": reaction}
+        for key, values in current_by_actor.items()
+        for reaction in values
+    ]
+    message.raw_event = raw_event
+
+
 async def handle_update_logging(
     session: AsyncSession,
     update: dict[str, Any],
@@ -429,5 +481,9 @@ async def handle_update_logging(
         save_mode = SaveMode(config.save_mode)
         if save_mode != SaveMode.SAVE_OFF:
             await mark_deleted_messages(session, deleted_payload, save_mode=save_mode)
+
+    reaction_payload = update.get("message_reaction")
+    if isinstance(reaction_payload, dict):
+        await store_message_reaction(session, reaction_payload)
 
     await session.commit()

@@ -52,6 +52,18 @@ class HeartbeatSource(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class AgentStateSnapshot(Base):
+    __tablename__ = "agent_state_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    is_online: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    agent_version: Mapped[str] = mapped_column(String(32), default="0.0.0", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True, nullable=False)
+
+
 class AgentPairCode(Base):
     __tablename__ = "agent_pair_codes"
 
@@ -118,6 +130,7 @@ class AgentCommand(Base):
     result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     requested_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    not_before_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -166,6 +179,15 @@ class MessageRevision(Base):
     message: Mapped[MessageLog] = relationship(back_populates="revisions")
 
 
+class PinnedConversation(Base):
+    __tablename__ = "pinned_conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    pinned_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class MediaAsset(Base):
     __tablename__ = "media_assets"
 
@@ -212,3 +234,48 @@ class AdminAction(Base):
     action: Mapped[str] = mapped_column(String(128), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class InternalNotification(Base):
+    __tablename__ = "internal_notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(96), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[str] = mapped_column(String(16), index=True, default="normal", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), index=True, default="new", nullable=False)
+    requires_action: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    device: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
+    dedup_key: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class NotificationPreference(Base):
+    __tablename__ = "notification_preferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(96), unique=True, index=True, nullable=False)
+    channels: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["internal", "telegram"])
+    priority: Mapped[str] = mapped_column(String(16), default="normal", nullable=False)
+    quiet_hours: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    updated_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class WebPushSubscription(Base):
+    __tablename__ = "web_push_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    endpoint_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    subscription: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    user_agent: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

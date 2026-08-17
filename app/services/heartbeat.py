@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import AgentArchiveTarget, AgentCredential, AppConfig, HeartbeatSource
+from app.models import AgentArchiveTarget, AgentCredential, AgentStateSnapshot, AppConfig, HeartbeatSource
 from app.schemas import HeartbeatPayload
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,29 @@ async def process_heartbeat(
 
     await session.commit()
     await session.refresh(source)
+    latest_snapshot = await session.scalar(
+        select(AgentStateSnapshot)
+        .where(AgentStateSnapshot.source_name == source.source_name)
+        .order_by(AgentStateSnapshot.id.desc())
+        .limit(1)
+    )
+    snapshot_due = (
+        latest_snapshot is None
+        or is_new
+        or recovered
+        or (_ensure_utc(latest_snapshot.created_at) < now - timedelta(minutes=5))
+    )
+    if snapshot_due:
+        session.add(
+            AgentStateSnapshot(
+                source_name=source.source_name,
+                is_online=True,
+                metrics=raw_payload.get("metrics") if isinstance(raw_payload.get("metrics"), dict) else {},
+                agent_version=str(raw_payload.get("agent_version") or "0.0.0")[:32],
+                last_error=str(raw_payload.get("last_error") or "")[:1000] or None,
+            )
+        )
+        await session.commit()
     return source, recovered, is_new
 
 
@@ -125,6 +148,16 @@ async def mark_offline_sources(
     for source in stale_list:
         source.is_online = False
         source.went_offline_at = now
+        payload = source.last_payload if isinstance(source.last_payload, dict) else {}
+        session.add(
+            AgentStateSnapshot(
+                source_name=source.source_name,
+                is_online=False,
+                metrics=payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {},
+                agent_version=str(payload.get("agent_version") or "0.0.0")[:32],
+                last_error=str(payload.get("last_error") or "")[:1000] or None,
+            )
+        )
 
     await session.commit()
     return stale_list

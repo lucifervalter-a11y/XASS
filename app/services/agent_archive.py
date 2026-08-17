@@ -51,6 +51,7 @@ def _media_entry(asset: MediaAsset, message: MessageLog) -> dict[str, Any]:
         "type": asset.media_type,
         "mime_type": asset.mime_type or "application/octet-stream",
         "file_size": asset.file_size,
+        "file_unique_id": asset.file_unique_id or "",
         "file_name": _asset_file_name(asset, message),
         "download_path": f"/agent/archive/media/{asset.id}",
     }

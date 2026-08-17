@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from app.config import Settings
@@ -29,6 +30,24 @@ def _b64_decode(value: str) -> bytes:
 def _session_secret(settings: Settings) -> bytes:
     material = f"{settings.bot_token}|{settings.setup_api_key}|xass-pwa-v1"
     return hashlib.sha256(material.encode("utf-8")).digest()
+
+
+def _session_generation(settings: Settings) -> int:
+    path = Path(getattr(settings, "pwa_session_generation_path", "./data/pwa_session_generation"))
+    try:
+        return max(0, int(path.read_text(encoding="utf-8").strip() or 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def rotate_session_generation(settings: Settings) -> int:
+    path = Path(getattr(settings, "pwa_session_generation_path", "./data/pwa_session_generation"))
+    generation = _session_generation(settings) + 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(str(generation), encoding="utf-8")
+    temporary.replace(path)
+    return generation
 
 
 def verify_telegram_login(payload: dict[str, Any], bot_token: str) -> dict[str, str] | None:
@@ -82,6 +101,7 @@ def issue_session(user: MiniAppUser, settings: Settings, *, now: int | None = No
         "username": user.username,
         "iat": issued_at,
         "exp": issued_at + SESSION_AGE_SEC,
+        "gen": _session_generation(settings),
     }
     encoded = _b64_encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     signature = hmac.new(_session_secret(settings), encoded.encode("ascii"), hashlib.sha256).digest()
@@ -98,6 +118,8 @@ def authenticate_session(token: str, settings: Settings, *, now: int | None = No
         current = int(time.time() if now is None else now)
         user_id = int(payload.get("id") or 0)
         if int(payload.get("v") or 0) != 1 or current >= int(payload.get("exp") or 0):
+            return None
+        if int(payload.get("gen") or 0) != _session_generation(settings):
             return None
         if not settings.owner_user_id or user_id != settings.owner_user_id:
             return None

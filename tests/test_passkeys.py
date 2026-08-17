@@ -38,6 +38,22 @@ class PasskeyCredentialTests(unittest.IsolatedAsyncioTestCase):
         session.delete.assert_awaited_once_with(credential)
         session.commit.assert_awaited_once()
 
+    async def test_owner_can_rename_trusted_device(self) -> None:
+        credential = SimpleNamespace(id=7, owner_user_id=42, name="Old")
+        session = SimpleNamespace(
+            scalar=AsyncMock(return_value=credential),
+            commit=AsyncMock(),
+            refresh=AsyncMock(),
+        )
+        renamed = await passkeys.rename_credential(
+            session,
+            owner_user_id=42,
+            credential_id=7,
+            name="My iPhone",
+        )
+        self.assertEqual(renamed.name, "My iPhone")
+        session.commit.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

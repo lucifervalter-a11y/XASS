@@ -61,6 +61,9 @@ class SiteTemplateTests(unittest.TestCase):
         self.assertEqual(legacy["accent_color"], "#376dff")
         self.assertEqual(legacy["widgets"], list(SITE_WIDGETS))
 
+        empty = normalize_site_config({"widgets": []})
+        self.assertEqual(empty["widgets"], list(SITE_WIDGETS))
+
         custom = normalize_site_config({"accent_color": "#ABCDEF", "widgets": ["music", "music", "invalid"]})
         self.assertEqual(custom["accent_color"], "#abcdef")
         self.assertEqual(custom["widgets"], ["music"])

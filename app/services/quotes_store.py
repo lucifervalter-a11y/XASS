@@ -122,3 +122,14 @@ def delete_quote(path: Path, quote_id: str) -> bool:
         return False
     save_quotes(path, remaining)
     return True
+
+
+def move_quote(path: Path, quote_id: str, direction: str) -> list[dict[str, Any]]:
+    quotes = load_quotes(path)
+    index = next((index for index, item in enumerate(quotes) if str(item.get("id")) == quote_id), -1)
+    if index < 0:
+        raise ValueError("Цитата не найдена")
+    target = index - 1 if direction == "up" else index + 1 if direction == "down" else index
+    if 0 <= target < len(quotes) and target != index:
+        quotes[index], quotes[target] = quotes[target], quotes[index]
+    return save_quotes(path, quotes)
