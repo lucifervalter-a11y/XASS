@@ -20,6 +20,7 @@ def ensure_data_dirs() -> None:
     site_config_path.parent.mkdir(parents=True, exist_ok=True)
     Path(settings.projects_backups_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.projects_audit_log_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.scenarios_json_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.projects_assets_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.backgrounds_assets_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.update_log_path).parent.mkdir(parents=True, exist_ok=True)

@@ -52,7 +52,14 @@ def _extract_reply_to(message: dict[str, Any]) -> int | None:
 
 def _extract_chat(message: dict[str, Any]) -> tuple[int | None, str, str | None]:
     chat = message.get("chat") or {}
-    return chat.get("id"), chat.get("type", "unknown"), chat.get("title") or chat.get("username")
+    title = chat.get("title")
+    if not title and chat.get("type") == "private":
+        title = " ".join(
+            str(part).strip()
+            for part in (chat.get("first_name"), chat.get("last_name"))
+            if str(part or "").strip()
+        )
+    return chat.get("id"), chat.get("type", "unknown"), title or chat.get("username")
 
 
 def _extract_user(message: dict[str, Any]) -> tuple[int | None, str | None]:
@@ -62,6 +69,27 @@ def _extract_user(message: dict[str, Any]) -> tuple[int | None, str | None]:
         parts = [user.get("first_name"), user.get("last_name")]
         username = " ".join(part for part in parts if part)
     return user.get("id"), username
+
+
+def forwarded_from_label(message: dict[str, Any]) -> str:
+    origin = message.get("forward_origin")
+    if isinstance(origin, dict):
+        origin_type = str(origin.get("type") or "")
+        if origin_type == "user":
+            user = origin.get("sender_user") or {}
+            return str(user.get("username") or " ".join(filter(None, (user.get("first_name"), user.get("last_name"))))).strip()
+        if origin_type == "hidden_user":
+            return str(origin.get("sender_user_name") or "").strip()
+        if origin_type in {"chat", "channel"}:
+            chat = origin.get("sender_chat") or origin.get("chat") or {}
+            return str(chat.get("title") or chat.get("username") or origin.get("author_signature") or "").strip()
+    legacy_user = message.get("forward_from") or {}
+    if isinstance(legacy_user, dict) and legacy_user:
+        return str(legacy_user.get("username") or " ".join(filter(None, (legacy_user.get("first_name"), legacy_user.get("last_name"))))).strip()
+    legacy_chat = message.get("forward_from_chat") or {}
+    if isinstance(legacy_chat, dict) and legacy_chat:
+        return str(legacy_chat.get("title") or legacy_chat.get("username") or "").strip()
+    return str(message.get("forward_sender_name") or "").strip()
 
 
 def _extract_media_items(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -79,18 +107,21 @@ def _extract_media_items(message: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
-    keys = ("video", "document", "voice", "video_note", "audio")
+    keys = ("video", "document", "voice", "video_note", "audio", "animation", "sticker")
     for key in keys:
         media = message.get(key)
         if not media:
             continue
+        mime_type = media.get("mime_type")
+        if key == "sticker" and not mime_type:
+            mime_type = "video/webm" if media.get("is_video") else "application/x-tgsticker" if media.get("is_animated") else "image/webp"
         items.append(
             {
                 "media_type": key,
                 "file_id": media.get("file_id"),
                 "file_unique_id": media.get("file_unique_id"),
                 "file_size": media.get("file_size"),
-                "mime_type": media.get("mime_type"),
+                "mime_type": mime_type,
             }
         )
 

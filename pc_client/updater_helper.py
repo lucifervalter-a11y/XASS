@@ -13,6 +13,11 @@ from datetime import datetime
 from pathlib import Path
 
 
+MANAGED_FILES_NAME = ".xass-managed-files.json"
+PROTECTED_PARTS = {".venv", ".updates", "archive", "data"}
+PROTECTED_NAMES = {"config.json", ".command-results.json", ".agent-status.json", ".installed-revision"}
+
+
 def _requirements_digest(requirements: Path) -> str:
     return hashlib.sha256(requirements.read_bytes()).hexdigest()
 
@@ -64,6 +69,50 @@ def _safe_files(stage: Path) -> list[Path]:
             raise RuntimeError("staged update escaped its directory")
         result.append(path)
     return result
+
+
+def _managed_files(path: Path) -> set[Path]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    raw_files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(raw_files, list):
+        return set()
+    result: set[Path] = set()
+    for raw in raw_files:
+        relative = Path(str(raw or "").replace("\\", "/"))
+        if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+            continue
+        if relative.name in PROTECTED_NAMES or any(part in PROTECTED_PARTS for part in relative.parts):
+            continue
+        result.add(relative)
+    return result
+
+
+def _health_check(target: Path, expected_version: str) -> None:
+    version_path = target / "version.json"
+    try:
+        installed_version = str(json.loads(version_path.read_text(encoding="utf-8")).get("version") or "")
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("updated version metadata is invalid") from exc
+    if installed_version != expected_version:
+        raise RuntimeError(f"updated version mismatch: expected {expected_version}, got {installed_version or 'empty'}")
+    core_files = [target / name for name in ("client_agent.py", "desktop_app.py", "client_update.py")]
+    missing = [path.name for path in core_files if not path.is_file()]
+    if missing:
+        raise RuntimeError("updated runtime is incomplete: " + ", ".join(missing))
+    completed = subprocess.run(
+        [sys.executable, "-m", "py_compile", *[str(path) for path in core_files]],
+        cwd=str(target),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=60,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("updated runtime health-check failed: " + (completed.stderr or "compile error")[-500:])
 
 
 def _write_result(target: Path, command_id: int | None, ok: bool, message: str) -> None:
@@ -123,6 +172,8 @@ def main() -> int:
     copied: list[Path] = []
     created: list[Path] = []
     try:
+        previous_managed = _managed_files(target / MANAGED_FILES_NAME)
+        next_managed = _managed_files(stage / MANAGED_FILES_NAME)
         for source in _safe_files(stage):
             relative = source.relative_to(stage)
             destination = target / relative
@@ -134,6 +185,16 @@ def main() -> int:
                 created.append(relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+            copied.append(relative)
+
+        for relative in sorted(previous_managed - next_managed, key=lambda item: item.as_posix(), reverse=True):
+            destination = target / relative
+            if not destination.is_file():
+                continue
+            backup_path = backup / relative
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(destination, backup_path)
+            destination.unlink()
             copied.append(relative)
 
         requirements = target / "requirements.txt"
@@ -159,6 +220,7 @@ def main() -> int:
             stamp = target / ".venv" / ".requirements.sha256"
             if stamp.parent.is_dir():
                 stamp.write_text(_requirements_digest(requirements), encoding="utf-8")
+        _health_check(target, args.version)
         (target / ".installed-revision").write_text(args.revision, encoding="utf-8")
         _write_result(target, args.command_id, True, f"Обновлено до {args.version}")
     except Exception as exc:

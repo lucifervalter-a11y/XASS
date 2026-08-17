@@ -75,6 +75,7 @@ jobs:
           fi
           echo "host=$ip" >> "$GITHUB_OUTPUT"
       - name: Publish installer to XASS server
+        continue-on-error: true
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ steps.vps.outputs.host }}

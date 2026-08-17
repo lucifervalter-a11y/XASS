@@ -14,7 +14,7 @@ class AgentUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cache:
             settings = SimpleNamespace(agent_update_cache_dir=cache, agent_updates_enabled=True)
             package = build_agent_package(settings)
-            self.assertEqual(package.version, "0.9.0")
+            self.assertEqual(package.version, "0.10.0")
             self.assertEqual(len(package.sha256), 64)
             self.assertGreater(package.size, 0)
             with zipfile.ZipFile(package.path, "r") as archive:
@@ -24,6 +24,7 @@ class AgentUpdateTests(unittest.TestCase):
             self.assertIn("bootstrap_dependencies.py", names)
             self.assertIn("connection_file.py", names)
             self.assertIn("archive_store.py", names)
+            self.assertIn(".xass-managed-files.json", names)
             self.assertNotIn("config.json", names)
             self.assertFalse(any(name.startswith(".venv/") for name in names))
 

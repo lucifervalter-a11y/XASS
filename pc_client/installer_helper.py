@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 
@@ -26,11 +28,62 @@ def _wait_for_process(pid: int, timeout_sec: int = 90) -> None:
         kernel32.CloseHandle(handle)
 
 
+def _install_paths() -> tuple[Path, Path]:
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    return local / "Programs" / "XASS", local / "XASS" / ".updates"
+
+
+def _backup_installed_runtime(installed_root: Path, updates_root: Path) -> Path | None:
+    if not (installed_root / "XASS.exe").is_file():
+        return None
+    updates_root.mkdir(parents=True, exist_ok=True)
+    backup = updates_root / f"installer-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    shutil.copytree(installed_root, backup)
+    return backup
+
+
+def _restore_installed_runtime(installed_root: Path, backup: Path | None) -> bool:
+    if backup is None or not (backup / "XASS.exe").is_file():
+        return False
+    if installed_root.name != "XASS" or installed_root.parent.name != "Programs":
+        return False
+    shutil.rmtree(installed_root, ignore_errors=True)
+    shutil.copytree(backup, installed_root)
+    return True
+
+
+def _runtime_is_healthy(installed_exe: Path) -> bool:
+    try:
+        completed = subprocess.run(
+            [str(installed_exe), "--health-check"],
+            cwd=str(installed_exe.parent),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _restore_and_launch(installed_root: Path, backup: Path | None) -> bool:
+    if not _restore_installed_runtime(installed_root, backup):
+        return False
+    previous = installed_root / "XASS.exe"
+    subprocess.Popen([str(previous)], cwd=str(previous.parent), close_fds=True)
+    return True
+
+
 def install_update(installer: Path, wait_pid: int) -> int:
     if os.name != "nt" or not installer.is_file():
         return 1
     _wait_for_process(wait_pid)
+    installed_root, updates_root = _install_paths()
+    backup: Path | None = None
     try:
+        backup = _backup_installed_runtime(installed_root, updates_root)
         completed = subprocess.run(
             [
                 str(installer),
@@ -43,12 +96,20 @@ def install_update(installer: Path, wait_pid: int) -> int:
             check=False,
         )
         if completed.returncode not in {0, 1641, 3010}:
+            _restore_and_launch(installed_root, backup)
             return completed.returncode or 1
-        installed_exe = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "Programs" / "XASS" / "XASS.exe"
-        if installed_exe.is_file():
-            subprocess.Popen([str(installed_exe)], cwd=str(installed_exe.parent), close_fds=True)
+        installed_exe = installed_root / "XASS.exe"
+        if not installed_exe.is_file() or not _runtime_is_healthy(installed_exe):
+            _restore_and_launch(installed_root, backup)
+            return 1
+        subprocess.Popen([str(installed_exe)], cwd=str(installed_exe.parent), close_fds=True)
+        backups = sorted(updates_root.glob("installer-backup-*"), reverse=True)
+        for old in backups[2:]:
+            if old.is_dir():
+                shutil.rmtree(old, ignore_errors=True)
         return 0
     except OSError:
+        _restore_and_launch(installed_root, backup)
         return 1
 
 

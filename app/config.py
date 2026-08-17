@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     projects_json_path: str = "./data/projects.json"
     site_config_json_path: str = "./data/site_config.json"
     quotes_json_path: str = "./data/quotes.json"
+    scenarios_json_path: str = "./data/scenarios.json"
     projects_backups_dir: str = "./data/backups/projects"
     projects_audit_log_path: str = "./data/projects_audit.log"
     projects_assets_dir: str = "./assets/projects"

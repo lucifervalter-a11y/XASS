@@ -69,9 +69,26 @@ function xass_icon(string $name, string $class = ''): string
 $profilePath = getenv('PROFILE_JSON_PATH') ?: __DIR__ . '/data/profile.json';
 $projectsPath = getenv('PROJECTS_JSON_PATH') ?: __DIR__ . '/data/projects.json';
 $quotesPath = getenv('QUOTES_JSON_PATH') ?: __DIR__ . '/data/quotes.json';
+$siteConfigPath = getenv('SITE_CONFIG_JSON_PATH') ?: __DIR__ . '/data/site_config.json';
 
 $profile = xass_json($profilePath, []);
 $profile = is_array($profile) ? $profile : [];
+$siteConfig = xass_json($siteConfigPath, []);
+$siteConfig = is_array($siteConfig) ? $siteConfig : [];
+$accentColor = strtolower(xass_text($siteConfig['accent_color'] ?? '', '#376dff'));
+if (preg_match('/^#[0-9a-f]{6}$/', $accentColor) !== 1) {
+    $accentColor = '#376dff';
+}
+$allowedWidgets = ['about', 'quotes', 'music', 'weather', 'projects', 'contacts'];
+$widgetPayload = $siteConfig['widgets'] ?? $allowedWidgets;
+$visibleWidgets = [];
+foreach (is_array($widgetPayload) ? $widgetPayload : $allowedWidgets as $widget) {
+    $widget = strtolower(xass_text($widget));
+    if (in_array($widget, $allowedWidgets, true) && !in_array($widget, $visibleWidgets, true)) {
+        $visibleWidgets[] = $widget;
+    }
+}
+$widgetVisible = static fn(string $name): bool => in_array($name, $visibleWidgets, true);
 
 $projectPayload = xass_json($projectsPath, []);
 if (is_array($projectPayload) && isset($projectPayload['projects']) && is_array($projectPayload['projects'])) {
@@ -200,7 +217,7 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
             --text: #f4f6fa;
             --muted: #8d949f;
             --quiet: #5f6671;
-            --blue: #376dff;
+            --blue: <?= xass_escape($accentColor) ?>;
             --blue-soft: #8eacff;
             --green: #43d98b;
             --red: #ff6b75;
@@ -399,7 +416,12 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
     <div class="shell header-inner">
         <a class="brand" href="#top" aria-label="XASS — наверх"><img src="/assets/xass-app-icon-192.png" alt=""><span>XASS</span></a>
         <nav class="nav" id="siteNav" aria-label="Основная навигация">
-            <a href="#about">Обо мне</a><a href="#quotes">Цитаты</a><a href="#music">Музыка</a><a href="#weather">Погода</a><a href="#projects">Проекты</a><a href="#contacts">Контакты</a>
+            <?php if ($widgetVisible('about')): ?><a href="#about">Обо мне</a><?php endif; ?>
+            <?php if ($widgetVisible('quotes')): ?><a href="#quotes">Цитаты</a><?php endif; ?>
+            <?php if ($widgetVisible('music')): ?><a href="#music">Музыка</a><?php endif; ?>
+            <?php if ($widgetVisible('weather')): ?><a href="#weather">Погода</a><?php endif; ?>
+            <?php if ($widgetVisible('projects')): ?><a href="#projects">Проекты</a><?php endif; ?>
+            <?php if ($widgetVisible('contacts')): ?><a href="#contacts">Контакты</a><?php endif; ?>
         </nav>
         <button class="menu-button" id="menuButton" type="button" aria-label="Открыть меню" aria-expanded="false" aria-controls="siteNav">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 8h16M4 16h16"/></svg>
@@ -413,7 +435,7 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
             <h1 id="hero-title"><?= xass_escape($title) ?></h1>
             <div class="hero-actions">
                 <?php if ($telegramUrl !== ''): ?><a class="button primary" href="<?= xass_escape($telegramUrl) ?>" target="_blank" rel="noopener">Написать в Telegram <?= xass_icon('telegram') ?></a><?php endif; ?>
-                <a class="button" href="#projects">Смотреть проекты <?= xass_icon('arrow-right') ?></a>
+                <?php if ($widgetVisible('projects')): ?><a class="button" href="#projects">Смотреть проекты <?= xass_icon('arrow-right') ?></a><?php endif; ?>
             </div>
             <div class="identity">
                 <?php if ($avatarUrl !== ''): ?><img class="identity-avatar" src="<?= xass_escape($avatarUrl) ?>" alt="Аватар <?= xass_escape($name) ?>">
@@ -425,14 +447,14 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
         <div class="hero-art reveal" data-delay="1"><img id="heroArt" src="/assets/xass-hero-glass.png" alt="Стеклянный знак XASS" fetchpriority="high"></div>
     </section>
 
-    <section class="section about" id="about">
+    <?php if ($widgetVisible('about')): ?><section class="section about" id="about">
         <div class="shell">
             <div class="section-head reveal"><h2 class="about-title">Делаю сложное <em>спокойным.</em></h2><p class="section-copy"><?= nl2br(xass_escape($bio)) ?></p></div>
             <?php if ($stack): ?><div class="tech-rail reveal" data-delay="1" aria-label="Технологии"><span class="tech-label">Технологии</span><?php foreach ($stack as $item): ?><span class="tech-item"><?= xass_escape($item) ?></span><?php endforeach; ?></div><?php endif; ?>
         </div>
-    </section>
+    </section><?php endif; ?>
 
-    <section class="section quotes" id="quotes" aria-labelledby="quotes-heading">
+    <?php if ($widgetVisible('quotes')): ?><section class="section quotes" id="quotes" aria-labelledby="quotes-heading">
         <div class="shell">
             <div class="quote-meta reveal"><strong>02</strong><span>/</span><span id="quotes-heading">Цитаты</span></div>
             <div class="quote-stage reveal" id="quoteStage"><div class="quote-mark" aria-hidden="true">“</div><blockquote class="quote-text" id="quoteText"><?= xass_escape($quotes[0] ?? $profileQuote) ?></blockquote></div>
@@ -443,9 +465,9 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
                 <div class="quote-count" aria-live="polite"><strong id="quoteIndex">01</strong> / <span id="quoteTotal"><?= str_pad((string)count($quotes), 2, '0', STR_PAD_LEFT) ?></span></div>
             </div>
         </div>
-    </section>
+    </section><?php endif; ?>
 
-    <section class="section" id="music" aria-labelledby="music-heading">
+    <?php if ($widgetVisible('music')): ?><section class="section" id="music" aria-labelledby="music-heading">
         <div class="shell">
             <div class="section-head reveal"><h2 id="music-heading">Музыка</h2><p class="section-copy">Трек, который действительно передал выбранный источник. Веб‑страницы и заголовки приложений сюда не попадают.</p></div>
             <div class="music-layout reveal" data-delay="1">
@@ -456,9 +478,9 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
                 <div class="service-list"><?php foreach ($musicLinks as $label => $url): ?><a class="row-link" href="<?= xass_escape($url) ?>" target="_blank" rel="noopener"><span><?= xass_escape($label) ?></span><span class="row-action"><span>Открыть</span><?= xass_icon('arrow-up-right') ?></span></a><?php endforeach; ?></div>
             </div>
         </div>
-    </section>
+    </section><?php endif; ?>
 
-    <section class="section" id="weather" aria-labelledby="weather-heading">
+    <?php if ($widgetVisible('weather')): ?><section class="section" id="weather" aria-labelledby="weather-heading">
         <div class="shell">
             <div class="section-head reveal"><h2 id="weather-heading">Погода</h2><p class="section-copy">Короткая живая сводка — отдельно от контактов, ссылок и статуса связи.</p></div>
             <div class="weather-strip reveal" data-delay="1">
@@ -468,9 +490,9 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
                 <div class="weather-cell"><div class="eyebrow">Обновлено</div><b><?php if ($weatherUpdatedAt !== ''): ?><time id="weatherTime" datetime="<?= xass_escape($weatherUpdatedAt) ?>">недавно</time><?php else: ?>—<?php endif; ?></b><p><?= xass_escape($weatherDetails[3] ?? 'Фоновая синхронизация') ?></p></div>
             </div>
         </div>
-    </section>
+    </section><?php endif; ?>
 
-    <section class="section" id="projects" aria-labelledby="projects-heading">
+    <?php if ($widgetVisible('projects')): ?><section class="section" id="projects" aria-labelledby="projects-heading">
         <div class="shell">
             <div class="section-head reveal"><h2 id="projects-heading">Проекты</h2><p class="section-copy">Выбранные рабочие системы и эксперименты — с коротким контекстом вместо лишней презентации.</p></div>
             <div class="project-list reveal" data-delay="1">
@@ -486,14 +508,14 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
                 <?php endif; ?>
             </div>
         </div>
-    </section>
+    </section><?php endif; ?>
 
-    <section class="section" id="contacts" aria-labelledby="contacts-heading">
+    <?php if ($widgetVisible('contacts')): ?><section class="section" id="contacts" aria-labelledby="contacts-heading">
         <div class="shell contacts-layout">
             <div class="contact-intro reveal"><h2 id="contacts-heading">Контакты</h2><p><?= xass_escape($availability) ?></p></div>
             <div class="contact-list reveal" data-delay="1"><?php if ($links): foreach ($links as $link): ?><a class="contact-row" href="<?= xass_escape($link['url']) ?>" target="_blank" rel="noopener"><span><?= xass_icon($link['icon'], 'contact-icon') ?></span><span><?= xass_escape($link['label']) ?></span><span class="row-action"><span><?= xass_escape($link['action']) ?></span><?= xass_icon('arrow-up-right') ?></span></a><?php endforeach; else: ?><a class="contact-row" href="#top"><span><?= xass_icon('link', 'contact-icon') ?></span><span>Контакты скоро появятся</span><span class="row-action"><?= xass_icon('arrow-up-right') ?></span></a><?php endif; ?></div>
         </div>
-    </section>
+    </section><?php endif; ?>
 </main>
 
 <footer class="shell footer"><div class="footer-brand"><img src="/assets/xass-app-icon-192.png" alt=""><span>XASS</span></div><div class="footer-line" aria-hidden="true"></div><a class="back-top" href="#top">Наверх <?= xass_icon('arrow-up-right') ?></a></footer>
@@ -539,9 +561,9 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
         quoteStage.classList.add('changing');
         setTimeout(() => { quoteText.textContent = quotes[currentQuote]; quoteIndex.textContent = String(currentQuote + 1).padStart(2,'0'); quoteStage.classList.remove('changing'); }, reduced ? 0 : 180);
     };
-    document.getElementById('quotePrev').addEventListener('click', () => showQuote(currentQuote - 1));
-    document.getElementById('quoteNext').addEventListener('click', () => showQuote(currentQuote + 1));
-    document.getElementById('quoteShuffle').addEventListener('click', () => { if (quotes.length < 2) return; let next = currentQuote; while (next === currentQuote) next = Math.floor(Math.random() * quotes.length); showQuote(next); });
+    document.getElementById('quotePrev')?.addEventListener('click', () => showQuote(currentQuote - 1));
+    document.getElementById('quoteNext')?.addEventListener('click', () => showQuote(currentQuote + 1));
+    document.getElementById('quoteShuffle')?.addEventListener('click', () => { if (quotes.length < 2) return; let next = currentQuote; while (next === currentQuote) next = Math.floor(Math.random() * quotes.length); showQuote(next); });
 
     const relativeTime = (id) => { const el = document.getElementById(id); if (!el) return; const value = Date.parse(el.dateTime); if (!Number.isFinite(value)) return; const minutes = Math.max(0, Math.round((Date.now() - value) / 60000)); el.textContent = minutes < 1 ? 'только что' : minutes < 60 ? minutes + ' мин назад' : minutes < 1440 ? Math.round(minutes / 60) + ' ч назад' : new Date(value).toLocaleDateString('ru-RU'); };
     relativeTime('musicTime'); relativeTime('weatherTime');

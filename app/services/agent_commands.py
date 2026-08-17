@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import AgentCommand
+from app.models import AdminAction, AgentCommand
 
 ALLOWED_AGENT_COMMANDS = {"update", "restart", "lock"}
 
@@ -69,6 +69,21 @@ async def acknowledge_agent_commands(
             "details": result.get("details") if isinstance(result.get("details"), dict) else {},
         }
         item.completed_at = _now_utc()
+        if item.requested_by_user_id:
+            session.add(
+                AdminAction(
+                    actor_user_id=item.requested_by_user_id,
+                    action="agent_command_result",
+                    payload={
+                        "command_id": item.id,
+                        "source_name": item.source_name,
+                        "command": item.command,
+                        "channel": "pc",
+                        "status": item.status,
+                        "message": item.result["message"],
+                    },
+                )
+            )
         changed = True
     if changed:
         await session.commit()

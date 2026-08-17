@@ -4,10 +4,18 @@ import json
 import unittest
 from datetime import datetime, timezone
 
+from app.services.qr_codes import connection_profile_svg
 from pc_client.connection_file import parse_connection_text
 
 
 class PcConnectionFileTests(unittest.TestCase):
+    def test_existing_connection_payload_can_be_rendered_as_offline_qr(self) -> None:
+        svg = connection_profile_svg(
+            {"format": "xass-connect", "version": 1, "server_url": "https://xass.example", "pair_code": "ABCD-EFGH"}
+        )
+        self.assertTrue(svg.startswith("<svg"))
+        self.assertIn('class="segno"', svg)
+
     def test_valid_profile_is_parsed(self) -> None:
         payload = {
             "format": "xass-connect",

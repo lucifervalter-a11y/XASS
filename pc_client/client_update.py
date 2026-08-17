@@ -124,6 +124,34 @@ def _validate_archive(archive: zipfile.ZipFile) -> None:
         raise RuntimeError("update package is too large")
 
 
+def _write_stream_with_progress(
+    response: Any,
+    destination: Path,
+    *,
+    label: str,
+    progress: Callable[[str], None] | None,
+) -> None:
+    try:
+        total = max(0, int(response.headers.get("content-length") or 0))
+    except (TypeError, ValueError):
+        total = 0
+    received = 0
+    last_percent = -1
+    if progress:
+        progress(f"{label} 0%" if total else f"{label}…")
+    with destination.open("wb") as handle:
+        for chunk in response.iter_bytes():
+            if not chunk:
+                continue
+            handle.write(chunk)
+            received += len(chunk)
+            if progress and total:
+                percent = min(100, int(received * 100 / total))
+                if percent == 100 or percent >= last_percent + 2:
+                    last_percent = percent
+                    progress(f"{label} {percent}%")
+
+
 def download_update(
     manifest: dict[str, Any],
     *,
@@ -152,8 +180,7 @@ def download_update(
     try:
         with httpx.Client(timeout=90, trust_env=trust_env, follow_redirects=True) as client:
             for attempt in range(2):
-                if progress:
-                    progress("Скачивание обновления…" if attempt == 0 else "Повторная загрузка обновления…")
+                label = "Скачивание обновления" if attempt == 0 else "Повторная загрузка обновления"
                 download_url = url if attempt == 0 else _cache_busted_url(url, attempt_id)
                 headers = {
                     "X-Api-Key": api_key,
@@ -162,9 +189,7 @@ def download_update(
                 }
                 with client.stream("GET", download_url, headers=headers) as response:
                     response.raise_for_status()
-                    with package_path.open("wb") as handle:
-                        for chunk in response.iter_bytes():
-                            handle.write(chunk)
+                    _write_stream_with_progress(response, package_path, label=label, progress=progress)
                 actual_sha = _sha256(package_path)
                 if actual_sha == expected_sha:
                     break
@@ -215,8 +240,6 @@ def download_installer_update(
     target = UPDATE_ROOT / f"XASS-Setup-{version}-{revision[:12]}.exe"
     temporary = target.with_suffix(".download")
     temporary.unlink(missing_ok=True)
-    if progress:
-        progress("Скачивание установщика XASS…")
     try:
         with httpx.Client(timeout=180, trust_env=trust_env, follow_redirects=True) as client:
             with client.stream(
@@ -225,9 +248,12 @@ def download_installer_update(
                 headers={"X-Api-Key": api_key, "Accept-Encoding": "identity", "Cache-Control": "no-cache"},
             ) as response:
                 response.raise_for_status()
-                with temporary.open("wb") as handle:
-                    for chunk in response.iter_bytes():
-                        handle.write(chunk)
+                _write_stream_with_progress(
+                    response,
+                    temporary,
+                    label="Скачивание установщика XASS",
+                    progress=progress,
+                )
         if _sha256(temporary) != expected_sha:
             raise RuntimeError("installer checksum mismatch")
         temporary.replace(target)

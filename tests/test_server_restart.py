@@ -48,6 +48,23 @@ async def _idle_loop(_settings: object, _bot: object, stop_event: asyncio.Event)
 
 
 class ServerStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standalone_dangerous_action_requires_registered_passkey(self) -> None:
+        user = MiniAppUser(1, "A", "", "a", True)
+        with (
+            patch.object(main, "miniapp_authenticate", return_value=None),
+            patch.object(main, "passkey_count_credentials", new=AsyncMock(return_value=0)),
+        ):
+            with self.assertRaises(main.HTTPException) as error:
+                await main._require_pwa_action_proof(
+                    session=object(),
+                    user=user,
+                    telegram_init_data="",
+                    action_proof="",
+                    purpose="server:restart",
+                )
+        self.assertEqual(error.exception.status_code, 428)
+        self.assertIn("Passkey", error.exception.detail)
+
     async def test_slow_telegram_setup_does_not_block_http_readiness(self) -> None:
         bot = _SlowBot()
         fake_settings = SimpleNamespace(
@@ -103,8 +120,18 @@ class ServerStartupTests(unittest.IsolatedAsyncioTestCase):
         )
         background = BackgroundTasks()
         user = MiniAppUser(1, "A", "", "a", True)
-        with patch.object(main, "run_update", return_value=result):
-            payload = await main.mini_run_update(background, user)
+        with (
+            patch.object(main, "run_update", return_value=result),
+            patch.object(main, "_require_pwa_action_proof", new=AsyncMock()),
+            patch.object(main, "log_admin_action", new=AsyncMock()),
+        ):
+            payload = await main.mini_run_update(
+                background,
+                x_xass_action_proof="proof",
+                x_telegram_init_data="telegram",
+                user=user,
+                session=object(),
+            )
         self.assertTrue(payload["restart_scheduled"])
         self.assertFalse(payload["restart_performed"])
         self.assertEqual(len(background.tasks), 1)
@@ -112,12 +139,44 @@ class ServerStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_restart_is_scheduled_after_response(self) -> None:
         background = BackgroundTasks()
         user = MiniAppUser(1, "A", "", "a", True)
-        payload = await main.mini_restart(background, user)
+        with (
+            patch.object(main, "_require_pwa_action_proof", new=AsyncMock()),
+            patch.object(main, "log_admin_action", new=AsyncMock()),
+        ):
+            payload = await main.mini_restart(
+                background,
+                x_xass_action_proof="proof",
+                x_telegram_init_data="telegram",
+                user=user,
+                session=object(),
+            )
         self.assertTrue(payload["restart_scheduled"])
         self.assertEqual(len(background.tasks), 1)
 
 
 class SiteManagementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_config_export_snapshot_excludes_credentials(self) -> None:
+        config = SimpleNamespace(
+            save_mode="SAVE_FULL",
+            heartbeat_timeout_minutes=10,
+            quiet_hours_enabled=False,
+            quiet_hours_start_minute=None,
+            quiet_hours_end_minute=None,
+            away_mode_enabled=False,
+            away_mode_message="",
+            away_schedule_enabled=False,
+            away_schedule_start_minute=None,
+            away_schedule_end_minute=None,
+            service_base_url="https://xass.example",
+            iphone_shortcut_url="",
+            api_key="must-not-leak",
+            bot_token="must-not-leak",
+        )
+        snapshot = main._config_settings_snapshot(config)
+        self.assertNotIn("api_key", snapshot)
+        self.assertNotIn("bot_token", snapshot)
+        self.assertEqual(snapshot["service_base_url"], "https://xass.example")
+
     async def test_owner_can_save_profile_and_project(self) -> None:
         user = MiniAppUser(1, "A", "", "a", True)
         with tempfile.TemporaryDirectory() as raw_root:
@@ -127,6 +186,7 @@ class SiteManagementTests(unittest.IsolatedAsyncioTestCase):
                 profile_backups_dir=str(root / "backups"),
                 profile_audit_log_path=str(root / "profile-audit.jsonl"),
                 projects_json_path=str(root / "projects.json"),
+                site_config_json_path=str(root / "site-config.json"),
                 projects_backups_dir=str(root / "project-backups"),
                 projects_audit_log_path=str(root / "project-audit.jsonl"),
                 profile_public_url="https://xass.example/profile.php",
@@ -152,11 +212,17 @@ class SiteManagementTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(main, "settings", fake_settings):
                 saved_profile = await main.mini_site_profile_save(profile_payload, user)
                 saved_project = await main.mini_site_project_save(project_payload, user)
+                saved_config = await main.mini_site_config_save(
+                    main.MiniSiteConfigPayload(accent_color="#123abc", widgets=["music", "projects"]),
+                    user,
+                )
                 snapshot = await main.mini_site(user)
             self.assertTrue(saved_profile["ok"])
             self.assertEqual(saved_profile["profile"]["name"], "XASS")
             self.assertTrue(saved_project["ok"])
             self.assertEqual(saved_project["project"]["status"], "working")
+            self.assertEqual(saved_config["site_config"]["accent_color"], "#123abc")
+            self.assertEqual(snapshot["site_config"]["widgets"], ["music", "projects"])
             self.assertEqual(snapshot["public_url"], "https://xass.example/profile.php")
             self.assertTrue((root / "profile-audit.jsonl").is_file())
             self.assertTrue((root / "project-audit.jsonl").is_file())
@@ -179,11 +245,14 @@ class UpdateStatusTests(unittest.TestCase):
         backend_unit = (root / "deploy" / "systemd" / "serverredus-backend.service").read_text(encoding="utf-8")
         agent_unit = (root / "deploy" / "systemd" / "serverredus-agent.service").read_text(encoding="utf-8")
         update_script = (root / "deploy" / "update.sh").read_text(encoding="utf-8")
+        windows_workflow = (root / ".github" / "workflows" / "windows-agent.yml").read_text(encoding="utf-8")
         self.assertIn("RestartSec=1s", backend_unit)
         self.assertIn("TimeoutStopSec=10s", backend_unit)
         self.assertIn("After=network.target serverredus-backend.service", agent_unit)
         self.assertIn("bootstrap_server_dependencies.py", update_script)
         self.assertIn("/health", update_script)
+        publish_step = windows_workflow.split("- name: Publish installer to XASS server", maxsplit=1)[1]
+        self.assertIn("continue-on-error: true", publish_step.split("publish-release:", maxsplit=1)[0])
 
 
 if __name__ == "__main__":

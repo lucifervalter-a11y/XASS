@@ -208,6 +208,14 @@ class TelegramBotClient:
     async def get_file(self, file_id: str) -> dict[str, Any]:
         return await self._request("getFile", payload={"file_id": file_id})
 
+    async def get_user_profile_photos(self, user_id: int, *, limit: int = 1) -> dict[str, Any]:
+        result = await self._request("getUserProfilePhotos", payload={"user_id": user_id, "offset": 0, "limit": limit})
+        return result if isinstance(result, dict) else {}
+
+    async def get_chat(self, chat_id: int) -> dict[str, Any]:
+        result = await self._request("getChat", payload={"chat_id": chat_id})
+        return result if isinstance(result, dict) else {}
+
     async def download_file(self, file_path: str, destination: Path) -> None:
         url = f"{self.file_url}/{file_path}"
         response = await self.client.get(url)

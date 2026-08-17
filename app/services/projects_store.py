@@ -17,26 +17,15 @@ PROJECT_STATUS_VALUES = {
 }
 
 
-DEFAULT_PROJECTS = [
-    {
-        "id": "demo-project",
-        "title": "Demo Project",
-        "subtitle": "Example",
-        "description": "Заполните проекты через Telegram-бота.",
-        "url": "",
-        "status": "dev",
-        "years": {"from": datetime.now(timezone.utc).year, "to": datetime.now(timezone.utc).year},
-        "tags": ["python", "fastapi"],
-        "featured": True,
-        "cover": {"type": "image", "src": ""},
-        "sort": 100,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-]
+DEFAULT_PROJECTS: list[dict[str, Any]] = []
 
 DEFAULT_SITE_CONFIG = {
     "projects_background": {"type": "image", "src": ""},
+    "accent_color": "#376dff",
+    "widgets": ["about", "quotes", "music", "weather", "projects", "contacts"],
 }
+
+SITE_WIDGETS = ("about", "quotes", "music", "weather", "projects", "contacts")
 
 
 def _now_iso() -> str:
@@ -182,8 +171,6 @@ def normalize_projects(raw: Any) -> list[dict[str, Any]]:
             suffix += 1
         used_ids.add(project["id"])
         projects.append(project)
-    if not projects:
-        projects = [normalize_project(DEFAULT_PROJECTS[0], fallback_id="project-1")]
     projects.sort(key=lambda item: (int(item.get("sort") or 0), str(item.get("title") or "").lower()))
     return projects
 
@@ -196,7 +183,22 @@ def normalize_site_config(raw: Any) -> dict[str, Any]:
     if bg_type not in {"image", "video"}:
         bg_type = "image"
     bg_src = _to_text((bg_raw or {}).get("src"))
-    return {"projects_background": {"type": bg_type, "src": bg_src}}
+    accent_color = _to_text(raw.get("accent_color"), DEFAULT_SITE_CONFIG["accent_color"]).lower()
+    if re.fullmatch(r"#[0-9a-f]{6}", accent_color) is None:
+        accent_color = str(DEFAULT_SITE_CONFIG["accent_color"])
+    raw_widgets = raw.get("widgets")
+    if not isinstance(raw_widgets, list):
+        raw_widgets = list(SITE_WIDGETS)
+    widgets = []
+    for item in raw_widgets:
+        name = _to_text(item).lower()
+        if name in SITE_WIDGETS and name not in widgets:
+            widgets.append(name)
+    return {
+        "projects_background": {"type": bg_type, "src": bg_src},
+        "accent_color": accent_color,
+        "widgets": widgets,
+    }
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:

@@ -626,9 +626,14 @@ class XassDesktop:
         summary = self._card(self.content, padding=18)
         summary.pack(fill="x", pady=(0, 14))
         tk.Label(summary, text="ЛОКАЛЬНОЕ ХРАНИЛИЩЕ", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        sync_state = "ожидает повторной доставки" if status.get("pending_retry") else "синхронизирован"
+        last_sync = str(status.get("last_sync_at") or "никогда").replace("T", " ")[:19]
+        error_line = f"\nПоследняя ошибка: {status.get('last_error')}" if status.get("last_error") else ""
         self.archive_state_var.set(
             f"Папка: {status.get('folder')}\nСинхронизировано событий: {status.get('cursor', 0)} · "
-            f"Индекс: {int(status.get('database_size', 0)) / 1024:.1f} КБ"
+            f"Индекс: {int(status.get('database_size', 0)) / 1024:.1f} КБ\n"
+            f"Состояние: {sync_state} · последняя синхронизация: {last_sync} · "
+            f"свободно {int(status.get('free_bytes', 0)) / (1024 ** 3):.1f} ГБ{error_line}"
         )
         tk.Label(summary, textvariable=self.archive_state_var, bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 10)).pack(anchor="w", pady=(9, 12))
         actions = tk.Frame(summary, bg=CARD)
@@ -655,6 +660,10 @@ class XassDesktop:
             timestamp = str(row.get("message_date") or row.get("updated_at") or "").replace("T", " ")[:16]
             title = row.get("chat_title") or row.get("from_username") or row.get("chat_id")
             marker = "  [УДАЛЕНО]" if row.get("deleted") else ""
+            if row.get("forwarded_from"):
+                marker += f"  [ПЕРЕСЛАНО ОТ {row.get('forwarded_from')}]"
+            if row.get("reply_to_message_id"):
+                marker += f"  [ОТВЕТ НА #{row.get('reply_to_message_id')}]"
             direction = "→" if row.get("direction") == "outgoing" else "←"
             text = str(row.get("text_content") or "Медиа / сообщение без текста").replace("\n", " ")
             media = f"  · файлов: {row.get('media_count')}" if row.get("media_count") else ""
@@ -1037,6 +1046,8 @@ class XassDesktop:
             self._set_status("В сети", GREEN)
             self.last_seen_var.set("Последний heartbeat только что")
             self.server_state_var.set("Доступен")
+        elif "Скачивание" in line and "%" in line:
+            self._set_status(line.strip(), AMBER)
         elif "heartbeat failed" in line:
             self._set_status("Нет связи", RED)
             self.last_seen_var.set(line[-120:])
@@ -1057,6 +1068,19 @@ class XassDesktop:
 
 
 def main() -> None:
+    if "--health-check" in sys.argv:
+        try:
+            version = current_version()
+            if not version or version == "0.0.0":
+                raise ValueError("version metadata is missing")
+            config_path = DATA_ROOT / "config.json"
+            if config_path.exists():
+                payload = json.loads(config_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("config.json is invalid")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            raise SystemExit(1)
+        raise SystemExit(0)
     if "--agent" in sys.argv:
         sys.argv = [sys.argv[0], *[arg for arg in sys.argv[1:] if arg != "--agent"]]
         from client_agent import main as agent_main

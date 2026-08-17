@@ -13,10 +13,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pc_client.client_update as client_update
-from pc_client.client_update import _cache_busted_url, _validate_archive, download_update, verify_manifest
+from pc_client.client_update import _cache_busted_url, _validate_archive, _write_stream_with_progress, download_update, verify_manifest
 
 
 class ClientUpdateTests(unittest.TestCase):
+    def test_download_progress_uses_real_content_length(self) -> None:
+        class Response:
+            headers = {"content-length": "10"}
+
+            @staticmethod
+            def iter_bytes():
+                yield b"1234"
+                yield b"567890"
+
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "package.bin"
+            updates: list[str] = []
+            _write_stream_with_progress(Response(), destination, label="Скачивание обновления", progress=updates.append)
+            self.assertEqual(destination.read_bytes(), b"1234567890")
+            self.assertEqual(updates[0], "Скачивание обновления 0%")
+            self.assertEqual(updates[-1], "Скачивание обновления 100%")
+
     def test_agent_status_round_trip_is_process_bound(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             status_path = Path(raw_root) / ".agent-status.json"

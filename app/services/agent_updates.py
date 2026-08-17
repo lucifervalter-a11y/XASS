@@ -101,6 +101,17 @@ def build_agent_package(settings: "Settings") -> AgentPackage:
             with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
                 for path in files:
                     archive.write(path, path.relative_to(client_root).as_posix())
+                archive.writestr(
+                    ".xass-managed-files.json",
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "files": [path.relative_to(client_root).as_posix() for path in files],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
             temporary.replace(package_path)
         finally:
             temporary.unlink(missing_ok=True)

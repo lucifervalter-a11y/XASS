@@ -47,6 +47,8 @@ from app.services.agent_updates import build_agent_package, build_update_manifes
 from app.services.app_config import (
     cycle_save_mode,
     get_or_create_app_config,
+    list_recent_admin_actions,
+    log_admin_action,
     parse_time_range,
     set_away_for_minutes,
     set_away_message,
@@ -61,6 +63,7 @@ from app.services.app_config import (
 from app.services.bot_identity import load_cached_bot_username, normalize_bot_username, save_cached_bot_username
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
+from app.services.message_logging import forwarded_from_label
 from app.services.pwa_auth import (
     COOKIE_NAME as PWA_COOKIE_NAME,
     SESSION_AGE_SEC as PWA_SESSION_AGE_SEC,
@@ -75,6 +78,7 @@ from app.services.passkeys import (
     complete_authentication as passkey_complete_authentication,
     complete_registration as passkey_complete_registration,
     count_credentials as passkey_count_credentials,
+    delete_credential as passkey_delete_credential,
     list_credentials as passkey_list_credentials,
     registration_options as passkey_registration_options,
     transaction_owner as passkey_transaction_owner,
@@ -85,12 +89,15 @@ from app.services.music_card import build_music_card, build_search_links, fallba
 from app.services.profile_editor import (
     ensure_profile_exists,
     load_profile,
+    normalize_profile,
     save_profile,
     save_profile_with_backup,
     validate_http_url,
 )
-from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes, update_quote
+from app.services.quotes_store import add_quote, delete_quote, ensure_quotes_exists, load_quotes, normalize_quotes, save_quotes, update_quote
+from app.services.qr_codes import connection_profile_svg
 from app.services.restart_notice import clear_restart_notice, get_restart_notice, save_restart_notice
+from app.services.scenarios_store import all_scenarios, delete_scenario, find_scenario, normalize_scenarios, save_scenarios, upsert_scenario
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import (
     append_audit_log as append_projects_audit_log,
@@ -99,8 +106,12 @@ from app.services.projects_store import (
     ensure_projects_exists,
     ensure_site_config_exists,
     load_projects,
+    load_site_config,
     normalize_project,
+    normalize_projects,
+    normalize_site_config,
     save_projects,
+    save_site_config,
 )
 from app.services.updater import get_update_status, restart_service, run_update
 from app.storage import ensure_data_dirs
@@ -113,7 +124,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -230,6 +241,71 @@ class PasskeyCompletePayload(BaseModel):
     name: str = Field(default="", max_length=120)
 
 
+class MiniConfigBundlePayload(BaseModel):
+    bundle_format: str = Field(alias="format", min_length=1, max_length=32)
+    version: int = Field(ge=1, le=1)
+    profile: dict[str, Any] = Field(default_factory=dict)
+    projects: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    site_config: dict[str, Any] = Field(default_factory=dict)
+    quotes: list[Any] = Field(default_factory=list, max_length=500)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    scenarios: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+
+
+class MiniScenarioPayload(BaseModel):
+    id: str = Field(default="", max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    actions: list[str] = Field(min_length=1, max_length=4)
+
+
+async def _require_pwa_action_proof(
+    *,
+    session: AsyncSession,
+    user: MiniAppUser,
+    telegram_init_data: str,
+    action_proof: str,
+    purpose: str,
+) -> None:
+    if miniapp_authenticate(telegram_init_data, settings) is not None:
+        return
+    if not await passkey_count_credentials(session, user.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Сначала добавьте Face ID / Passkey в разделе iPhone и веб-приложение",
+        )
+    if not verify_action_proof(action_proof, user.user_id, purpose, settings):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Подтвердите действие через Face ID / Passkey",
+        )
+
+
+def _config_settings_snapshot(config: Any) -> dict[str, Any]:
+    return {
+        "save_mode": config.save_mode,
+        "heartbeat_timeout_minutes": int(config.heartbeat_timeout_minutes),
+        "quiet_hours_enabled": bool(config.quiet_hours_enabled),
+        "quiet_hours_start_minute": config.quiet_hours_start_minute,
+        "quiet_hours_end_minute": config.quiet_hours_end_minute,
+        "away_mode_enabled": bool(config.away_mode_enabled),
+        "away_mode_message": config.away_mode_message or "",
+        "away_schedule_enabled": bool(config.away_schedule_enabled),
+        "away_schedule_start_minute": config.away_schedule_start_minute,
+        "away_schedule_end_minute": config.away_schedule_end_minute,
+        "service_base_url": config.service_base_url or "",
+        "iphone_shortcut_url": config.iphone_shortcut_url or "",
+    }
+
+
+def _minute_or_none(value: Any) -> int | None:
+    if value in {None, ""}:
+        return None
+    parsed = int(value)
+    if parsed < 0 or parsed >= 24 * 60:
+        raise ValueError("Время в резервной копии должно быть от 0 до 1439 минут")
+    return parsed
+
+
 class MiniSiteProfilePayload(BaseModel):
     name: str = Field(default="", max_length=120)
     title: str = Field(default="", max_length=180)
@@ -255,6 +331,11 @@ class MiniSiteProjectPayload(BaseModel):
     featured: bool = False
     cover_type: str = Field(default="image", max_length=16)
     cover_src: str = Field(default="", max_length=1000)
+
+
+class MiniSiteConfigPayload(BaseModel):
+    accent_color: str = Field(default="#376dff", min_length=7, max_length=7)
+    widgets: list[str] = Field(default_factory=list, max_length=6)
 
 
 async def _run_bot_post_startup() -> None:
@@ -1011,6 +1092,37 @@ async def pwa_passkey_register_verify(
     return {"ok": True, "credential": {"id": credential.id, "name": credential.name}}
 
 
+@app.delete("/api/mini/passkeys/{credential_id}")
+async def mini_passkey_delete(
+    credential_id: int,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    await _require_pwa_action_proof(
+        session=session,
+        user=user,
+        telegram_init_data=x_telegram_init_data or "",
+        action_proof=x_xass_action_proof or "",
+        purpose=f"passkey:delete:{credential_id}",
+    )
+    credential = await passkey_delete_credential(
+        session,
+        owner_user_id=user.user_id,
+        credential_id=credential_id,
+    )
+    if credential is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Passkey не найден")
+    await log_admin_action(
+        session,
+        user.user_id,
+        "passkey_deleted",
+        {"credential_id": credential_id, "name": credential.name},
+    )
+    return {"ok": True, "deleted_id": credential_id}
+
+
 def _now_source_label(value: str) -> str:
     return {"pc_agent": "PC", "iphone": "iPhone", "vk": "VK"}.get(value, value or "pc_agent")
 
@@ -1064,6 +1176,7 @@ async def mini_bootstrap(
     archive_targets = await archive_target_map(session)
     archive = await archive_summary(session)
     passkeys = await passkey_list_credentials(session, user.user_id) if user.is_owner else []
+    admin_actions = await list_recent_admin_actions(session, 30) if user.is_owner else []
     metrics = collect_server_metrics(top_processes_limit=settings.top_processes_limit)
     services = collect_systemd_statuses(settings.monitored_services)
     quotes = load_quotes(Path(settings.quotes_json_path))
@@ -1132,6 +1245,16 @@ async def mini_bootstrap(
             }
             for item in passkeys
         ],
+        "admin_actions": [
+            {
+                "id": item.id,
+                "action": item.action,
+                "payload": item.payload or {},
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in admin_actions
+        ],
+        "scenarios": all_scenarios(Path(settings.scenarios_json_path)),
         "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
     }
 
@@ -1182,9 +1305,36 @@ async def mini_site(
         "ok": True,
         "profile": _mini_public_profile(profile),
         "projects": projects,
+        "site_config": load_site_config(Path(settings.site_config_json_path)),
         "public_url": (settings.profile_public_url or "").strip(),
         "can_edit": user.is_owner,
     }
+
+
+@app.post("/api/mini/site/config")
+async def mini_site_config_save(
+    payload: MiniSiteConfigPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    config_path = Path(settings.site_config_json_path)
+    current = load_site_config(config_path)
+    candidate = {
+        **current,
+        "accent_color": payload.accent_color,
+        "widgets": payload.widgets,
+    }
+    normalized = normalize_site_config(candidate)
+    if normalized["accent_color"] != payload.accent_color.lower():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Акцентный цвет должен быть в формате #RRGGBB")
+    backup = backup_json_file(config_path, Path(settings.projects_backups_dir), "site_config")
+    saved = save_site_config(config_path, normalized)
+    append_projects_audit_log(
+        Path(settings.projects_audit_log_path),
+        user.user_id,
+        "miniapp_site_config_save",
+        {"widgets": saved["widgets"], "accent_color": saved["accent_color"], "backup_path": str(backup) if backup else None},
+    )
+    return {"ok": True, "site_config": saved}
 
 
 @app.post("/api/mini/site/profile")
@@ -1405,6 +1555,7 @@ async def mini_agent_pair_code(
         "ttl_minutes": result.ttl_minutes,
         "server_url": server_url,
         "connection": connection,
+        "qr_svg": connection_profile_svg(connection),
         "connection_file_name": "xass-connect.xass",
     }
 
@@ -1487,6 +1638,104 @@ async def mini_agent_installer_ticket(
     }
 
 
+@app.get("/api/mini/scenarios")
+async def mini_scenarios(user: MiniAppUser = Depends(require_mini_owner)) -> dict[str, Any]:
+    return {"ok": True, "scenarios": all_scenarios(Path(settings.scenarios_json_path))}
+
+
+@app.post("/api/mini/scenarios")
+async def mini_scenario_save(
+    payload: MiniScenarioPayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        scenario = upsert_scenario(Path(settings.scenarios_json_path), payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await log_admin_action(session, user.user_id, "scenario_saved", {"scenario_id": scenario["id"], "actions": scenario["actions"]})
+    return {"ok": True, "scenario": scenario, "scenarios": all_scenarios(Path(settings.scenarios_json_path))}
+
+
+@app.delete("/api/mini/scenarios/{scenario_id}")
+async def mini_scenario_delete(
+    scenario_id: str,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    if not delete_scenario(Path(settings.scenarios_json_path), scenario_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользовательский сценарий не найден")
+    await log_admin_action(session, user.user_id, "scenario_deleted", {"scenario_id": scenario_id})
+    return {"ok": True, "scenarios": all_scenarios(Path(settings.scenarios_json_path))}
+
+
+@app.post("/api/mini/scenarios/{scenario_id}/run")
+async def mini_scenario_run(
+    scenario_id: str,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    scenario = find_scenario(Path(settings.scenarios_json_path), scenario_id)
+    if scenario is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Сценарий не найден")
+    actions = [str(item) for item in scenario.get("actions") or []]
+    if any(item in {"lock_all", "update_all"} for item in actions):
+        await _require_pwa_action_proof(
+            session=session,
+            user=user,
+            telegram_init_data=x_telegram_init_data or "",
+            action_proof=x_xass_action_proof or "",
+            purpose=f"scenario:{scenario_id}",
+        )
+    config = await get_or_create_app_config(session, settings)
+    if "away_on" in actions:
+        config.away_mode_enabled = True
+        config.away_until_at = None
+    if "quiet_on" in actions:
+        config.quiet_hours_enabled = True
+    config.updated_by_user_id = user.user_id
+    await session.commit()
+
+    command_names = [
+        command
+        for action, command in (("update_all", "update"), ("lock_all", "lock"))
+        if action in actions
+    ]
+    commands: list[dict[str, Any]] = []
+    skipped_offline: list[str] = []
+    if command_names:
+        for source in await list_sources(session):
+            if "PC" not in str(source.source_type or "").upper():
+                continue
+            if not source.is_online:
+                skipped_offline.append(source.source_name)
+                continue
+            for command_name in command_names:
+                command = await enqueue_agent_command(
+                    session,
+                    source_name=source.source_name,
+                    command=command_name,
+                    payload={},
+                    actor_user_id=user.user_id,
+                )
+                commands.append({"id": command.id, "source_name": command.source_name, "command": command.command})
+    await log_admin_action(
+        session,
+        user.user_id,
+        "scenario_run",
+        {
+            "scenario_id": scenario_id,
+            "actions": actions,
+            "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa",
+            "commands": len(commands),
+            "skipped_offline": skipped_offline,
+        },
+    )
+    return {"ok": True, "scenario": scenario, "commands": commands, "skipped_offline": skipped_offline}
+
+
 @app.get("/api/agent-installer/download")
 async def agent_installer_ticket_download(ticket: str = "") -> FileResponse:
     if not verify_installer_ticket(settings, ticket):
@@ -1505,16 +1754,14 @@ async def mini_agent_command(
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
-    telegram_user = miniapp_authenticate(x_telegram_init_data or "", settings)
-    if payload.command in {"lock", "restart"} and telegram_user is None:
-        purpose = f"agent:{payload.command}:{source.source_name}"
-        if await passkey_count_credentials(session, user.user_id) and not verify_action_proof(
-            payload.action_proof,
-            user.user_id,
-            purpose,
-            settings,
-        ):
-            raise HTTPException(status_code=status.HTTP_428_PRECONDITION_REQUIRED, detail="Подтвердите действие через Face ID / Passkey")
+    if payload.command in {"lock", "restart"}:
+        await _require_pwa_action_proof(
+            session=session,
+            user=user,
+            telegram_init_data=x_telegram_init_data or "",
+            action_proof=payload.action_proof,
+            purpose=f"agent:{payload.command}:{source.source_name}",
+        )
     try:
         item = await enqueue_agent_command(
             session,
@@ -1525,6 +1772,18 @@ async def mini_agent_command(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await log_admin_action(
+        session,
+        user.user_id,
+        "agent_command",
+        {
+            "command_id": item.id,
+            "source_name": item.source_name,
+            "command": item.command,
+            "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa",
+            "status": item.status,
+        },
+    )
     return {
         "ok": True,
         "command": {
@@ -1711,6 +1970,60 @@ async def mini_conversations(
     return {"ok": True, "chats": chats, "archive": await archive_summary(session)}
 
 
+@app.get("/api/mini/conversations/{chat_id}/avatar")
+async def mini_conversation_avatar(
+    chat_id: int,
+    user: MiniAppUser = Depends(require_mini_user),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    if bot_client is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram avatar is unavailable")
+    latest = await session.scalar(
+        select(MessageLog)
+        .where(MessageLog.chat_id == chat_id)
+        .order_by(MessageLog.id.desc())
+        .limit(1)
+    )
+    if latest is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    file_id = ""
+    try:
+        if latest.chat_type == "private":
+            user_id = latest.from_user_id
+            if not user_id:
+                user_id = await session.scalar(
+                    select(MessageLog.from_user_id)
+                    .where(MessageLog.chat_id == chat_id, MessageLog.from_user_id.is_not(None))
+                    .order_by(MessageLog.id.desc())
+                    .limit(1)
+                )
+            photos = await bot_client.get_user_profile_photos(int(user_id or chat_id), limit=1)
+            groups = photos.get("photos") if isinstance(photos.get("photos"), list) else []
+            sizes = groups[0] if groups and isinstance(groups[0], list) else []
+            if sizes:
+                file_id = str(sizes[-1].get("file_id") or "")
+        else:
+            chat = await bot_client.get_chat(chat_id)
+            photo = chat.get("photo") if isinstance(chat.get("photo"), dict) else {}
+            file_id = str(photo.get("small_file_id") or "")
+        if not file_id:
+            raise ValueError("No avatar")
+        telegram_file = await bot_client.get_file(file_id)
+        file_path = str(telegram_file.get("file_path") or "")
+        if not file_path:
+            raise ValueError("No avatar path")
+        response = await bot_client.client.get(f"{bot_client.file_url}/{file_path}")
+        response.raise_for_status()
+    except Exception as exc:
+        logger.debug("Conversation avatar unavailable for chat_id=%s: %s", chat_id, exc)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram avatar is unavailable") from exc
+    return Response(
+        content=response.content,
+        media_type=response.headers.get("content-type") or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 @app.get("/api/mini/conversations/{chat_id}")
 async def mini_conversation_messages(
     chat_id: int,
@@ -1729,6 +2042,16 @@ async def mini_conversation_messages(
     fetched = list(await session.scalars(query.order_by(MessageLog.id.desc()).limit(bounded + 1)))
     has_more = len(fetched) > bounded
     rows = fetched[:bounded]
+    reply_ids = {int(row.reply_to_message_id) for row in rows if row.reply_to_message_id is not None}
+    reply_rows = list(
+        await session.scalars(
+            select(MessageLog).where(
+                MessageLog.chat_id == chat_id,
+                MessageLog.telegram_message_id.in_(reply_ids),
+            )
+        )
+    ) if reply_ids else []
+    replies = {item.telegram_message_id: item for item in reply_rows}
     messages: list[dict[str, Any]] = []
     for row in reversed(rows):
         revisions = list(
@@ -1756,6 +2079,16 @@ async def mini_conversation_messages(
                 "deleted": bool(row.deleted),
                 "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
                 "edited": row.edited_at is not None,
+                "forwarded_from": forwarded_from_label(row.raw_event if isinstance(row.raw_event, dict) else {}),
+                "reply": (
+                    {
+                        "telegram_message_id": replies[row.reply_to_message_id].telegram_message_id,
+                        "from_username": replies[row.reply_to_message_id].from_username or "",
+                        "text": (replies[row.reply_to_message_id].text_content or "Медиа")[:240],
+                    }
+                    if row.reply_to_message_id in replies
+                    else ({"telegram_message_id": row.reply_to_message_id, "from_username": "", "text": "Сообщение недоступно"} if row.reply_to_message_id else None)
+                ),
                 "date": (row.message_date or row.created_at).isoformat(),
                 "revisions": [
                     {"event": item.event_type, "text": item.text_content or "", "date": item.created_at.isoformat()}
@@ -1852,6 +2185,114 @@ async def mini_quotes_update(
     return {"ok": True, "updated": updated, "quotes": load_quotes(Path(settings.quotes_json_path))}
 
 
+@app.get("/api/mini/config/export")
+async def mini_config_export(
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    config = await get_or_create_app_config(session, settings)
+    return {
+        "format": "xass-config",
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "app_version": APP_VERSION,
+        "profile": load_profile(Path(settings.profile_json_path)),
+        "projects": load_projects(Path(settings.projects_json_path)),
+        "site_config": load_site_config(Path(settings.site_config_json_path)),
+        "quotes": load_quotes(Path(settings.quotes_json_path)),
+        "settings": _config_settings_snapshot(config),
+        "scenarios": [item for item in all_scenarios(Path(settings.scenarios_json_path)) if not item.get("builtin")],
+    }
+
+
+@app.post("/api/mini/config/restore")
+async def mini_config_restore(
+    payload: MiniConfigBundlePayload,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    if payload.bundle_format != "xass-config":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Это не резервная копия XASS")
+    await _require_pwa_action_proof(
+        session=session,
+        user=user,
+        telegram_init_data=x_telegram_init_data or "",
+        action_proof=x_xass_action_proof or "",
+        purpose="config:restore",
+    )
+    try:
+        restored_profile = normalize_profile(payload.profile)
+        restored_projects = normalize_projects(payload.projects)
+        restored_site_config = normalize_site_config(payload.site_config)
+        restored_quotes = normalize_quotes(payload.quotes)
+        restored_settings = payload.settings if isinstance(payload.settings, dict) else {}
+        restored_scenarios = normalize_scenarios(payload.scenarios)
+        restored_mode = SaveMode(str(restored_settings.get("save_mode") or SaveMode.SAVE_BASIC.value)).value
+        timeout_minutes = max(1, min(int(restored_settings.get("heartbeat_timeout_minutes") or 10), 1440))
+        quiet_start = _minute_or_none(restored_settings.get("quiet_hours_start_minute"))
+        quiet_end = _minute_or_none(restored_settings.get("quiet_hours_end_minute"))
+        away_start = _minute_or_none(restored_settings.get("away_schedule_start_minute"))
+        away_end = _minute_or_none(restored_settings.get("away_schedule_end_minute"))
+        service_base_url = str(restored_settings.get("service_base_url") or "").strip()
+        if service_base_url:
+            normalized_origin = normalize_server_origin(service_base_url)
+            if normalized_origin is None:
+                raise ValueError("Публичный адрес в резервной копии некорректен")
+            service_base_url = normalized_origin
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Резервная копия повреждена: {exc}") from exc
+
+    profile_path = Path(settings.profile_json_path)
+    projects_path = Path(settings.projects_json_path)
+    site_config_path = Path(settings.site_config_json_path)
+    quotes_path = Path(settings.quotes_json_path)
+    projects_backup = backup_json_file(projects_path, Path(settings.projects_backups_dir), "projects")
+    site_backup = backup_json_file(site_config_path, Path(settings.projects_backups_dir), "site_config")
+    quotes_backup = backup_json_file(quotes_path, Path(settings.profile_backups_dir), "quotes")
+    _, profile_backup, _ = save_profile_with_backup(
+        profile_path=profile_path,
+        backup_dir=Path(settings.profile_backups_dir),
+        audit_log_path=Path(settings.profile_audit_log_path),
+        actor_user_id=user.user_id,
+        action="miniapp_config_restore",
+        profile_data=restored_profile,
+    )
+    save_projects(projects_path, restored_projects)
+    save_site_config(site_config_path, restored_site_config)
+    save_quotes(quotes_path, restored_quotes)
+    save_scenarios(Path(settings.scenarios_json_path), restored_scenarios)
+
+    config = await get_or_create_app_config(session, settings)
+    config.save_mode = restored_mode
+    config.heartbeat_timeout_minutes = timeout_minutes
+    config.quiet_hours_enabled = bool(restored_settings.get("quiet_hours_enabled"))
+    config.quiet_hours_start_minute = quiet_start
+    config.quiet_hours_end_minute = quiet_end
+    config.away_mode_enabled = bool(restored_settings.get("away_mode_enabled"))
+    config.away_mode_message = str(restored_settings.get("away_mode_message") or "")[:4000]
+    config.away_schedule_enabled = bool(restored_settings.get("away_schedule_enabled"))
+    config.away_schedule_start_minute = away_start
+    config.away_schedule_end_minute = away_end
+    config.service_base_url = service_base_url or None
+    config.iphone_shortcut_url = str(restored_settings.get("iphone_shortcut_url") or "")[:1000] or None
+    config.updated_by_user_id = user.user_id
+    await session.commit()
+    await log_admin_action(
+        session,
+        user.user_id,
+        "config_restored",
+        {
+            "profile_backup": str(profile_backup) if profile_backup else None,
+            "projects_backup": str(projects_backup) if projects_backup else None,
+            "site_backup": str(site_backup) if site_backup else None,
+            "quotes_backup": str(quotes_backup) if quotes_backup else None,
+        },
+    )
+    return {"ok": True, "restored": {"profile": True, "projects": len(restored_projects), "quotes": len(restored_quotes)}}
+
+
 @app.get("/api/mini/vk-url")
 async def mini_vk_url(
     chat_id: int | None = None,
@@ -1914,9 +2355,31 @@ async def mini_update_status(
 @app.post("/api/mini/run-update")
 async def mini_run_update(
     background_tasks: BackgroundTasks,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
     user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    await _require_pwa_action_proof(
+        session=session,
+        user=user,
+        telegram_init_data=x_telegram_init_data or "",
+        action_proof=x_xass_action_proof or "",
+        purpose="server:update",
+    )
     result = await asyncio.to_thread(run_update, settings, execute_restart=False)
+    await log_admin_action(
+        session,
+        user.user_id,
+        "server_update",
+        {
+            "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa",
+            "ok": bool(result.ok),
+            "before": result.before.short_hash if result.before else None,
+            "after": result.after.short_hash if result.after else None,
+            "error": str(result.error or "")[:500],
+        },
+    )
     update_applied = bool(
         result.ok
         and result.before is not None
@@ -1945,8 +2408,27 @@ async def mini_run_update(
 @app.post("/api/mini/restart")
 async def mini_restart(
     background_tasks: BackgroundTasks,
+    x_xass_action_proof: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
     user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    await _require_pwa_action_proof(
+        session=session,
+        user=user,
+        telegram_init_data=x_telegram_init_data or "",
+        action_proof=x_xass_action_proof or "",
+        purpose="server:restart",
+    )
+    await log_admin_action(
+        session,
+        user.user_id,
+        "server_restart",
+        {
+            "channel": "telegram" if miniapp_authenticate(x_telegram_init_data or "", settings) else "pwa",
+            "status": "scheduled",
+        },
+    )
     background_tasks.add_task(_restart_after_mini_request, user.user_id, "по команде из Mini App")
     return {"ok": True, "restart_scheduled": True}
 

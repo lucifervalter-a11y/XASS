@@ -33,8 +33,10 @@ def collect_server_metrics(top_processes_limit: int = 5) -> dict[str, Any]:
     uptime_seconds = int(time.time() - psutil.boot_time())
     return {
         "cpu_percent": psutil.cpu_percent(interval=0.2),
+        "ram_used_percent": round(float(vm.percent), 2),
         "ram_used_gb": _bytes_to_gb(vm.used),
         "ram_total_gb": _bytes_to_gb(vm.total),
+        "disk_used_percent": round(float(disk.percent), 2),
         "disk_used_gb": _bytes_to_gb(disk.used),
         "disk_total_gb": _bytes_to_gb(disk.total),
         "net_rx_mb": round(net.bytes_recv / (1024**2), 2),
@@ -64,4 +66,3 @@ def collect_systemd_statuses(services: list[str]) -> dict[str, str]:
         except Exception:
             result[service] = "error"
     return result
-

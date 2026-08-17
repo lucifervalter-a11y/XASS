@@ -33,6 +33,10 @@ from now_playing import get_active_activity, get_now_playing
 from archive_store import apply_archive_events, archive_cursor, archive_status
 
 CONFIG_PATH = DATA_ROOT / "config.json"
+_last_heartbeat_latency_ms = 0.0
+_last_heartbeat_error = ""
+_last_heartbeat_error_at = ""
+_last_server_version = ""
 
 
 def _disk_path() -> str:
@@ -171,6 +175,8 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
     include_now_playing = bool(config.get("include_now_playing", True))
     include_activity = bool(config.get("include_activity", True))
     metrics, processes = collect_metrics(include_processes=include_processes)
+    if _last_heartbeat_latency_ms > 0:
+        metrics["heartbeat_latency_ms"] = round(_last_heartbeat_latency_ms, 1)
     now_playing = get_now_playing() if include_now_playing else None
     activity = get_active_activity() if include_activity else {}
     active_app = (activity.get("title") or activity.get("process")) if isinstance(activity, dict) else None
@@ -191,6 +197,9 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
         "command_results": load_command_results(),
         "archive_cursor": archive_cursor(config),
         "archive_status": archive_status(config),
+        "last_error": _last_heartbeat_error,
+        "last_error_at": _last_heartbeat_error_at,
+        "server_version_seen": _last_server_version,
     }
     if discord is not None:
         payload["discord"] = discord
@@ -456,6 +465,7 @@ def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], co
 
 
 def run_agent(config: dict[str, Any]) -> str:
+    global _last_heartbeat_error, _last_heartbeat_error_at, _last_heartbeat_latency_ms, _last_server_version
     endpoint = f"{config['server_url'].rstrip('/')}/agent/heartbeat"
     headers = {"X-Api-Key": config["api_key"]}
     interval_sec = int(config.get("interval_sec", 30))
@@ -479,7 +489,9 @@ def run_agent(config: dict[str, Any]) -> str:
                 if str(item.get("id", "")).isdigit()
             ]
             try:
+                heartbeat_started = time.perf_counter()
                 response = client.post(endpoint, headers=headers, json=payload)
+                _last_heartbeat_latency_ms = (time.perf_counter() - heartbeat_started) * 1000
                 response.raise_for_status()
                 body = _parse_json_body(response)
                 if not isinstance(body, dict):
@@ -490,7 +502,11 @@ def run_agent(config: dict[str, Any]) -> str:
                         f"Check server URL ({config['server_url']}). "
                         f"content-type={content_type!r}, body={preview!r}"
                     )
-                msg = f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')}"
+                _last_server_version = str(body.get("server_version") or "")[:32]
+                msg = (
+                    f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')} "
+                    f"latency={_last_heartbeat_latency_ms:.0f}ms"
+                )
                 if body.get("new_source"):
                     msg += " | новый агент зарегистрирован"
                 write_agent_status(
@@ -556,6 +572,8 @@ def run_agent(config: dict[str, Any]) -> str:
                         failed_auto_revision = revision
             except Exception as exc:
                 error = f"[pc-client] heartbeat failed: {exc}"
+                _last_heartbeat_error = str(exc)[:1000]
+                _last_heartbeat_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 write_agent_status("offline", detail=error)
                 print(error, flush=True)
             time.sleep(min(interval_sec, 5) if config.get("archive_enabled") else interval_sec)

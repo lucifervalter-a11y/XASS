@@ -23,10 +23,45 @@ from app.services.agent_installer import (
 )
 import client_agent
 import client_update
+import installer_helper
 from client_update import verify_manifest
 
 
 class AgentInstallerTests(unittest.TestCase):
+    def test_installer_runtime_backup_can_restore_previous_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            installed = root / "Programs" / "XASS"
+            updates = root / "data" / ".updates"
+            installed.mkdir(parents=True)
+            (installed / "XASS.exe").write_bytes(b"previous")
+            backup = installer_helper._backup_installed_runtime(installed, updates)
+            self.assertIsNotNone(backup)
+            (installed / "XASS.exe").write_bytes(b"broken")
+            self.assertTrue(installer_helper._restore_installed_runtime(installed, backup))
+            self.assertEqual((installed / "XASS.exe").read_bytes(), b"previous")
+
+    def test_failed_installer_restores_and_launches_previous_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            installed = root / "Programs" / "XASS"
+            updates = root / "data" / ".updates"
+            installer = root / "XASS-Setup.exe"
+            installed.mkdir(parents=True)
+            (installed / "XASS.exe").write_bytes(b"previous")
+            installer.write_bytes(b"broken-installer")
+            with patch.object(installer_helper.os, "name", "nt"), patch.object(
+                installer_helper, "_wait_for_process"
+            ), patch.object(installer_helper, "_install_paths", return_value=(installed, updates)), patch.object(
+                installer_helper.subprocess, "run", return_value=SimpleNamespace(returncode=5)
+            ), patch.object(installer_helper.subprocess, "Popen") as popen:
+                result = installer_helper.install_update(installer, 123)
+            self.assertEqual(result, 5)
+            self.assertEqual((installed / "XASS.exe").read_bytes(), b"previous")
+            popen.assert_called_once_with(
+                [str(installed / "XASS.exe")], cwd=str(installed), close_fds=True
+            )
+
     def test_installer_manifest_is_signed_and_versioned(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

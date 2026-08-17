@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AgentArchiveTarget, HeartbeatSource, MediaAsset, MessageLog, MessageRevision
+from app.services.message_logging import forwarded_from_label
 
 
 async def archive_target_map(session: AsyncSession) -> dict[str, AgentArchiveTarget]:
@@ -72,6 +73,9 @@ def _asset_file_name(asset: MediaAsset, message: MessageLog) -> str:
         "video/mp4": ".mp4",
         "audio/mpeg": ".mp3",
         "audio/ogg": ".ogg",
+        "video/webm": ".webm",
+        "image/webp": ".webp",
+        "application/x-tgsticker": ".tgs",
         "application/pdf": ".pdf",
     }.get(mime, "")
     return f"{asset.media_type}-{asset.id}{extension}"
@@ -119,6 +123,7 @@ async def archive_events_after(
                 "from_username": message.from_username or "",
                 "direction": message.direction,
                 "reply_to_message_id": message.reply_to_message_id,
+                "forwarded_from": forwarded_from_label(message.raw_event if isinstance(message.raw_event, dict) else {}),
                 "text": revision.text_content or message.text_content or "",
                 "deleted": bool(message.deleted),
                 "message_date": message.message_date.isoformat() if message.message_date else None,

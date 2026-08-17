@@ -109,6 +109,25 @@ async def list_credentials(session: AsyncSession, owner_user_id: int) -> list[Pa
     )
 
 
+async def delete_credential(
+    session: AsyncSession,
+    *,
+    owner_user_id: int,
+    credential_id: int,
+) -> PasskeyCredential | None:
+    credential = await session.scalar(
+        select(PasskeyCredential).where(
+            PasskeyCredential.id == int(credential_id),
+            PasskeyCredential.owner_user_id == int(owner_user_id),
+        )
+    )
+    if credential is None:
+        return None
+    await session.delete(credential)
+    await session.commit()
+    return credential
+
+
 async def registration_options(
     session: AsyncSession,
     *,

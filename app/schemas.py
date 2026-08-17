@@ -22,6 +22,9 @@ class HeartbeatPayload(BaseModel):
     command_results: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
     archive_cursor: int = Field(default=0, ge=0)
     archive_status: dict[str, Any] = Field(default_factory=dict)
+    last_error: str = Field(default="", max_length=1000)
+    last_error_at: str = Field(default="", max_length=64)
+    server_version_seen: str = Field(default="", max_length=32)
 
 
 class HeartbeatResponse(BaseModel):
@@ -30,7 +33,7 @@ class HeartbeatResponse(BaseModel):
     recovered: bool = False
     new_source: bool = False
     server_time: datetime
-    server_version: str = "0.10.0"
+    server_version: str = "0.11.0"
     update: dict[str, Any] | None = None
     installer_update: dict[str, Any] | None = None
     commands: list[dict[str, Any]] = Field(default_factory=list)

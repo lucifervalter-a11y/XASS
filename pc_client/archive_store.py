@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,26 +36,45 @@ def _state_path(config: dict[str, Any]) -> Path:
     return archive_root(config) / STATE_FILE
 
 
-def archive_cursor(config: dict[str, Any]) -> int:
+def _read_state(config: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = json.loads(_state_path(config).read_text(encoding="utf-8"))
-        return max(0, int(payload.get("cursor") or 0))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def archive_cursor(config: dict[str, Any]) -> int:
+    try:
+        payload = _read_state(config)
+        return max(0, int(payload.get("cursor") or 0))
+    except (ValueError, TypeError):
         return 0
 
 
 def archive_status(config: dict[str, Any]) -> dict[str, Any]:
     root = archive_root(config)
     cursor = archive_cursor(config)
+    state = _read_state(config)
     try:
         database_size = (root / DB_FILE).stat().st_size
     except OSError:
         database_size = 0
+    disk_root = root if root.exists() else root.parent
+    try:
+        free_bytes = shutil.disk_usage(disk_root).free
+    except OSError:
+        free_bytes = 0
     return {
         "folder": str(root),
         "cursor": cursor,
         "database_size": database_size,
+        "free_bytes": free_bytes,
         "enabled": bool(config.get("archive_enabled", False)),
+        "last_sync_at": str(state.get("last_sync_at") or ""),
+        "last_error": str(state.get("last_error") or "")[:500],
+        "errors": max(0, int(state.get("errors") or 0)),
+        "pending_retry": bool(state.get("pending_retry")),
     }
 
 
@@ -73,6 +94,7 @@ def _connect(root: Path) -> sqlite3.Connection:
             from_username TEXT,
             direction TEXT,
             reply_to_message_id INTEGER,
+            forwarded_from TEXT,
             text_content TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
             message_date TEXT,
@@ -98,13 +120,35 @@ def _connect(root: Path) -> sqlite3.Connection:
         );
         """
     )
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(messages)")}
+    if "forwarded_from" not in columns:
+        connection.execute("ALTER TABLE messages ADD COLUMN forwarded_from TEXT")
     return connection
 
 
-def _write_state(root: Path, cursor: int) -> None:
+def _write_state(
+    root: Path,
+    cursor: int,
+    *,
+    errors: int = 0,
+    pending_retry: bool = False,
+    last_error: str = "",
+) -> None:
     target = root / STATE_FILE
     temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"cursor": int(cursor)}, ensure_ascii=False), encoding="utf-8")
+    temporary.write_text(
+        json.dumps(
+            {
+                "cursor": int(cursor),
+                "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                "errors": max(0, int(errors)),
+                "pending_retry": bool(pending_retry),
+                "last_error": str(last_error)[:500],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     temporary.replace(target)
 
 
@@ -161,6 +205,7 @@ def apply_archive_events(
     retry_gap = False
     saved = 0
     errors = 0
+    last_error = ""
     media_headers = dict(headers)
     source_name = str(config.get("source_name") or "").strip()
     if source_name:
@@ -176,8 +221,8 @@ def apply_archive_events(
             connection.execute(
                 """
                 INSERT INTO messages(id, telegram_message_id, chat_id, chat_type, chat_title, from_user_id,
-                    from_username, direction, reply_to_message_id, text_content, deleted, message_date, updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    from_username, direction, reply_to_message_id, forwarded_from, text_content, deleted, message_date, updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     text_content=excluded.text_content, deleted=excluded.deleted, chat_title=excluded.chat_title,
                     from_username=excluded.from_username, updated_at=excluded.updated_at
@@ -192,6 +237,7 @@ def apply_archive_events(
                     str(event.get("from_username") or ""),
                     str(event.get("direction") or "incoming"),
                     event.get("reply_to_message_id"),
+                    str(event.get("forwarded_from") or ""),
                     str(event.get("text") or ""),
                     int(bool(event.get("deleted"))),
                     event.get("message_date"),
@@ -223,6 +269,8 @@ def apply_archive_events(
                     is_saved = bool(local_path)
                     errors += int(not is_saved)
                     event_failed = event_failed or not is_saved
+                    if error:
+                        last_error = error
                 connection.execute(
                     """INSERT OR REPLACE INTO media(asset_id,message_id,media_type,mime_type,file_size,local_path,saved,error)
                     VALUES(?,?,?,?,?,?,?,?)""",
@@ -235,7 +283,13 @@ def apply_archive_events(
             saved += 1
         connection.commit()
         cursor = contiguous_cursor
-        _write_state(root, cursor)
+        _write_state(
+            root,
+            cursor,
+            errors=errors,
+            pending_retry=retry_gap,
+            last_error=last_error,
+        )
     finally:
         connection.close()
     return {"saved": saved, "cursor": cursor, "errors": errors, "folder": str(root)}
