@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models import InternalNotification, NotificationPreference
-from app.services.app_config import sanitize_audit_payload
+from app.services.app_config import get_or_create_app_config, sanitize_audit_payload
+from app.services.heartbeat import is_quiet_hours
 from app.services.web_push import send_push
 
 
@@ -88,14 +89,17 @@ async def emit_notification(
         if duplicate is not None:
             return None, policy
     if "push" in channels:
-        await send_push(
-            session,
-            get_settings(),
-            title=title,
-            message=message,
-            event_type=event_type,
-            priority=priority if priority in PRIORITIES else policy["priority"],
-        )
+        current_settings = get_settings()
+        app_config = await get_or_create_app_config(session, current_settings)
+        if not policy["quiet_hours"] or not is_quiet_hours(app_config, current_settings):
+            await send_push(
+                session,
+                current_settings,
+                title=title,
+                message=message,
+                event_type=event_type,
+                priority=priority if priority in PRIORITIES else policy["priority"],
+            )
     internal_enabled = "internal" in channels
     clean_details = sanitize_audit_payload(details or {})
     item = InternalNotification(
