@@ -21,8 +21,15 @@ ALLOWED_AGENT_COMMANDS = {
     "ping",
     "open_archive",
     "cleanup_archive",
+    "screenshot",
+    "files_list",
+    "file_download",
+    "file_upload",
+    "file_delete",
+    "clipboard_get",
+    "clipboard_set",
 }
-DANGEROUS_AGENT_COMMANDS = {"lock", "sleep", "reboot", "shutdown", "restart", "update", "cleanup_archive"}
+DANGEROUS_AGENT_COMMANDS = {"lock", "sleep", "reboot", "shutdown", "restart", "update", "cleanup_archive", "file_delete"}
 
 
 def _now_utc() -> datetime:

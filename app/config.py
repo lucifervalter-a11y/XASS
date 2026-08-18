@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     site_config_json_path: str = "./data/site_config.json"
     quotes_json_path: str = "./data/quotes.json"
     scenarios_json_path: str = "./data/scenarios.json"
+    rules_json_path: str = "./data/rules.json"
     projects_backups_dir: str = "./data/backups/projects"
     projects_audit_log_path: str = "./data/projects_audit.log"
     projects_assets_dir: str = "./assets/projects"
@@ -81,6 +82,9 @@ class Settings(BaseSettings):
     agent_installer_path: str = "./data/releases/XASS-Setup.exe"
     agent_installer_metadata_path: str = "./data/releases/XASS-Setup.json"
     agent_installer_fallback_url: str = "https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe"
+    agent_workspace_dir: str = "./data/agent_workspace"
+    agent_screenshot_max_bytes: int = 8 * 1024 * 1024
+    agent_file_max_bytes: int = 32 * 1024 * 1024
 
     notify_chat_id: int | None = None
     monitored_services: Annotated[list[str], NoDecode] = []

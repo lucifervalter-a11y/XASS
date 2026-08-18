@@ -33,6 +33,15 @@ from client_update import (
 from discord_presence import get_discord_activity
 from now_playing import get_active_activity, get_now_playing
 from archive_store import apply_archive_events, archive_cursor, archive_root, archive_status, cleanup_archive
+from remote_tools import (
+    capture_screenshot,
+    clipboard_get,
+    clipboard_set,
+    delete_file,
+    list_files,
+    receive_uploaded_file,
+    upload_requested_file,
+)
 try:
     from runtime_state import acquire_single_instance, atomic_write_json, configure_utf8_logging, load_json_object
 except ModuleNotFoundError:
@@ -496,6 +505,62 @@ def _open_archive_folder(config: dict[str, Any], command_id: int) -> None:
         store_command_result(command_id, False, f"Не удалось открыть папку архива: {exc}")
 
 
+def _handle_workspace_command(
+    command_name: str,
+    command_payload: dict[str, Any],
+    *,
+    command_id: int,
+    config: dict[str, Any],
+    source_name: str,
+    client: httpx.Client,
+) -> bool:
+    supported = {
+        "screenshot", "files_list", "file_download", "file_upload", "file_delete",
+        "clipboard_get", "clipboard_set",
+    }
+    if command_name not in supported:
+        return False
+    try:
+        common = {
+            "endpoint": str(config["server_url"]),
+            "api_key": str(config["api_key"]),
+            "source_name": source_name,
+        }
+        if command_name == "screenshot":
+            details = capture_screenshot(client, command_id=command_id, **common)
+            store_command_result(command_id, True, "Снимок экрана получен", details)
+        elif command_name == "files_list":
+            details = list_files(DATA_ROOT, command_payload.get("root"), command_payload.get("path"))
+            store_command_result(command_id, True, f"Папка открыта: {details['root_label']}", details)
+        elif command_name == "file_download":
+            details = upload_requested_file(
+                DATA_ROOT, client, command_id=command_id,
+                root_name=command_payload.get("root"), relative_path=command_payload.get("path"), **common,
+            )
+            store_command_result(command_id, True, f"Файл готов: {details['filename']}", details)
+        elif command_name == "file_upload":
+            details = receive_uploaded_file(
+                DATA_ROOT, client, root_name=command_payload.get("root"),
+                relative_path=command_payload.get("path"), asset_token=command_payload.get("asset_token"),
+                filename=command_payload.get("filename"), **common,
+            )
+            store_command_result(command_id, True, f"Файл сохранён: {details['filename']}", details)
+        elif command_name == "file_delete":
+            details = delete_file(DATA_ROOT, command_payload.get("root"), command_payload.get("path"))
+            store_command_result(command_id, True, f"Файл удалён: {details['name']}", details)
+        elif command_name == "clipboard_get":
+            text = clipboard_get()
+            store_command_result(command_id, True, "Текст получен из буфера ПК", {"text": text, "length": len(text)})
+        elif command_name == "clipboard_set":
+            length = clipboard_set(command_payload.get("text"))
+            store_command_result(command_id, True, "Текст отправлен в буфер ПК", {"length": length})
+        return True
+    except Exception as exc:
+        store_command_result(command_id, False, f"{command_name}: {exc}")
+        print(f"[pc-client] {command_name} failed: {exc}", flush=True)
+        return True
+
+
 def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: int | None) -> str | None:
     try:
         version = str(manifest.get("version") or "")
@@ -689,6 +754,15 @@ def run_agent(config: dict[str, Any]) -> str:
                             f"Локальный архив очищен: {result['removed_files']} файлов",
                             result,
                         )
+                        continue
+                    if _handle_workspace_command(
+                        command_name,
+                        command_payload,
+                        command_id=command_id,
+                        config=config,
+                        source_name=source_name,
+                        client=client,
+                    ):
                         continue
                     if command_name == "check_update":
                         update_info = installer_manifest if is_installer_build() else manifest

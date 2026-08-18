@@ -29,9 +29,14 @@ EVENT_TYPES = (
     "passkey_registered",
     "pair_code_created",
     "auth_failed",
+    "automation_rule",
 )
 CHANNELS = {"internal", "telegram", "push"}
-PRIORITIES = {"low", "normal", "high", "critical"}
+PRIORITIES = {"low", "normal", "high", "info", "success", "warning", "critical"}
+
+
+def public_priority(value: str) -> str:
+    return {"low": "info", "normal": "info", "high": "warning"}.get(value, value if value in PRIORITIES else "info")
 
 
 def _now_utc() -> datetime:
@@ -43,7 +48,7 @@ def _default_policy(event_type: str) -> dict[str, Any]:
     return {
         "event_type": event_type,
         "channels": ["internal", "telegram"],
-        "priority": "high" if critical else "normal",
+        "priority": "warning" if critical else "info",
         "quiet_hours": not critical,
     }
 
@@ -126,7 +131,7 @@ def notification_json(item: InternalNotification) -> dict[str, Any]:
         "event_type": item.event_type,
         "title": item.title,
         "message": item.message,
-        "priority": item.priority,
+        "priority": public_priority(item.priority),
         "status": item.status,
         "requires_action": bool(item.requires_action),
         "device": item.device or "",
@@ -197,7 +202,7 @@ async def list_preferences(session: AsyncSession) -> list[dict[str, Any]]:
             else {
                 "event_type": item.event_type,
                 "channels": [value for value in (item.channels or []) if value in CHANNELS],
-                "priority": item.priority,
+                "priority": public_priority(item.priority),
                 "quiet_hours": bool(item.quiet_hours),
             }
         )

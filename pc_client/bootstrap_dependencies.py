@@ -29,7 +29,7 @@ def _dependencies_ready(python: Path, digest: str) -> bool:
     except OSError:
         return False
     result = subprocess.run(
-        [str(python), "-c", "import httpx, psutil"],
+        [str(python), "-c", "import httpx, psutil, PIL, pystray, tkinterdnd2"],
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

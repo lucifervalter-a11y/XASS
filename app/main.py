@@ -28,7 +28,7 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
+from app.models import AgentCommand, AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
 from app.services.agent_commands import (
     DANGEROUS_AGENT_COMMANDS,
     acknowledge_agent_commands,
@@ -49,6 +49,13 @@ from app.services.agent_installer import (
 )
 from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code, revoke_active_pair_codes
 from app.services.agent_updates import build_agent_package, build_update_manifest
+from app.services.agent_workspace import (
+    delete_asset as delete_workspace_asset,
+    latest_screenshot,
+    load_asset as load_workspace_asset,
+    normalize_remote_location,
+    store_asset as store_workspace_asset,
+)
 from app.services.app_config import (
     cycle_save_mode,
     get_or_create_app_config,
@@ -119,6 +126,8 @@ from app.services.qr_codes import connection_profile_svg
 from app.services.restart_notice import clear_restart_notice, get_restart_notice, save_restart_notice
 from app.services.scenarios_store import all_scenarios, delete_scenario, find_scenario, normalize_scenarios, save_scenarios, upsert_scenario
 from app.services.scenario_runner import execute_scenario, finish_scenario, scenario_is_dangerous, try_start_scenario
+from app.services.rules_store import delete_rule, load_rules, normalize_rule, save_rules, upsert_rule
+from app.services.timeline import timeline_items
 from app.services.profile_runtime import set_profile_now_playing_source, sync_profile_now_playing_from_heartbeat, update_profile_discord, update_profile_now_playing_external
 from app.services.projects_store import (
     SITE_WIDGETS,
@@ -148,7 +157,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.13.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -308,6 +317,7 @@ class MiniConfigBundlePayload(BaseModel):
     quotes: list[Any] = Field(default_factory=list, max_length=500)
     settings: dict[str, Any] = Field(default_factory=dict)
     scenarios: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    rules: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     notifications: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     agents: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
     archive: dict[str, Any] = Field(default_factory=dict)
@@ -331,6 +341,19 @@ class MiniScenarioPayload(BaseModel):
     actions: list[str] = Field(min_length=1, max_length=12)
     delay_sec: int = Field(default=0, ge=0, le=3600)
     schedule: str = Field(default="", max_length=64)
+    enabled: bool = True
+
+
+class MiniRulePayload(BaseModel):
+    id: str = Field(default="", max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    condition: str = Field(min_length=1, max_length=32)
+    device: str = Field(default="", max_length=128)
+    service: str = Field(default="", max_length=128)
+    threshold: float = Field(default=0, ge=0, le=10000)
+    duration_minutes: int = Field(default=0, ge=0, le=1440)
+    cooldown_minutes: int = Field(default=60, ge=1, le=10080)
+    priority: str = Field(default="warning", max_length=16)
     enabled: bool = True
 
 
@@ -393,6 +416,7 @@ async def _build_config_bundle(session: AsyncSession) -> dict[str, Any]:
         "quotes": load_quotes(Path(settings.quotes_json_path)),
         "settings": _config_settings_snapshot(config),
         "scenarios": [item for item in all_scenarios(Path(settings.scenarios_json_path)) if not item.get("builtin")],
+        "rules": load_rules(Path(settings.rules_json_path)),
         "notifications": await list_notification_preferences(session),
         "agents": [
             {
@@ -802,6 +826,66 @@ async def agent_heartbeat(
         archive_enabled=archive_enabled,
         archive_events=archive_events,
     )
+
+
+@app.post("/agent/workspace/assets/{command_id}")
+async def agent_workspace_asset_upload(
+    command_id: int,
+    request: Request,
+    kind: str = "",
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+    x_xass_source: str | None = Header(default=None),
+    x_xass_filename: str | None = Header(default=None),
+) -> dict[str, Any]:
+    auth = await authenticate_agent_api_key(
+        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    source_name = str(auth.source_name or x_xass_source or "").strip()
+    if not source_name or (auth.source_name and x_xass_source and auth.source_name != x_xass_source):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
+    command = await session.get(AgentCommand, int(command_id))
+    expected_kind = {"screenshot": "screenshot", "file_download": "file_download"}.get(command.command if command else "")
+    if command is None or command.source_name != source_name or command.status != "delivered" or expected_kind != kind:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset does not match the delivered command")
+    body = await request.body()
+    try:
+        metadata = await asyncio.to_thread(
+            store_workspace_asset,
+            settings,
+            source_name=source_name,
+            kind=kind,
+            filename=x_xass_filename or ("screenshot.jpg" if kind == "screenshot" else "xass-file.bin"),
+            content_type=request.headers.get("content-type", "application/octet-stream"),
+            body=body,
+            command_id=command.id,
+            ttl_seconds=10 * 60 if kind == "screenshot" else 30 * 60,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"ok": True, "asset": metadata}
+
+
+@app.get("/agent/workspace/assets/{token}")
+async def agent_workspace_asset_download(
+    token: str,
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+    x_xass_source: str | None = Header(default=None),
+) -> FileResponse:
+    auth = await authenticate_agent_api_key(
+        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    source_name = str(auth.source_name or x_xass_source or "").strip()
+    loaded = await asyncio.to_thread(load_workspace_asset, settings, token, source_name=source_name)
+    if loaded is None or loaded[0].get("kind") != "file_upload":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Temporary upload is unavailable")
+    metadata, path = loaded
+    return FileResponse(path, media_type=metadata["content_type"], filename=metadata["filename"], headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/agent/archive/media/{asset_id}")
@@ -1926,6 +2010,7 @@ async def mini_bootstrap(
         ],
         "admin_actions": [_admin_action_json(item) for item in admin_actions],
         "scenarios": all_scenarios(Path(settings.scenarios_json_path)),
+        "rules": load_rules(Path(settings.rules_json_path)),
         "vk_app_id": settings.vk_app_id or (int(str(profile.get("vk_app_id") or "").strip()) if str(profile.get("vk_app_id") or "").strip().isdigit() else None),
     }
 
@@ -2415,6 +2500,60 @@ async def mini_agent_installer_ticket(
     }
 
 
+@app.get("/api/mini/timeline")
+async def mini_timeline(
+    limit: int = 100,
+    event_type: str = "",
+    device: str = "",
+    level: str = "",
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    items = await timeline_items(
+        session, limit=limit, event_type=event_type, device=device, level=level,
+    )
+    return {"ok": True, "items": items}
+
+
+@app.get("/api/mini/rules")
+async def mini_rules(
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> dict[str, Any]:
+    del user
+    return {
+        "ok": True,
+        "rules": load_rules(Path(settings.rules_json_path)),
+        "conditions": ["agent_offline", "cpu_high", "disk_low", "service_down", "agent_outdated"],
+    }
+
+
+@app.post("/api/mini/rules")
+async def mini_rule_save(
+    payload: MiniRulePayload,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        item = upsert_rule(Path(settings.rules_json_path), payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await log_admin_action(session, user.user_id, "automation_rule_saved", {"rule_id": item["id"], "condition": item["condition"]})
+    return {"ok": True, "rule": item, "rules": load_rules(Path(settings.rules_json_path))}
+
+
+@app.delete("/api/mini/rules/{rule_id}")
+async def mini_rule_delete(
+    rule_id: str,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    if not delete_rule(Path(settings.rules_json_path), rule_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Правило не найдено")
+    await log_admin_action(session, user.user_id, "automation_rule_deleted", {"rule_id": rule_id})
+    return {"ok": True, "rules": load_rules(Path(settings.rules_json_path))}
+
+
 @app.get("/api/mini/scenarios")
 async def mini_scenarios(user: MiniAppUser = Depends(require_mini_owner)) -> dict[str, Any]:
     return {"ok": True, "scenarios": all_scenarios(Path(settings.scenarios_json_path))}
@@ -2519,6 +2658,109 @@ async def agent_installer_ticket_download(ticket: str = "") -> FileResponse:
     return _agent_installer_response()
 
 
+@app.get("/api/mini/agents/{source_name}/screenshot")
+async def mini_agent_screenshot(
+    source_name: str,
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    del user
+    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Агент не найден")
+    item = await asyncio.to_thread(latest_screenshot, settings, source.source_name)
+    if item is None:
+        return {"ok": True, "available": False, "screenshot": None}
+    return {
+        "ok": True,
+        "available": True,
+        "screenshot": {
+            **{key: item.get(key) for key in ("token", "size", "sha256", "created_at", "expires_at")},
+            "url": f"/api/mini/agents/{quote(source.source_name, safe='')}/assets/{item['token']}",
+        },
+    }
+
+
+@app.get("/api/mini/agents/{source_name}/assets/{token}")
+async def mini_agent_asset_download(
+    source_name: str,
+    token: str,
+    user: MiniAppUser = Depends(require_mini_owner),
+) -> FileResponse:
+    del user
+    loaded = await asyncio.to_thread(load_workspace_asset, settings, token, source_name=source_name)
+    if loaded is None or loaded[0].get("kind") not in {"screenshot", "file_download"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Временный файл недоступен")
+    metadata, path = loaded
+    disposition = "inline" if metadata["kind"] == "screenshot" else "attachment"
+    return FileResponse(
+        path,
+        media_type=metadata["content_type"],
+        filename=metadata["filename"],
+        content_disposition_type=disposition,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.post("/api/mini/agents/{source_name}/files/upload")
+async def mini_agent_file_upload(
+    source_name: str,
+    request: Request,
+    root: str,
+    path: str = "",
+    filename: str = "",
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Агент не найден")
+    try:
+        root_name, relative_path = normalize_remote_location(root, path)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    body = await request.body()
+    metadata: dict[str, Any] | None = None
+    try:
+        metadata = await asyncio.to_thread(
+            store_workspace_asset,
+            settings,
+            source_name=source.source_name,
+            kind="file_upload",
+            filename=filename or request.headers.get("x-xass-filename") or "xass-file.bin",
+            content_type=request.headers.get("content-type", "application/octet-stream"),
+            body=body,
+            ttl_seconds=30 * 60,
+        )
+        command = await enqueue_agent_command(
+            session,
+            source_name=source.source_name,
+            command="file_upload",
+            payload={
+                "root": root_name,
+                "path": relative_path,
+                "asset_token": metadata["token"],
+                "filename": metadata["filename"],
+            },
+            actor_user_id=user.user_id,
+        )
+    except ValueError as exc:
+        if metadata:
+            await asyncio.to_thread(delete_workspace_asset, settings, metadata["token"])
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception:
+        if metadata:
+            await asyncio.to_thread(delete_workspace_asset, settings, metadata["token"])
+        raise
+    await log_admin_action(
+        session,
+        user.user_id,
+        "agent_file_upload",
+        {"source_name": source.source_name, "root": root_name, "path": relative_path, "filename": metadata["filename"], "command_id": command.id},
+    )
+    return {"ok": True, "command": {"id": command.id, "status": command.status}, "filename": metadata["filename"]}
+
+
 @app.post("/api/mini/agents/{source_name}/commands")
 async def mini_agent_command(
     source_name: str,
@@ -2532,6 +2774,19 @@ async def mini_agent_command(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     command_name = payload.command.strip().lower()
     command_payload = payload.payload if isinstance(payload.payload, dict) else {}
+    if command_name in {"files_list", "file_download", "file_delete"}:
+        try:
+            root_name, relative_path = normalize_remote_location(command_payload.get("root"), command_payload.get("path"))
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if command_name in {"file_download", "file_delete"} and not relative_path:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите файл")
+        command_payload = {"root": root_name, "path": relative_path}
+    if command_name == "clipboard_set":
+        text_value = str(command_payload.get("text") or "")
+        if len(text_value) > 64 * 1024:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Текст превышает 64 КБ")
+        command_payload = {"text": text_value}
     if command_name in {"reboot", "shutdown"}:
         try:
             delay_sec = int(command_payload.get("delay_sec") or 0)
@@ -3168,6 +3423,7 @@ async def mini_config_preview(
             "projects": {"current": len(current_bundle["projects"]), "incoming": len(projects)},
             "quotes": {"current": len(current_bundle["quotes"]), "incoming": len(quotes)},
             "scenarios": {"current": len(current_bundle["scenarios"]), "incoming": len(scenarios)},
+            "rules": {"current": len(current_bundle["rules"]), "incoming": len(candidate.rules)},
             "notification_rules": len(candidate.notifications),
             "archive_targets": len(candidate.archive.get("targets") or []),
             "agents_are_informational": len(candidate.agents),
@@ -3204,6 +3460,11 @@ async def mini_config_restore(
         restored_quotes = normalize_quotes(payload.quotes)
         restored_settings = payload.settings if isinstance(payload.settings, dict) else {}
         restored_scenarios = normalize_scenarios(payload.scenarios)
+        restored_rules = [
+            normalized
+            for index, item in enumerate(payload.rules, start=1)
+            if (normalized := normalize_rule(item, f"rule-{index}")) is not None
+        ]
         restored_mode = SaveMode(str(restored_settings.get("save_mode") or SaveMode.SAVE_BASIC.value)).value
         timeout_minutes = max(1, min(int(restored_settings.get("heartbeat_timeout_minutes") or 10), 1440))
         quiet_start = _minute_or_none(restored_settings.get("quiet_hours_start_minute"))
@@ -3238,6 +3499,7 @@ async def mini_config_restore(
     save_site_config(site_config_path, restored_site_config)
     save_quotes(quotes_path, restored_quotes)
     save_scenarios(Path(settings.scenarios_json_path), restored_scenarios)
+    save_rules(Path(settings.rules_json_path), restored_rules)
 
     restored_notification_rules = 0
     for item in payload.notifications:
@@ -3302,6 +3564,7 @@ async def mini_config_restore(
             "projects": len(restored_projects),
             "quotes": len(restored_quotes),
             "scenarios": len(restored_scenarios),
+            "rules": len(restored_rules),
             "notification_rules": restored_notification_rules,
             "archive_targets": restored_archive_targets,
         },

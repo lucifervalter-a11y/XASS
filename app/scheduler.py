@@ -10,7 +10,10 @@ from app.db import SessionLocal
 from app.services.app_config import get_or_create_app_config, log_admin_action
 from app.services.heartbeat import is_quiet_hours, list_sources, mark_offline_sources
 from app.services.notifications import emit_notification
+from app.services.monitoring import collect_systemd_statuses
 from app.services.profile_runtime import sync_profile_now_playing_from_heartbeat, sync_profile_weather
+from app.services.rules_engine import evaluate_rules
+from app.services.rules_store import load_rules
 from app.services.scenario_runner import execute_scenario, finish_scenario, try_start_scenario
 from app.services.scenarios_store import all_scenarios
 
@@ -144,6 +147,13 @@ async def offline_check_loop(
                 stale_sources = await mark_offline_sources(session, config.heartbeat_timeout_minutes)
                 sources = await list_sources(session)
                 await run_due_scenarios(session, settings, config)
+                rule_services = [
+                    str(item.get("service") or "").strip()
+                    for item in load_rules(Path(settings.rules_json_path))
+                    if item.get("condition") == "service_down" and str(item.get("service") or "").strip()
+                ]
+                service_statuses = collect_systemd_statuses(list(dict.fromkeys([*settings.monitored_services, *rule_services])))
+                await evaluate_rules(session, settings, sources=sources, services=service_statuses)
                 await sync_profile_now_playing_from_heartbeat(session, settings, config.heartbeat_timeout_minutes)
                 if stale_sources:
                     chat_id = _notification_chat_id(settings, config.notify_chat_id)

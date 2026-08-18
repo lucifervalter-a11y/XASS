@@ -17,8 +17,8 @@
 </p>
 
 <p align="center">
-  <img alt="Server 0.12.0" src="https://img.shields.io/badge/server-0.12.0-3b82f6?style=flat-square">
-  <img alt="Windows agent 0.12.0" src="https://img.shields.io/badge/Windows_agent-0.12.0-2563eb?style=flat-square&logo=windows11&logoColor=white">
+  <img alt="Server 0.13.0" src="https://img.shields.io/badge/server-0.13.0-3b82f6?style=flat-square">
+  <img alt="Windows agent 0.13.0" src="https://img.shields.io/badge/Windows_agent-0.13.0-2563eb?style=flat-square&logo=windows11&logoColor=white">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-111827?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-059669?style=flat-square&logo=fastapi&logoColor=white">
   <img alt="Telegram Mini App" src="https://img.shields.io/badge/Telegram-Mini_App-229ED9?style=flat-square&logo=telegram&logoColor=white">
@@ -56,8 +56,8 @@ XASS объединяет персонального Telegram Business‑бот�
 | Поверхность | Что умеет |
 |---|---|
 | Telegram | Business‑бот, полные переписки, история правок и удалений, уведомления и команды владельца |
-| Mini App | Единый центр состояния, сценарии, уведомления, аудит, диагностика, переписки, локальные архивы, команды ПК и управление сайтом |
-| Windows | Нативное приложение, автозапуск, CPU/RAM/Disk, локальный архив сообщений и медиа, однофайловая привязка и автообновления |
+| Mini App | Единый центр состояния, агенты, Screenshot, безопасные файлы, Clipboard, Timeline, Rules, уведомления, аудит, переписки и управление сайтом |
+| Windows | Нативное приложение, автозапуск, CPU/RAM/Disk, снимок экрана по запросу, ограниченный файловый доступ, Clipboard, локальный архив и автообновления |
 | iPhone / PWA | Вход и подтверждение опасных действий через Face ID / Passkey, установка на экран «Домой» |
 | Публичный сайт | Профиль, проекты, цитаты, аватары, контакты, погода и музыка с раздельными зонами интерфейса |
 | Backend | FastAPI, heartbeat, PostgreSQL/SQLite, очередь команд, экспорт, резервные копии и контроль состояния сервисов |
@@ -68,6 +68,10 @@ XASS объединяет персонального Telegram Business‑бот�
 - Отдельный API‑ключ для каждого устройства.
 - Удалённые команды: проверить связь и обновление, открыть/очистить архив, обновить или перезапустить агент, заблокировать, усыпить, перезагрузить и выключить Windows.
 - История команд показывает очередь и результат; отложенную команду можно отменить до выполнения.
+- Снимок экрана создаётся только по команде, временно хранится на backend и заменяет предыдущий кадр этого агента.
+- Файловый менеджер ограничен папками `Рабочий стол`, `Загрузки`, `Документы` и `XASS Files`; каталог и файлы передаются только по запросу, а `../` и абсолютные пути блокируются на backend и агенте.
+- Clipboard читается и меняется только явными командами; Mini App хранит короткую локальную историю, которую можно очистить.
+- Timeline объединяет состояние агентов, команды, уведомления и аудит. Простые правила `ЕСЛИ → ТО` выполняются серверным scheduler.
 - Одинаковое подтверждение команд в Telegram и standalone PWA; при настроенном Passkey блокировка и перезапуск требуют биометрию устройства.
 - Подписанные манифесты обновлений и проверка SHA‑256 перед установкой.
 - Локальный статус соединения, не зависящий от буферизации журнала процесса.
