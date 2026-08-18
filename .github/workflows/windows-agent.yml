@@ -83,7 +83,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
           source: "release/XASS-Setup.exe,release/XASS-Setup.json"
-          target: "/opt/serverredus/data/releases"
+          target: "/home/red/serverredus/data/releases"
           strip_components: 1
 
   publish-release:

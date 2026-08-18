@@ -45,5 +45,5 @@ jobs:
           port: ${{ secrets.SSH_PORT || 22 }}
           script: |
             set -e
-            cd /opt/serverredus
+            cd /home/red/serverredus
             bash deploy/update.sh
