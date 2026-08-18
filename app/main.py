@@ -696,6 +696,7 @@ async def agent_pair_claim(
 async def agent_heartbeat(
     payload: HeartbeatPayload,
     request: Request,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None),
 ) -> HeartbeatResponse:
@@ -751,7 +752,8 @@ async def agent_heartbeat(
     if is_new and bot_client and "telegram" in new_policy["channels"]:
         chat_id = _notify_chat_id(config.notify_chat_id)
         if chat_id:
-            await bot_client.send_message(
+            background_tasks.add_task(
+                bot_client.send_message,
                 chat_id,
                 (
                     "Новый агент подключен к серверу.\n"
@@ -768,7 +770,8 @@ async def agent_heartbeat(
     if recovered and bot_client and recovered_telegram:
         chat_id = _notify_chat_id(config.notify_chat_id)
         if chat_id:
-            await bot_client.send_message(
+            background_tasks.add_task(
+                bot_client.send_message,
                 chat_id,
                 (
                     "Связь восстановлена.\n"

@@ -21,6 +21,10 @@ try:
     from runtime_state import atomic_write_json, load_json_object
 except ModuleNotFoundError:  # Imported as pc_client.client_update in tests/tools.
     from pc_client.runtime_state import atomic_write_json, load_json_object
+try:
+    from network_client import create_http_client
+except ModuleNotFoundError:
+    from pc_client.network_client import create_http_client
 
 CLIENT_ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", CLIENT_ROOT))
@@ -338,7 +342,12 @@ def download_update(
     package_path = stage_root / "package.zip"
     extract_path = stage_root / "staged"
     try:
-        with httpx.Client(timeout=httpx.Timeout(90, connect=15), trust_env=trust_env, follow_redirects=True) as client:
+        with create_http_client(
+            url,
+            timeout=httpx.Timeout(90, connect=15),
+            trust_env=trust_env,
+            follow_redirects=True,
+        ) as client:
             last_error: Exception | None = None
             for attempt in range(2):
                 label = "Скачивание обновления" if attempt == 0 else "Повторная загрузка обновления"
@@ -417,7 +426,12 @@ def download_installer_update(
     temporary.unlink(missing_ok=True)
     try:
         last_error: Exception | None = None
-        with httpx.Client(timeout=httpx.Timeout(180, connect=15), trust_env=trust_env, follow_redirects=True) as client:
+        with create_http_client(
+            url,
+            timeout=httpx.Timeout(180, connect=15),
+            trust_env=trust_env,
+            follow_redirects=True,
+        ) as client:
             for attempt in range(2):
                 label = "Скачивание установщика XASS" if attempt == 0 else "Повторная загрузка установщика XASS"
                 try:

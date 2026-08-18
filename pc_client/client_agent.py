@@ -42,6 +42,7 @@ from remote_tools import (
     receive_uploaded_file,
     upload_requested_file,
 )
+from network_client import create_http_client
 try:
     from runtime_state import acquire_single_instance, atomic_write_json, configure_utf8_logging, load_json_object
 except ModuleNotFoundError:
@@ -126,7 +127,7 @@ def _build_server_candidates(value: str) -> list[str]:
 
 def discover_backend_url(server_url: str) -> str:
     candidates = _build_server_candidates(server_url)
-    with httpx.Client(timeout=8, trust_env=False) as client:
+    with create_http_client(server_url, timeout=8, trust_env=False) as client:
         for candidate in candidates:
             health_url = f"{candidate}/health"
             try:
@@ -261,7 +262,7 @@ def claim_pair_code(
         "source_type": source_type,
     }
 
-    with httpx.Client(timeout=20, trust_env=False) as client:
+    with create_http_client(server_url, timeout=20, trust_env=False) as client:
         response = client.post(endpoint, json=payload)
 
     body = _parse_json_body(response)
@@ -646,7 +647,11 @@ def run_agent(config: dict[str, Any]) -> str:
     failed_auto_revision = ""
     consecutive_failures = 0
     sleep_seconds = 0.0
-    with httpx.Client(timeout=20, trust_env=trust_env_proxy) as client:
+    with create_http_client(
+        str(config["server_url"]),
+        timeout=20,
+        trust_env=trust_env_proxy,
+    ) as client:
         while True:
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)

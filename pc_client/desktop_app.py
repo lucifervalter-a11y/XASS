@@ -65,6 +65,7 @@ from client_update import (
 )
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 from archive_store import archive_root, archive_status, cleanup_archive, conversation_rows
+from network_client import create_http_client
 try:
     from runtime_state import acquire_single_instance, append_log, configure_utf8_logging, read_log_tail
 except ModuleNotFoundError:
@@ -1232,6 +1233,10 @@ class XassDesktop:
             return
         if self.process and self.process.poll() is None:
             return
+        # Always launch from the durable config. This also makes a fast restart
+        # pick up a config imported or repaired outside the current GUI object.
+        self.config = ensure_minimal_defaults(load_config())
+        self.server_var.set(str(self.config.get("server_url") or self.server_var.get()))
         existing_status = load_agent_status() or {}
         try:
             existing_pid = int(existing_status.get("process_id") or 0)
@@ -1345,7 +1350,11 @@ class XassDesktop:
             except (OSError, ValueError, TypeError):
                 result = {}
             if isinstance(result, dict) and result:
-                self.update_state_var.set(str(result.get("message") or ("Готово" if result.get("ok") else "Ошибка")))
+                result_version = str(result.get("version") or "").strip()
+                if result.get("ok") and result_version:
+                    self.update_state_var.set(f"Последняя установка: {result_version} · проверка не выполнялась")
+                else:
+                    self.update_state_var.set(str(result.get("message") or ("Готово" if result.get("ok") else "Ошибка")))
             elif not self._update_checking:
                 self.update_state_var.set("Готово к проверке")
         self.root.after(700, self._refresh_update_status)
@@ -1449,16 +1458,16 @@ class XassDesktop:
         def worker() -> None:
             if process and process.poll() is None:
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=1.5)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     try:
-                        process.wait(timeout=2)
+                        process.wait(timeout=0.8)
                     except subprocess.TimeoutExpired:
                         pass
             if external_pid:
                 try:
-                    psutil.Process(external_pid).wait(timeout=5)
+                    psutil.Process(external_pid).wait(timeout=1.5)
                 except (psutil.NoSuchProcess, psutil.TimeoutExpired, psutil.AccessDenied):
                     pass
             self.root.after(0, lambda: self._schedule_start(80))
@@ -1482,7 +1491,11 @@ class XassDesktop:
             try:
                 server = discover_backend_url(str(self.config.get("server_url")))
                 payload = build_payload(self.config)
-                with httpx.Client(timeout=25, trust_env=bool(self.config.get("trust_env_proxy", False))) as client:
+                with create_http_client(
+                    server,
+                    timeout=25,
+                    trust_env=bool(self.config.get("trust_env_proxy", False)),
+                ) as client:
                     response = client.post(
                         f"{server}/agent/heartbeat",
                         headers={"X-Api-Key": self.config["api_key"]},
