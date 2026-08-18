@@ -15,7 +15,9 @@ $BuildPython = Join-Path $BuildVenv "Scripts\python.exe"
 function Test-XassPython([string]$Candidate) {
     if (-not $Candidate -or -not (Test-Path $Candidate)) { return $false }
     try {
-        & $Candidate -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" 2>$null
+        # Keep the frozen runtime on the Python version exercised in CI.
+        # Reusing a newer build venv produced an installer without Tcl/Tk data.
+        & $Candidate -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)" 2>$null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -30,8 +32,8 @@ if (-not $BuildPythonReady) {
     $SeedCandidates = @(
         (Join-Path $RepoRoot ".venv\Scripts\python.exe"),
         (Join-Path $ClientRoot ".venv\Scripts\python.exe"),
-        (Get-Command py.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
-        (Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+        (Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+        (Get-Command py.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
     ) | Where-Object { $_ -and (Test-Path $_) }
     foreach ($Candidate in $SeedCandidates) {
         if (Test-XassPython $Candidate) {
@@ -96,6 +98,11 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --specpath $WorkRoot `
     (Join-Path $ClientRoot "desktop_app.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+$BuiltExe = Join-Path $DistRoot "XASS\XASS.exe"
+& $BuiltExe --health-check --expected-version $Version
+if ($LASTEXITCODE -ne 0) {
+    throw "Frozen XASS runtime failed health check. The installer will not be published."
+}
 
 $UpdaterWorkRoot = Join-Path $WorkRoot "updater"
 & $BuildPython -m PyInstaller `

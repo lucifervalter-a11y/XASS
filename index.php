@@ -7,7 +7,7 @@ declare(strict_types=1);
 // by proxy.php, while JSON endpoints preserve their real HTTP status/body.
 $requestPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH);
 $requestPath = is_string($requestPath) ? rawurldecode($requestPath) : '/';
-if (str_starts_with($requestPath, '/agent/')) {
+if ($requestPath === '/health' || str_starts_with($requestPath, '/agent/')) {
     $_GET['_p'] = $requestPath;
     if (
         str_starts_with($requestPath, '/agent/update/package') ||

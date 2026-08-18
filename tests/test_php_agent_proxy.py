@@ -11,6 +11,7 @@ class PhpAgentProxyTests(unittest.TestCase):
     def test_front_controller_routes_agent_json_and_binary_paths(self) -> None:
         index = (ROOT / "index.php").read_text(encoding="utf-8")
         self.assertIn("str_starts_with($requestPath, '/agent/')", index)
+        self.assertIn("$requestPath === '/health'", index)
         self.assertIn("'/agent/update/package'", index)
         self.assertIn("'/agent/installer/'", index)
         self.assertIn("require __DIR__ . '/proxy.php'", index)
@@ -19,6 +20,7 @@ class PhpAgentProxyTests(unittest.TestCase):
         proxy = (ROOT / "proxy.php").read_text(encoding="utf-8")
         self.assertIn("strpos($rawPath, '/api/')", proxy)
         self.assertIn("strpos($rawPath, '/agent/')", proxy)
+        self.assertIn("$rawPath !== '/health'", proxy)
         self.assertIn("proxy_error(400, 'invalid proxy path')", proxy)
 
 
