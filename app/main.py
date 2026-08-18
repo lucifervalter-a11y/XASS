@@ -75,6 +75,12 @@ from app.services.app_config import (
 )
 from app.services.bot_identity import load_cached_bot_username, normalize_bot_username, save_cached_bot_username
 from app.services.backup_crypto import decrypt_backup, encrypt_backup
+from app.services.conversation_avatar_cache import (
+    load_cached_avatar,
+    mark_avatar_missing,
+    missing_cache_is_fresh,
+    store_cached_avatar,
+)
 from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
 from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
 from app.services.message_logging import forwarded_from_label
@@ -157,11 +163,12 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.13.1"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
 update_handler = TelegramUpdateHandler(settings, bot_client)
+conversation_avatar_fetch_slots = asyncio.Semaphore(3)
 
 
 def _restart_notice_chat_candidates(primary_chat_id: Any) -> list[int]:
@@ -3145,6 +3152,24 @@ async def mini_conversation_avatar(
 ) -> Response:
     if bot_client is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram avatar is unavailable")
+    cache_dir = Path(settings.conversation_avatar_cache_dir)
+    cached = await asyncio.to_thread(
+        load_cached_avatar,
+        cache_dir,
+        chat_id,
+        ttl_seconds=max(1, settings.conversation_avatar_cache_ttl_hours) * 3600,
+    )
+    if cached is not None:
+        body, media_type = cached
+        return Response(content=body, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
+    negative_cached = await asyncio.to_thread(
+        missing_cache_is_fresh,
+        cache_dir,
+        chat_id,
+        ttl_seconds=settings.conversation_avatar_failure_ttl_seconds,
+    )
+    if negative_cached:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram avatar is unavailable")
     latest = await session.scalar(
         select(MessageLog)
         .where(MessageLog.chat_id == chat_id)
@@ -3155,38 +3180,55 @@ async def mini_conversation_avatar(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     file_id = ""
     try:
-        if latest.chat_type == "private":
-            user_id = latest.from_user_id
-            if not user_id:
-                user_id = await session.scalar(
-                    select(MessageLog.from_user_id)
-                    .where(MessageLog.chat_id == chat_id, MessageLog.from_user_id.is_not(None))
-                    .order_by(MessageLog.id.desc())
-                    .limit(1)
+        async with asyncio.timeout(max(0.5, settings.conversation_avatar_fetch_timeout_seconds)):
+            async with conversation_avatar_fetch_slots:
+                cached = await asyncio.to_thread(
+                    load_cached_avatar,
+                    cache_dir,
+                    chat_id,
+                    ttl_seconds=max(1, settings.conversation_avatar_cache_ttl_hours) * 3600,
                 )
-            photos = await bot_client.get_user_profile_photos(int(user_id or chat_id), limit=1)
-            groups = photos.get("photos") if isinstance(photos.get("photos"), list) else []
-            sizes = groups[0] if groups and isinstance(groups[0], list) else []
-            if sizes:
-                file_id = str(sizes[-1].get("file_id") or "")
-        else:
-            chat = await bot_client.get_chat(chat_id)
-            photo = chat.get("photo") if isinstance(chat.get("photo"), dict) else {}
-            file_id = str(photo.get("small_file_id") or "")
-        if not file_id:
-            raise ValueError("No avatar")
-        telegram_file = await bot_client.get_file(file_id)
-        file_path = str(telegram_file.get("file_path") or "")
-        if not file_path:
-            raise ValueError("No avatar path")
-        response = await bot_client.client.get(f"{bot_client.file_url}/{file_path}")
-        response.raise_for_status()
+                if cached is not None:
+                    body, media_type = cached
+                    return Response(content=body, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
+                if latest.chat_type == "private":
+                    user_id = latest.from_user_id
+                    if not user_id:
+                        user_id = await session.scalar(
+                            select(MessageLog.from_user_id)
+                            .where(MessageLog.chat_id == chat_id, MessageLog.from_user_id.is_not(None))
+                            .order_by(MessageLog.id.desc())
+                            .limit(1)
+                        )
+                    photos = await bot_client.get_user_profile_photos(int(user_id or chat_id), limit=1)
+                    groups = photos.get("photos") if isinstance(photos.get("photos"), list) else []
+                    sizes = groups[0] if groups and isinstance(groups[0], list) else []
+                    if sizes:
+                        file_id = str(sizes[-1].get("file_id") or "")
+                else:
+                    chat = await bot_client.get_chat(chat_id)
+                    photo = chat.get("photo") if isinstance(chat.get("photo"), dict) else {}
+                    file_id = str(photo.get("small_file_id") or "")
+                if not file_id:
+                    raise ValueError("No avatar")
+                telegram_file = await bot_client.get_file(file_id)
+                file_path = str(telegram_file.get("file_path") or "")
+                if not file_path:
+                    raise ValueError("No avatar path")
+                response = await bot_client.client.get(f"{bot_client.file_url}/{file_path}")
+                response.raise_for_status()
+                body = response.content
+                media_type = response.headers.get("content-type") or "image/jpeg"
+                if not media_type.startswith("image/") or not body or len(body) > settings.conversation_avatar_max_bytes:
+                    raise ValueError("Invalid avatar response")
+                await asyncio.to_thread(store_cached_avatar, cache_dir, chat_id, body, media_type)
     except Exception as exc:
         logger.debug("Conversation avatar unavailable for chat_id=%s: %s", chat_id, exc)
+        await asyncio.to_thread(mark_avatar_missing, cache_dir, chat_id)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Telegram avatar is unavailable") from exc
     return Response(
-        content=response.content,
-        media_type=response.headers.get("content-type") or "image/jpeg",
+        content=body,
+        media_type=media_type,
         headers={"Cache-Control": "private, max-age=300"},
     )
 

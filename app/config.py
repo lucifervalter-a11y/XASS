@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     profile_audit_log_path: str = "./data/audit.log"
     profile_public_url: str = ""
     profile_avatars_dir: str = "./data/avatars"
+    conversation_avatar_cache_dir: str = "./data/conversation_avatars"
+    conversation_avatar_cache_ttl_hours: int = 168
+    conversation_avatar_failure_ttl_seconds: int = 300
+    conversation_avatar_fetch_timeout_seconds: float = 2.5
+    conversation_avatar_max_bytes: int = 3 * 1024 * 1024
     projects_json_path: str = "./data/projects.json"
     site_config_json_path: str = "./data/site_config.json"
     quotes_json_path: str = "./data/quotes.json"

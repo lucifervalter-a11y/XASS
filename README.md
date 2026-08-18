@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img alt="Server 0.13.0" src="https://img.shields.io/badge/server-0.13.0-3b82f6?style=flat-square">
+  <img alt="Server 0.13.1" src="https://img.shields.io/badge/server-0.13.1-3b82f6?style=flat-square">
   <img alt="Windows agent 0.13.0" src="https://img.shields.io/badge/Windows_agent-0.13.0-2563eb?style=flat-square&logo=windows11&logoColor=white">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-111827?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-059669?style=flat-square&logo=fastapi&logoColor=white">
