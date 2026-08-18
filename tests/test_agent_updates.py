@@ -6,10 +6,28 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.services.agent_updates import build_agent_package, build_update_manifest
+from app.services.agent_updates import build_agent_package, build_update_manifest, update_is_available
 
 
 class AgentUpdateTests(unittest.TestCase):
+    def test_update_comparison_never_downgrades_newer_client(self) -> None:
+        self.assertFalse(
+            update_is_available(
+                current_version="0.13.2",
+                current_revision="local-newer",
+                published_version="0.13.1",
+                published_revision="published-older",
+            )
+        )
+        self.assertTrue(
+            update_is_available(
+                current_version="0.13.2",
+                current_revision="old-build",
+                published_version="0.13.2",
+                published_revision="new-build",
+            )
+        )
+
     def test_package_is_versioned_and_excludes_runtime_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as cache:
             settings = SimpleNamespace(agent_update_cache_dir=cache, agent_updates_enabled=True)

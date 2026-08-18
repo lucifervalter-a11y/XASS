@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,26 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def update_is_available(
+    *,
+    current_version: str,
+    current_revision: str,
+    published_version: str,
+    published_revision: str,
+) -> bool:
+    """Return True for upgrades or a new build of the same version, never downgrades."""
+
+    def version_key(value: str) -> tuple[int, int, int, int]:
+        parts = [int(item) for item in re.findall(r"\d+", str(value or ""))[:4]]
+        return tuple((parts + [0, 0, 0, 0])[:4])  # type: ignore[return-value]
+
+    current_key = version_key(current_version)
+    published_key = version_key(published_version)
+    if published_key != current_key:
+        return published_key > current_key
+    return str(current_revision or "").strip() != str(published_revision or "").strip()
+
+
 def build_agent_package(settings: "Settings") -> AgentPackage:
     client_root = _client_root()
     files = _package_files(client_root)
@@ -154,7 +175,12 @@ def build_update_manifest(
     url = f"{base_url.rstrip('/')}/agent/update/package/{package.revision}.zip"
     current_version = (current_version or "0.0.0").strip()
     current_revision = (current_revision or "").strip()
-    available = current_version != package.version or current_revision != package.revision
+    available = update_is_available(
+        current_version=current_version,
+        current_revision=current_revision,
+        published_version=package.version,
+        published_revision=package.revision,
+    )
     signature = sign_manifest(
         api_key,
         version=package.version,

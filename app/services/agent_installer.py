@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from app.services.agent_updates import sign_manifest
+from app.services.agent_updates import sign_manifest, update_is_available
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -137,7 +137,12 @@ def build_installer_manifest(
         url=url,
     )
     return {
-        "available": current_version.strip() != installer.version or current_revision.strip() != installer.revision,
+        "available": update_is_available(
+            current_version=current_version,
+            current_revision=current_revision,
+            published_version=installer.version,
+            published_revision=installer.revision,
+        ),
         "version": installer.version,
         "revision": installer.revision,
         "sha256": installer.sha256,

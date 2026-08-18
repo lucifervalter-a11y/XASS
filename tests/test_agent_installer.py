@@ -91,6 +91,17 @@ class AgentInstallerTests(unittest.TestCase):
             self.assertTrue(verify_manifest(manifest, "agent-secret"))
             self.assertTrue(str(manifest["url"]).endswith("/agent/installer/abc123.exe"))
 
+            newer = build_installer_manifest(
+                settings,
+                api_key="agent-secret",
+                base_url="https://xass.example",
+                current_version="0.7.0",
+                current_revision="newer-client",
+            )
+            self.assertIsNotNone(newer)
+            assert newer is not None
+            self.assertFalse(newer["available"])
+
     def test_installer_without_expected_checksum_is_not_published(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
