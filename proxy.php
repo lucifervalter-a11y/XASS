@@ -30,7 +30,7 @@ function proxy_error(int $status, string $detail): void {
 $rawPath = isset($_GET['_p']) ? (string)$_GET['_p'] : '';
 $rawPath = '/' . ltrim(rawurldecode($rawPath), '/');
 
-if (strpos($rawPath, '/api/') !== 0) {
+if (strpos($rawPath, '/api/') !== 0 && strpos($rawPath, '/agent/') !== 0) {
     proxy_error(400, 'invalid proxy path');
 }
 
