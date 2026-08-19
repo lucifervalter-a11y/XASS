@@ -11,7 +11,8 @@ if ($requestPath === '/health' || str_starts_with($requestPath, '/agent/')) {
     $_GET['_p'] = $requestPath;
     if (
         str_starts_with($requestPath, '/agent/update/package') ||
-        str_starts_with($requestPath, '/agent/installer/')
+        str_starts_with($requestPath, '/agent/installer/') ||
+        str_starts_with($requestPath, '/agent/migration/export/')
     ) {
         $_GET['_binary'] = '1';
     } else {

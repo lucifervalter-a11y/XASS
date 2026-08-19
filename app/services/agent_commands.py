@@ -28,8 +28,12 @@ ALLOWED_AGENT_COMMANDS = {
     "file_delete",
     "clipboard_get",
     "clipboard_set",
+    "migration_download",
 }
-DANGEROUS_AGENT_COMMANDS = {"lock", "sleep", "reboot", "shutdown", "restart", "update", "cleanup_archive", "file_delete"}
+DANGEROUS_AGENT_COMMANDS = {
+    "lock", "sleep", "reboot", "shutdown", "restart", "update",
+    "cleanup_archive", "file_delete", "migration_download",
+}
 
 
 def _now_utc() -> datetime:

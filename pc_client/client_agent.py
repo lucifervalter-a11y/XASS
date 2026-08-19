@@ -38,7 +38,9 @@ from remote_tools import (
     clipboard_get,
     clipboard_set,
     delete_file,
+    download_migration_export,
     list_files,
+    list_volumes,
     receive_uploaded_file,
     upload_requested_file,
 )
@@ -241,6 +243,7 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
             "version": platform.version(),
             "machine": platform.machine(),
             "hostname": platform.node(),
+            "volumes": list_volumes(),
         },
     }
     if discord is not None:
@@ -517,7 +520,7 @@ def _handle_workspace_command(
 ) -> bool:
     supported = {
         "screenshot", "files_list", "file_download", "file_upload", "file_delete",
-        "clipboard_get", "clipboard_set",
+        "clipboard_get", "clipboard_set", "migration_download",
     }
     if command_name not in supported:
         return False
@@ -555,6 +558,19 @@ def _handle_workspace_command(
         elif command_name == "clipboard_set":
             length = clipboard_set(command_payload.get("text"))
             store_command_result(command_id, True, "Текст отправлен в буфер ПК", {"length": length})
+        elif command_name == "migration_download":
+            details = download_migration_export(
+                DATA_ROOT,
+                client,
+                endpoint=str(config["server_url"]),
+                api_key=str(config["api_key"]),
+                source_name=source_name,
+                filename=command_payload.get("filename"),
+                destination_drive=command_payload.get("destination_drive"),
+                expected_size=command_payload.get("size"),
+                expected_sha256=command_payload.get("sha256"),
+            )
+            store_command_result(command_id, True, f"Миграционный архив сохранён: {details['path']}", details)
         return True
     except Exception as exc:
         store_command_result(command_id, False, f"{command_name}: {exc}")

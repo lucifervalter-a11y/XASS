@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import hmac
 import mimetypes
 import os
 import re
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import psutil
 
 try:
     from PIL import ImageGrab
@@ -19,6 +22,7 @@ except ImportError:  # pragma: no cover - dependency bootstrap handles this in b
 MAX_CLIPBOARD_CHARS = 64 * 1024
 MAX_LIST_ENTRIES = 250
 MAX_FILE_BYTES = 32 * 1024 * 1024
+MIGRATION_EXPORT_RE = re.compile(r"^xass-(?:app|system)-\d{8}\.tar\.zst$")
 ROOT_LABELS = {
     "desktop": "Рабочий стол",
     "downloads": "Загрузки",
@@ -38,6 +42,116 @@ def allowed_roots(data_root: Path) -> dict[str, Path]:
     for path in roots.values():
         path.mkdir(parents=True, exist_ok=True)
     return {key: value.resolve() for key, value in roots.items()}
+
+
+def list_volumes() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for partition in psutil.disk_partitions(all=False):
+        mountpoint = str(partition.mountpoint or "").strip()
+        key = mountpoint.casefold()
+        if not mountpoint or key in seen:
+            continue
+        seen.add(key)
+        try:
+            usage = psutil.disk_usage(mountpoint)
+        except OSError:
+            continue
+        rows.append({
+            "mountpoint": mountpoint,
+            "device": str(partition.device or mountpoint),
+            "filesystem": str(partition.fstype or ""),
+            "total_gb": round(usage.total / (1024 ** 3), 2),
+            "used_gb": round(usage.used / (1024 ** 3), 2),
+            "free_gb": round(usage.free / (1024 ** 3), 2),
+            "used_percent": round(float(usage.percent), 1),
+        })
+    rows.sort(key=lambda item: float(item.get("free_gb") or 0), reverse=True)
+    return rows
+
+
+def download_migration_export(
+    data_root: Path,
+    client: httpx.Client,
+    *,
+    endpoint: str,
+    api_key: str,
+    source_name: str,
+    filename: object,
+    destination_drive: object,
+    expected_size: object,
+    expected_sha256: object,
+) -> dict[str, Any]:
+    del data_root  # Reserved for future per-agent migration-folder preferences.
+    if os.name != "nt":
+        raise RuntimeError("Перенос миграционного архива доступен только на Windows")
+    safe_name = Path(str(filename or "")).name
+    if not MIGRATION_EXPORT_RE.fullmatch(safe_name):
+        raise ValueError("Недопустимое имя миграционного архива")
+    drive = str(destination_drive or "").strip().upper().rstrip("\\/")
+    if not re.fullmatch(r"[A-Z]:", drive):
+        raise ValueError("Укажите диск Windows, например D:")
+    drive_root = Path(f"{drive}\\")
+    if not drive_root.is_dir():
+        raise FileNotFoundError(f"Диск {drive} недоступен")
+    size = int(expected_size or 0)
+    digest = str(expected_sha256 or "").strip().lower()
+    if size <= 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Размер или SHA-256 архива не подтверждены")
+    free_bytes = int(psutil.disk_usage(str(drive_root)).free)
+    reserve = 512 * 1024 * 1024
+    if free_bytes < size + reserve:
+        missing_gb = (size + reserve - free_bytes) / (1024 ** 3)
+        raise OSError(f"На диске {drive} недостаточно места: нужно ещё {missing_gb:.1f} ГБ")
+
+    destination = drive_root / "XASS Migration"
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / safe_name
+    temporary = target.with_suffix(target.suffix + ".part")
+    temporary.unlink(missing_ok=True)
+    url = f"{endpoint.rstrip('/')}/agent/migration/export/{safe_name}"
+    received = 0
+    hasher = hashlib.sha256()
+    try:
+        with client.stream(
+            "GET",
+            url,
+            headers={
+                "X-Api-Key": api_key,
+                "X-XASS-Source": source_name,
+                "Accept-Encoding": "identity",
+                "Cache-Control": "no-cache",
+            },
+            timeout=None,
+        ) as response:
+            response.raise_for_status()
+            proxy_status = int(response.headers.get("X-XASS-Status") or 200)
+            if proxy_status >= 400:
+                raise RuntimeError(f"Сервер отклонил архив: HTTP {proxy_status}")
+            with temporary.open("wb") as output:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    if not chunk:
+                        continue
+                    output.write(chunk)
+                    hasher.update(chunk)
+                    received += len(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        if received != size:
+            raise RuntimeError(f"Размер архива не совпал: ожидалось {size}, получено {received}")
+        actual_sha256 = hasher.hexdigest()
+        if not hmac.compare_digest(actual_sha256, digest):
+            raise RuntimeError("SHA-256 архива не совпал")
+        os.replace(temporary, target)
+        return {
+            "filename": safe_name,
+            "path": str(target),
+            "size": received,
+            "sha256": actual_sha256,
+            "drive": drive,
+        }
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _safe_target(data_root: Path, root_name: object, relative_path: object = "", *, must_exist: bool = True) -> tuple[Path, Path]:

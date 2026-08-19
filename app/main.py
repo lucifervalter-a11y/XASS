@@ -2,6 +2,7 @@
 import ipaddress
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1028,6 +1029,37 @@ def _agent_installer_response() -> FileResponse:
             "X-XASS-Revision": installer.revision,
             "Cache-Control": "private, no-store",
         },
+    )
+
+
+_MIGRATION_EXPORT_RE = re.compile(r"^xass-(?:app|system)-\d{8}\.tar\.zst$")
+
+
+@app.get("/agent/migration/export/{filename}")
+async def agent_migration_export_download(
+    filename: str,
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+) -> FileResponse:
+    auth = await authenticate_agent_api_key(
+        session,
+        api_key=x_api_key,
+        global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    safe_name = Path(filename).name
+    if safe_name != filename or not _MIGRATION_EXPORT_RE.fullmatch(safe_name):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Migration export not found")
+    export_root = Path(settings.agent_migration_export_dir).resolve()
+    export_path = (export_root / safe_name).resolve()
+    if export_path.parent != export_root or not export_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Migration export not found")
+    return FileResponse(
+        export_path,
+        media_type="application/zstd",
+        filename=safe_name,
+        headers={"Cache-Control": "private, no-store"},
     )
 
 

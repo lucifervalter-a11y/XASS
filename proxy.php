@@ -108,6 +108,10 @@ $context      = stream_context_create($opts);
 // Installers can be tens of megabytes. Stream them chunk-by-chunk so PHP and
 // the Telegram WebView do not have to buffer the full executable in memory.
 if ($binaryMode) {
+    // Large migration exports may take several minutes. Keep streaming as long
+    // as the client remains connected instead of inheriting PHP's short limit.
+    @set_time_limit(0);
+    ignore_user_abort(true);
     $responseStream = @fopen($url, 'rb', false, $context);
     if ($responseStream === false) {
         proxy_error(502, 'Backend unavailable: could not connect to ' . $url);

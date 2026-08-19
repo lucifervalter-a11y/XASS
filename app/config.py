@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     agent_installer_metadata_path: str = "./data/releases/XASS-Setup.json"
     agent_installer_fallback_url: str = "https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe"
     agent_workspace_dir: str = "./data/agent_workspace"
+    agent_migration_export_dir: str = "./data/migration_exports"
     agent_screenshot_max_bytes: int = 8 * 1024 * 1024
     agent_file_max_bytes: int = 32 * 1024 * 1024
 

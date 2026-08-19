@@ -172,6 +172,7 @@ class AgentInstallerTests(unittest.TestCase):
 
     def test_remote_lock_is_an_allowed_agent_command(self) -> None:
         self.assertIn("lock", ALLOWED_AGENT_COMMANDS)
+        self.assertIn("migration_download", ALLOWED_AGENT_COMMANDS)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows API test")
     def test_lock_command_uses_windows_lock_workstation(self) -> None:
