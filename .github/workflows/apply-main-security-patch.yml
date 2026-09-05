@@ -1,0 +1,64 @@
+name: Apply main.py security patch
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/security-vk-proxy-hardening]
+    paths:
+      - ".github/workflows/apply-main-security-patch.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-main-security-patch
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore main.py, strip BOM, apply patch, push
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import subprocess
+          from pathlib import Path
+          good = "c12232b97348d6a918fb06799cf7be94b2a39cdb"
+          data = subprocess.check_output(["git", "show", f"{good}:app/main.py"])
+          if data.startswith(b"\xef\xbb\xbf"):
+              data = data[3:]
+              print("stripped UTF-8 BOM")
+          Path("app/main.py").write_bytes(data)
+          print("restored bytes", len(data))
+          PY
+          patch -p1 < patches/2026-09-05-main-vk-proxy-security.patch
+          grep -q '^import hmac$' app/main.py
+          grep -q 'issue_vk_connect_proof' app/main.py
+          grep -q 'verify_vk_connect_proof' app/main.py
+          grep -q 'hmac.compare_digest' app/main.py
+          grep -q 'docs_url=None' app/main.py
+          grep -q 'redoc_url=None' app/main.py
+          grep -q 'openapi_url=None' app/main.py
+          grep -q 'verify_vk_connect_proof((payload.secret' app/main.py
+          grep -q 'issue_vk_connect_proof(settings, chat_id=chat_id)' app/main.py
+          if grep -q 'secret = (settings.setup_api_key or "").strip()' app/main.py; then
+            echo "setup_api_key still used for OAuth secret" >&2
+            exit 1
+          fi
+          rm -f patches/.push-probe patches/.probe-ref-object patches/.size-probe-*.txt patches/.main-py-wiring-pending || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/main.py
+          git add -u patches || true
+          if git diff --cached --quiet; then
+            echo "Nothing to commit; main.py already wired"
+            exit 0
+          fi
+          git commit -m "fix: wire VK proofs, disable OpenAPI docs, timing-safe API keys"
+          git push origin HEAD:fix/security-vk-proxy-hardening
