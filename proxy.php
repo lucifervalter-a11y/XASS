@@ -30,7 +30,18 @@ function proxy_error(int $status, string $detail): void {
 $rawPath = isset($_GET['_p']) ? (string)$_GET['_p'] : '';
 $rawPath = '/' . ltrim(rawurldecode($rawPath), '/');
 
-if ($rawPath !== '/health' && strpos($rawPath, '/api/') !== 0 && strpos($rawPath, '/agent/') !== 0) {
+// Block traversal and control chars before the namespace allow-list.
+// Without this, /api/../telegram/webhook/... reaches the backend via path normalization.
+if (
+    strpos($rawPath, '..') !== false
+    || strpos($rawPath, "\0") !== false
+    || strpbrk($rawPath, "\r\n") !== false
+) {
+    proxy_error(400, 'invalid proxy path');
+}
+
+$pathOnly = explode('?', $rawPath, 2)[0];
+if ($pathOnly !== '/health' && strpos($pathOnly, '/api/') !== 0 && strpos($pathOnly, '/agent/') !== 0) {
     proxy_error(400, 'invalid proxy path');
 }
 
