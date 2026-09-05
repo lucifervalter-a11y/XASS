@@ -1,0 +1,16 @@
+--- a/app/main.py
++++ b/app/main.py
+@@ -10,6 +10,7 @@
+ from urllib.parse import quote, urlsplit
+ from uuid import uuid4
+ 
++import hmac
+ import httpx
+ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
+ from fastapi.responses import FileResponse, StreamingResponse
+@@ -84,6 +85,7 @@
+ )
+ from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
+ from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
++from app.services.vk_bind import issue_vk_bind_token, verify_vk_bind_token
+ from app.services.message_logging import forwarded_from_label
