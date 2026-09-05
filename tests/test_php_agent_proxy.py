@@ -18,9 +18,10 @@ class PhpAgentProxyTests(unittest.TestCase):
 
     def test_proxy_allows_only_api_and_agent_namespaces(self) -> None:
         proxy = (ROOT / "proxy.php").read_text(encoding="utf-8")
-        self.assertIn("strpos($rawPath, '/api/')", proxy)
-        self.assertIn("strpos($rawPath, '/agent/')", proxy)
-        self.assertIn("$rawPath !== '/health'", proxy)
+        self.assertIn("strpos($pathOnly, '/api/')", proxy)
+        self.assertIn("strpos($pathOnly, '/agent/')", proxy)
+        self.assertIn("$pathOnly !== '/health'", proxy)
+        self.assertIn("strpos($rawPath, '..')", proxy)
         self.assertIn("proxy_error(400, 'invalid proxy path')", proxy)
 
 
