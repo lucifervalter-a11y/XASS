@@ -29,6 +29,16 @@ function proxy_error(int $status, string $detail): void {
 
 $rawPath = isset($_GET['_p']) ? (string)$_GET['_p'] : '';
 $rawPath = '/' . ltrim(rawurldecode($rawPath), '/');
+// Reject path traversal and NUL before prefix checks. Otherwise `/api/../docs`
+// would pass the `/api/` allow-list and reach FastAPI's OpenAPI UI.
+if (
+    strpos($rawPath, '..') !== false
+    || strpos($rawPath, chr(0)) !== false
+    || strpos($rawPath, chr(92)) !== false
+) {
+    proxy_error(400, 'invalid proxy path');
+}
+$rawPath = preg_replace('#/+#', '/', $rawPath) ?? $rawPath;
 
 if ($rawPath !== '/health' && strpos($rawPath, '/api/') !== 0 && strpos($rawPath, '/agent/') !== 0) {
     proxy_error(400, 'invalid proxy path');

@@ -26,7 +26,7 @@ class PhpAgentProxyTests(unittest.TestCase):
     def test_proxy_rejects_path_traversal(self) -> None:
         proxy = (ROOT / "proxy.php").read_text(encoding="utf-8")
         self.assertIn('strpos($rawPath, \'..\') !== false', proxy)
-        self.assertIn('strpos($rawPath, "\\0") !== false', proxy)
+        self.assertIn('strpos($rawPath, chr(0)) !== false', proxy)
 
 
 if __name__ == "__main__":
