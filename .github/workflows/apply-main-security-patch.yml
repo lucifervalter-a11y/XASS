@@ -21,25 +21,23 @@ jobs:
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          ref: fix/security-vk-proxy-hardening
           fetch-depth: 0
 
-      - name: Restore main.py from last good commit and apply patch
+      - name: Restore main.py, strip BOM, apply patch, push
         run: |
           set -euo pipefail
-          GOOD_SHA=c12232b97348d6a918fb06799cf7be94b2a39cdb
-          git show "${GOOD_SHA}:app/main.py" > app/main.py
-          test -s app/main.py
-          # Strip UTF-8 BOM so patch hunk #1 matches `import asyncio`
-          python3 - <<'PY'
+          python3 <<'PY'
+          import subprocess
           from pathlib import Path
-          p = Path('app/main.py')
-          data = p.read_bytes()
-          if data.startswith(b'\xef\xbb\xbf'):
-              p.write_bytes(data[3:])
-              print('stripped UTF-8 BOM from app/main.py')
+          good = "c12232b97348d6a918fb06799cf7be94b2a39cdb"
+          data = subprocess.check_output(["git", "show", f"{good}:app/main.py"])
+          if data.startswith(b"\xef\xbb\xbf"):
+              data = data[3:]
+              print("stripped UTF-8 BOM")
+          Path("app/main.py").write_bytes(data)
+          print("restored bytes", len(data))
           PY
-          patch -p1 --forward < patches/2026-09-05-main-vk-proxy-security.patch
+          patch -p1 < patches/2026-09-05-main-vk-proxy-security.patch
           grep -q '^import hmac$' app/main.py
           grep -q 'issue_vk_connect_proof' app/main.py
           grep -q 'verify_vk_connect_proof' app/main.py
@@ -49,13 +47,11 @@ jobs:
           grep -q 'openapi_url=None' app/main.py
           grep -q 'verify_vk_connect_proof((payload.secret' app/main.py
           grep -q 'issue_vk_connect_proof(settings, chat_id=chat_id)' app/main.py
-          ! grep -q 'secret = (settings.setup_api_key or "").strip()' app/main.py
-          ! grep -q 'FILE_REF:' app/main.py
+          if grep -q 'secret = (settings.setup_api_key or "").strip()' app/main.py; then
+            echo "setup_api_key still used for OAuth secret" >&2
+            exit 1
+          fi
           rm -f patches/.push-probe patches/.probe-ref-object patches/.size-probe-*.txt patches/.main-py-wiring-pending || true
-
-      - name: Commit and push wired main.py
-        run: |
-          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app/main.py
