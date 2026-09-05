@@ -1,4 +1,5 @@
-﻿import hashlib
+import hashlib
+import hmac
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -229,7 +230,7 @@ async def authenticate_agent_api_key(
     if not key:
         return None
 
-    if global_agent_api_key and key == global_agent_api_key:
+    if global_agent_api_key and hmac.compare_digest(key, global_agent_api_key):
         return AgentAuthResult(mode="global")
 
     credential = await session.scalar(
