@@ -1,0 +1,180 @@
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,6 +1,6 @@
+-﻿import asyncio
++import asyncio
+ import ipaddress
+ import logging
+ import os
+ import re
+ from contextlib import asynccontextmanager
+@@ -8,10 +8,11 @@
+ from pathlib import Path
+ from typing import Any
+ from urllib.parse import quote, urlsplit
+ from uuid import uuid4
+ 
++import hmac
+ import httpx
+ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
+ from fastapi.responses import FileResponse, StreamingResponse
+ from pydantic import BaseModel, Field, HttpUrl
+ from sqlalchemy.ext.asyncio import AsyncSession
+@@ -82,10 +83,11 @@
+     missing_cache_is_fresh,
+     store_cached_avatar,
+ )
+ from app.services.heartbeat import is_quiet_hours, list_sources, process_heartbeat
+ from app.services.miniapp import MiniAppUser, authenticate as miniapp_authenticate
++from app.services.vk_bind import issue_vk_bind_token, verify_vk_bind_token
+ from app.services.message_logging import forwarded_from_label
+ from app.services.pwa_auth import (
+     COOKIE_NAME as PWA_COOKIE_NAME,
+     SESSION_AGE_SEC as PWA_SESSION_AGE_SEC,
+     authenticate_session as pwa_authenticate_session,
+@@ -195,11 +197,13 @@
+ 
+ 
+ def _verify_api_key(header_value: str | None, expected: str, reason: str) -> None:
+     if not expected:
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{reason} key is not configured")
+-    if (header_value or "").strip() != expected:
++    provided = (header_value or "").strip().encode("utf-8")
++    wanted = expected.encode("utf-8")
++    if len(provided) != len(wanted) or not hmac.compare_digest(provided, wanted):
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid {reason} key")
+ 
+ 
+ def _resolve_external_now_playing_text(payload: ExternalNowPlayingPayload) -> str:
+     direct_text = (payload.text or "").strip()
+@@ -1091,14 +1095,18 @@
+ ) -> dict[str, Any]:
+     profile = load_profile(Path(settings.profile_json_path))
+     profile_key = str(profile.get("iphone_hook_key") or "").strip()
+     env_key = (settings.iphone_now_playing_api_key or "").strip()
+     incoming = (x_api_key or "").strip()
+-    accepted = {key for key in (profile_key, env_key) if key}
++    accepted = [key for key in (profile_key, env_key) if key]
+     if not accepted:
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="iphone now playing key is not configured")
+-    if incoming not in accepted:
++    incoming_b = incoming.encode("utf-8")
++    if not any(
++        len(incoming_b) == len(key.encode("utf-8")) and hmac.compare_digest(incoming_b, key.encode("utf-8"))
++        for key in accepted
++    ):
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid iphone now playing key")
+     resolved_text = _resolve_external_now_playing_text(payload)
+     if not resolved_text:
+         raise HTTPException(
+             status_code=status.HTTP_400_BAD_REQUEST,
+@@ -1113,12 +1121,13 @@
+     }
+ 
+ 
+ @app.post("/api/vk/save-token")
+ async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
+-    if not settings.setup_api_key or (payload.secret or "").strip() != settings.setup_api_key:
+-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid secret")
++    bind = verify_vk_bind_token((payload.secret or "").strip(), settings)
++    if bind is None:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired VK bind secret")
+     token = (payload.access_token or "").strip()
+     if len(token) < 20:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="access_token is too short")
+     if payload.user_id <= 0:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="user_id must be positive")
+@@ -1130,22 +1139,25 @@
+     profile["vk_user_id"] = payload.user_id
+     profile["now_listening_source"] = "vk"
+     profile["vk_connected_at"] = datetime.now(timezone.utc).isoformat()
+     save_profile(profile_path, profile)
+ 
+-    if payload.chat_id and bot_client:
++    notify_chat_id = payload.chat_id
++    if notify_chat_id is None and isinstance(bind.get("chat_id"), int):
++        notify_chat_id = int(bind["chat_id"])
++    if notify_chat_id and bot_client:
+         try:
+             await bot_client.send_message(
+-                int(payload.chat_id),
++                int(notify_chat_id),
+                 (
+                     "✅ ВКонтакте подключён!\n\n"
+                     "Музыка из статуса ВК теперь будет обновляться автоматически.\n"
+                     "Источник «сейчас слушаю» переключён на VK."
+                 ),
+             )
+         except Exception:
+-            logger.warning("Failed to deliver VK connect confirmation to chat_id=%s", payload.chat_id)
++            logger.warning("Failed to deliver VK connect confirmation to chat_id=%s", notify_chat_id)
+ 
+     return {"ok": True}
+ 
+ 
+ # ─────────────────────────── Telegram Mini App API ───────────────────────────
+@@ -1803,10 +1815,15 @@
+         config_issues.append("BOT_TOKEN не настроен")
+     if settings.setup_api_key.startswith("change-me"):
+         config_issues.append("SETUP_API_KEY использует значение по умолчанию")
+     if settings.agent_api_key.startswith("change-me"):
+         config_issues.append("AGENT_API_KEY использует значение по умолчанию")
++    if not settings.use_polling:
++        if not settings.telegram_webhook_path or "change-me" in settings.telegram_webhook_path:
++            config_issues.append("TELEGRAM_WEBHOOK_PATH использует значение по умолчанию")
++        if not settings.telegram_secret_token or "change-me" in settings.telegram_secret_token:
++            config_issues.append("TELEGRAM_SECRET_TOKEN не настроен (webhook будет отклонять updates)")
+     recent = await list_recent_admin_actions(session, 100)
+     last_errors = [
+         {
+             "action": item.action,
+             "error": str((item.payload or {}).get("error") or (item.payload or {}).get("message") or "")[:500],
+@@ -3691,11 +3708,11 @@
+             base = f"{split.scheme}://{split.netloc}"
+     if not base:
+         base = "https://redvps.site"
+     app_id = int(resolved_app_id)
+     version = (settings.vk_api_version or "5.199").strip() or "5.199"
+-    secret = (settings.setup_api_key or "").strip()
++    secret = issue_vk_bind_token(settings, chat_id=chat_id)
+     redirect_target = f"{base}/vk-auth.php?secret={quote(secret, safe='')}"
+     if chat_id:
+         redirect_target += f"&chat_id={int(chat_id)}"
+     oauth_url = (
+         "https://oauth.vk.com/authorize"
+@@ -3842,17 +3859,30 @@
+     return {"ok": True, "webhook_url": webhook_url, "result": result}
+ 
+ 
+ @app.post("/telegram/webhook/{secret_path}")
+ async def telegram_webhook(secret_path: str, request: Request) -> dict[str, bool]:
+-    if secret_path != settings.telegram_webhook_path:
++    expected_path = (settings.telegram_webhook_path or "").strip()
++    path_ok = bool(expected_path) and "change-me" not in expected_path
++    if path_ok:
++        path_a = secret_path.encode("utf-8")
++        path_b = expected_path.encode("utf-8")
++        path_ok = len(path_a) == len(path_b) and hmac.compare_digest(path_a, path_b)
++    if not path_ok:
+         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook path not found")
+ 
+-    if settings.telegram_secret_token:
+-        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+-        if header_secret != settings.telegram_secret_token:
+-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Telegram secret token")
++    expected_secret = (settings.telegram_secret_token or "").strip()
++    if not expected_secret or "change-me" in expected_secret:
++        raise HTTPException(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            detail="TELEGRAM_SECRET_TOKEN is not configured",
++        )
++    header_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
++    secret_a = header_secret.encode("utf-8")
++    secret_b = expected_secret.encode("utf-8")
++    if len(secret_a) != len(secret_b) or not hmac.compare_digest(secret_a, secret_b):
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Telegram secret token")
+ 
+     update = await request.json()
+     async with SessionLocal() as session:
+         await update_handler.handle_update(session, update)
+     return {"ok": True}
