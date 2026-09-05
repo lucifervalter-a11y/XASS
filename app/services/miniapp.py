@@ -51,10 +51,11 @@ def verify_init_data(init_data: str, bot_token: str) -> dict[str, str] | None:
         return None
 
     auth_date_raw = pairs.get("auth_date", "")
-    if auth_date_raw.isdigit():
-        age = time.time() - int(auth_date_raw)
-        if age > MAX_AUTH_AGE_SEC:
-            return None
+    if not auth_date_raw.isdigit():
+        return None
+    age = time.time() - int(auth_date_raw)
+    if age < -60 or age > MAX_AUTH_AGE_SEC:
+        return None
 
     return pairs
 
