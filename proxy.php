@@ -9,6 +9,7 @@ $BACKEND = 'http://127.0.0.1:8000';
 
 $binaryMode = isset($_GET['_binary']) && (string)$_GET['_binary'] === '1';
 $passthroughMode = isset($_GET['_passthrough']) && (string)$_GET['_passthrough'] === '1';
+header('Cache-Control: private, no-store');
 if (!$binaryMode && !$passthroughMode) {
     header('Content-Type: application/json; charset=utf-8');
 }
@@ -72,7 +73,7 @@ if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
 $forwardHeaders[] = 'X-Forwarded-Proto: ' . $publicProto;
 
 if (function_exists('getallheaders')) {
-    $allowed = ['content-type', 'x-telegram-init-data', 'x-api-key', 'authorization', 'cookie'];
+    $allowed = ['content-type', 'x-telegram-init-data', 'x-xass-action-proof', 'x-api-key', 'authorization', 'cookie'];
     foreach (getallheaders() as $name => $val) {
         if (in_array(strtolower((string)$name), $allowed, true)) {
             $forwardHeaders[] = $name . ': ' . $val;
@@ -83,6 +84,7 @@ if (function_exists('getallheaders')) {
 // PHP-FPM fallback via $_SERVER.
 $serverMap = [
     'HTTP_X_TELEGRAM_INIT_DATA' => 'X-Telegram-Init-Data',
+    'HTTP_X_XASS_ACTION_PROOF'  => 'X-XASS-Action-Proof',
     'HTTP_X_API_KEY'            => 'X-Api-Key',
     'HTTP_AUTHORIZATION'        => 'Authorization',
     'HTTP_COOKIE'               => 'Cookie',

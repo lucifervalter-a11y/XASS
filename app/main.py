@@ -1189,11 +1189,14 @@ async def require_mini_owner(
 
 
 def _public_origin(request: Request) -> tuple[str, str]:
-    forwarded_host = str(request.headers.get("x-forwarded-host") or request.url.hostname or "").split(",", 1)[0].strip()
-    host = forwarded_host.split(":", 1)[0]
+    forwarded_host = str(request.headers.get("x-forwarded-host") or request.url.netloc or "").split(",", 1)[0].strip().lower()
     forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",", 1)[0].strip().lower()
-    origin = f"{forwarded_proto}://{forwarded_host}"
-    return host, origin
+    parsed = urlsplit(f"{forwarded_proto}://{forwarded_host}")
+    host = parsed.hostname or ""
+    authority = f"[{host}]" if ":" in host else host
+    if parsed.port is not None and parsed.port != {"http": 80, "https": 443}.get(parsed.scheme):
+        authority += f":{parsed.port}"
+    return host, f"{parsed.scheme}://{authority}"
 
 
 @app.get("/api/pwa/config")

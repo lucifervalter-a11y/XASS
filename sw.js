@@ -1,8 +1,7 @@
-const CACHE = 'xass-shell-v7';
+const CACHE = 'xass-shell-v8';
 const OFFLINE = '/offline.html';
 const SHELL = [
   OFFLINE,
-  '/miniapp.php?standalone=1',
   '/manifest.webmanifest',
   '/assets/miniapp-control-center.css?v=0130',
   '/assets/miniapp-control-center.js?v=0130',
@@ -67,34 +66,42 @@ self.addEventListener('fetch', event => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname === '/proxy.php' || url.pathname.startsWith('/api/')) return;
 
-  if (request.mode === 'navigate') {
+  if (request.mode === 'navigate' && url.pathname === '/miniapp.php') {
     event.respondWith((async () => {
       try {
-        const response = await fetch(request);
-        if (response.ok) {
-          const cache = await caches.open(CACHE);
-          await cache.put('/miniapp.php?standalone=1', response.clone());
-        }
-        return response;
+        return await fetch(request);
       } catch (error) {
-        return (await caches.match('/miniapp.php?standalone=1')) || (await caches.match(OFFLINE));
+        const cache = await caches.open(CACHE);
+        return (await cache.match(OFFLINE)) || new Response('XASS сейчас без сети.', {
+          status: 503,
+          headers: {'Content-Type': 'text/plain; charset=utf-8'}
+        });
       }
     })());
     return;
   }
 
+  // Only public shell assets belong in the offline cache. Other PHP pages,
+  // private downloads and arbitrary URLs must always reach the server.
+  if (!SHELL.includes(url.pathname + url.search)) return;
+
   event.respondWith((async () => {
-    const cached = await caches.match(request);
-    if (cached) return cached;
+    // Stable asset URLs can change during a deployment; cache-first would keep
+    // the old JavaScript forever even after the server has been updated.
     try {
-      const response = await fetch(request);
+      const response = await fetch(request, {cache: 'no-cache'});
       if (response.ok) {
-        const cache = await caches.open(CACHE);
-        await cache.put(request, response.clone());
+        try {
+          const cache = await caches.open(CACHE);
+          await cache.put(request, response.clone());
+        } catch (error) {
+          // Storage quota/private browsing must not break an online response.
+        }
       }
       return response;
     } catch (error) {
-      return new Response('', {status: 503, statusText: 'Offline'});
+      const cache = await caches.open(CACHE);
+      return (await cache.match(request)) || new Response('', {status: 503, statusText: 'Offline'});
     }
   })());
 });
