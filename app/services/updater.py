@@ -194,6 +194,7 @@ def fetch_remote(branch: str, *, repo_root: Path | None = None, log_path: Path |
         cwd=root,
         log_path=log_path,
         check=False,
+        timeout_sec=30,
     )
     return completed.returncode == 0
 
@@ -277,9 +278,27 @@ def get_changed_files_between(start_ref: str, end_ref: str, *, repo_root: Path |
     return files
 
 
-def pull_fast_forward(branch: str, *, repo_root: Path | None = None, log_path: Path | None = None) -> None:
+def _has_remote_updates(current_ref: str, remote_ref: str, *, repo_root: Path) -> bool:
+    if current_ref == remote_ref:
+        return False
+    forward = _run_command(
+        ["git", "merge-base", "--is-ancestor", current_ref, remote_ref], cwd=repo_root, check=False,
+    )
+    if forward.returncode == 0:
+        return True
+    reverse = _run_command(
+        ["git", "merge-base", "--is-ancestor", remote_ref, current_ref], cwd=repo_root, check=False,
+    )
+    if reverse.returncode == 0:
+        return False
+    raise UpdateError("Локальная и удалённая истории Git разошлись. Сначала согласуйте изменения в репозитории.")
+
+
+def merge_fast_forward(revision: str, *, repo_root: Path | None = None, log_path: Path | None = None) -> None:
     root = repo_root or _repo_root()
-    _run_command(["git", "pull", "--ff-only", "origin", branch], cwd=root, log_path=log_path, check=True)
+    # Install exactly the revision whose changed files were inspected. A second
+    # fetch could otherwise pull newer dependencies without installing them.
+    _run_command(["git", "merge", "--ff-only", revision], cwd=root, log_path=log_path, check=True)
 
 
 def _install_requirements_if_needed(
@@ -535,7 +554,10 @@ def get_update_status(settings: Settings, *, include_release_notes: bool = True)
             errors.append("Не удалось определить текущий commit (HEAD).")
         if remote is None:
             errors.append(f"Не удалось определить commit origin/{branch}.")
-        has_updates = bool(current and remote and current.full_hash != remote.full_hash)
+        has_updates = bool(
+            fetch_ok and current and remote
+            and _has_remote_updates(current.full_hash, remote.full_hash, repo_root=root)
+        )
         commits = get_commits_between("HEAD", f"origin/{branch}", repo_root=root, limit=30) if has_updates else []
     except Exception as exc:
         errors.append(str(exc))
@@ -586,11 +608,12 @@ def run_update(settings: Settings, *, execute_restart: bool = True) -> UpdateRun
     try:
         _append_log(log_path, "=== update start ===")
         branch = resolve_branch(settings, repo_root=root)
-        fetch_remote(branch, repo_root=root, log_path=log_path)
+        if not fetch_remote(branch, repo_root=root, log_path=log_path):
+            raise UpdateError(f"Не удалось выполнить git fetch origin {branch}. Обновление не установлено.")
         remote = get_remote_commit(branch, repo_root=root)
         if before is None or remote is None:
             raise UpdateError("Cannot resolve current/remote commit")
-        if before.full_hash == remote.full_hash:
+        if not _has_remote_updates(before.full_hash, remote.full_hash, repo_root=root):
             _append_log(log_path, "No updates available")
             return UpdateRunResult(
                 ok=True,
@@ -605,8 +628,8 @@ def run_update(settings: Settings, *, execute_restart: bool = True) -> UpdateRun
                 error=None,
             )
 
-        changed_files = get_changed_files_between("HEAD", f"origin/{branch}", repo_root=root)
-        pull_fast_forward(branch, repo_root=root, log_path=log_path)
+        changed_files = get_changed_files_between(before.full_hash, remote.full_hash, repo_root=root)
+        merge_fast_forward(remote.full_hash, repo_root=root, log_path=log_path)
         steps.extend(run_post_update_steps(changed_files, repo_root=root, log_path=log_path))
         restart_required = restart_mode not in {"", "none"}
         if restart_required and execute_restart:

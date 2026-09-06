@@ -235,6 +235,9 @@ docs/                   изображения и operational reference
 ```bash
 python -m unittest discover -s tests -v
 python -m compileall -q app pc_client tests
+node --test tests/test_pwa_runtime.js
+php tests/test_pwa_proxy.php
+XASS_PROXY_TEST_CASE=fallback php tests/test_pwa_proxy.php
 ```
 
 Тесты покрывают привязку агентов, подписанные обновления, PWA‑авторизацию, одноразовые ссылки, музыку, миграцию старого клиента, сайт и быстрый перезапуск сервиса.
