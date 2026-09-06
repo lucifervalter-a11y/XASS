@@ -92,7 +92,8 @@ def main():
             manifest = create_snapshot(root, Settings(), args.output, password=password,
                                        public_key=public_key, system_config=args.system_config)
             print(json.dumps({"ok": True, "revision": manifest["revision"], "database": manifest["database"],
-                              "skipped_links": len(manifest["skipped_links"]), "bytes": args.output.stat().st_size}))
+                              "skipped_links": len(manifest["skipped_links"]),
+                              "unreadable_system_paths": len(manifest["unreadable_system_paths"]), "bytes": args.output.stat().st_size}))
         elif args.command in ("restore", "receive"):
             postgres = getpass.getpass("DATABASE_URL новой пустой PostgreSQL БД: ") if args.postgres else ""
             if args.command == "receive":

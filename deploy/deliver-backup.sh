@@ -26,8 +26,8 @@ import json,sys
 from pathlib import Path
 Path(sys.argv[1]).write_text(json.loads(Path('deploy/backup-request.json').read_text())['recipient'])
 PY
-# Root can include TLS and nginx files. Only ciphertext leaves the host.
-sudo -n .venv/bin/python deploy/migrate.py export --root "$root" --output "$delivery/server.xass-server" --recipient-key "$delivery/recipient.pem" --system-config
-sudo -n chown "$(id -u):$(id -g)" "$delivery/server.xass-server"
+# Respect the SSH account's existing access. Unreadable system files are listed
+# in the manifest; application data must be readable or the export fails.
+.venv/bin/python deploy/migrate.py export --root "$root" --output "$delivery/server.xass-server" --recipient-key "$delivery/recipient.pem" --system-config
 chmod 600 "$delivery/server.xass-server"
 echo 'Encrypted server delivery ready.'

@@ -205,7 +205,7 @@ def create_snapshot(root: Path, settings: Settings, destination: Path, *, passwo
     if backup_dir == root or backup_dir in root.parents:
         raise ValueError("Каталог копий должен быть отдельным каталогом")
     manifest = {"format": "xass-server", "version": 1, "created_at": time.time(),
-                "source_root": str(root), "path_map": {}, "skipped_links": [],
+                "source_root": str(root), "path_map": {}, "skipped_links": [], "unreadable_system_paths": [],
                 "scope": "XASS code, database, configured files and local data; not an OS disk image",
                 "system_config": system_config}
     revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
@@ -238,7 +238,12 @@ def create_snapshot(root: Path, settings: Settings, destination: Path, *, passwo
                 if source.is_dir():
                     for child in sorted(source.iterdir()):
                         if child.name not in IGNORED and not child.name.endswith(".pyc"):
-                            add_tree(child, name + "/" + child.name, system=system)
+                            try:
+                                add_tree(child, name + "/" + child.name, system=system)
+                            except PermissionError:
+                                if not system:
+                                    raise
+                                manifest["unreadable_system_paths"].append(name + "/" + child.name)
                 elif source.is_file():
                     tar.add(source, arcname=name, recursive=False)
 
@@ -264,7 +269,10 @@ def create_snapshot(root: Path, settings: Settings, destination: Path, *, passwo
                 for path in [Path("/etc/nginx"), Path("/etc/letsencrypt"),
                              *Path("/etc/systemd/system").glob("serverredus*"),
                              *Path("/etc/systemd/system").glob("xass*")]:
-                    add_tree(path, "system" + str(path), system=True)
+                    try:
+                        add_tree(path, "system" + str(path), system=True)
+                    except PermissionError:
+                        manifest["unreadable_system_paths"].append("system" + str(path))
             raw = json.dumps(manifest, ensure_ascii=False, indent=2).encode()
             info = tarfile.TarInfo("manifest.json")
             info.size, info.mode = len(raw), 0o600
