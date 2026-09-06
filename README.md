@@ -18,7 +18,7 @@
 
 <p align="center">
   <img alt="Server 0.13.1" src="https://img.shields.io/badge/server-0.13.1-3b82f6?style=flat-square">
-  <img alt="Windows agent 0.13.4" src="https://img.shields.io/badge/Windows_agent-0.13.4-2563eb?style=flat-square&logo=windows11&logoColor=white">
+  <img alt="Windows agent 0.13.5" src="https://img.shields.io/badge/Windows_agent-0.13.5-2563eb?style=flat-square&logo=windows11&logoColor=white">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-111827?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-059669?style=flat-square&logo=fastapi&logoColor=white">
   <img alt="Telegram Mini App" src="https://img.shields.io/badge/Telegram-Mini_App-229ED9?style=flat-square&logo=telegram&logoColor=white">
@@ -253,6 +253,7 @@ GitHub Actions автоматически:
 
 - [Полная установка, команды и troubleshooting](./docs/OPERATIONS.md)
 - [Windows Agent](./pc_client/README.md)
+- [Перенос сервера](./docs/SERVER_MIGRATION.md)
 - [Шаблон конфигурации](./.env.example)
 - [Последняя стабильная версия Windows](https://github.com/lucifervalter-a11y/XASS/releases/tag/agent-latest)
 
@@ -261,6 +262,3 @@ GitHub Actions автоматически:
 <p align="center">
   <sub>XASS — когда личная инфраструктура ощущается как один продукт.</sub>
 </p>
-# Полная копия и перенос сервера
-
-В Mini App: **Инструменты → Данные → Весь сервер и перенос**. Полный архив включает сайт, БД, медиа и ключи; код позволяет скачать и восстановить его на новом сервере. [Инструкция переноса и финального переключения](docs/SERVER_MIGRATION.md).

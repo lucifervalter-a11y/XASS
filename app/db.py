@@ -50,6 +50,14 @@ def _apply_runtime_migrations(connection) -> None:
         command_columns = {item["name"] for item in inspector.get_columns("agent_commands")}
         if "not_before_at" not in command_columns:
             connection.execute(text(f"ALTER TABLE agent_commands ADD COLUMN not_before_at {datetime_type}"))
+    if "agent_pair_codes" in tables:
+        pair_columns = {item["name"] for item in inspector.get_columns("agent_pair_codes")}
+        if "owner_e2e_public_jwk" not in pair_columns:
+            connection.execute(text("ALTER TABLE agent_pair_codes ADD COLUMN owner_e2e_public_jwk TEXT"))
+    if "agent_credentials" in tables:
+        cred_columns = {item["name"] for item in inspector.get_columns("agent_credentials")}
+        if "e2e_public_jwk" not in cred_columns:
+            connection.execute(text("ALTER TABLE agent_credentials ADD COLUMN e2e_public_jwk TEXT"))
     if "app_config" not in tables:
         return
 

@@ -31,7 +31,7 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import AgentCommand, AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
+from app.models import AgentCommand, AgentCredential, AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
 from app.services.agent_commands import (
     DANGEROUS_AGENT_COMMANDS,
     acknowledge_agent_commands,
@@ -50,7 +50,13 @@ from app.services.agent_installer import (
     issue_installer_ticket,
     verify_installer_ticket,
 )
-from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code, revoke_active_pair_codes
+from app.services.agent_pairing import (
+    authenticate_agent_api_key,
+    claim_pair_code_and_issue_key,
+    dump_e2e_public_jwk,
+    issue_pair_code,
+    revoke_active_pair_codes,
+)
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.agent_workspace import (
     delete_asset as delete_workspace_asset,
@@ -287,6 +293,7 @@ class MiniDiagnosticActionPayload(BaseModel):
 class MiniAgentPairPayload(BaseModel):
     server_url: str = Field(default="", max_length=512)
     source_name: str = Field(default="", max_length=128)
+    e2e_public_jwk: dict[str, Any] | None = None
 
 
 class MiniPwaPairPayload(BaseModel):
@@ -683,6 +690,7 @@ async def agent_pair_claim(
             pair_code=payload.pair_code,
             source_name=payload.source_name,
             source_type=payload.source_type,
+            e2e_public_jwk=payload.e2e_public_jwk,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -693,6 +701,7 @@ async def agent_pair_claim(
         source_type=result.source_type,
         agent_api_key=result.agent_api_key,
         issued_at=result.issued_at,
+        owner_e2e_public_jwk=result.owner_e2e_public_jwk,
     )
 
 
@@ -715,6 +724,16 @@ async def agent_heartbeat(
     # For per-agent keys we pin source_name on server side to keep identity stable.
     if auth.source_name and payload.source_name != auth.source_name:
         payload = payload.model_copy(update={"source_name": auth.source_name})
+
+    if auth.credential_id and payload.e2e_public_jwk:
+        credential = await session.get(AgentCredential, auth.credential_id)
+        try:
+            dumped = dump_e2e_public_jwk(payload.e2e_public_jwk)
+        except ValueError:
+            dumped = None
+        if credential is not None and dumped and credential.e2e_public_jwk != dumped:
+            credential.e2e_public_jwk = dumped
+            await session.commit()
 
     await acknowledge_agent_commands(
         session,
@@ -876,6 +895,8 @@ async def agent_workspace_asset_upload(
             body=body,
             command_id=command.id,
             ttl_seconds=10 * 60 if kind == "screenshot" else 30 * 60,
+            cipher=request.headers.get("x-xass-cipher", ""),
+            inner_type=request.headers.get("x-xass-inner-type", ""),
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -2406,12 +2427,16 @@ async def mini_agent_pair_code(
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    result = await issue_pair_code(
-        session,
-        actor_user_id=user.user_id,
-        ttl_minutes=settings.agent_pair_code_ttl_minutes,
-        code_length=settings.agent_pair_code_length,
-    )
+    try:
+        result = await issue_pair_code(
+            session,
+            actor_user_id=user.user_id,
+            ttl_minutes=settings.agent_pair_code_ttl_minutes,
+            code_length=settings.agent_pair_code_length,
+            owner_e2e_public_jwk=payload.e2e_public_jwk if payload else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     await emit_notification(
         session,
         event_type="pair_code_created",
@@ -2458,6 +2483,7 @@ async def mini_agent_pair_code(
         pair_code=result.code,
         expires_at=result.expires_at,
         source_name=payload.source_name if payload else "",
+        e2e_public_jwk=result.owner_e2e_public_jwk,
     )
     return {
         "ok": True,
@@ -2734,7 +2760,7 @@ async def mini_agent_screenshot(
         "ok": True,
         "available": True,
         "screenshot": {
-            **{key: item.get(key) for key in ("token", "size", "sha256", "created_at", "expires_at")},
+            **{key: item.get(key) for key in ("token", "size", "sha256", "created_at", "expires_at", "cipher", "inner_type", "content_type")},
             "url": f"/api/mini/agents/{quote(source.source_name, safe='')}/assets/{item['token']}",
         },
     }
@@ -2751,13 +2777,14 @@ async def mini_agent_asset_download(
     if loaded is None or loaded[0].get("kind") not in {"screenshot", "file_download"}:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Временный файл недоступен")
     metadata, path = loaded
-    disposition = "inline" if metadata["kind"] == "screenshot" else "attachment"
+    sealed = str(metadata.get("cipher") or "").startswith("xass-sealed")
+    disposition = "inline" if metadata["kind"] == "screenshot" and not sealed else "attachment"
     return FileResponse(
         path,
-        media_type=metadata["content_type"],
+        media_type="application/x-xass-sealed" if sealed else metadata["content_type"],
         filename=metadata["filename"],
         content_disposition_type=disposition,
-        headers={"Cache-Control": "private, no-store"},
+        headers={"Cache-Control": "private, no-store", "X-XASS-Cipher": str(metadata.get("cipher") or "")},
     )
 
 
@@ -2790,6 +2817,8 @@ async def mini_agent_file_upload(
             content_type=request.headers.get("content-type", "application/octet-stream"),
             body=body,
             ttl_seconds=30 * 60,
+            cipher=request.headers.get("x-xass-cipher", ""),
+            inner_type=request.headers.get("x-xass-inner-type", ""),
         )
         command = await enqueue_agent_command(
             session,

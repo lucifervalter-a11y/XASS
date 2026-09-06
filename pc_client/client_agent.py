@@ -46,6 +46,12 @@ from remote_tools import (
 )
 from network_client import create_http_client
 try:
+    from e2e_crypto import can_seal, ensure_agent_keys, is_public_jwk, seal_text, unseal_text
+    from secret_store import seal_config, unseal_config
+except ModuleNotFoundError:
+    from pc_client.e2e_crypto import can_seal, ensure_agent_keys, is_public_jwk, seal_text, unseal_text
+    from pc_client.secret_store import seal_config, unseal_config
+try:
     from runtime_state import acquire_single_instance, atomic_write_json, configure_utf8_logging, load_json_object
 except ModuleNotFoundError:
     from pc_client.runtime_state import acquire_single_instance, atomic_write_json, configure_utf8_logging, load_json_object
@@ -145,11 +151,15 @@ def discover_backend_url(server_url: str) -> str:
 
 
 def load_config() -> dict[str, Any]:
-    return load_json_object(CONFIG_PATH, restore_backup=True)
+    payload = load_json_object(CONFIG_PATH, restore_backup=True)
+    try:
+        return unseal_config(payload, data_dir=CONFIG_PATH.parent)
+    except ValueError:
+        return payload if isinstance(payload, dict) else {}
 
 
 def save_config(data: dict[str, Any]) -> None:
-    atomic_write_json(CONFIG_PATH, data, backup=True)
+    atomic_write_json(CONFIG_PATH, seal_config(data, data_dir=CONFIG_PATH.parent), backup=True)
 
 
 def _processed_commands() -> dict[str, Any]:
@@ -248,6 +258,9 @@ def build_payload(config: dict[str, Any]) -> dict[str, Any]:
     }
     if discord is not None:
         payload["discord"] = discord
+    if is_public_jwk(config.get("e2e_public_jwk")):
+        payload["e2e_public_jwk"] = config.get("e2e_public_jwk")
+        payload["e2e"] = can_seal(config)
     return payload
 
 
@@ -257,6 +270,7 @@ def claim_pair_code(
     pair_code: str,
     source_name: str,
     source_type: str,
+    e2e_public_jwk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     endpoint = f"{server_url.rstrip('/')}/agent/pair/claim"
     payload = {
@@ -264,6 +278,8 @@ def claim_pair_code(
         "source_name": source_name,
         "source_type": source_type,
     }
+    if e2e_public_jwk:
+        payload["e2e_public_jwk"] = e2e_public_jwk
 
     with create_http_client(server_url, timeout=20, trust_env=False) as client:
         response = client.post(endpoint, json=payload)
@@ -315,11 +331,14 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             server_url = discovered_url
+        staging: dict[str, Any] = {}
+        ensure_agent_keys(staging)
         result = claim_pair_code(
             server_url=server_url,
             pair_code=pair_code,
             source_name=source_name,
             source_type=source_type,
+            e2e_public_jwk=staging.get("e2e_public_jwk"),
         )
         api_key = str(result.get("agent_api_key") or "").strip()
         source_name = str(result.get("source_name") or source_name)
@@ -327,6 +346,8 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
         print(f"[pc-client] pairing ok, source_name={source_name}")
     else:
         api_key = input("AGENT_API_KEY: ").strip()
+        staging = {}
+        result = {}
 
     if not api_key:
         raise RuntimeError("Пустой ключ агента")
@@ -346,6 +367,9 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
         "trust_env_proxy": bool(existing.get("trust_env_proxy", False)),
         "auto_update": bool(existing.get("auto_update", True)),
         "desktop_managed": bool(existing.get("desktop_managed", False)),
+        "e2e_private_jwk": staging.get("e2e_private_jwk") or existing.get("e2e_private_jwk"),
+        "e2e_public_jwk": staging.get("e2e_public_jwk") or existing.get("e2e_public_jwk"),
+        "owner_e2e_public_jwk": result.get("owner_e2e_public_jwk") if pair_code else existing.get("owner_e2e_public_jwk"),
     }
     save_config(data)
     print(f"Конфиг сохранен: {CONFIG_PATH}")
@@ -416,16 +440,20 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
             server_url = discovered_url
         source_name = str(config.get("source_name") or socket.gethostname())
         source_type = str(config.get("source_type") or "PC_AGENT")
+        ensure_agent_keys(config)
         result = claim_pair_code(
             server_url=server_url,
             pair_code=pair_code,
             source_name=source_name,
             source_type=source_type,
+            e2e_public_jwk=config.get("e2e_public_jwk"),
         )
         config["server_url"] = server_url
         config["api_key"] = str(result.get("agent_api_key") or "").strip()
         config["source_name"] = str(result.get("source_name") or source_name)
         config["source_type"] = str(result.get("source_type") or source_type)
+        if result.get("owner_e2e_public_jwk"):
+            config["owner_e2e_public_jwk"] = result.get("owner_e2e_public_jwk")
         updated = True
         print(f"[pc-client] pairing ok, source_name={config['source_name']}")
 
@@ -530,8 +558,14 @@ def _handle_workspace_command(
             "api_key": str(config["api_key"]),
             "source_name": source_name,
         }
+        e2e = {}
+        if can_seal(config):
+            e2e = {
+                "e2e_private_jwk": config["e2e_private_jwk"],
+                "owner_e2e_public_jwk": config["owner_e2e_public_jwk"],
+            }
         if command_name == "screenshot":
-            details = capture_screenshot(client, command_id=command_id, **common)
+            details = capture_screenshot(client, command_id=command_id, **common, **e2e)
             store_command_result(command_id, True, "Снимок экрана получен", details)
         elif command_name == "files_list":
             details = list_files(DATA_ROOT, command_payload.get("root"), command_payload.get("path"))
@@ -539,14 +573,14 @@ def _handle_workspace_command(
         elif command_name == "file_download":
             details = upload_requested_file(
                 DATA_ROOT, client, command_id=command_id,
-                root_name=command_payload.get("root"), relative_path=command_payload.get("path"), **common,
+                root_name=command_payload.get("root"), relative_path=command_payload.get("path"), **common, **e2e,
             )
             store_command_result(command_id, True, f"Файл готов: {details['filename']}", details)
         elif command_name == "file_upload":
             details = receive_uploaded_file(
                 DATA_ROOT, client, root_name=command_payload.get("root"),
                 relative_path=command_payload.get("path"), asset_token=command_payload.get("asset_token"),
-                filename=command_payload.get("filename"), **common,
+                filename=command_payload.get("filename"), **common, **e2e,
             )
             store_command_result(command_id, True, f"Файл сохранён: {details['filename']}", details)
         elif command_name == "file_delete":
@@ -554,9 +588,19 @@ def _handle_workspace_command(
             store_command_result(command_id, True, f"Файл удалён: {details['name']}", details)
         elif command_name == "clipboard_get":
             text = clipboard_get()
-            store_command_result(command_id, True, "Текст получен из буфера ПК", {"text": text, "length": len(text)})
+            if can_seal(config):
+                details = seal_text(text, private_jwk=config["e2e_private_jwk"], peer_public_jwk=config["owner_e2e_public_jwk"], aad="clipboard")
+                details["length"] = len(text)
+            else:
+                details = {"text": text, "length": len(text)}
+            store_command_result(command_id, True, "Текст получен из буфера ПК", details)
         elif command_name == "clipboard_set":
-            length = clipboard_set(command_payload.get("text"))
+            raw = command_payload
+            if can_seal(config) and isinstance(raw, dict) and raw.get("sealed"):
+                text = unseal_text(raw, private_jwk=config["e2e_private_jwk"], peer_public_jwk=config["owner_e2e_public_jwk"], aad="clipboard")
+            else:
+                text = command_payload.get("text")
+            length = clipboard_set(text)
             store_command_result(command_id, True, "Текст отправлен в буфер ПК", {"length": length})
         elif command_name == "migration_download":
             details = download_migration_export(
@@ -877,6 +921,8 @@ def _run_main() -> None:
         args = build_arg_parser().parse_args()
         config = ensure_minimal_defaults(load_config())
         config, changed_by_args = apply_cli_overrides(config, args)
+        if ensure_agent_keys(config):
+            changed_by_args = True
 
         if not config.get("server_url") or not config.get("api_key"):
             config = setup_wizard(config)

@@ -59,6 +59,11 @@ class AgentWorkspaceTests(unittest.TestCase):
                     settings, source_name="PC-1", kind="screenshot", filename="screen.txt",
                     content_type="text/plain", body=b"screen",
                 )
+            sealed = store_asset(
+                settings, source_name="PC-1", kind="screenshot", filename="screen.bin",
+                content_type="application/x-xass-sealed", body=b"XASS" + b"\x01" + b"\x00" * 20,
+            )
+            self.assertEqual(sealed["cipher"], "xass-sealed-v1")
             with self.assertRaises(ValueError):
                 store_asset(
                     settings, source_name="PC-1", kind="file_upload", filename="large.bin",

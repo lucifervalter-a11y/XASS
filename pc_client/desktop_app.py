@@ -46,6 +46,8 @@ from client_agent import (
     normalize_server_url,
     save_config,
 )
+from e2e_crypto import can_seal, ensure_agent_keys
+from secret_store import cipher_label
 from client_update import (
     DATA_ROOT,
     UPDATE_MARKER,
@@ -890,6 +892,13 @@ class XassDesktop:
         self._connection_row(maintenance, "Ревизия", current_revision()[:16] or "локальная")
         self._connection_row(maintenance, "Python", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
         self._connection_row(maintenance, "Автозапуск", "Windows Startup")
+        on_disk = {}
+        try:
+            on_disk = json.loads((DATA_ROOT / "config.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError):
+            pass
+        self._connection_row(maintenance, "Секрет на диске", cipher_label(on_disk) if isinstance(on_disk, dict) else "—")
+        self._connection_row(maintenance, "Канал Mini App", "E2E AES-256-GCM" if can_seal(self.config) else "открытый (перепривяжите ПК)")
         self._button(maintenance, "Проверить обновление", self.check_update, kind="ghost").pack(fill="x", pady=(22, 9))
         self._button(maintenance, "Перезапустить агент", self.restart_agent).pack(fill="x")
 
@@ -1315,6 +1324,8 @@ class XassDesktop:
         if profile.source_name:
             self.name_var.set(profile.source_name)
         self.auto_update_var.set(profile.auto_update)
+        if profile.e2e_public_jwk:
+            self.config["owner_e2e_public_jwk"] = profile.e2e_public_jwk
         expires = profile.expires_at.astimezone().strftime("%H:%M")
         self.import_status_var.set(f"Конфиг из {source} принят · ключ действует до {expires}. Подключаю…")
         self._log(f"Импортирован файл подключения: {source}")
@@ -1340,11 +1351,13 @@ class XassDesktop:
         def worker() -> None:
             try:
                 server = discover_backend_url(normalize_server_url(server_input))
+                ensure_agent_keys(self.config)
                 result = claim_pair_code(
                     server_url=server,
                     pair_code=code,
                     source_name=source_name,
                     source_type="PC_AGENT",
+                    e2e_public_jwk=self.config.get("e2e_public_jwk"),
                 )
                 self.config.update(
                     {
@@ -1357,6 +1370,8 @@ class XassDesktop:
                         "desktop_managed": True,
                     }
                 )
+                if result.get("owner_e2e_public_jwk"):
+                    self.config["owner_e2e_public_jwk"] = result.get("owner_e2e_public_jwk")
                 save_config(self.config)
                 self.root.after(0, lambda: self._paired_ok(server))
             except Exception as exc:
@@ -1374,7 +1389,7 @@ class XassDesktop:
         self.server_var.set(server)
         self.name_var.set(str(self.config.get("source_name") or ""))
         self.pair_var.set("")
-        self.import_status_var.set("Компьютер успешно привязан. Персональный API-ключ сохранён локально.")
+        self.import_status_var.set("Компьютер успешно привязан. Ключ зашифрован на этом Windows-аккаунте.")
         self._log("Pairing выполнен, персональный ключ сохранён локально")
         self._set_status("Подключён", GREEN)
         self.restart_agent()

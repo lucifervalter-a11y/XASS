@@ -26,6 +26,7 @@ def build_connection_profile(
     pair_code: str,
     expires_at: datetime,
     source_name: str = "",
+    e2e_public_jwk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_server_origin(server_url)
     if normalized is None:
@@ -33,7 +34,7 @@ def build_connection_profile(
     code = (pair_code or "").strip()
     if not code:
         raise ValueError("Pair code is empty")
-    return {
+    profile = {
         "format": CONNECTION_FORMAT,
         "version": CONNECTION_VERSION,
         "server_url": normalized,
@@ -42,3 +43,11 @@ def build_connection_profile(
         "expires_at": expires_at.isoformat(),
         "auto_update": True,
     }
+    if isinstance(e2e_public_jwk, dict) and e2e_public_jwk.get("kty") == "EC":
+        profile["e2e_public_jwk"] = {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": str(e2e_public_jwk.get("x") or ""),
+            "y": str(e2e_public_jwk.get("y") or ""),
+        }
+    return profile

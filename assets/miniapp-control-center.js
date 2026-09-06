@@ -368,9 +368,16 @@
       const shot = response.data.screenshot;
       const raw = await rawRequest('agents/' + encodeURIComponent(source) + '/assets/' + encodeURIComponent(shot.token));
       if (!raw.ok) throw new Error('Не удалось загрузить снимок');
-      const url = URL.createObjectURL(await raw.blob()); ui.objectUrls.add(url);
+      let blob = await raw.blob();
+      if (shot.cipher === 'xass-sealed-v1') {
+        const peer = XassE2E.agentPublic(source);
+        if (!peer) throw new Error('Нет ключа агента для расшифровки снимка');
+        const plain = await XassE2E.unsealBytes(await blob.arrayBuffer(), peer, 'screenshot');
+        blob = new Blob([plain], { type: shot.inner_type || shot.content_type || 'image/jpeg' });
+      }
+      const url = URL.createObjectURL(blob); ui.objectUrls.add(url);
       shell.innerHTML = '<img src="' + url + '" alt="Последний снимок экрана ' + esc(source) + '">';
-      if (meta) meta.textContent = 'Получен ' + dateText(shot.created_at) + ' · временное хранение';
+      if (meta) meta.textContent = (shot.cipher === 'xass-sealed-v1' ? 'E2E · ' : '') + 'Получен ' + dateText(shot.created_at) + ' · сервер хранит только шифротекст';
       shell.querySelector('img').onclick = () => { $('ccLightboxImage').src = url; $('ccLightbox').classList.add('open'); };
     } catch (error) { shell.innerHTML = '<div class="cc-error">' + esc(error.message || 'Снимок недоступен') + '</div>'; }
   }
@@ -420,7 +427,13 @@
     try {
       const response = await rawRequest('agents/' + encodeURIComponent(source) + '/assets/' + encodeURIComponent(token));
       if (!response.ok) throw new Error('Временный файл недоступен');
-      const url = URL.createObjectURL(await response.blob()), anchor = document.createElement('a');
+      let blob = await response.blob();
+      const peer = XassE2E.agentPublic(source);
+      if (peer && blob.type === 'application/x-xass-sealed') {
+        const plain = await XassE2E.unsealBytes(await blob.arrayBuffer(), peer, 'file_download');
+        blob = new Blob([plain], { type: 'application/octet-stream' });
+      }
+      const url = URL.createObjectURL(blob), anchor = document.createElement('a');
       anchor.href = url; anchor.download = result.result.details.filename || name; document.body.appendChild(anchor); anchor.click(); anchor.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (error) { X.toast(error.message); }
@@ -440,7 +453,13 @@
     const upload = $('ccFileUpload'); if (upload) upload.disabled = true;
     try {
       const path = 'agents/' + encodeURIComponent(source) + '/files/upload?root=' + encodeURIComponent(ui.fileRoot) + '&path=' + encodeURIComponent(ui.filePath) + '&filename=' + encodeURIComponent(file.name);
-      const response = await rawRequest(path, { method: 'POST', headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-XASS-Filename': file.name }, body: file });
+      const peer = XassE2E.agentPublic(source);
+      let body = file, headers = { 'Content-Type': file.type || 'application/octet-stream', 'X-XASS-Filename': file.name };
+      if (peer) {
+        body = await XassE2E.sealBytes(new Uint8Array(await file.arrayBuffer()), peer, 'file_upload');
+        headers = { 'Content-Type': 'application/x-xass-sealed', 'X-XASS-Filename': file.name, 'X-XASS-Cipher': 'xass-sealed-v1', 'X-XASS-Inner-Type': file.type || 'application/octet-stream' };
+      }
+      const response = await rawRequest(path, { method: 'POST', headers, body });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !data.ok) throw new Error(data.detail || 'Файл не принят');
       const result = X.demo ? demoCommand('file_upload', {}) : await waitForCommand(source, data.command.id);
@@ -462,9 +481,15 @@
   }
 
   async function getClipboard() {
-    const result = await runAgentCommand(ensureAgent(), 'clipboard_get', {}, $('ccClipboardGet'));
+    const source = ensureAgent();
+    const result = await runAgentCommand(source, 'clipboard_get', {}, $('ccClipboardGet'));
     if (!result) return;
-    const text = String(result.result?.details?.text || '');
+    const details = result.result?.details || {};
+    let text = String(details.text || '');
+    if (details.sealed) {
+      const peer = XassE2E.agentPublic(source);
+      text = peer ? await XassE2E.unsealText(details, peer) : '';
+    }
     $('ccClipboardValue').textContent = text || 'Буфер ПК пуст.';
     $('ccClipboardCopy').disabled = !text;
     $('ccClipboardCopy').onclick = () => X.copyText(text).then(() => X.toast('Скопировано'));
@@ -474,7 +499,10 @@
   async function setClipboard() {
     const text = $('ccClipboardSend').value;
     if (!text) return X.toast('Введите текст');
-    const result = await runAgentCommand(ensureAgent(), 'clipboard_set', { text }, $('ccClipboardSet'));
+    const source = ensureAgent();
+    const peer = XassE2E.agentPublic(source);
+    const payload = peer ? await XassE2E.sealText(text, peer) : { text };
+    const result = await runAgentCommand(source, 'clipboard_set', payload, $('ccClipboardSet'));
     if (result) { storeClipboard(text, 'XASS → ПК'); X.toast('Текст отправлен в буфер ПК'); }
   }
 
