@@ -66,6 +66,7 @@ from client_update import (
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 from archive_store import archive_root, archive_status, cleanup_archive, conversation_rows
 from network_client import create_http_client
+from remote_tools import ROOT_LABELS, clipboard_get, list_files
 try:
     from runtime_state import acquire_single_instance, append_log, configure_utf8_logging, read_log_tail
 except ModuleNotFoundError:
@@ -83,7 +84,6 @@ TEXT = "#f4f4f5"
 MUTED = "#9c9ca3"
 ACCENT = "#3b82f6"
 ACCENT_HOVER = "#2f73df"
-VIOLET = "#3b82f6"
 GREEN = "#61c554"
 AMBER = "#efb65c"
 RED = "#f36b76"
@@ -332,11 +332,13 @@ class XassDesktop:
 
         for key, label in (
             ("overview", "Обзор"),
+            ("commands", "Команды"),
             ("connection", "Подключение"),
+            ("files", "Файлы"),
             ("archive", "Архив"),
+            ("journal", "Журнал"),
             ("updates", "Обновления"),
             ("settings", "Настройки"),
-            ("diagnostics", "Диагностика"),
         ):
             button = tk.Button(
                 self.sidebar,
@@ -417,13 +419,17 @@ class XassDesktop:
         self._clear_content()
         if name == "connection":
             self._build_connection()
+        elif name == "commands":
+            self._build_commands()
+        elif name == "files":
+            self._build_files()
         elif name == "archive":
             self._build_archive()
         elif name == "updates":
             self._build_updates()
         elif name == "settings":
             self._build_settings()
-        elif name == "diagnostics":
+        elif name in {"journal", "diagnostics"}:
             self._build_diagnostics()
         else:
             self._build_overview()
@@ -534,10 +540,28 @@ class XassDesktop:
         self._connection_row(connection, "Автообновления", "Включены (подписанные)" if self.auto_update_var.get() else "Выключены", GREEN if self.auto_update_var.get() else AMBER)
 
         tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
+        process_head = tk.Frame(self.content, bg=BG)
+        process_head.pack(fill="x", pady=(18, 10))
+        tk.Label(process_head, text="Топ-процессы", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
+        process_card = self._card(self.content, padding=0)
+        process_card.pack(fill="x", pady=(0, 4))
+        header = tk.Frame(process_card, bg=CARD)
+        header.pack(fill="x", padx=16, pady=(12, 4))
+        for title, width in (("Имя", 28), ("PID", 10), ("CPU", 8), ("RAM", 10)):
+            tk.Label(header, text=title, bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8), width=width, anchor="w").pack(side="left")
+        for proc in self._top_processes():
+            row = tk.Frame(process_card, bg=CARD)
+            row.pack(fill="x", padx=16, pady=3)
+            tk.Label(row, text=proc["name"], bg=CARD, fg=TEXT, font=("Segoe UI", 9), width=28, anchor="w").pack(side="left")
+            tk.Label(row, text=str(proc["pid"]), bg=CARD, fg=MUTED, font=("Cascadia Mono", 9), width=10, anchor="w").pack(side="left")
+            tk.Label(row, text=f"{proc['cpu']:.1f}%", bg=CARD, fg=TEXT, font=("Cascadia Mono", 9), width=8, anchor="w").pack(side="left")
+            tk.Label(row, text=f"{proc['ram_mb']:.0f} МБ", bg=CARD, fg=TEXT, font=("Cascadia Mono", 9), width=10, anchor="w").pack(side="left")
+
+        tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
         events_head = tk.Frame(self.content, bg=BG)
         events_head.pack(fill="x", pady=(18, 10))
         tk.Label(events_head, text="Последние события", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
-        self._button(events_head, "Открыть диагностику", lambda: self.show_view("diagnostics"), kind="ghost").pack(side="right")
+        self._button(events_head, "Открыть журнал", lambda: self.show_view("journal"), kind="ghost").pack(side="right")
         self.overview_log = DarkScrolledText(
             self.content,
             height=8,
@@ -641,6 +665,135 @@ class XassDesktop:
         entry.pack(fill="x", ipady=10, padx=11)
         return entry
 
+    def _top_processes(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                info = proc.info
+                memory = info.get("memory_info")
+                rows.append(
+                    {
+                        "pid": int(info.get("pid") or 0),
+                        "name": str(info.get("name") or "—")[:42],
+                        "cpu": float(proc.cpu_percent(interval=None) or 0),
+                        "ram_mb": float(getattr(memory, "rss", 0) or 0) / (1024 * 1024),
+                    }
+                )
+            except (psutil.Error, TypeError, ValueError):
+                continue
+        rows.sort(key=lambda item: item["cpu"], reverse=True)
+        return rows[:6]
+
+    def _build_commands(self) -> None:
+        self._header("Команды", "Локальные действия на этом ПК. Опасные операции подтверждаются.")
+        grid = tk.Frame(self.content, bg=BG)
+        grid.pack(fill="x")
+        actions = (
+            ("Проверить связь", self.check_connection, "primary"),
+            ("Снимок экрана", self.take_local_screenshot, "secondary"),
+            ("Буфер обмена", self.show_clipboard, "secondary"),
+            ("Заблокировать экран", self.lock_workstation, "danger"),
+            ("Перезапустить агент", self.restart_agent, "secondary"),
+            ("Проверить обновление", self.check_update, "ghost"),
+        )
+        for index, (label, command, kind) in enumerate(actions):
+            cell = tk.Frame(grid, bg=BG)
+            cell.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 8, 8 if index % 2 == 0 else 0), pady=6)
+            grid.columnconfigure(index % 2, weight=1)
+            self._button(cell, label, command, kind=kind).pack(fill="x")
+        hint = self._card(self.content, padding=18)
+        hint.pack(fill="x", pady=(16, 0))
+        tk.Label(hint, text="MINI APP", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(
+            hint,
+            text="Команды из Telegram Mini App приходят фоновому агенту. Здесь те же действия можно выполнить локально: снимок сохраняется в «Изображения\\XASS», блокировка — только Windows Hello / PIN.",
+            bg=CARD,
+            fg=MUTED,
+            justify="left",
+            wraplength=780,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(8, 0))
+
+    def _build_files(self) -> None:
+        self._header("Файлы", "Только разрешённые папки. Сервер не копирует байты на VPS без запроса.")
+        self._file_root = getattr(self, "_file_root", "desktop")
+        toolbar = tk.Frame(self.content, bg=BG)
+        toolbar.pack(fill="x", pady=(0, 12))
+        for key, label in ROOT_LABELS.items():
+            kind = "primary" if key == self._file_root else "ghost"
+            self._button(
+                toolbar,
+                label,
+                lambda item=key: self._open_file_root(item),
+                kind=kind,
+            ).pack(side="left", padx=(0, 8))
+        card = self._card(self.content, padding=8)
+        card.pack(fill="both", expand=True)
+        try:
+            listing = list_files(DATA_ROOT, self._file_root, "")
+            entries = listing.get("entries") or []
+        except Exception as exc:
+            tk.Label(card, text=str(exc), bg=CARD, fg=RED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=16)
+            return
+        if not entries:
+            tk.Label(card, text="В этой папке пока пусто.", bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=16)
+            return
+        for item in entries:
+            row = tk.Frame(card, bg=CARD)
+            row.pack(fill="x", padx=10, pady=4)
+            mark = "папка" if item.get("type") == "directory" else self._format_bytes(int(item.get("size") or 0))
+            tk.Label(row, text=str(item.get("name") or "—"), bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 10)).pack(side="left")
+            tk.Label(row, text=mark, bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="right")
+
+    def _open_file_root(self, root_name: str) -> None:
+        self._file_root = root_name
+        self.show_view("files")
+
+    @staticmethod
+    def _format_bytes(size: int) -> str:
+        if size < 1024:
+            return f"{size} Б"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} КБ"
+        return f"{size / (1024 * 1024):.1f} МБ"
+
+    def take_local_screenshot(self) -> None:
+        try:
+            from PIL import ImageGrab
+        except ImportError:
+            messagebox.showerror("XASS", "Для снимка экрана нужен Pillow.")
+            return
+        try:
+            image = ImageGrab.grab(all_screens=True)
+            folder = Path(os.environ.get("USERPROFILE") or Path.home()) / "Pictures" / "XASS"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"xass-{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg"
+            image.convert("RGB").save(path, "JPEG", quality=85)
+        except Exception as exc:
+            messagebox.showerror("XASS", f"Не удалось снять экран:\n{exc}")
+            return
+        self._log(f"снимок экрана сохранён: {path}")
+        messagebox.showinfo("XASS", f"Снимок сохранён:\n{path}")
+
+    def lock_workstation(self) -> None:
+        if os.name != "nt":
+            messagebox.showinfo("XASS", "Блокировка экрана доступна только на Windows.")
+            return
+        if not messagebox.askyesno("XASS", "Заблокировать этот компьютер сейчас?", parent=self.root):
+            return
+        try:
+            ctypes.windll.user32.LockWorkStation()
+            self._log("экран заблокирован локально")
+        except Exception as exc:
+            messagebox.showerror("XASS", f"Не удалось заблокировать экран:\n{exc}")
+
+    def show_clipboard(self) -> None:
+        try:
+            text = clipboard_get() or "Буфер пуст"
+        except Exception as exc:
+            text = str(exc)
+        messagebox.showinfo("XASS", text[:1200])
+
     def _build_connection(self) -> None:
         self._header("Подключение", "Самый быстрый способ — импортировать конфиг из Telegram Mini App")
         columns = tk.Frame(self.content, bg=BG)
@@ -655,14 +808,14 @@ class XassDesktop:
         tk.Label(quick, text="Импортировать конфиг", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 20)).pack(anchor="w", pady=(12, 5))
         tk.Label(
             quick,
-            text="В Mini App откройте «Агенты» → «Подключить ПК» и скачайте xass-connect.json. Адрес сервера и одноразовый ключ уже будут внутри.",
+            text="В Mini App откройте «Агенты» → «Подключить ПК» и скачайте xass-connect.xass. Адрес сервера и одноразовый ключ уже будут внутри.",
             bg=CARD,
             fg=MUTED,
             justify="left",
             wraplength=330,
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(0, 20))
-        self._button(quick, "Выбрать xass-connect.json", self.import_connection_file, kind="primary").pack(fill="x")
+        self._button(quick, "Выбрать xass-connect.xass", self.import_connection_file, kind="primary").pack(fill="x")
         self._button(quick, "Вставить JSON из буфера", self.paste_connection, kind="secondary").pack(fill="x", pady=(9, 0))
         status_box = tk.Frame(quick, bg=FIELD, padx=14, pady=12, highlightbackground=LINE, highlightthickness=1)
         status_box.pack(side="bottom", fill="x", pady=(22, 0))
@@ -786,7 +939,7 @@ class XassDesktop:
         ).pack(anchor="w", pady=(10, 0))
 
     def _build_diagnostics(self) -> None:
-        self._header("Диагностика", "Безопасный статус GUI, агента, сети и updater")
+        self._header("Журнал", "Безопасный статус GUI, агента, сети и updater")
         card = self._card(self.content, padding=21)
         card.pack(fill="x", pady=(0, 14))
         columns = tk.Frame(card, bg=CARD)
@@ -1170,7 +1323,7 @@ class XassDesktop:
     def pair(self) -> None:
         code = self.pair_var.get().strip()
         if not code:
-            messagebox.showwarning("XASS", "Введите одноразовый ключ или импортируйте xass-connect.json")
+            messagebox.showwarning("XASS", "Введите одноразовый ключ или импортируйте xass-connect.xass")
             return
         if hasattr(self, "pair_button") and self.pair_button.winfo_exists():
             self.pair_button.configure(state="disabled", text="Подключение…")
