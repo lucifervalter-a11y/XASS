@@ -1,0 +1,74 @@
+name: Encrypted server backup
+
+on:
+  workflow_run:
+    workflows: [Deploy to redvps.site]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-server-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Validate a current owner delivery request
+        id: request
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json,os,re,time
+          from pathlib import Path
+          path=Path('deploy/backup-request.json')
+          if not path.exists():
+              raise SystemExit(0)
+          data=json.loads(path.read_text())
+          if not re.fullmatch(r'[a-z0-9-]{1,80}', data['id']) or not time.time() < data['expires'] < time.time()+172800:
+              raise SystemExit(0)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write('active=true\nid='+data['id']+'\n')
+          PY
+      - name: Export encrypted snapshot and retrieve it over SSH
+        if: steps.request.outputs.active == 'true'
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          REQUEST_ID: ${{ steps.request.outputs.id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key_file="$RUNNER_TEMP/xass-backup-key"
+          known_hosts="$RUNNER_TEMP/xass-backup-hosts"
+          trap 'rm -f "$key_file" "$known_hosts"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$key_file"
+          host="$SSH_HOST"
+          if [[ ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            host="$(curl --fail --silent --show-error --retry 3 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=${SSH_HOST}&type=A" | python3 -c 'import json,sys; print(next((x["data"] for x in json.load(sys.stdin).get("Answer",[]) if x.get("type")==1),""))')"
+          fi
+          [[ -n "$host" ]] || { echo 'Could not resolve VPS host'; exit 1; }
+          ssh-keyscan -T 15 -p "$SSH_PORT" "$host" > "$known_hosts"
+          ssh -i "$key_file" -p "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" "$SSH_USER@$host" 'cd /home/red/serverredus && bash deploy/deliver-backup.sh'
+          mkdir -p delivery
+          scp -i "$key_file" -P "$SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" "$SSH_USER@$host:/home/red/.xass-delivery/$REQUEST_ID/server.xass-server" delivery/server.xass-server
+      - name: Save ciphertext only
+        if: steps.request.outputs.active == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xass-server-encrypted-${{ steps.request.outputs.id }}
+          path: delivery/server.xass-server
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error

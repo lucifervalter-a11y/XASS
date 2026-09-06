@@ -857,6 +857,14 @@ class TelegramUpdateHandler:
         config = await get_or_create_app_config(session, self.settings)
         command = text.split()[0].split("@")[0].lower()
 
+        if not self.settings.telegram_management_buttons and command == "/help":
+            await self._safe_send(chat_id, dot_commands_help_text())
+            await self._send_miniapp_entry(chat_id, config)
+            return
+        if not self.settings.telegram_management_buttons:
+            await self._send_miniapp_entry(chat_id, config)
+            return
+
         if command in ("/start", "/panel"):
             keyboard = main_panel_keyboard()
             webapp_url = self._miniapp_url(config)
@@ -2230,6 +2238,15 @@ class TelegramUpdateHandler:
     def _remove_reply_keyboard(self) -> dict[str, Any]:
         return {"remove_keyboard": True}
 
+    async def _send_miniapp_entry(self, chat_id: int, config: AppConfig) -> None:
+        url = self._miniapp_url(config)
+        text = "Управление XASS перенесено в мини-приложение. Бот продолжает сохранять сообщения и уведомлять об изменениях и удалениях."
+        if url:
+            text += "\n\nОткрыть XASS: " + url
+        else:
+            text += "\n\nОткройте miniapp.php на вашем сайте."
+        await self._safe_send(chat_id, text, reply_markup=self._remove_reply_keyboard())
+
     async def _ensure_start_shortcut(self, chat_id: int) -> None:
         if chat_id in self.start_shortcut_hint_sent:
             return
@@ -2321,6 +2338,12 @@ class TelegramUpdateHandler:
             return
 
         config = await get_or_create_app_config(session, self.settings)
+
+        if not self.settings.telegram_management_buttons:
+            if chat_id is not None:
+                await self._safe_edit_or_send(chat_id, message_id, "Управление перенесено в мини-приложение XASS.", {"inline_keyboard": []})
+                await self._send_miniapp_entry(chat_id, config)
+            return
 
         if data in ("panel", "panel:home"):
             await self._safe_edit_or_send(chat_id, message_id, panel_text(), self._main_kb(config))
@@ -4922,6 +4945,8 @@ class TelegramUpdateHandler:
     ) -> None:
         if chat_id is None or not self.bot_client:
             return
+        if not self.settings.telegram_management_buttons and reply_markup:
+            reply_markup = {"inline_keyboard": []}
         if message_id is not None:
             try:
                 await self.bot_client.edit_message_text(
@@ -4960,6 +4985,8 @@ class TelegramUpdateHandler:
     ) -> None:
         if not self.bot_client:
             return
+        if not self.settings.telegram_management_buttons and reply_markup and "inline_keyboard" in reply_markup:
+            reply_markup = None
         try:
             await self.bot_client.send_message(
                 chat_id,

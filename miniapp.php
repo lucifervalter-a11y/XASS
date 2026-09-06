@@ -305,4 +305,5 @@ demo||initData?loadBoot():initPwa();
 })();
 </script>
 <script src="/assets/miniapp-control-center.js?v=0130"></script>
+<script src="/assets/miniapp-server-migration.js?v=1"></script>
 </body></html>

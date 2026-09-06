@@ -21,6 +21,7 @@ from app.bot_api import TelegramBotClient
 from app.config import Settings, get_settings
 from app.db import SessionLocal, get_session, init_db
 from app.poller import telegram_polling_loop
+from app.server_migration_api import build_router as build_server_migration_router
 from app.schemas import (
     AgentPairClaimPayload,
     AgentPairClaimResponse,
@@ -556,15 +557,8 @@ async def _run_bot_post_startup() -> None:
     try:
         await bot_client.set_my_commands(
             [
-                {"command": "start", "description": "Панель управления"},
+                {"command": "start", "description": "Открыть XASS"},
                 {"command": "webapp", "description": "Открыть мини-приложение XASS"},
-                {"command": "status", "description": "Статус heartbeat-источников"},
-                {"command": "server", "description": "Метрики сервера"},
-                {"command": "pc", "description": "Состояние ПК-агентов"},
-                {"command": "chats", "description": "Сохранённые переписки"},
-                {"command": "deleted", "description": "Удалённые сообщения"},
-                {"command": "archive", "description": "Локальный архив на ПК"},
-                {"command": "update", "description": "Обновление бота и сервиса"},
                 {"command": "help", "description": "Все команды (.muz, .weather…)"},
             ]
         )
@@ -611,6 +605,8 @@ async def _update_miniapp_menu_button(public_url: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if Path(".migration-pending").exists():
+        raise RuntimeError("Migration is staged. Stop the source server, then run deploy/migrate.py activate")
     ensure_data_dirs()
     ensure_profile_exists(Path(settings.profile_json_path))
     ensure_projects_exists(Path(settings.projects_json_path))
@@ -1197,6 +1193,9 @@ def _public_origin(request: Request) -> tuple[str, str]:
     if parsed.port is not None and parsed.port != {"http": 80, "https": 443}.get(parsed.scheme):
         authority += f":{parsed.port}"
     return host, f"{parsed.scheme}://{authority}"
+
+
+app.include_router(build_server_migration_router(settings, require_mini_owner, _require_pwa_action_proof, _public_origin))
 
 
 @app.get("/api/pwa/config")

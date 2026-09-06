@@ -3,6 +3,12 @@ __pycache__/
 .venv/
 .env
 .agent.env
+.env.source
+.migration-pending
+migration-manifest.json
+migration-system/
+restored/
+*.xass-server
 run-agent.sh
 data/
 *.sqlite3
