@@ -1,11 +1,12 @@
-const CACHE = 'xass-shell-v7';
+const CACHE = 'xass-shell-v8';
 const OFFLINE = '/offline.html';
 const SHELL = [
   OFFLINE,
   '/miniapp.php?standalone=1',
   '/manifest.webmanifest',
-  '/assets/miniapp-control-center.css?v=0130',
-  '/assets/miniapp-control-center.js?v=0130',
+  '/assets/miniapp-control-center.css?v=0140',
+  '/assets/miniapp-control-center.js?v=0140',
+  '/assets/miniapp-network.js?v=0140',
   '/assets/xass-app-icon-96.png',
   '/assets/xass-app-icon-144.png',
   '/assets/xass-app-icon-180.png',
@@ -68,12 +69,17 @@ self.addEventListener('fetch', event => {
   if (url.pathname === '/proxy.php' || url.pathname.startsWith('/api/')) return;
 
   if (request.mode === 'navigate') {
+    // A public profile/project page must never replace the authenticated app shell.
+    if (url.pathname !== '/miniapp.php') return;
     event.respondWith((async () => {
       try {
         const response = await fetch(request);
-        if (response.ok) {
+        if (response.ok && response.headers.get('content-type')?.includes('text/html') && !url.searchParams.has('demo')) {
           const cache = await caches.open(CACHE);
           await cache.put('/miniapp.php?standalone=1', response.clone());
+        }
+        if (response.status >= 500) {
+          return (await caches.match('/miniapp.php?standalone=1')) || (await caches.match(OFFLINE)) || response;
         }
         return response;
       } catch (error) {
@@ -83,6 +89,9 @@ self.addEventListener('fetch', event => {
     return;
   }
 
+  // Only public static assets are cached. Downloads, auth replies, profile JSON,
+  // temporary screenshots and arbitrary future endpoints are always network-only.
+  if (!SHELL.some(item => new URL(item, self.location.origin).href === url.href)) return;
   event.respondWith((async () => {
     const cached = await caches.match(request);
     if (cached) return cached;

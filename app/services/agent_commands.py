@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AdminAction, AgentCommand
@@ -52,6 +52,20 @@ async def enqueue_agent_command(
     normalized = (command or "").strip().lower()
     if normalized not in ALLOWED_AGENT_COMMANDS:
         raise ValueError(f"Unsupported agent command: {normalized}")
+    if normalized == "update" and not_before_at is None:
+        existing = await session.scalar(
+            select(AgentCommand)
+            .where(
+                AgentCommand.source_name == source_name,
+                AgentCommand.command == normalized,
+                AgentCommand.status.in_(["pending", "delivered"]),
+                AgentCommand.not_before_at.is_(None),
+            )
+            .order_by(AgentCommand.id.asc())
+            .limit(1)
+        )
+        if existing is not None:
+            return existing
     item = AgentCommand(
         source_name=source_name,
         command=normalized,
@@ -87,7 +101,7 @@ async def acknowledge_agent_commands(
                 AgentCommand.source_name == source_name,
             )
         )
-        if item is None or item.status in {"completed", "failed"}:
+        if item is None or item.status in {"completed", "failed", "cancelled"}:
             continue
         ok = bool(result.get("ok"))
         item.status = "completed" if ok else "failed"
@@ -144,26 +158,45 @@ async def acknowledge_agent_commands(
 
 
 async def deliver_agent_commands(session: AsyncSession, *, source_name: str) -> list[dict[str, Any]]:
-    rows = list(
+    due = or_(AgentCommand.not_before_at.is_(None), AgentCommand.not_before_at <= _now_utc())
+    pending = list(
         await session.scalars(
             select(AgentCommand)
             .where(
                 AgentCommand.source_name == source_name,
-                AgentCommand.status.in_(["pending", "delivered"]),
-                or_(AgentCommand.not_before_at.is_(None), AgentCommand.not_before_at <= _now_utc()),
+                AgentCommand.status == "pending",
+                due,
             )
             .order_by(AgentCommand.id.asc())
             .limit(10)
         )
     )
+    # Reserve two slots for retries even when new requests keep arriving. Old
+    # unacknowledged commands cannot block new controls, and neither queue starves.
+    retries = list(
+        await session.scalars(
+            select(AgentCommand)
+            .where(
+                AgentCommand.source_name == source_name,
+                AgentCommand.status == "delivered",
+                due,
+            )
+            .order_by(
+                func.coalesce(AgentCommand.delivered_at, AgentCommand.created_at).asc(),
+                AgentCommand.id.asc(),
+            )
+            .limit(max(2, 10 - len(pending)))
+        )
+    )
+    rows = pending[:10 - len(retries)] + retries
     now = _now_utc()
     changed = False
     result: list[dict[str, Any]] = []
     for item in rows:
         if item.status == "pending":
             item.status = "delivered"
-            item.delivered_at = now
-            changed = True
+        item.delivered_at = now
+        changed = True
         result.append({"id": item.id, "command": item.command, "payload": item.payload or {}})
     if changed:
         await session.commit()

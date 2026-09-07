@@ -1,4 +1,4 @@
-/* XASS control-center layer. Keeps the original visual language and layout. */
+/* XASS control-center layer. Loaded after the legacy base styles. */
 :root {
   --cc-card: #0b1018;
   --cc-card-raised: #101722;
@@ -248,6 +248,84 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .cc-overview-head { grid-template-columns: 44px minmax(0, 1fr); }
   .cc-attention { grid-column: 2; text-align: left; }
   .cc-filter-row { grid-template-columns: 1fr; }
+}
+
+/* Shared readable sizing for Safari, Telegram and desktop browsers. */
+:root { --cc-blue-soft: #a5bdff; --muted: #a0abba; }
+body { line-height: 1.6; }
+body.cc-device-open { overflow: hidden; }
+[hidden] { display: none !important; }
+.wrap { max-width: 920px; }
+.head { padding-top: max(14px, env(safe-area-inset-top)); }
+.eyebrow, .intro .eyebrow { display: none; }
+.intro h1 { font-size: clamp(30px, 6vw, 44px); letter-spacing: -.045em; }
+.intro p { font-size: 14px; max-width: 580px; }
+.input, textarea.input, select.input { font-size: 16px; }
+.btn, .links a { font-size: 13px; }
+.label, .section-note, .metric-name { font-size: 11px; }
+.tab, .tabs .tab { font-size: 11px; min-height: 62px; }
+.tabs-inner { max-width: 920px; }
+.cc-hub-card { min-height: 100px; padding: 16px; border-radius: 14px; }
+.cc-hub-title { font-size: 15px; }
+.cc-hub-note, .cc-tools-head p, .cc-agent-meta { font-size: 12px; }
+.cc-agent-name { display: block; font-size: 16px; }
+.cc-agent-row .cc-agent-meta { display: block; margin-top: 4px; }
+.cc-agent-row .cc-chevron { display: block; }
+.cc-agent-row { min-height: 84px; }
+.cc-agent-state { font-size: 11px; }
+.cc-overview-copy, .cc-card-note, .cc-service-label, .cc-service-value { font-size: 12px; }
+.cc-status-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.cc-overview-head { display: grid; grid-template-columns: 47px minmax(0, 1fr); }
+.cc-attention { grid-column: 2; text-align: left; font-size: 12px; }
+.cc-card { padding: 18px; }
+.cc-card-title { font-size: 16px; flex-wrap: wrap; }
+.cc-detail-hero { margin: 4px 0 22px; }
+.cc-detail-name { font-size: 24px; overflow-wrap: anywhere; }
+.cc-metric span, .cc-fact span { font-size: 11px; }
+.cc-metric strong { font-size: 24px; }
+.cc-fact strong { font-size: 13px; }
+.cc-action { min-height: 68px; font-size: 13px; line-height: 1.4; padding: 12px; }
+.cc-action-icon { flex: 0 0 22px; display: flex; }
+.cc-action-icon svg { width: 22px; height: 22px; }
+.cc-action.primary { background: #193267; border-color: #466ac2; }
+.cc-action:hover:not(:disabled) { background-color: #152137; border-color: #486188; }
+.cc-action:disabled { opacity: .4; cursor: default; }
+.cc-action-label { font-size: 11px; }
+.cc-command-status { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.cc-command-status.pending, .cc-offline-note { color: var(--cc-amber); }
+.cc-offline-note { font-size: 13px; margin-bottom: 18px; }
+.cc-screenshot-empty, .cc-empty, .cc-error, .cc-file-meta { font-size: 13px; }
+.cc-overlay-head { padding-inline: max(16px, calc((100vw - 880px) / 2)); }
+.cc-overlay-head button { width: 44px; height: 44px; font-size: 20px; }
+.cc-overlay-body { width: min(920px, 100%); margin-inline: auto; flex: 1; min-height: 0; scrollbar-gutter: stable; }
+.cc-overlay-heading strong { font-size: 17px; }
+.cc-overlay-heading small { font-size: 12px; }
+.cc-migration-intro { color: var(--muted); font-size: 14px; }
+.cc-migration-steps { margin: 24px 0; padding-left: 24px; }
+.cc-migration-steps li { padding-left: 6px; margin-bottom: 28px; }
+.cc-migration-steps li::marker { color: var(--cc-blue-soft); font-weight: 700; }
+.cc-migration-steps h3 { font-size: 17px; font-weight: 600; }
+.cc-migration-steps p { color: var(--muted); font-size: 14px; margin: 6px 0 12px; }
+.cc-migration-steps pre { overflow-x: auto; padding: 14px; background: #05080e; border: 1px solid var(--cc-line); border-radius: 10px; margin-bottom: 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.cc-doc-link { display: inline-flex; align-items: center; text-decoration: none; }
+.screen { overflow-y: auto; padding: max(24px, env(safe-area-inset-top)) 24px max(24px, env(safe-area-inset-bottom)); }
+.login, .deny { margin: auto; }
+.login .ios-help { font-size: 13px; }
+.toast { font-size: 13px; border-radius: 12px; bottom: calc(86px + env(safe-area-inset-bottom)); }
+.view, .cc-panel { scroll-margin-top: 100px; }
+@media (min-width: 800px) {
+  .wrap { padding-inline: 28px; }
+  .cc-status-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .cc-overview-head { grid-template-columns: 47px minmax(0, 1fr) auto; }
+  .cc-attention { grid-column: auto; }
+  .cc-overlay-body { padding: 24px 28px 40px; }
+}
+@media (max-width: 380px) {
+  .widget-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cc-hub-grid { gap: 8px; }
+  .cc-hub-card { padding: 12px; }
+  .cc-action { font-size: 12px; gap: 6px; }
+  .cc-card { padding: 14px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -20,6 +20,9 @@
     file_delete: 'Удаление файла', clipboard_get: 'Получение буфера', clipboard_set: 'Отправка в буфер',
   };
   const DANGEROUS = new Set(['lock', 'sleep', 'restart', 'update', 'reboot', 'shutdown', 'cleanup_archive', 'file_delete']);
+  const pendingCommands = new Map();
+  const REASONS = {offline: 'нет связи', high_cpu: 'высокая нагрузка процессора', high_ram: 'мало памяти', low_disk: 'мало места на диске', agent_error: 'ошибка агента', archive_error: 'ошибка архива', update_available: 'доступно обновление'};
+  const COMMAND_STATES = {pending: 'Ожидает агента', delivered: 'Доставлена агенту', completed: 'Выполнена', failed: 'Ошибка', cancelled: 'Отменена'};
   const ui = {
     activeAgent: '', activePanel: '', fileRoot: 'desktop', filePath: '',
     clipboardHistory: readClipboardHistory(), objectUrls: new Set(),
@@ -39,6 +42,39 @@
     data: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>',
     scenarios: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m13 2-9 12h7l-1 8 10-13h-7z"/></svg>',
   };
+
+  function actionIcon(command) {
+    const paths = {
+      lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/>',
+      screenshot: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3"/>',
+      ping: '<path d="M2 12h4l3-7 5 14 3-7h5"/>',
+      history: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+      sleep: '<path d="M20 15A8 8 0 0 1 9 4a8 8 0 1 0 11 11Z"/>',
+      restart: '<path d="M20 5v5h-5m5 0a8 8 0 1 0-1 8"/>',
+      check_update: '<path d="M20 5v5h-5m5 0a8 8 0 1 0-1 8"/>',
+      update: '<path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5"/>',
+      open_archive: '<path d="M3 7h18v14H3zM2 3h20v4H2zM9 12h6"/>',
+      cleanup_archive: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/>',
+      reboot: '<path d="M20 5v5h-5m5 0a8 8 0 1 0-1 8"/>',
+      shutdown: '<path d="M12 2v10m-5-7a9 9 0 1 0 10 0"/>',
+    };
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' + (paths[command] || '<path d="M5 12h14m-5-5 5 5-5 5"/>') + '</svg>';
+  }
+
+  function renderMigrationPanel() {
+    const host = $('ccDynamic-migration'); if (!host) return;
+    const steps = [
+      ['Создайте копию', 'В терминале старого сервера, из папки XASS. Архив включает настройки, ключи, сайт, базу и данные сервера.', 'sudo bash deploy/backup.sh /opt/serverredus /opt/serverredus-backups'],
+      ['Перенесите архив', 'Скопируйте полученный .tar.gz на новый сервер через SFTP. Не публикуйте архив: внутри находятся ключи доступа. Медиа, хранящиеся только на ПК-агенте, остаются на этом ПК.', ''],
+      ['Проверьте и восстановите', 'На новом Debian/Ubuntu откройте папку свежей копии репозитория XASS. Замените путь к архиву и домен своими значениями. Папка назначения должна быть пустой.', 'python3 deploy/migrate.py inspect /private/xass.tar.gz\nsudo bash deploy/restore.sh /private/xass.tar.gz /opt/serverredus example.com'],
+      ['Переключите домен', 'Остановите старый сервер XASS, направьте DNS на новый IP и выпустите HTTPS-сертификат по инструкции. При сохранении домена агенты, ссылки и вход на iPhone продолжат использовать прежний адрес.', ''],
+    ];
+    host.innerHTML = '<div class="cc-card-title">XASS на новом сервере</div><p class="cc-migration-intro">Код, данные и настройки в одной проверяемой копии.</p><ol class="cc-migration-steps">' + steps.map(([title, description, command], index) => '<li><h3>' + title + '</h3><p>' + description + '</p>' + (command ? '<pre><code>' + esc(command) + '</code></pre><button class="btn" data-copy-migration="' + index + '">Скопировать команду</button>' : '') + '</li>').join('') + '</ol><a class="btn cc-doc-link" target="_blank" rel="noopener noreferrer" href="https://github.com/lucifervalter-a11y/XASS/blob/main/docs/MIGRATION.md">Полная инструкция по переносу ↗</a>';
+    host.querySelectorAll('[data-copy-migration]').forEach(button => button.onclick = async () => {
+      try { await X.copyText(steps[Number(button.dataset.copyMigration)][2]); X.toast('Команда скопирована'); }
+      catch (_) { X.toast('Не удалось скопировать. Выделите команду вручную.'); }
+    });
+  }
 
   function readClipboardHistory() {
     try {
@@ -137,7 +173,7 @@
   function renderCompactAgents() {
     const home = $('homeDevices');
     const all = $('deviceList');
-    if (home) home.innerHTML = '<div class="cc-agent-list">' + (X.state.boot?.sources || []).slice(0, 3).map(compactAgentHtml).join('') + '</div>' || '<div class="cc-empty">Устройства ещё не подключены.</div>';
+    if (home) { const sources = X.state.boot?.sources || []; home.innerHTML = sources.length ? '<div class="cc-agent-list">' + sources.slice(0, 3).map(compactAgentHtml).join('') + '</div>' : '<div class="cc-empty">Подключите первый ПК: Инструменты → Агенты → Подключить ПК.</div>'; }
     if (all) {
       const list = currentFilteredAgents();
       all.innerHTML = list.length ? '<div class="cc-agent-list">' + list.map(compactAgentHtml).join('') + '</div>' : '<div class="cc-empty">В этой группе устройств нет.</div>';
@@ -175,7 +211,7 @@
     ['server', 'Сервер', 'Сервисы и обновления', 'server', 'Сервер'],
     ['files', 'Файлы', 'Разрешённые папки ПК', 'file', ''],
     ['clipboard', 'Буфер', 'Текст между XASS и ПК', 'clipboard', ''],
-    ['timeline', 'Timeline', 'Единый журнал событий', 'timeline', ''],
+    ['timeline', 'События', 'Единый журнал событий', 'timeline', ''],
     ['rules', 'Правила', 'Простые ЕСЛИ → ТО', 'rules', ''],
     ['notifications', 'Уведомления', 'События и каналы', 'bell', 'Уведомления'],
     ['archive', 'Архив', 'Удалённые и медиа', 'archive', 'Архив переписки'],
@@ -183,6 +219,7 @@
     ['scenarios', 'Сценарии', 'Группы действий', 'scenarios', 'Сценарии'],
     ['iphone', 'iPhone', 'Вход и Face ID', 'phone', 'iPhone'],
     ['data', 'Данные', 'Копии и диагностика', 'data', 'Данные и диагностика'],
+    ['migration', 'Перенос', 'На другой сервер', 'server', ''],
   ];
 
   function buildToolsHub() {
@@ -226,6 +263,7 @@
     if (id === 'timeline') loadTimeline();
     if (id === 'rules') renderRulesPanel();
     if (id === 'agents') renderCompactAgents();
+    if (id === 'migration') renderMigrationPanel();
     setTimeout(() => panel?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 20);
   }
 
@@ -236,11 +274,26 @@
     $('ccAgentRefresh').onclick = async () => { await X.loadBoot(); openAgent(ui.activeAgent); };
     $('ccLightboxClose').onclick = () => $('ccLightbox').classList.remove('open');
     $('ccLightbox').addEventListener('click', event => { if (event.target === $('ccLightbox')) $('ccLightbox').classList.remove('open'); });
+    const detail = $('ccAgentDetail');
+    detail.setAttribute('role', 'dialog'); detail.setAttribute('aria-modal', 'true'); detail.setAttribute('aria-labelledby', 'ccAgentTitle');
+    document.addEventListener('keydown', event => {
+      if (!detail.classList.contains('open') || document.querySelector('.confirm-screen.show')) return;
+      if (event.key === 'Escape') { if ($('ccLightbox').classList.contains('open')) $('ccLightbox').classList.remove('open'); else closeAgent(); }
+      if (event.key === 'Tab') {
+        const targets = [...detail.querySelectorAll('button:not(:disabled),input,select,[href]')].filter(node => node.getClientRects().length);
+        const first = targets[0], last = targets[targets.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
+    });
   }
 
   function closeAgent() {
     $('ccAgentDetail')?.classList.remove('open');
     $('ccAgentDetail')?.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('cc-device-open');
+    $('app').inert = false; $('tabs').inert = false;
+    ui.returnFocus?.focus({preventScroll: true});
   }
 
   function openAgent(source) {
@@ -248,27 +301,33 @@
     const item = selectedAgent();
     if (!item) return X.toast('Агент не найден');
     createOverlays();
+    const wasOpen = $('ccAgentDetail').classList.contains('open');
+    if (!wasOpen) ui.returnFocus = document.activeElement;
     $('ccAgentTitle').textContent = item.source_name;
     $('ccAgentSubtitle').textContent = (item.last_payload?.platform || item.source_type || 'Устройство') + ' · v' + (item.agent_version || '0.0.0');
     $('ccAgentBody').innerHTML = agentDetailHtml(item);
     $('ccAgentDetail').classList.add('open');
     $('ccAgentDetail').setAttribute('aria-hidden', 'false');
+    document.body.classList.add('cc-device-open');
+    $('app').inert = true; $('tabs').inert = true;
+    if (!wasOpen) $('ccAgentBack').focus({preventScroll: true});
     bindAgentDetail(item);
     loadLatestScreenshot(item.source_name);
   }
 
   function agentDetailHtml(item) {
     const metrics = item.last_payload?.metrics || {}, system = item.system || item.last_payload?.system || {}, state = agentState(item);
-    const reason = (item.attention_reasons || []).join(', ');
-    const action = (command, label, icon = '→', kind = '') => '<button class="cc-action ' + kind + '" data-cc-command="' + command + '"><span class="cc-action-icon">' + icon + '</span><span>' + label + '</span></button>';
+    const reason = (item.attention_reasons || []).map(reason => REASONS[reason] || reason).join(', ');
+    const action = (command, label, icon = '→', kind = '') => '<button class="cc-action ' + kind + '" data-cc-command="' + command + '" ' + (!item.is_online && command !== 'history' ? 'disabled' : '') + '><span class="cc-action-icon" aria-hidden="true">' + actionIcon(command) + '</span><span>' + label + '</span></button>';
     return '<div class="cc-detail-hero">' + agentIcon() + '<div><div class="cc-detail-name">' + esc(item.source_name) + '</div><div class="cc-agent-meta">' + esc(item.last_payload?.platform || item.source_type || 'Устройство') + ' · ' + esc(X.age(item.last_seen_at)) + '</div></div><span class="cc-agent-state ' + state[0] + '">' + state[1] + '</span></div>' +
       (reason ? '<div class="cc-card" style="border-color:rgba(240,182,87,.35);color:#f3c879">Требует внимания: ' + esc(reason) + '</div>' : '') +
       '<div class="cc-card"><div class="cc-card-title"><span>Состояние</span><span class="cc-card-note">' + esc(item.is_online ? 'связь активна' : X.age(item.last_seen_at)) + '</span></div><div class="cc-metrics">' +
       [['CPU', metrics.cpu_percent], ['RAM', metrics.ram_used_percent], ['Диск', metrics.disk_used_percent]].map(([name, value]) => '<div class="cc-metric"><span>' + name + '</span><strong>' + esc(X.valueText(value, '%')) + '</strong></div>').join('') +
       '</div><div class="cc-detail-facts"><div class="cc-fact"><span>Uptime</span><strong>' + esc(system.uptime || item.last_payload?.uptime || '—') + '</strong></div><div class="cc-fact"><span>Последняя связь</span><strong>' + esc(X.age(item.last_seen_at)) + '</strong></div><div class="cc-fact"><span>Версия агента</span><strong>' + esc(item.agent_version || '0.0.0') + '</strong></div><div class="cc-fact"><span>Последняя команда</span><strong>' + esc(item.latest_command?.command ? COMMAND_LABELS[item.latest_command.command] || item.latest_command.command : 'нет команд') + '</strong></div></div></div>' +
       '<div class="cc-card"><div class="cc-card-title"><span>Быстрые действия</span><span class="cc-card-note">команды выполняет агент</span></div>' +
-      '<div class="cc-action-group"><div class="cc-action-label">Диагностика</div><div class="cc-action-grid">' + action('ping', 'Проверить связь', '⌁') + action('check_update', 'Проверить обновление', '↻') + action('history', 'История команд', '≡') + action('screenshot', 'Сделать снимок', '▣') + '</div></div>' +
-      '<div class="cc-action-group"><div class="cc-action-label">Система</div><div class="cc-action-grid">' + action('sleep', 'Сон', '☾') + action('lock', 'Заблокировать экран', '▢') + action('restart', 'Перезапустить агент', '↻') + action('update', 'Обновить агент', '⇧') + '</div></div>' +
+      (!item.is_online ? '<div class="cc-offline-note">ПК не в сети. Включите компьютер и агент XASS, затем обновите состояние. История команд остаётся доступной.</div>' : '') +
+      '<div class="cc-action-group"><div class="cc-action-grid">' + action('lock', 'Заблокировать экран', '', 'primary') + action('screenshot', 'Сделать снимок') + action('ping', 'Проверить связь') + action('history', 'История команд') + '</div></div>' +
+      '<div class="cc-action-group"><div class="cc-action-label">Система и обновления</div><div class="cc-action-grid">' + action('sleep', 'Режим сна') + action('check_update', 'Проверить обновление') + action('restart', 'Перезапустить агент') + action('update', 'Обновить агент') + '</div></div>' +
       '<div class="cc-action-group"><div class="cc-action-label">Архив</div><div class="cc-action-grid">' + action('open_archive', 'Открыть архив', '▤') + action('cleanup_archive', 'Очистить медиа', '⌫') + '<button class="cc-action wide" id="ccArchiveToggle"><span class="cc-action-icon">◉</span><span>' + (item.archive_enabled ? 'Не хранить архив на этом ПК' : 'Хранить архив на этом ПК') + '</span></button></div></div>' +
       '<div class="cc-action-group"><div class="cc-action-label">Опасные</div><div class="cc-action-grid">' + action('reboot', 'Перезагрузить ПК', '↻', 'danger') + action('shutdown', 'Выключить ПК', '⏻', 'danger') + '</div></div><div class="cc-command-status" id="ccCommandStatus"></div></div>' +
       '<div class="cc-card"><div class="cc-card-title"><span>Экран</span><button class="btn" id="ccScreenshotRefresh">Обновить снимок</button></div><div class="cc-screenshot-shell" id="ccScreenshot"><div class="cc-screenshot-empty">Снимок загружается только по вашему запросу и временно хранится на сервере.</div></div><div class="cc-card-note" id="ccScreenshotMeta" style="margin-top:8px"></div></div>' +
@@ -281,6 +340,7 @@
       if (command === 'history') return loadCommandHistory(item.source_name);
       runAgentCommand(item.source_name, command, {}, button);
     });
+    $('ccScreenshotRefresh').disabled = !item.is_online;
     $('ccScreenshotRefresh').onclick = () => runAgentCommand(item.source_name, 'screenshot', {}, $('ccScreenshotRefresh'), () => loadLatestScreenshot(item.source_name));
     $('ccArchiveToggle').onclick = async () => {
       const enabled = !item.archive_enabled;
@@ -293,8 +353,14 @@
   }
 
   async function runAgentCommand(source, command, payload = {}, button = null, after = null) {
+    const key = source + ':' + command;
+    if (pendingCommands.has(key)) { X.toast('Эта команда уже отправлена. Дождитесь результата.'); return null; }
+    const agent = (X.state.boot?.sources || []).find(item => item.source_name === source);
+    if (!agent?.is_online) { X.toast('Нет связи с ПК. Включите агент и обновите состояние.'); return null; }
     const dangerous = DANGEROUS.has(command);
     if (dangerous && !await confirmAction((COMMAND_LABELS[command] || command) + ' на «' + source + '»?')) return null;
+    if (pendingCommands.has(key)) return null;
+    pendingCommands.set(key, true);
     if (button) button.disabled = true;
     const status = $('ccCommandStatus');
     if (status) { status.className = 'cc-command-status'; status.textContent = (COMMAND_LABELS[command] || command) + ': отправляю…'; }
@@ -309,8 +375,16 @@
       const proof = dangerous ? await X.passkeyAction('agent:' + command + ':' + source) : '';
       const response = await ccApi('agents/' + encodeURIComponent(source) + '/commands', { method: 'POST', body: { command, payload, action_proof: proof } });
       if (!response.data?.ok) throw new Error(response.data?.detail || 'Команда не принята');
-      if (status) status.textContent = (COMMAND_LABELS[command] || command) + ': агент выполняет…';
-      const result = await waitForCommand(source, response.data.command.id);
+      const commandId = response.data.command.id;
+      if (status) status.textContent = (COMMAND_LABELS[command] || command) + ': ожидает агента';
+      const result = await waitForCommand(source, commandId, commandState => {
+        if (status) status.textContent = (COMMAND_LABELS[command] || command) + ': ' + (COMMAND_STATES[commandState] || 'ожидание');
+      });
+      if (result.status === 'pending' || result.status === 'delivered') {
+        if (status) { status.classList.add('pending'); status.textContent = 'Команда №' + commandId + ' ещё ожидает результата. Проверьте «Историю команд»; повторно отправлять её не нужно.'; }
+        X.toast('Команда сохранена. Результат появится в истории.');
+        return null;
+      }
       const ok = result.status === 'completed' && result.result?.ok !== false;
       if (!ok) throw new Error(result.result?.message || 'Команда завершилась ошибкой');
       if (status) { status.classList.add('ok'); status.textContent = result.result?.message || 'Готово'; }
@@ -320,7 +394,7 @@
       if (status) { status.classList.add('bad'); status.textContent = error.message || 'Ошибка команды'; }
       if (error?.name !== 'NotAllowedError') X.toast(error.message || 'Команда не выполнена');
       return null;
-    } finally { if (button) button.disabled = false; }
+    } finally { pendingCommands.delete(key); if (button) button.disabled = false; }
   }
 
   function demoCommand(command, payload) {
@@ -331,14 +405,18 @@
     return { id: Date.now(), status: 'completed', result: { ok: true, message: (COMMAND_LABELS[command] || command) + ': готово', details } };
   }
 
-  async function waitForCommand(source, id) {
-    for (let attempt = 0; attempt < 55; attempt++) {
+  async function waitForCommand(source, id, onState) {
+    const deadline = Date.now() + 65000;
+    let latest = {id, status: 'pending'};
+    while (Date.now() < deadline) {
       const response = await ccApi('agents/' + encodeURIComponent(source) + '/commands?limit=40');
+      if (!response.data?.ok) throw new Error(response.data?.detail || 'Не удалось проверить команду. Откройте историю перед повторной отправкой.');
       const command = (response.data?.commands || []).find(item => Number(item.id) === Number(id));
+      if (command) { latest = command; onState?.(command.status); }
       if (command && ['completed', 'failed', 'cancelled'].includes(command.status)) return command;
       await delay(1200);
     }
-    throw new Error('Агент долго не отвечает. Команда остаётся в очереди.');
+    return latest;
   }
 
   async function loadCommandHistory(source) {
@@ -368,7 +446,11 @@
       const shot = response.data.screenshot;
       const raw = await rawRequest('agents/' + encodeURIComponent(source) + '/assets/' + encodeURIComponent(shot.token));
       if (!raw.ok) throw new Error('Не удалось загрузить снимок');
-      const url = URL.createObjectURL(await raw.blob()); ui.objectUrls.add(url);
+      const blob = await raw.blob();
+      if (source !== ui.activeAgent || shell !== $('ccScreenshot')) return;
+      const previous = shell.querySelector('img')?.src;
+      if (previous) { URL.revokeObjectURL(previous); ui.objectUrls.delete(previous); }
+      const url = URL.createObjectURL(blob); ui.objectUrls.add(url);
       shell.innerHTML = '<img src="' + url + '" alt="Последний снимок экрана ' + esc(source) + '">';
       if (meta) meta.textContent = 'Получен ' + dateText(shot.created_at) + ' · временное хранение';
       shell.querySelector('img').onclick = () => { $('ccLightboxImage').src = url; $('ccLightbox').classList.add('open'); };
@@ -572,7 +654,7 @@
     if (ui.activePanel === 'files') renderFilesPanel();
     if (ui.activePanel === 'clipboard') renderClipboardPanel();
     if (ui.activePanel === 'rules') renderRulesPanel();
-    if (ui.activeAgent && $('ccAgentDetail')?.classList.contains('open')) openAgent(ui.activeAgent);
+    if (ui.activeAgent && $('ccAgentDetail')?.classList.contains('open') && ![...pendingCommands.keys()].some(key => key.startsWith(ui.activeAgent + ':'))) openAgent(ui.activeAgent);
     setTimeout(enhanceNotifications, 250);
   }
 
@@ -587,6 +669,12 @@
     if (event.detail?.name === 'tools') setTimeout(() => { buildToolsHub(); renderCompactAgents(); enhanceNotifications(); }, 0);
   });
   window.addEventListener('beforeunload', () => ui.objectUrls.forEach(url => URL.revokeObjectURL(url)));
+  function refreshVisibleDevices() {
+    if (document.hidden || X.demo || !X.state.boot || X.state.profileDirty || pendingCommands.size) return;
+    if ($('view-home')?.classList.contains('on') || $('ccAgentDetail')?.classList.contains('open')) X.loadBoot();
+  }
+  document.addEventListener('visibilitychange', refreshVisibleDevices);
+  setInterval(refreshVisibleDevices, 15000);
 
   if (X.state.boot) enhance();
 })();

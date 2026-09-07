@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import zipfile
@@ -32,7 +33,8 @@ class AgentUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cache:
             settings = SimpleNamespace(agent_update_cache_dir=cache, agent_updates_enabled=True)
             package = build_agent_package(settings)
-            self.assertEqual(package.version, "0.13.3")
+            expected_version = json.loads((Path(__file__).resolve().parents[1] / "pc_client" / "version.json").read_text(encoding="utf-8"))["version"]
+            self.assertEqual(package.version, expected_version)
             self.assertEqual(len(package.sha256), 64)
             self.assertGreater(package.size, 0)
             with zipfile.ZipFile(package.path, "r") as archive:

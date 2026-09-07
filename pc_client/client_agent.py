@@ -7,6 +7,7 @@ import random
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,44 @@ _last_heartbeat_latency_ms = 0.0
 _last_heartbeat_error = ""
 _last_heartbeat_error_at = ""
 _last_server_version = ""
+COMMAND_POLL_INTERVAL_SEC = 5.0
+
+
+class _ArchiveSyncWorker:
+    """Keep at most one archive batch in flight, independent of command polling."""
+
+    def __init__(self) -> None:
+        self.thread: threading.Thread | None = None
+
+    @property
+    def busy(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def submit(self, config: dict[str, Any], response: dict[str, Any], headers: dict[str, str]) -> None:
+        if self.busy or not response.get("archive_enabled") or not response.get("archive_events"):
+            # The server redelivers events after the last durable archive cursor.
+            return
+        config_snapshot = dict(config)
+
+        def worker() -> None:
+            try:
+                with create_http_client(
+                    str(config_snapshot["server_url"]),
+                    timeout=20,
+                    trust_env=bool(config_snapshot.get("trust_env_proxy", False)),
+                ) as client:
+                    result = apply_archive_events(config_snapshot, response, client=client, headers=headers)
+                if result.get("saved"):
+                    print(
+                        f"[pc-client] archive saved={result['saved']} "
+                        f"cursor={result['cursor']} errors={result.get('errors', 0)}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[pc-client] archive sync failed: {exc}", flush=True)
+
+        self.thread = threading.Thread(target=worker, name="xass-archive-sync", daemon=True)
+        self.thread.start()
 
 
 def _disk_path() -> str:
@@ -170,6 +209,21 @@ def mark_command_processed(command_id: int, command_name: str) -> None:
     }
     ordered = sorted(rows.items(), key=lambda item: float((item[1] or {}).get("processed_at") or 0))[-250:]
     atomic_write_json(PROCESSED_COMMANDS_PATH, {"commands": dict(ordered)}, backup=False)
+
+
+def _command_needs_execution(command_id: int) -> bool:
+    if not command_was_processed(command_id):
+        return True
+    if not any(str(row.get("id")) == str(command_id) for row in load_command_results()):
+        # A crash can occur between the durable execution marker and the result.
+        # Never replay a power/file action whose outcome is uncertain.
+        store_command_result(
+            command_id,
+            False,
+            "Результат команды потерян после прерывания агента. Проверьте состояние ПК; при необходимости отправьте команду снова.",
+            {"interrupted": True},
+        )
+    return False
 
 
 def collect_metrics(include_processes: bool, top_n: int = 5) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -649,7 +703,7 @@ def run_agent(config: dict[str, Any]) -> str:
     global _last_heartbeat_error, _last_heartbeat_error_at, _last_heartbeat_latency_ms, _last_server_version
     endpoint = f"{config['server_url'].rstrip('/')}/agent/heartbeat"
     headers = {"X-Api-Key": config["api_key"]}
-    interval_sec = int(config.get("interval_sec", 30))
+    interval_sec = max(1, int(config.get("interval_sec", 30)))
     source_name = str(config.get("source_name") or socket.gethostname())
     source_type = str(config.get("source_type") or "PC_AGENT")
     trust_env_proxy = bool(config.get("trust_env_proxy", False))
@@ -663,6 +717,10 @@ def run_agent(config: dict[str, Any]) -> str:
     failed_auto_revision = ""
     consecutive_failures = 0
     sleep_seconds = 0.0
+    telemetry: dict[str, Any] | None = None
+    telemetry_collected_at = 0.0
+    last_successful_heartbeat_at = 0.0
+    archive_worker = _ArchiveSyncWorker()
     with create_http_client(
         str(config["server_url"]),
         timeout=20,
@@ -671,7 +729,17 @@ def run_agent(config: dict[str, Any]) -> str:
         while True:
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
-            payload = build_payload({**config, "source_name": source_name, "source_type": source_type})
+            if telemetry is None or time.monotonic() - telemetry_collected_at >= interval_sec:
+                telemetry = build_payload({**config, "source_name": source_name, "source_type": source_type})
+                telemetry_collected_at = time.monotonic()
+            payload = {
+                **telemetry,
+                "command_results": load_command_results(),
+                "archive_cursor": archive_cursor(config),
+                "last_error": _last_heartbeat_error,
+                "last_error_at": _last_heartbeat_error_at,
+                "server_version_seen": _last_server_version,
+            }
             sent_result_ids = [
                 int(item.get("id"))
                 for item in payload.get("command_results", [])
@@ -698,6 +766,7 @@ def run_agent(config: dict[str, Any]) -> str:
                 )
                 if body.get("new_source"):
                     msg += " | новый агент зарегистрирован"
+                last_successful_heartbeat_at = time.time()
                 write_agent_status(
                     "online",
                     detail=msg,
@@ -706,10 +775,13 @@ def run_agent(config: dict[str, Any]) -> str:
                     agent_version=current_version(),
                     server_version=_last_server_version,
                     last_error="",
+                    heartbeat_at=last_successful_heartbeat_at,
                 )
                 print(msg, flush=True)
                 consecutive_failures = 0
-                sleep_seconds = float(min(interval_sec, 5) if config.get("archive_enabled") else interval_sec)
+                _last_heartbeat_error = ""
+                _last_heartbeat_error_at = ""
+                sleep_seconds = min(float(interval_sec), COMMAND_POLL_INTERVAL_SEC)
                 commands = body.get("commands") if isinstance(body.get("commands"), list) else []
                 if sent_result_ids:
                     still_pending = {
@@ -721,13 +793,7 @@ def run_agent(config: dict[str, Any]) -> str:
 
                 manifest = body.get("update") if isinstance(body.get("update"), dict) else None
                 installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
-                archive_result = apply_archive_events(config, body, client=client, headers=headers)
-                if archive_result.get("saved"):
-                    print(
-                        f"[pc-client] archive saved={archive_result['saved']} "
-                        f"cursor={archive_result['cursor']} errors={archive_result.get('errors', 0)}",
-                        flush=True,
-                    )
+                config["archive_enabled"] = bool(body.get("archive_enabled"))
                 update_command_id: int | None = None
                 for command in commands:
                     if not isinstance(command, dict):
@@ -738,7 +804,7 @@ def run_agent(config: dict[str, Any]) -> str:
                         continue
                     command_name = str(command.get("command") or "").strip().lower()
                     command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-                    if command_was_processed(command_id):
+                    if not _command_needs_execution(command_id):
                         continue
                     # Persist before execution. If the process dies after a power or
                     # lock command, the same server delivery cannot execute it twice.
@@ -768,6 +834,9 @@ def run_agent(config: dict[str, Any]) -> str:
                         _open_archive_folder(config, command_id)
                         continue
                     if command_name == "cleanup_archive":
+                        if archive_worker.busy:
+                            store_command_result(command_id, False, "Архив ещё синхронизируется. Повторите очистку после завершения синхронизации.")
+                            continue
                         result = cleanup_archive(config, force=True)
                         store_command_result(
                             command_id,
@@ -799,7 +868,15 @@ def run_agent(config: dict[str, Any]) -> str:
                     if command_name == "restart":
                         return _restart_agent(config, command_id)
                     if command_name == "update":
-                        update_command_id = command_id
+                        if update_command_id is None:
+                            update_command_id = command_id
+                        else:
+                            store_command_result(
+                                command_id,
+                                False,
+                                f"Повторный запрос обновления отменён: выполняется команда №{update_command_id}.",
+                                {"duplicate_of": update_command_id},
+                            )
                         continue
                     store_command_result(command_id, False, f"Неизвестная команда агента: {command_name or 'empty'}")
 
@@ -828,6 +905,10 @@ def run_agent(config: dict[str, Any]) -> str:
                         if update_result:
                             return update_result
                         failed_auto_revision = revision
+                archive_worker.submit(config, body, headers)
+                if load_command_results():
+                    # Acknowledge promptly instead of waiting another telemetry interval.
+                    sleep_seconds = 0.1
             except Exception as exc:
                 error = f"[pc-client] heartbeat failed: {exc}"
                 _last_heartbeat_error = str(exc)[:1000]
@@ -839,6 +920,7 @@ def run_agent(config: dict[str, Any]) -> str:
                     agent_version=current_version(),
                     server_version=_last_server_version,
                     last_error=str(exc)[:1000],
+                    heartbeat_at=last_successful_heartbeat_at,
                 )
                 print(error, flush=True)
                 consecutive_failures += 1

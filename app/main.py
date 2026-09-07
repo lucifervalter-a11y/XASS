@@ -164,7 +164,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.13.1"
+APP_VERSION = "0.14.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -691,6 +691,46 @@ async def agent_pair_claim(
         agent_api_key=result.agent_api_key,
         issued_at=result.issued_at,
     )
+
+
+@app.get("/agent/update-manifest")
+async def agent_update_manifest(
+    request: Request,
+    response: Response,
+    agent_version: str = "",
+    agent_revision: str = "",
+    agent_distribution: str = "source",
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Desktop update checks must never consume commands or impersonate a heartbeat."""
+    auth = await authenticate_agent_api_key(
+        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key,
+    )
+    if auth is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    if agent_distribution not in {"source", "installer"}:
+        raise HTTPException(status_code=400, detail="Unknown agent distribution")
+    if len(agent_version) > 128 or len(agent_revision) > 128:
+        raise HTTPException(status_code=400, detail="Invalid agent version")
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "X-Api-Key"
+    config = await get_or_create_app_config(session, settings)
+    base_url = str(request.base_url).rstrip("/")
+    configured = urlsplit((config.service_base_url or settings.profile_public_url or "").strip())
+    if configured.scheme in {"http", "https"} and configured.netloc:
+        base_url = f"{configured.scheme}://{configured.netloc}"
+    installer = agent_distribution == "installer"
+    manifest = await asyncio.to_thread(
+        build_installer_manifest if installer else build_update_manifest,
+        settings,
+        api_key=(x_api_key or "").strip(),
+        base_url=base_url,
+        current_version=agent_version,
+        current_revision=agent_revision,
+    )
+    return {"ok": True, "update": None if installer else manifest,
+            "installer_update": manifest if installer else None}
 
 
 @app.post("/agent/heartbeat", response_model=HeartbeatResponse)
@@ -1913,7 +1953,7 @@ async def mini_diagnostic_action(
         )
         result.update({"message": "Тестовая команда поставлена в очередь", "command_id": command.id})
     elif action == "restart_backend":
-        background_tasks.add_task(restart_service, settings)
+        background_tasks.add_task(_restart_after_mini_request, user.user_id, "из диагностики Mini App")
         result["message"] = "Перезапуск backend запланирован после ответа"
     elif action == "rollback_update":
         rollback_result = await asyncio.to_thread(rollback_update, settings, execute_restart=False)

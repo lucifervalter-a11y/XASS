@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import math
 import os
 import platform
 import queue
@@ -21,7 +22,6 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 from typing import Any, Callable
 
-import httpx
 import psutil
 
 try:
@@ -38,7 +38,6 @@ except ImportError:
     TkinterDnD = None
 
 from client_agent import (
-    build_payload,
     claim_pair_code,
     discover_backend_url,
     ensure_minimal_defaults,
@@ -87,6 +86,67 @@ VIOLET = "#3b82f6"
 GREEN = "#61c554"
 AMBER = "#efb65c"
 RED = "#f36b76"
+
+
+def connection_snapshot(
+    payload: dict[str, Any] | None,
+    *,
+    active_pid: int,
+    started_at: float = 0,
+    interval_sec: float = 30,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """A status file is evidence of a live connection only while it is fresh."""
+    now = time.time() if now is None else now
+    try:
+        report = payload if isinstance(payload, dict) else {}
+        updated_at = float(report.get("updated_at") or 0)
+        status_pid = int(report.get("process_id") or 0)
+        interval = max(5.0, float(interval_sec))
+        latency = float(report.get("latency_ms") or 0)
+        if not all(math.isfinite(value) for value in (updated_at, interval, latency)):
+            raise ValueError("invalid status number")
+    except (ValueError, TypeError, OverflowError):
+        return {"state": "connecting", "age": None, "latency_ms": 0}
+    if not active_pid or status_pid != active_pid or updated_at <= 0 or updated_at < started_at or updated_at > now + 5:
+        return {"state": "connecting", "age": None, "latency_ms": 0}
+    age = max(0, int(now - updated_at))
+    state = str(report.get("state") or "connecting").lower()
+    if age > max(45, interval * 3 + 15):
+        state = "stale"
+    return {"state": state, "age": age, "latency_ms": max(0, latency)}
+
+
+class ResponsiveColumns(tk.Frame):
+    """Keep panels readable at normal Windows zoom and narrow window widths."""
+
+    def __init__(self, parent: tk.Misc, *, breakpoint: int = 850, **options: Any) -> None:
+        super().__init__(parent, **options)
+        self.breakpoint = breakpoint
+        self.panels: list[tk.Widget] = []
+        self._wide: bool | None = None
+        self.bind("<Configure>", self._arrange)
+
+    def add(self, panel: tk.Widget) -> None:
+        self.panels.append(panel)
+        self._wide = None
+        self._arrange()
+
+    def _arrange(self, _event: Any = None) -> None:
+        wide = self.winfo_width() >= self.breakpoint
+        if wide == self._wide:
+            return
+        self._wide = wide
+        for column in range(len(self.panels)):
+            self.columnconfigure(column, weight=1 if wide or column == 0 else 0, uniform="panels" if wide else "")
+        for index, panel in enumerate(self.panels):
+            panel.grid(
+                row=0 if wide else index,
+                column=index if wide else 0,
+                sticky="nsew",
+                padx=(0 if index == 0 or not wide else 8, 0 if index == len(self.panels) - 1 or not wide else 8),
+                pady=(0, 0 if wide or index == len(self.panels) - 1 else 16),
+            )
 
 
 class DarkScrolledText(tk.Frame):
@@ -144,6 +204,7 @@ def _resource_path(relative: str) -> Path:
 class XassDesktop:
     def __init__(self, root: tk.Tk, *, minimized: bool = False, preview: bool = False) -> None:
         self.root = root
+        self.preview = preview
         self.root.title("XASS — предпросмотр" if preview else "XASS")
         screen_width = max(960, self.root.winfo_screenwidth())
         screen_height = max(700, self.root.winfo_screenheight())
@@ -177,6 +238,7 @@ class XassDesktop:
             width=11,
         )
         style.map("XASS.Vertical.TScrollbar", background=[("active", ACCENT)])
+        style.configure("XASS.Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD, bordercolor=FIELD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=4)
         icon_path = _resource_path("assets/xass.ico")
         if icon_path.is_file():
             try:
@@ -187,20 +249,26 @@ class XassDesktop:
         brand_path = _resource_path("assets/xass-icon.png")
         if brand_path.is_file():
             try:
-                self.brand_image = tk.PhotoImage(file=str(brand_path)).subsample(8, 8)
+                self.brand_image = tk.PhotoImage(file=str(brand_path)).subsample(10, 10)
             except tk.TclError:
                 self.brand_image = None
 
-        self.config = ensure_minimal_defaults(load_config())
+        self.config = ensure_minimal_defaults({"server_url": "https://your-server.example", "source_name": "Мой компьютер"} if preview else load_config())
+        if preview:
+            self.config["archive_folder"] = str(Path(tempfile.gettempdir()) / f"xass-preview-{os.getpid()}")
         self.config["desktop_managed"] = True
         self.process: subprocess.Popen[str] | None = None
         self.external_agent_pid = 0
+        self._external_agent_started_at = 0.0
         self._agent_started_at = 0.0
         self._start_after_id: str | None = None
         self._closing = False
         self._hidden_to_tray = False
         self._restart_failures: list[float] = []
         self._update_checking = False
+        self._pairing = False
+        self._connection_checking = False
+        self._update_notice = ""
         self._archive_cancel = threading.Event()
         self._archive_moving = False
         self.tray_icon: Any | None = None
@@ -220,11 +288,12 @@ class XassDesktop:
         self.archive_retention_days_var = tk.StringVar(value=str(self.config.get("archive_retention_days") or ""))
         self.archive_state_var = tk.StringVar(value="Локальный архив ещё не синхронизирован")
         self.connection_var = tk.StringVar(value="Остановлен")
-        self.last_seen_var = tk.StringVar(value="Heartbeat ещё не получен")
+        self.last_seen_var = tk.StringVar(value="Ожидаем первый ответ")
         self.latency_var = tk.StringVar(value="—")
         self.agent_version_var = tk.StringVar(value=current_version())
         self.agent_pid_var = tk.StringVar(value="—")
         self.update_state_var = tk.StringVar(value="Готово к проверке")
+        self.update_detail_var = tk.StringVar(value="Проверяйте обновления вручную или включите автоматическую установку в настройках.")
         self.last_error_var = tk.StringVar(value="Ошибок нет")
         self.server_state_var = tk.StringVar(value="Не проверен")
         self.import_status_var = tk.StringVar(value="Выберите файл .xass, скачанный в Telegram Mini App")
@@ -239,8 +308,9 @@ class XassDesktop:
         self.metric_bars: dict[str, tuple[tk.Canvas, int]] = {}
 
         self._build_shell()
-        self._setup_tray()
-        self.show_view("overview")
+        if not preview:
+            self._setup_tray()
+        self.show_view("overview" if self.config.get("api_key") or preview else "connection")
         self.root.after(120, self._drain_logs)
         self.root.after(450, self._refresh_agent_status)
         self.root.after(700, self._refresh_update_status)
@@ -285,8 +355,12 @@ class XassDesktop:
             cursor="hand2",
             font=("Segoe UI Semibold", 10),
             width=width or 0,
+            highlightthickness=1,
+            highlightbackground=background,
+            highlightcolor=ACCENT,
+            disabledforeground=MUTED,
         )
-        button.bind("<Enter>", lambda _event: button.configure(bg=active))
+        button.bind("<Enter>", lambda _event: button.configure(bg=active) if str(button.cget("state")) != "disabled" else None)
         button.bind("<Leave>", lambda _event: button.configure(bg=background))
         return button
 
@@ -311,12 +385,12 @@ class XassDesktop:
         shell = tk.Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=244, highlightbackground=LINE, highlightthickness=1)
+        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=208, highlightbackground=LINE, highlightthickness=1)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
         brand = tk.Frame(self.sidebar, bg=SIDEBAR)
-        brand.pack(fill="x", padx=24, pady=(27, 38))
+        brand.pack(fill="x", padx=20, pady=(22, 20))
         if self.brand_image is not None:
             tk.Label(brand, image=self.brand_image, bg=SIDEBAR, borderwidth=0).pack(side="left", padx=(0, 12))
         brand_copy = tk.Frame(brand, bg=SIDEBAR)
@@ -324,7 +398,7 @@ class XassDesktop:
         tk.Label(brand_copy, text="XASS", bg=SIDEBAR, fg=TEXT, font=("Segoe UI Semibold", 25)).pack(anchor="w")
         tk.Label(
             brand_copy,
-            text="DESKTOP AGENT",
+            text="WINDOWS",
             bg=SIDEBAR,
             fg=MUTED,
             font=("Segoe UI Semibold", 8),
@@ -350,7 +424,7 @@ class XassDesktop:
                 relief="flat",
                 borderwidth=0,
                 padx=18,
-                pady=14,
+                pady=10,
                 cursor="hand2",
                 font=("Segoe UI Semibold", 10),
             )
@@ -369,6 +443,8 @@ class XassDesktop:
             bg=CARD,
             fg=TEXT,
             font=("Segoe UI Semibold", 10),
+            wraplength=140,
+            justify="left",
         )
         self.side_status.pack(side="left", padx=(7, 0))
         tk.Label(
@@ -395,7 +471,7 @@ class XassDesktop:
         self.content_window = self.body_canvas.create_window((0, 0), window=self.content, anchor="nw")
         self.content.bind("<Configure>", self._on_content_configure)
         self.body_canvas.bind("<Configure>", self._on_canvas_configure)
-        self.body_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.root.bind("<MouseWheel>", self._on_mousewheel, add="+")
 
     def _on_content_configure(self, _event: tk.Event[Any]) -> None:
         self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
@@ -404,7 +480,16 @@ class XassDesktop:
         self.body_canvas.itemconfigure(self.content_window, width=max(1, event.width))
 
     def _on_mousewheel(self, event: tk.Event[Any]) -> None:
-        self.body_canvas.yview_scroll(int(-event.delta / 120), "units")
+        widget = event.widget
+        # Text panes keep their own scroll position; all other content scrolls
+        # the page even when the cursor is above a card, label or input.
+        if isinstance(widget, (tk.Text, tk.Listbox)):
+            return
+        while widget is not None and widget is not self.content:
+            widget = getattr(widget, "master", None)
+        if widget is self.content and self.body_canvas.yview() != (0.0, 1.0):
+            steps = max(1, min(10, int(abs(event.delta) / 120)))
+            self.body_canvas.yview_scroll(-steps if event.delta > 0 else steps, "units")
 
     def _clear_content(self) -> None:
         for widget in self.content.winfo_children():
@@ -427,32 +512,52 @@ class XassDesktop:
             self._build_diagnostics()
         else:
             self._build_overview()
+        self._wrap_labels(self.content)
         self.body_canvas.yview_moveto(0)
+
+    def _wrap_labels(self, parent: tk.Misc) -> None:
+        for widget in parent.winfo_children():
+            if isinstance(widget, (tk.Label, tk.Checkbutton)) and (widget.cget("text") or widget.cget("textvariable")):
+                if not getattr(widget, "_row_value", False):
+                    def resize(_event: Any = None, item: tk.Widget = widget) -> None:
+                        if item.winfo_exists():
+                            padding = item.master.winfo_pixels(item.master.cget("padx"))
+                            width = max(80, item.master.winfo_width() - 2 * padding - 8)
+                            item.configure(wraplength=width, justify="left")
+                    widget.master.bind("<Configure>", resize, add="+")
+            self._wrap_labels(widget)
+
+    @staticmethod
+    def _flow_actions(parent: tk.Frame) -> None:
+        buttons = list(parent.winfo_children())
+        for button in buttons:
+            button.pack_forget()
+        def arrange(event: Any = None) -> None:
+            available = max(1, parent.winfo_width())
+            column, row, used = 0, 0, 0
+            for button in buttons:
+                width = button.winfo_reqwidth() + 10
+                if used and used + width > available:
+                    column, used, row = 0, 0, row + 1
+                button.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=(0, 8))
+                column, used = column + 1, used + width
+        parent.bind("<Configure>", arrange)
+        parent.after_idle(arrange)
 
     def _header(self, title: str, subtitle: str) -> None:
         top = tk.Frame(self.content, bg=BG)
         top.pack(fill="x", pady=(0, 18))
         copy = tk.Frame(top, bg=BG)
-        copy.pack(side="left")
+        copy.pack(side="left", fill="x", expand=True)
         tk.Label(copy, text=title, bg=BG, fg=TEXT, font=("Segoe UI", 25)).pack(anchor="w")
         tk.Label(copy, text=subtitle, bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
-        version = tk.Label(
-            top,
-            text=f"v{current_version()}",
-            bg=CARD,
-            fg=MUTED,
-            padx=12,
-            pady=6,
-            font=("Cascadia Mono", 9),
-        )
-        version.pack(side="right", anchor="n")
 
     def _set_status(self, text: str, color: str) -> None:
         self.connection_var.set(text)
         self.status_color = color
         if hasattr(self, "side_dot") and self.side_dot.winfo_exists():
             self.side_dot.configure(fg=color)
-        for attr in ("hero_dot", "header_dot"):
+        for attr in ("hero_dot", "header_dot", "hero_status"):
             widget = getattr(self, attr, None)
             if widget and widget.winfo_exists():
                 widget.configure(fg=color)
@@ -473,65 +578,59 @@ class XassDesktop:
         self._header("Этот компьютер", "Агент XASS, локальные ресурсы и соединение")
         self.metric_bars = {}
 
-        identity = tk.Frame(self.content, bg=BG)
+        identity = ResponsiveColumns(self.content, bg=BG, breakpoint=880)
         identity.pack(fill="x", pady=(3, 18))
-        identity.columnconfigure(0, weight=3)
-        identity.columnconfigure(1, weight=2)
 
-        primary = tk.Frame(identity, bg=BG)
-        primary.grid(row=0, column=0, sticky="nsew")
-        computer = tk.Canvas(primary, width=150, height=118, bg=BG, highlightthickness=0)
-        computer.pack(side="left", padx=(8, 30))
-        computer.create_rectangle(25, 15, 125, 82, outline=TEXT, width=3)
-        computer.create_line(75, 82, 75, 101, fill=TEXT, width=3)
-        computer.create_line(49, 102, 101, 102, fill=TEXT, width=3)
-        computer.create_oval(72, 46, 78, 52, fill=ACCENT, outline=ACCENT)
-        copy = tk.Frame(primary, bg=BG)
-        copy.pack(side="left", fill="y", pady=(10, 0))
-        tk.Label(copy, text=self.name_var.get(), bg=BG, fg=TEXT, font=("Segoe UI Semibold", 24)).pack(anchor="w")
-        status_line = tk.Frame(copy, bg=BG)
+        primary = self._card(identity, padding=22)
+        identity.add(primary)
+        tk.Label(primary, text="ВАШ КОМПЬЮТЕР", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        copy = tk.Frame(primary, bg=CARD)
+        copy.pack(fill="x", pady=(12, 0))
+        tk.Label(copy, textvariable=self.name_var, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 24)).pack(anchor="w")
+        status_line = tk.Frame(copy, bg=CARD)
         status_line.pack(anchor="w", pady=(12, 0))
-        self.hero_dot = tk.Label(status_line, text="●", bg=BG, fg=self.status_color, font=("Segoe UI", 12))
+        self.hero_dot = tk.Label(status_line, text="●", bg=CARD, fg=self.status_color, font=("Segoe UI", 12))
         self.hero_dot.pack(side="left")
-        tk.Label(status_line, textvariable=self.connection_var, bg=BG, fg=GREEN, font=("Segoe UI Semibold", 13)).pack(side="left", padx=(8, 0))
+        self.hero_status = tk.Label(status_line, textvariable=self.connection_var, bg=CARD, fg=self.status_color, font=("Segoe UI Semibold", 13))
+        self.hero_status.pack(side="left", padx=(8, 0))
         channel = "TLS-соединение" if self.server_var.get().lower().startswith("https://") else "Канал с персональным API-ключом"
-        tk.Label(copy, text=channel, bg=BG, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(8, 0))
+        tk.Label(copy, text=channel, bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(8, 16))
+        self._button(primary, "Настроить подключение", lambda: self.show_view("connection"), kind="secondary").pack(fill="x", side="bottom")
 
-        system_info = tk.Frame(identity, bg=BG)
-        system_info.grid(row=0, column=1, sticky="nsew", padx=(28, 0))
+        system_info = self._card(identity, padding=22)
+        identity.add(system_info)
+        tk.Label(system_info, text="СИСТЕМА", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w", pady=(0, 10))
         self._connection_row(system_info, "Имя компьютера", socket.gethostname())
         self._connection_row(system_info, "Пользователь", os.environ.get("USERNAME") or "—")
         self._connection_row(system_info, "ОС", f"Windows {platform.release()}" if os.name == "nt" else platform.system())
         self._connection_row(system_info, "Время работы", self.uptime_var)
         self._connection_row(system_info, "Локальное время", self.local_time_var)
 
-        tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
-        middle = tk.Frame(self.content, bg=BG)
-        middle.pack(fill="x", pady=22)
-        middle.columnconfigure(0, weight=1, uniform="middle")
-        middle.columnconfigure(1, weight=1, uniform="middle")
+        middle = ResponsiveColumns(self.content, bg=BG)
+        middle.pack(fill="x", pady=(0, 18))
 
-        resources = tk.Frame(middle, bg=BG)
-        resources.grid(row=0, column=0, sticky="nsew", padx=(18, 40))
-        tk.Label(resources, text="Локальные ресурсы", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
+        resources = self._card(middle, padding=22)
+        middle.add(resources)
+        tk.Label(resources, text="Локальные ресурсы", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
         self._metric_row(resources, "CPU", self.cpu_var, ACCENT, "cpu")
         self._metric_row(resources, "Память", self.memory_var, ACCENT, "memory", self.memory_detail_var)
         self._metric_row(resources, "Диск", self.disk_var, ACCENT, "disk", self.disk_detail_var)
 
-        connection = tk.Frame(middle, bg=BG, highlightbackground=LINE, highlightthickness=0)
-        connection.grid(row=0, column=1, sticky="nsew", padx=(40, 18))
-        tk.Label(connection, text="Подключение", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
+        connection = self._card(middle, padding=22)
+        middle.add(connection)
+        tk.Label(connection, text="Соединение с сервером", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
         server = normalize_server_url(self.server_var.get())
         protocol = "TLS" if server.lower().startswith("https://") else "HTTP"
         self._connection_row(connection, "Сервер", server)
         self._connection_row(connection, "Протокол", protocol)
-        self._connection_row(connection, "Статус", self.server_state_var, GREEN)
+        self._connection_row(connection, "Доступность", self.server_state_var)
         self._connection_row(connection, "Версия приложения", current_version())
         self._connection_row(connection, "Версия агента", self.agent_version_var)
         self._connection_row(connection, "Задержка", self.latency_var)
-        self._connection_row(connection, "Последний heartbeat", self.last_seen_var)
+        self._connection_row(connection, "Отчёт агента", self.last_seen_var)
         self._connection_row(connection, "Обновление", self.update_state_var)
-        self._connection_row(connection, "Автообновления", "Включены (подписанные)" if self.auto_update_var.get() else "Выключены", GREEN if self.auto_update_var.get() else AMBER)
+        self._connection_row(connection, "Автообновления", "Включены" if self.auto_update_var.get() else "Выключены", GREEN if self.auto_update_var.get() else AMBER)
+        self._button(connection, "Проверить доступность сервера", self.check_connection, kind="ghost").pack(fill="x", pady=(10, 0))
 
         tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
         events_head = tk.Frame(self.content, bg=BG)
@@ -556,7 +655,10 @@ class XassDesktop:
         self._style_scrolled_text(self.overview_log)
         for line in self.history[-120:]:
             self.overview_log.insert("end", line + "\n")
+        if not self.history:
+            self.overview_log.insert("end", "Здесь появятся события подключения, команды и обновления.\n")
         self.overview_log.see("end")
+        self.overview_log.configure(state="disabled")
 
     def _metric_row(
         self,
@@ -567,26 +669,33 @@ class XassDesktop:
         key: str,
         detail: tk.StringVar | None = None,
     ) -> None:
-        row = tk.Frame(parent, bg=BG)
+        background = str(parent.cget("bg"))
+        row = tk.Frame(parent, bg=background)
         row.pack(fill="x", pady=10)
-        head = tk.Frame(row, bg=BG)
+        head = tk.Frame(row, bg=background)
         head.pack(fill="x")
-        tk.Label(head, text=label, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
-        tk.Label(head, textvariable=value, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="right")
+        tk.Label(head, text=label, bg=background, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
+        tk.Label(head, textvariable=value, bg=background, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="right")
         track = tk.Canvas(row, height=5, bg="#2b2d31", highlightthickness=0)
         track.pack(fill="x", pady=(8, 3))
         bar = track.create_rectangle(0, 0, 0, 5, fill=color, outline=color)
         self.metric_bars[key] = (track, bar)
         if detail is not None:
-            tk.Label(row, textvariable=detail, bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="e")
+            tk.Label(row, textvariable=detail, bg=background, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="e")
 
     def _connection_row(self, parent: tk.Misc, label: str, value: str | tk.StringVar, color: str = TEXT) -> None:
         parent_bg = str(parent.cget("bg"))
         row = tk.Frame(parent, bg=parent_bg)
         row.pack(fill="x", pady=6)
-        tk.Label(row, text=label, bg=parent_bg, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
+        row.columnconfigure(0, weight=1, uniform="value")
+        row.columnconfigure(1, weight=1, uniform="value")
+        key_label = tk.Label(row, text=label, bg=parent_bg, fg=MUTED, font=("Segoe UI", 9), anchor="w", justify="left")
+        key_label.grid(row=0, column=0, sticky="nw", padx=(0, 12))
         options: dict[str, Any] = {"textvariable": value} if isinstance(value, tk.StringVar) else {"text": value}
-        tk.Label(row, bg=parent_bg, fg=color, font=("Segoe UI Semibold", 9), wraplength=260, **options).pack(side="right")
+        value_label = tk.Label(row, bg=parent_bg, fg=color, font=("Segoe UI Semibold", 9), justify="right", anchor="e", **options)
+        value_label.grid(row=0, column=1, sticky="ne")
+        key_label._row_value = value_label._row_value = True
+        row.bind("<Configure>", lambda event: (key_label.configure(wraplength=max(70, event.width // 2 - 16)), value_label.configure(wraplength=max(70, event.width // 2 - 4))))
 
     def _refresh_local_metrics(self) -> None:
         try:
@@ -639,34 +748,32 @@ class XassDesktop:
             font=("Cascadia Mono", 10) if not secret else ("Segoe UI", 10),
         )
         entry.pack(fill="x", ipady=10, padx=11)
+        entry.bind("<FocusIn>", lambda _event: border.configure(bg=ACCENT))
+        entry.bind("<FocusOut>", lambda _event: border.configure(bg=LINE))
         return entry
 
     def _build_connection(self) -> None:
-        self._header("Подключение", "Самый быстрый способ — импортировать конфиг из Telegram Mini App")
-        columns = tk.Frame(self.content, bg=BG)
+        self._header("Подключение", "Привяжите этот компьютер к своему XASS за пару шагов")
+        columns = ResponsiveColumns(self.content, bg=BG)
         columns.pack(fill="both", expand=True)
-        columns.columnconfigure(0, weight=1, uniform="connect")
-        columns.columnconfigure(1, weight=1, uniform="connect")
-        columns.rowconfigure(0, weight=1)
 
         quick = self._card(columns, padding=23)
-        quick.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        columns.add(quick)
         tk.Label(quick, text="БЫСТРОЕ ПОДКЛЮЧЕНИЕ", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(quick, text="Импортировать конфиг", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 20)).pack(anchor="w", pady=(12, 5))
+        tk.Label(quick, text="Один файл — и готово", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 20)).pack(anchor="w", pady=(12, 5))
         tk.Label(
             quick,
-            text="В Mini App откройте «Агенты» → «Подключить ПК» и скачайте xass-connect.json. Адрес сервера и одноразовый ключ уже будут внутри.",
+            text="1. Откройте «Агенты» → «Подключить ПК» в Telegram или веб-приложении.\n\n2. Скачайте файл подключения и выберите его здесь. Адрес и ключ заполнятся автоматически.",
             bg=CARD,
             fg=MUTED,
             justify="left",
             wraplength=330,
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(0, 20))
-        self._button(quick, "Выбрать xass-connect.json", self.import_connection_file, kind="primary").pack(fill="x")
-        self._button(quick, "Вставить JSON из буфера", self.paste_connection, kind="secondary").pack(fill="x", pady=(9, 0))
+        self._button(quick, "Выбрать файл подключения", self.import_connection_file, kind="primary").pack(fill="x")
+        self._button(quick, "Вставить конфигурацию", self.paste_connection, kind="secondary").pack(fill="x", pady=(9, 0))
         status_box = tk.Frame(quick, bg=FIELD, padx=14, pady=12, highlightbackground=LINE, highlightthickness=1)
         status_box.pack(side="bottom", fill="x", pady=(22, 0))
-        tk.Label(status_box, text="●", bg=FIELD, fg=GREEN, font=("Segoe UI", 10)).pack(side="left", anchor="n")
         tk.Label(
             status_box,
             textvariable=self.import_status_var,
@@ -677,52 +784,40 @@ class XassDesktop:
             font=("Segoe UI", 8),
         ).pack(side="left", padx=(8, 0), fill="x", expand=True)
         if DND_FILES is not None and hasattr(quick, "drop_target_register"):
-            quick.drop_target_register(DND_FILES)
-            quick.dnd_bind("<<Drop>>", self._drop_connection_file)
+            try:
+                quick.drop_target_register(DND_FILES)
+                quick.dnd_bind("<<Drop>>", self._drop_connection_file)
+            except tk.TclError:
+                pass  # File picker and clipboard import remain available.
 
         manual = self._card(columns, padding=23)
-        manual.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        columns.add(manual)
         tk.Label(manual, text="РУЧНАЯ НАСТРОЙКА", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
         tk.Label(manual, text="Адрес и одноразовый ключ", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 17)).pack(anchor="w", pady=(10, 2))
         self._field(manual, "Адрес сервера или IP", self.server_var)
         self._field(manual, "Имя компьютера", self.name_var)
-        self._field(manual, "Одноразовый ключ", self.pair_var)
-        self._field(manual, "Интервал heartbeat, сек", self.interval_var)
-        check = tk.Checkbutton(
-            manual,
-            text="Устанавливать обновления автоматически",
-            variable=self.auto_update_var,
-            bg=CARD,
-            fg=TEXT,
-            activebackground=CARD,
-            activeforeground=TEXT,
-            selectcolor=FIELD,
-            relief="flat",
-            borderwidth=0,
-            font=("Segoe UI", 9),
-        )
-        check.pack(anchor="w", pady=(17, 15))
+        self._field(manual, "Одноразовый ключ", self.pair_var, secret=True)
+        tk.Label(manual, text="Ключ выдаётся в разделе «Подключить ПК» и действует ограниченное время. Его не нужно сохранять или вводить повторно.", bg=CARD, fg=MUTED, font=("Segoe UI", 9), justify="left").pack(fill="x", pady=(14, 20))
         actions = tk.Frame(manual, bg=CARD)
         actions.pack(fill="x", side="bottom")
-        self._button(actions, "Сохранить", self.save_settings, kind="secondary").pack(side="left")
         self.pair_button = self._button(actions, "Подключить", self.pair, kind="primary")
-        self.pair_button.pack(side="right")
+        self.pair_button.pack(fill="x")
+        if self._pairing:
+            self.pair_button.configure(state="disabled", text="Подключение…")
 
     def _build_settings(self) -> None:
         self._header("Настройки", "Поведение агента и обслуживание приложения")
-        columns = tk.Frame(self.content, bg=BG)
+        columns = ResponsiveColumns(self.content, bg=BG, breakpoint=930)
         columns.pack(fill="both", expand=True)
-        columns.columnconfigure(0, weight=1, uniform="settings")
-        columns.columnconfigure(1, weight=1, uniform="settings")
 
         runtime = self._card(columns, padding=23)
-        runtime.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        columns.add(runtime)
         tk.Label(runtime, text="АГЕНТ", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
         tk.Label(runtime, text="Фоновая работа", bg=CARD, fg=TEXT, font=("Segoe UI", 20)).pack(anchor="w", pady=(11, 4))
-        tk.Label(runtime, text="Окно можно свернуть — heartbeat и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 18))
+        tk.Label(runtime, text="Окно можно свернуть — связь с сервером и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 18))
         check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
         check.pack(anchor="w", pady=(6, 14))
-        self._field(runtime, "Интервал heartbeat, секунд", self.interval_var)
+        self._field(runtime, "Интервал обновления показателей, секунд", self.interval_var)
         self._field(runtime, "Папка локального архива", self.archive_folder_var)
         self._button(runtime, "Выбрать папку архива", self.choose_archive_folder, kind="ghost").pack(fill="x", pady=(9, 0))
         self._field(runtime, "Лимит архива, ГБ (пусто — без лимита)", self.archive_max_gb_var)
@@ -730,18 +825,18 @@ class XassDesktop:
         self._button(runtime, "Сохранить настройки", self.save_settings, kind="primary").pack(fill="x", pady=(20, 0))
 
         maintenance = self._card(columns, padding=23)
-        maintenance.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        columns.add(maintenance)
         tk.Label(maintenance, text="ОБСЛУЖИВАНИЕ", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
         tk.Label(maintenance, text="Клиент XASS", bg=CARD, fg=TEXT, font=("Segoe UI", 20)).pack(anchor="w", pady=(11, 18))
         self._connection_row(maintenance, "Версия", current_version())
         self._connection_row(maintenance, "Ревизия", current_revision()[:16] or "локальная")
         self._connection_row(maintenance, "Python", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-        self._connection_row(maintenance, "Автозапуск", "Windows Startup")
+        tk.Label(maintenance, text="Команды с телефона доступны, пока компьютер включён и агент работает. Закрытие окна сворачивает XASS в системный трей.", bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 10)).pack(fill="x", pady=(16, 0))
         self._button(maintenance, "Проверить обновление", self.check_update, kind="ghost").pack(fill="x", pady=(22, 9))
         self._button(maintenance, "Перезапустить агент", self.restart_agent).pack(fill="x")
 
     def _build_updates(self) -> None:
-        self._header("Обновления", "Проверка, загрузка, установка и автоматический откат")
+        self._header("Обновления", "Актуальная версия без повторной настройки компьютера")
         state = load_update_state()
         result: dict[str, Any] = {}
         try:
@@ -753,8 +848,10 @@ class XassDesktop:
         card.pack(fill="x", pady=(0, 16))
         tk.Label(card, text="СОСТОЯНИЕ ОБНОВЛЕНИЯ", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
         tk.Label(card, textvariable=self.update_state_var, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(10, 4))
-        message = str(state.get("message") or result.get("message") or "Обновление ещё не запускалось")
-        tk.Label(card, text=message, bg=CARD, fg=MUTED, justify="left", wraplength=760, font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Label(card, textvariable=self.update_detail_var, bg=CARD, fg=MUTED, justify="left", wraplength=760, font=("Segoe UI", 10)).pack(anchor="w")
+        self.update_progress = ttk.Progressbar(card, mode="determinate", style="XASS.Horizontal.TProgressbar")
+        self.update_progress.pack(fill="x", pady=(18, 0))
+        self._progress_running = False
         details = tk.Frame(card, bg=CARD)
         details.pack(fill="x", pady=(18, 0))
         self._connection_row(details, "Текущая версия", current_version())
@@ -766,7 +863,8 @@ class XassDesktop:
         actions.pack(fill="x", pady=(20, 0))
         self.update_button = self._button(actions, "Проверить обновление", self.check_update, kind="primary")
         self.update_button.pack(side="left")
-        self._button(actions, "Перезапустить только агент", self.restart_agent, kind="secondary").pack(side="left", padx=(10, 0))
+        self._button(actions, "Перезапустить агент", self.restart_agent, kind="secondary").pack(side="left", padx=(10, 0))
+        self._flow_actions(actions)
 
         safety = self._card(self.content, padding=20)
         safety.pack(fill="x")
@@ -774,9 +872,9 @@ class XassDesktop:
         tk.Label(
             safety,
             text=(
-                "Manifest подписывается персональным ключом агента. Клиент проверяет revision, размер и SHA-256 "
-                "скачанного файла, запускает внешний helper, сохраняет config.json и архив. Если новая версия "
-                "не проходит локальный health-check или завершается сразу после запуска, предыдущая версия возвращается автоматически."
+                "XASS проверяет подлинность и целостность обновления перед установкой. Привязка компьютера, "
+                "настройки и локальный архив сохраняются. После установки приложение запускается снова. "
+                "Если проверка новой версии завершится ошибкой, установщик попытается вернуть предыдущую версию."
             ),
             bg=CARD,
             fg=MUTED,
@@ -789,12 +887,12 @@ class XassDesktop:
         self._header("Диагностика", "Безопасный статус GUI, агента, сети и updater")
         card = self._card(self.content, padding=21)
         card.pack(fill="x", pady=(0, 14))
-        columns = tk.Frame(card, bg=CARD)
+        columns = ResponsiveColumns(card, bg=CARD, breakpoint=850)
         columns.pack(fill="x")
         left = tk.Frame(columns, bg=CARD)
         right = tk.Frame(columns, bg=CARD)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 24))
-        right.pack(side="left", fill="both", expand=True)
+        columns.add(left)
+        columns.add(right)
         self._connection_row(left, "GUI", "работает")
         self._connection_row(left, "Агент", self.connection_var)
         self._connection_row(left, "PID агента", self.agent_pid_var)
@@ -803,7 +901,7 @@ class XassDesktop:
         self._connection_row(right, "Конфигурация", str(DATA_ROOT / "config.json"))
         self._connection_row(right, "Архив", str(archive_root(self.config)))
         self._connection_row(right, "Endpoint", f"{str(self.config.get('server_url') or '').rstrip('/')}/agent/heartbeat")
-        self._connection_row(right, "Heartbeat", self.last_seen_var)
+        self._connection_row(right, "Отчёт агента", self.last_seen_var)
         self._connection_row(right, "Updater", self.update_state_var)
         self._connection_row(right, "Последняя ошибка", self.last_error_var, RED if self.last_error_var.get() != "Ошибок нет" else GREEN)
         actions = tk.Frame(card, bg=CARD)
@@ -811,6 +909,7 @@ class XassDesktop:
         self._button(actions, "Проверить соединение", self.check_connection, kind="primary").pack(side="left")
         self._button(actions, "Перезапустить агент", self.restart_agent, kind="secondary").pack(side="left", padx=(9, 0))
         self._button(actions, "Экспорт отчёта", self.export_diagnostics, kind="ghost").pack(side="right")
+        self._flow_actions(actions)
 
         self.full_log = DarkScrolledText(
             self.content,
@@ -828,18 +927,23 @@ class XassDesktop:
         )
         self.full_log.pack(fill="both", expand=True)
         self._style_scrolled_text(self.full_log)
-        rows = self.history[-300:] or read_log_tail(300)
+        rows = self.history[-300:] or ([] if self.preview else read_log_tail(300))
         for line in rows:
             self.full_log.insert("end", line + "\n")
         self.full_log.configure(state="disabled")
 
     def check_connection(self) -> None:
-        self._set_status("Проверка связи…", AMBER)
+        if self.preview or self._connection_checking:
+            return
+        self._connection_checking = True
+        self.server_state_var.set("Проверяем доступность…")
+        server_input = str(self.config.get("server_url") or self.server_var.get())
+        trust_env = bool(self.config.get("trust_env_proxy", False))
 
         def worker() -> None:
             try:
-                server = discover_backend_url(str(self.config.get("server_url") or self.server_var.get()))
-                with httpx.Client(timeout=10, trust_env=bool(self.config.get("trust_env_proxy", False))) as client:
+                server = discover_backend_url(server_input)
+                with create_http_client(server, timeout=10, trust_env=trust_env) as client:
                     response = client.get(f"{server.rstrip('/')}/health")
                     response.raise_for_status()
                 self.root.after(0, lambda: self._connection_checked(True, f"Сервер доступен: {server}"))
@@ -849,14 +953,13 @@ class XassDesktop:
         threading.Thread(target=worker, daemon=True).start()
 
     def _connection_checked(self, ok: bool, detail: str) -> None:
+        self._connection_checking = False
         if ok:
             self.server_state_var.set("Доступен")
-            self._set_status("В сети", GREEN)
             self._log(detail)
         else:
             self.server_state_var.set("Ошибка")
             self.last_error_var.set(detail[-240:])
-            self._set_status("Нет связи", RED)
             messagebox.showerror("XASS", f"Проверка соединения не пройдена:\n{detail}")
 
     @staticmethod
@@ -887,7 +990,8 @@ class XassDesktop:
             "archive_path": str(archive_root(self.config)),
             "server_endpoint": f"{str(self.config.get('server_url') or '').rstrip('/')}/agent/heartbeat",
             "heartbeat_state": status.get("state"),
-            "heartbeat_updated_at": status.get("updated_at"),
+            "heartbeat_updated_at": status.get("heartbeat_at"),
+            "status_updated_at": status.get("updated_at"),
             "latency_ms": status.get("latency_ms"),
             "last_error": status.get("last_error") or "",
             "updater": load_update_state(),
@@ -948,6 +1052,7 @@ class XassDesktop:
         self._button(actions, "Очистить медиа", self.cleanup_archive_files, kind="ghost").pack(side="left", padx=(9, 0))
         if self._archive_moving:
             self._button(actions, "Отменить перенос", self._archive_cancel.set, kind="danger").pack(side="right")
+        self._flow_actions(actions)
 
         self.archive_messages = DarkScrolledText(
             self.content,
@@ -1096,6 +1201,8 @@ class XassDesktop:
             self.full_log.configure(state="disabled")
 
     def save_settings(self) -> None:
+        if self.preview:
+            return
         try:
             interval = max(5, int(self.interval_var.get().strip()))
             max_gb = max(0.0, float(self.archive_max_gb_var.get().strip() or 0))
@@ -1141,6 +1248,8 @@ class XassDesktop:
         self.import_connection_path(selected.expanduser().resolve())
 
     def import_connection_path(self, selected: Path) -> None:
+        if self.preview:
+            return
         try:
             profile = load_connection_file(selected)
         except ValueError as exc:
@@ -1149,6 +1258,8 @@ class XassDesktop:
         self._apply_connection_profile(profile, selected.name)
 
     def paste_connection(self) -> None:
+        if self.preview:
+            return
         try:
             profile = parse_connection_text(self.root.clipboard_get())
         except (tk.TclError, ValueError) as exc:
@@ -1168,6 +1279,8 @@ class XassDesktop:
         self.root.after(180, self.pair)
 
     def pair(self) -> None:
+        if self.preview or self._pairing:
+            return
         code = self.pair_var.get().strip()
         if not code:
             messagebox.showwarning("XASS", "Введите одноразовый ключ или импортируйте xass-connect.json")
@@ -1180,9 +1293,10 @@ class XassDesktop:
         try:
             interval = max(5, int(self.interval_var.get() or 30))
         except ValueError:
-            self._pair_failed("Интервал heartbeat должен быть числом")
+            self._pair_failed("Интервал обновления показателей должен быть числом")
             return
         auto_update = self.auto_update_var.get()
+        self._pairing = True
 
         def worker() -> None:
             try:
@@ -1212,12 +1326,15 @@ class XassDesktop:
         threading.Thread(target=worker, daemon=True).start()
 
     def _pair_failed(self, error: str) -> None:
+        self._pairing = False
         self._set_status("Ошибка подключения", RED)
+        self.import_status_var.set("Не удалось подключиться. Проверьте адрес сервера и срок действия ключа.")
         if hasattr(self, "pair_button") and self.pair_button.winfo_exists():
             self.pair_button.configure(state="normal", text="Подключить")
         messagebox.showerror("XASS", f"Не удалось подключить агент:\n{error}")
 
     def _paired_ok(self, server: str) -> None:
+        self._pairing = False
         self.server_var.set(server)
         self.name_var.set(str(self.config.get("source_name") or ""))
         self.pair_var.set("")
@@ -1229,7 +1346,7 @@ class XassDesktop:
         messagebox.showinfo("XASS", "Компьютер подключён к серверу")
 
     def start_agent(self) -> None:
-        if self._closing:
+        if self._closing or self.preview:
             return
         if self.process and self.process.poll() is None:
             return
@@ -1242,10 +1359,14 @@ class XassDesktop:
             existing_pid = int(existing_status.get("process_id") or 0)
             existing = psutil.Process(existing_pid) if existing_pid > 0 else None
             command = " ".join(existing.cmdline()).casefold() if existing is not None else ""
-            if existing is not None and existing.is_running() and "--agent" in command:
+            if existing is not None and existing.is_running() and ("--agent" in command or "client_agent.py" in command):
+                created_at = existing.create_time()
+                if float(existing_status.get("updated_at") or 0) < created_at - 2:
+                    raise ValueError("status belongs to a previous process")
                 self.external_agent_pid = existing_pid
+                self._external_agent_started_at = created_at
                 self.agent_pid_var.set(str(existing_pid))
-                self._set_status("В сети" if existing_status.get("state") == "online" else "Подключение…", GREEN if existing_status.get("state") == "online" else AMBER)
+                self._set_status("Проверка состояния…", AMBER)
                 return
         except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
             self.external_agent_pid = 0
@@ -1298,34 +1419,49 @@ class XassDesktop:
     def _refresh_agent_status(self) -> None:
         if self._closing:
             return
+        if self.preview:
+            return
         process = self.process
+        if self.external_agent_pid:
+            try:
+                external = psutil.Process(self.external_agent_pid)
+                alive = external.is_running() and external.create_time() == self._external_agent_started_at
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                alive = False
+            if not alive:
+                self.external_agent_pid = 0
+                self.agent_pid_var.set("—")
+                self.latency_var.set("—")
+                self._set_status("Агент остановлен", RED)
+                self.server_state_var.set("Не подтверждён")
+                if not self._start_after_id:
+                    self._schedule_start(750)
         active_pid = process.pid if process is not None and process.poll() is None else self.external_agent_pid
         if active_pid:
-            payload = load_agent_status()
-            try:
-                status_pid = int((payload or {}).get("process_id") or 0)
-                updated_at = float((payload or {}).get("updated_at") or 0)
-            except (TypeError, ValueError):
-                status_pid = 0
-                updated_at = 0
-            if status_pid == active_pid and (self.external_agent_pid or updated_at >= self._agent_started_at):
-                state = str((payload or {}).get("state") or "").lower()
-                self.agent_pid_var.set(str(status_pid))
-                self.agent_version_var.set(str((payload or {}).get("agent_version") or current_version()))
-                latency = float((payload or {}).get("latency_ms") or 0)
-                self.latency_var.set(f"{latency:.0f} мс" if latency > 0 else "—")
-                age = max(0, int(time.time() - updated_at))
-                self.last_seen_var.set("только что" if age < 3 else f"{age} сек. назад")
+            payload = load_agent_status() or {}
+            snapshot = connection_snapshot(payload, active_pid=active_pid, started_at=self._external_agent_started_at if self.external_agent_pid else self._agent_started_at, interval_sec=self.config.get("interval_sec") or 30)
+            state, age, latency = snapshot["state"], snapshot["age"], snapshot["latency_ms"]
+            self.agent_pid_var.set(str(active_pid))
+            self.agent_version_var.set(str(payload.get("agent_version") or current_version()))
+            self.latency_var.set(f"{latency:.0f} мс" if state == "online" and latency > 0 else "—")
+            self.last_seen_var.set("Ожидаем первый ответ" if age is None else ("только что" if age < 3 else f"{age} сек. назад"))
+            if not self._pairing:
                 if state == "online":
                     self._set_status("В сети", GREEN)
                     self._restart_failures.clear()
                     self.server_state_var.set("Доступен")
                     self.last_error_var.set("Ошибок нет")
-                elif state == "offline":
-                    self._set_status("Нет связи", RED)
-                    detail = str((payload or {}).get("detail") or "Сервер не отвечает")
-                    self.last_error_var.set(str((payload or {}).get("last_error") or detail)[-240:])
-                    self.server_state_var.set("Ошибка")
+                elif state in {"offline", "stale"}:
+                    self._set_status("Нет связи" if state == "offline" else "Ответ задерживается", RED if state == "offline" else AMBER)
+                    detail = str(payload.get("last_error") or payload.get("detail") or "Сервер не отвечает") if state == "offline" else "Данные агента устарели. Проверьте соединение или перезапустите агент."
+                    self.last_error_var.set(detail[-240:])
+                    self.server_state_var.set("Нет подтверждения")
+                else:
+                    self._set_status("Ожидаем ответ…", AMBER)
+        elif not self._pairing and not self._start_after_id and not update_in_progress():
+            self.agent_pid_var.set("—")
+            self.latency_var.set("—")
+            self._set_status("Остановлен" if self.config.get("api_key") else "Требуется подключение", AMBER)
         self.root.after(750, self._refresh_agent_status)
 
     def _refresh_update_status(self) -> None:
@@ -1341,9 +1477,16 @@ class XassDesktop:
             "restarting": "Перезапуск",
             "health-check": "Проверка запуска",
         }
-        if state and update_in_progress():
+        in_progress = bool(state and update_in_progress())
+        if in_progress:
             message = str(state.get("message") or labels.get(phase) or "Обновление выполняется")
-            self.update_state_var.set(message)
+            self.update_state_var.set(labels.get(phase) or "Обновление выполняется")
+            self.update_detail_var.set(message)
+            self._update_notice = ""
+        elif self._update_checking:
+            self.update_state_var.set("Проверка обновления…")
+        elif self._update_notice:
+            self.update_state_var.set(self._update_notice)
         else:
             try:
                 result = json.loads(UPDATE_RESULT.read_text(encoding="utf-8"))
@@ -1357,6 +1500,19 @@ class XassDesktop:
                     self.update_state_var.set(str(result.get("message") or ("Готово" if result.get("ok") else "Ошибка")))
             elif not self._update_checking:
                 self.update_state_var.set("Готово к проверке")
+        progress = getattr(self, "update_progress", None)
+        if progress is not None and progress.winfo_exists():
+            busy = in_progress or self._update_checking
+            if busy and not getattr(self, "_progress_running", False):
+                progress.configure(mode="indeterminate")
+                progress.start(15)
+            elif not busy:
+                progress.stop()
+                progress.configure(mode="determinate", value=0)
+            self._progress_running = busy
+        button = getattr(self, "update_button", None)
+        if button is not None and button.winfo_exists():
+            button.configure(state="disabled" if in_progress or self._update_checking else "normal")
         self.root.after(700, self._refresh_update_status)
 
     def _update_is_running(self, marker: Path) -> bool:
@@ -1416,7 +1572,7 @@ class XassDesktop:
             self.last_error_var.set(f"Агент завершился с кодом {code}; автоперезапуск остановлен")
 
     def _schedule_start(self, delay_ms: int) -> None:
-        if self._closing:
+        if self._closing or self.preview:
             return
         if self._start_after_id is not None:
             try:
@@ -1430,6 +1586,8 @@ class XassDesktop:
         self.start_agent()
 
     def stop_agent(self) -> subprocess.Popen[str] | None:
+        if self.preview:
+            return None
         if self._start_after_id is not None:
             try:
                 self.root.after_cancel(self._start_after_id)
@@ -1443,7 +1601,9 @@ class XassDesktop:
             process.terminate()
         if self.external_agent_pid:
             try:
-                psutil.Process(self.external_agent_pid).terminate()
+                external = psutil.Process(self.external_agent_pid)
+                if external.create_time() == self._external_agent_started_at:
+                    external.terminate()
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                 pass
             self.external_agent_pid = 0
@@ -1451,6 +1611,8 @@ class XassDesktop:
         return process
 
     def restart_agent(self) -> None:
+        if self.preview:
+            return
         external_pid = self.external_agent_pid
         process = self.stop_agent()
         self._set_status("Быстрый перезапуск…", AMBER)
@@ -1475,6 +1637,8 @@ class XassDesktop:
         threading.Thread(target=worker, daemon=True).start()
 
     def check_update(self) -> None:
+        if self.preview:
+            return
         if not self.config.get("api_key"):
             messagebox.showwarning("XASS", "Сначала подключите компьютер")
             return
@@ -1482,7 +1646,9 @@ class XassDesktop:
             messagebox.showinfo("XASS", "Проверка или установка обновления уже выполняется")
             return
         self._update_checking = True
+        self._update_notice = ""
         self.update_state_var.set("Проверка обновления…")
+        self.update_detail_var.set("Запрашиваем актуальную версию на вашем сервере.")
         button = getattr(self, "update_button", None)
         if button and button.winfo_exists():
             button.configure(state="disabled", text="Проверка…")
@@ -1490,17 +1656,18 @@ class XassDesktop:
         def worker() -> None:
             try:
                 server = discover_backend_url(str(self.config.get("server_url")))
-                payload = build_payload(self.config)
                 with create_http_client(
                     server,
                     timeout=25,
                     trust_env=bool(self.config.get("trust_env_proxy", False)),
                 ) as client:
-                    response = client.post(
-                        f"{server}/agent/heartbeat",
+                    response = client.get(
+                        f"{server}/agent/update-manifest",
                         headers={"X-Api-Key": self.config["api_key"]},
-                        json=payload,
+                        params={"agent_version": current_version(), "agent_revision": current_revision(), "agent_distribution": "installer" if is_installer_build() else "source"},
                     )
+                    if response.status_code == 404:
+                        raise RuntimeError("Сначала обновите сервер XASS: эта версия сервера не поддерживает отдельную проверку обновлений.")
                     response.raise_for_status()
                     data = response.json()
                 manifest_key = "installer_update" if is_installer_build() else "update"
@@ -1520,18 +1687,24 @@ class XassDesktop:
         if button and button.winfo_exists():
             button.configure(state="normal", text="Проверить обновление")
         if error:
+            self._update_notice = "Ошибка проверки"
             self.update_state_var.set("Ошибка проверки")
+            self.update_detail_var.set(error[-240:])
             self.last_error_var.set(error[-240:])
             messagebox.showerror("XASS", f"Не удалось проверить обновление:\n{error}")
             return
         if manifest is None:
+            self._update_notice = "Установлена актуальная версия"
             self.update_state_var.set("Установлена актуальная версия")
+            self.update_detail_var.set(f"Проверено {datetime.now().strftime('%H:%M')}. Вы используете последнюю доступную версию.")
             messagebox.showinfo("XASS", "Установлена актуальная версия")
             return
         self._confirm_update(manifest)
 
     def _confirm_update(self, manifest: dict[str, Any]) -> None:
         version = str(manifest.get("version") or "")
+        self._update_notice = f"Доступна версия {version}"
+        self.update_detail_var.set("Обновление готово к установке. Привязка компьютера и архив сохранятся.")
         if not messagebox.askyesno("XASS", f"Доступна версия {version}. Установить сейчас?"):
             return
         # Do not let the background agent download the same package in parallel
@@ -1579,7 +1752,9 @@ class XassDesktop:
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_failed(self, error: str) -> None:
+        self._update_notice = "Ошибка обновления"
         self.update_state_var.set("Ошибка обновления")
+        self.update_detail_var.set(error[-240:])
         self.last_error_var.set(error[-240:])
         messagebox.showerror("XASS", f"Обновление не установлено:\n{error}")
         self._schedule_start(120)
@@ -1594,28 +1769,21 @@ class XassDesktop:
 
     def _log(self, line: str) -> None:
         stamped = f"{datetime.now().strftime('%H:%M:%S')}  {line}"
-        append_log(stamped)
+        if not self.preview:
+            append_log(stamped)
         self.history.append(stamped)
         self.history = self.history[-1000:]
-        if "[pc-client] ok" in line:
-            self._set_status("В сети", GREEN)
-            self.last_seen_var.set("Последний heartbeat только что")
-            self.server_state_var.set("Доступен")
-        elif "Скачивание" in line or "Повторная загрузка" in line:
-            self._set_status(line.strip(), AMBER)
-            self.update_state_var.set(line.strip())
+        if "Скачивание" in line or "Повторная загрузка" in line:
+            self.update_detail_var.set(line.strip())
         elif "heartbeat failed" in line:
-            self._set_status("Нет связи", RED)
-            self.last_seen_var.set(line[-120:])
-            self.server_state_var.set("Ошибка")
+            self.last_error_var.set(line[-240:])
         for attr in ("overview_log", "full_log"):
             widget = getattr(self, attr, None)
             if widget and widget.winfo_exists():
                 widget.configure(state="normal")
                 widget.insert("end", stamped + "\n")
                 widget.see("end")
-                if attr == "full_log":
-                    widget.configure(state="disabled")
+                widget.configure(state="disabled")
 
     def _setup_tray(self) -> None:
         if pystray is None or Image is None:
@@ -1648,6 +1816,10 @@ class XassDesktop:
             pass
 
     def close(self) -> None:
+        if self.preview:
+            self._closing = True
+            self.root.destroy()
+            return
         # Closing the window keeps the background agent alive. A deliberate exit
         # remains available from the tray menu.
         self._hidden_to_tray = True
@@ -1702,14 +1874,15 @@ def main() -> None:
 
         agent_main()
         return
-    configure_utf8_logging()
+    if "--preview" not in sys.argv:
+        configure_utf8_logging()
     parser = argparse.ArgumentParser(description="XASS desktop PC agent")
     parser.add_argument("--minimized", action="store_true")
     parser.add_argument("--preview", action="store_true", help="show the interface without starting the agent")
     parser.add_argument("connection_file", nargs="?", help="XASS connection profile to import")
     args = parser.parse_args()
     _configure_windows_process()
-    instance = acquire_single_instance("XASS-desktop-GUI")
+    instance = acquire_single_instance("XASS-desktop-preview" if args.preview else "XASS-desktop-GUI")
     if instance is None:
         return
     try:

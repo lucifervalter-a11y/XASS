@@ -3,17 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="${1:-/opt/serverredus}"
 BACKUP_DIR="${2:-/opt/serverredus-backups}"
-TS="$(date +%Y%m%d_%H%M%S)"
-
 mkdir -p "${BACKUP_DIR}"
-
-if [[ -f "${ROOT_DIR}/data/serverredus.db" ]]; then
-  cp "${ROOT_DIR}/data/serverredus.db" "${BACKUP_DIR}/serverredus_${TS}.db"
+umask 077
+PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="python3"
 fi
-
-if [[ -d "${ROOT_DIR}/data/media" ]]; then
-  tar -czf "${BACKUP_DIR}/media_${TS}.tar.gz" -C "${ROOT_DIR}/data" media
-fi
-
-echo "Backup complete: ${BACKUP_DIR}"
+exec "${PYTHON_BIN}" "${ROOT_DIR}/deploy/migrate.py" export --root "${ROOT_DIR}" --output "${BACKUP_DIR}"
 

@@ -9,6 +9,8 @@ $VersionData = Get-Content (Join-Path $ClientRoot "version.json") -Raw | Convert
 $Version = [string]$VersionData.version
 $Revision = (& git -C $RepoRoot rev-parse HEAD 2>$null)
 if (-not $Revision) { $Revision = "local-build" }
+$LocalBuild = [bool](& git -C $RepoRoot status --porcelain -- pc_client 2>$null)
+if ($LocalBuild) { $Revision = "$Revision-dirty" }
 
 $BuildVenv = Join-Path $ClientRoot ".build-venv"
 $BuildPython = Join-Path $BuildVenv "Scripts\python.exe"
@@ -26,10 +28,14 @@ function Test-XassPython([string]$Candidate) {
 $BuildPythonReady = Test-XassPython $BuildPython
 if (-not $BuildPythonReady) {
     if (Test-Path $BuildVenv) {
+        $ResolvedBuildVenv = [System.IO.Path]::GetFullPath($BuildVenv)
+        $ExpectedBuildVenv = Join-Path ([System.IO.Path]::GetFullPath($ClientRoot)) ".build-venv"
+        if ($ResolvedBuildVenv -ne $ExpectedBuildVenv) { throw "Unexpected build environment path: $ResolvedBuildVenv" }
         Remove-Item -LiteralPath $BuildVenv -Recurse -Force
     }
     $SeedPython = $null
     $SeedCandidates = @(
+        (Join-Path $RepoRoot ".venv312\Scripts\python.exe"),
         (Join-Path $RepoRoot ".venv\Scripts\python.exe"),
         (Join-Path $ClientRoot ".venv\Scripts\python.exe"),
         (Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
@@ -45,6 +51,7 @@ if (-not $BuildPythonReady) {
     & $SeedPython -m venv $BuildVenv
 }
 & $BuildPython -m pip install --disable-pip-version-check --quiet -r (Join-Path $ClientRoot "requirements.txt") -r (Join-Path $ClientRoot "build-requirements.txt")
+if ($LASTEXITCODE -ne 0) { throw "Build dependencies could not be installed" }
 
 $PackagingRoot = Join-Path $ClientRoot "packaging"
 $BuildInfo = Join-Path $PackagingRoot "build-info.generated.json"
@@ -54,6 +61,7 @@ $BuildInfoJson = @{
     version = $Version
     revision = $Revision
     distribution = "installer"
+    local_build = $LocalBuild
 } | ConvertTo-Json
 [System.IO.File]::WriteAllText($BuildInfo, $BuildInfoJson, $Utf8NoBom)
 
@@ -165,6 +173,7 @@ $InstallerMetadata = @{
     revision = $Revision
     sha256 = $Hash
     size = (Get-Item -LiteralPath $Installer).Length
+    local_build = $LocalBuild
     built_at = [DateTime]::UtcNow.ToString("o")
 } | ConvertTo-Json
 [System.IO.File]::WriteAllText((Join-Path $InstallerOut "XASS-Setup.json"), $InstallerMetadata, $Utf8NoBom)
