@@ -1,4 +1,6 @@
-﻿import hashlib
+import hashlib
+import hmac
+import json
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,6 +31,32 @@ def _format_pair_code(normalized: str) -> str:
         return normalized
     chunks = [normalized[i : i + 4] for i in range(0, len(normalized), 4)]
     return "-".join(chunks)
+
+
+def normalize_e2e_public_jwk(value: object) -> dict[str, str] | None:
+    if value in (None, "", {}):
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise PairingError("Invalid E2E public key") from exc
+    if not isinstance(value, dict):
+        raise PairingError("Invalid E2E public key")
+    if value.get("kty") != "EC" or value.get("crv") != "P-256":
+        raise PairingError("Invalid E2E public key")
+    x = str(value.get("x") or "").strip()
+    y = str(value.get("y") or "").strip()
+    if not x or not y or value.get("d"):
+        raise PairingError("Invalid E2E public key")
+    return {"kty": "EC", "crv": "P-256", "x": x, "y": y}
+
+
+def dump_e2e_public_jwk(value: object) -> str | None:
+    cleaned = normalize_e2e_public_jwk(value)
+    if cleaned is None:
+        return None
+    return json.dumps(cleaned, separators=(",", ":"), sort_keys=True)
 
 
 def normalize_source_name(raw: str | None, fallback: str = "pc-agent") -> str:
@@ -82,6 +110,7 @@ class PairCodeIssueResult:
     code: str
     expires_at: datetime
     ttl_minutes: int
+    owner_e2e_public_jwk: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -91,6 +120,7 @@ class PairClaimResult:
     agent_api_key: str
     issued_at: datetime
     key_hint: str
+    owner_e2e_public_jwk: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -110,6 +140,7 @@ async def issue_pair_code(
     actor_user_id: int | None,
     ttl_minutes: int = 15,
     code_length: int = 8,
+    owner_e2e_public_jwk: object = None,
 ) -> PairCodeIssueResult:
     now = _now_utc()
     ttl = max(1, int(ttl_minutes))
@@ -142,10 +173,16 @@ async def issue_pair_code(
         used_count=0,
         created_by_user_id=actor_user_id,
         expires_at=expires_at,
+        owner_e2e_public_jwk=dump_e2e_public_jwk(owner_e2e_public_jwk),
     )
     session.add(pair)
     await session.commit()
-    return PairCodeIssueResult(code=code, expires_at=expires_at, ttl_minutes=ttl)
+    return PairCodeIssueResult(
+        code=code,
+        expires_at=expires_at,
+        ttl_minutes=ttl,
+        owner_e2e_public_jwk=normalize_e2e_public_jwk(owner_e2e_public_jwk),
+    )
 
 
 async def revoke_active_pair_codes(session: AsyncSession) -> int:
@@ -167,6 +204,7 @@ async def claim_pair_code_and_issue_key(
     pair_code: str,
     source_name: str | None,
     source_type: SourceType,
+    e2e_public_jwk: object = None,
 ) -> PairClaimResult:
     normalized_code = _normalize_pair_code(pair_code)
     if not normalized_code:
@@ -201,6 +239,7 @@ async def claim_pair_code_and_issue_key(
         is_active=True,
         created_by_user_id=pair.created_by_user_id,
         issued_at=now,
+        e2e_public_jwk=dump_e2e_public_jwk(e2e_public_jwk),
     )
     session.add(credential)
 
@@ -216,6 +255,7 @@ async def claim_pair_code_and_issue_key(
         agent_api_key=api_key,
         issued_at=now,
         key_hint=credential.key_hint,
+        owner_e2e_public_jwk=normalize_e2e_public_jwk(pair.owner_e2e_public_jwk),
     )
 
 
@@ -229,7 +269,7 @@ async def authenticate_agent_api_key(
     if not key:
         return None
 
-    if global_agent_api_key and key == global_agent_api_key:
+    if global_agent_api_key and hmac.compare_digest(key, global_agent_api_key):
         return AgentAuthResult(mode="global")
 
     credential = await session.scalar(

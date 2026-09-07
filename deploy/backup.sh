@@ -9,5 +9,5 @@ PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="python3"
 fi
-exec "${PYTHON_BIN}" "${ROOT_DIR}/deploy/migrate.py" export --root "${ROOT_DIR}" --output "${BACKUP_DIR}"
+exec "${PYTHON_BIN}" "${ROOT_DIR}/deploy/portable_migrate.py" export --root "${ROOT_DIR}" --output "${BACKUP_DIR}"
 

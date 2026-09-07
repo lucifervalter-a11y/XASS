@@ -1,4 +1,5 @@
-﻿import asyncio
+import asyncio
+import hmac
 import ipaddress
 import logging
 import os
@@ -20,6 +21,7 @@ from app.bot_api import TelegramBotClient
 from app.config import Settings, get_settings
 from app.db import SessionLocal, get_session, init_db
 from app.poller import telegram_polling_loop
+from app.server_migration_api import build_router as build_server_migration_router
 from app.schemas import (
     AgentPairClaimPayload,
     AgentPairClaimResponse,
@@ -29,7 +31,7 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import AgentCommand, AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
+from app.models import AgentCommand, AgentCredential, AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
 from app.services.agent_commands import (
     DANGEROUS_AGENT_COMMANDS,
     acknowledge_agent_commands,
@@ -48,7 +50,13 @@ from app.services.agent_installer import (
     issue_installer_ticket,
     verify_installer_ticket,
 )
-from app.services.agent_pairing import authenticate_agent_api_key, claim_pair_code_and_issue_key, issue_pair_code, revoke_active_pair_codes
+from app.services.agent_pairing import (
+    authenticate_agent_api_key,
+    claim_pair_code_and_issue_key,
+    dump_e2e_public_jwk,
+    issue_pair_code,
+    revoke_active_pair_codes,
+)
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.agent_workspace import (
     delete_asset as delete_workspace_asset,
@@ -92,8 +100,10 @@ from app.services.pwa_auth import (
     authenticate_telegram_login as pwa_authenticate_login,
     issue_session as issue_pwa_session,
     issue_action_proof,
+    issue_vk_connect_proof,
     rotate_session_generation,
     verify_action_proof,
+    verify_vk_connect_proof,
 )
 from app.services.passkeys import (
     authentication_options as passkey_authentication_options,
@@ -197,7 +207,8 @@ def _notify_chat_id(config_chat_id: int | None) -> int | None:
 def _verify_api_key(header_value: str | None, expected: str, reason: str) -> None:
     if not expected:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{reason} key is not configured")
-    if (header_value or "").strip() != expected:
+    incoming = (header_value or "").strip()
+    if not hmac.compare_digest(incoming, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid {reason} key")
 
 
@@ -282,6 +293,7 @@ class MiniDiagnosticActionPayload(BaseModel):
 class MiniAgentPairPayload(BaseModel):
     server_url: str = Field(default="", max_length=512)
     source_name: str = Field(default="", max_length=128)
+    e2e_public_jwk: dict[str, Any] | None = None
 
 
 class MiniPwaPairPayload(BaseModel):
@@ -552,15 +564,8 @@ async def _run_bot_post_startup() -> None:
     try:
         await bot_client.set_my_commands(
             [
-                {"command": "start", "description": "Панель управления"},
+                {"command": "start", "description": "Открыть XASS"},
                 {"command": "webapp", "description": "Открыть мини-приложение XASS"},
-                {"command": "status", "description": "Статус heartbeat-источников"},
-                {"command": "server", "description": "Метрики сервера"},
-                {"command": "pc", "description": "Состояние ПК-агентов"},
-                {"command": "chats", "description": "Сохранённые переписки"},
-                {"command": "deleted", "description": "Удалённые сообщения"},
-                {"command": "archive", "description": "Локальный архив на ПК"},
-                {"command": "update", "description": "Обновление бота и сервиса"},
                 {"command": "help", "description": "Все команды (.muz, .weather…)"},
             ]
         )
@@ -607,6 +612,8 @@ async def _update_miniapp_menu_button(public_url: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if Path(".migration-pending").exists():
+        raise RuntimeError("Migration is staged. Stop the source server, then run deploy/migrate.py activate")
     ensure_data_dirs()
     ensure_profile_exists(Path(settings.profile_json_path))
     ensure_projects_exists(Path(settings.projects_json_path))
@@ -655,6 +662,9 @@ app = FastAPI(
     title="Serverredus Telegram Business Control",
     version=APP_VERSION,
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -680,6 +690,7 @@ async def agent_pair_claim(
             pair_code=payload.pair_code,
             source_name=payload.source_name,
             source_type=payload.source_type,
+            e2e_public_jwk=payload.e2e_public_jwk,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -690,6 +701,7 @@ async def agent_pair_claim(
         source_type=result.source_type,
         agent_api_key=result.agent_api_key,
         issued_at=result.issued_at,
+        owner_e2e_public_jwk=result.owner_e2e_public_jwk,
     )
 
 
@@ -752,6 +764,16 @@ async def agent_heartbeat(
     # For per-agent keys we pin source_name on server side to keep identity stable.
     if auth.source_name and payload.source_name != auth.source_name:
         payload = payload.model_copy(update={"source_name": auth.source_name})
+
+    if auth.credential_id and payload.e2e_public_jwk:
+        credential = await session.get(AgentCredential, auth.credential_id)
+        try:
+            dumped = dump_e2e_public_jwk(payload.e2e_public_jwk)
+        except ValueError:
+            dumped = None
+        if credential is not None and dumped and credential.e2e_public_jwk != dumped:
+            credential.e2e_public_jwk = dumped
+            await session.commit()
 
     await acknowledge_agent_commands(
         session,
@@ -884,6 +906,8 @@ async def agent_workspace_asset_upload(
     command_id: int,
     request: Request,
     kind: str = "",
+    filename: str = "",
+    source_name: str = "",
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None),
     x_xass_source: str | None = Header(default=None),
@@ -894,8 +918,9 @@ async def agent_workspace_asset_upload(
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
-    source_name = str(auth.source_name or x_xass_source or "").strip()
-    if not source_name or (auth.source_name and x_xass_source and auth.source_name != x_xass_source):
+    requested_source = str(x_xass_source or source_name or "").strip()
+    source_name = str(auth.source_name or requested_source).strip()
+    if not source_name or (auth.source_name and requested_source and auth.source_name != requested_source):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
     command = await session.get(AgentCommand, int(command_id))
     expected_kind = {"screenshot": "screenshot", "file_download": "file_download"}.get(command.command if command else "")
@@ -908,11 +933,13 @@ async def agent_workspace_asset_upload(
             settings,
             source_name=source_name,
             kind=kind,
-            filename=x_xass_filename or ("screenshot.jpg" if kind == "screenshot" else "xass-file.bin"),
+            filename=filename or x_xass_filename or ("screenshot.jpg" if kind == "screenshot" else "xass-file.bin"),
             content_type=request.headers.get("content-type", "application/octet-stream"),
             body=body,
             command_id=command.id,
             ttl_seconds=10 * 60 if kind == "screenshot" else 30 * 60,
+            cipher=request.headers.get("x-xass-cipher", ""),
+            inner_type=request.headers.get("x-xass-inner-type", ""),
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -922,6 +949,7 @@ async def agent_workspace_asset_upload(
 @app.get("/agent/workspace/assets/{token}")
 async def agent_workspace_asset_download(
     token: str,
+    source_name: str = "",
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None),
     x_xass_source: str | None = Header(default=None),
@@ -931,17 +959,27 @@ async def agent_workspace_asset_download(
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
-    source_name = str(auth.source_name or x_xass_source or "").strip()
+    requested_source = str(x_xass_source or source_name or "").strip()
+    if auth.source_name and requested_source and auth.source_name != requested_source:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
+    source_name = str(auth.source_name or requested_source).strip()
     loaded = await asyncio.to_thread(load_workspace_asset, settings, token, source_name=source_name)
     if loaded is None or loaded[0].get("kind") != "file_upload":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Temporary upload is unavailable")
     metadata, path = loaded
-    return FileResponse(path, media_type=metadata["content_type"], filename=metadata["filename"], headers={"Cache-Control": "private, no-store"})
+    headers = {"Cache-Control": "private, no-store"}
+    media_type = metadata["content_type"]
+    if metadata.get("cipher") == "xass-sealed-v1":
+        media_type = "application/x-xass-sealed"
+        headers["X-XASS-Cipher"] = "xass-sealed-v1"
+        headers["X-XASS-Inner-Type"] = metadata["content_type"]
+    return FileResponse(path, media_type=media_type, filename=metadata["filename"], headers=headers)
 
 
 @app.get("/agent/archive/media/{asset_id}")
 async def agent_archive_media(
     asset_id: int,
+    source_name: str = "",
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None),
     x_xass_source: str | None = Header(default=None),
@@ -953,7 +991,7 @@ async def agent_archive_media(
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
-    requested_source = str(x_xass_source or "").strip()
+    requested_source = str(x_xass_source or source_name or "").strip()
     if auth.source_name and requested_source and requested_source != auth.source_name:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
     source_name = str(auth.source_name or requested_source).strip()
@@ -1078,8 +1116,10 @@ _MIGRATION_EXPORT_RE = re.compile(r"^xass-(?:app|system)-\d{8}\.tar\.zst$")
 @app.get("/agent/migration/export/{filename}")
 async def agent_migration_export_download(
     filename: str,
+    source_name: str = "",
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None),
+    x_xass_source: str | None = Header(default=None),
 ) -> FileResponse:
     auth = await authenticate_agent_api_key(
         session,
@@ -1088,9 +1128,31 @@ async def agent_migration_export_download(
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    # These legacy exports may contain the entire plaintext server, including
+    # credentials. A generic/shared agent key must never grant backup access.
+    if auth.mode != "issued" or not auth.source_name:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Переподключите ПК с индивидуальным ключом перед переносом архива")
+    header_source = str(x_xass_source or "").strip()
+    query_source = str(source_name or "").strip()
+    if any(value and value != auth.source_name for value in (header_source, query_source)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
     safe_name = Path(filename).name
     if safe_name != filename or not _MIGRATION_EXPORT_RE.fullmatch(safe_name):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Migration export not found")
+    if not settings.owner_user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Server owner is not configured")
+    authorization = await session.scalar(
+        select(AgentCommand.id).where(
+            AgentCommand.source_name == auth.source_name,
+            AgentCommand.command == "migration_download",
+            AgentCommand.status == "delivered",
+            AgentCommand.requested_by_user_id == settings.owner_user_id,
+            AgentCommand.delivered_at >= datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 3600, timezone.utc),
+            AgentCommand.payload["filename"].as_string() == safe_name,
+        ).limit(1)
+    )
+    if authorization is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Владелец должен отправить этому ПК новую команду скачивания именно этого архива")
     export_root = Path(settings.agent_migration_export_dir).resolve()
     export_path = (export_root / safe_name).resolve()
     if export_path.parent != export_root or not export_path.is_file():
@@ -1136,7 +1198,7 @@ async def profile_now_playing_external(
     accepted = {key for key in (profile_key, env_key) if key}
     if not accepted:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="iphone now playing key is not configured")
-    if incoming not in accepted:
+    if not any(hmac.compare_digest(incoming, key) for key in accepted):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid iphone now playing key")
     resolved_text = _resolve_external_now_playing_text(payload)
     if not resolved_text:
@@ -1155,13 +1217,21 @@ async def profile_now_playing_external(
 
 @app.post("/api/vk/save-token")
 async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
-    if not settings.setup_api_key or (payload.secret or "").strip() != settings.setup_api_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid secret")
+    proof = verify_vk_connect_proof((payload.secret or "").strip(), settings)
+    if proof is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired VK connect proof")
     token = (payload.access_token or "").strip()
     if len(token) < 20:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="access_token is too short")
     if payload.user_id <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="user_id must be positive")
+
+    notify_chat_id = payload.chat_id
+    if notify_chat_id is None and proof.get("chat_id") is not None:
+        try:
+            notify_chat_id = int(proof["chat_id"])
+        except (TypeError, ValueError):
+            notify_chat_id = None
 
     profile_path = Path(settings.profile_json_path)
     ensure_profile_exists(profile_path)
@@ -1172,10 +1242,10 @@ async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
     profile["vk_connected_at"] = datetime.now(timezone.utc).isoformat()
     save_profile(profile_path, profile)
 
-    if payload.chat_id and bot_client:
+    if notify_chat_id and bot_client:
         try:
             await bot_client.send_message(
-                int(payload.chat_id),
+                int(notify_chat_id),
                 (
                     "✅ ВКонтакте подключён!\n\n"
                     "Музыка из статуса ВК теперь будет обновляться автоматически.\n"
@@ -1183,7 +1253,7 @@ async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
                 ),
             )
         except Exception:
-            logger.warning("Failed to deliver VK connect confirmation to chat_id=%s", payload.chat_id)
+            logger.warning("Failed to deliver VK connect confirmation to chat_id=%s", notify_chat_id)
 
     return {"ok": True}
 
@@ -1214,11 +1284,17 @@ async def require_mini_owner(
 
 
 def _public_origin(request: Request) -> tuple[str, str]:
-    forwarded_host = str(request.headers.get("x-forwarded-host") or request.url.hostname or "").split(",", 1)[0].strip()
-    host = forwarded_host.split(":", 1)[0]
+    forwarded_host = str(request.headers.get("x-forwarded-host") or request.url.netloc or "").split(",", 1)[0].strip().lower()
     forwarded_proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",", 1)[0].strip().lower()
-    origin = f"{forwarded_proto}://{forwarded_host}"
-    return host, origin
+    parsed = urlsplit(f"{forwarded_proto}://{forwarded_host}")
+    host = parsed.hostname or ""
+    authority = f"[{host}]" if ":" in host else host
+    if parsed.port is not None and parsed.port != {"http": 80, "https": 443}.get(parsed.scheme):
+        authority += f":{parsed.port}"
+    return host, f"{parsed.scheme}://{authority}"
+
+
+app.include_router(build_server_migration_router(settings, require_mini_owner, _require_pwa_action_proof, _public_origin))
 
 
 @app.get("/api/pwa/config")
@@ -2429,12 +2505,16 @@ async def mini_agent_pair_code(
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    result = await issue_pair_code(
-        session,
-        actor_user_id=user.user_id,
-        ttl_minutes=settings.agent_pair_code_ttl_minutes,
-        code_length=settings.agent_pair_code_length,
-    )
+    try:
+        result = await issue_pair_code(
+            session,
+            actor_user_id=user.user_id,
+            ttl_minutes=settings.agent_pair_code_ttl_minutes,
+            code_length=settings.agent_pair_code_length,
+            owner_e2e_public_jwk=payload.e2e_public_jwk if payload else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     await emit_notification(
         session,
         event_type="pair_code_created",
@@ -2481,6 +2561,7 @@ async def mini_agent_pair_code(
         pair_code=result.code,
         expires_at=result.expires_at,
         source_name=payload.source_name if payload else "",
+        e2e_public_jwk=result.owner_e2e_public_jwk,
     )
     return {
         "ok": True,
@@ -2757,7 +2838,7 @@ async def mini_agent_screenshot(
         "ok": True,
         "available": True,
         "screenshot": {
-            **{key: item.get(key) for key in ("token", "size", "sha256", "created_at", "expires_at")},
+            **{key: item.get(key) for key in ("token", "size", "sha256", "created_at", "expires_at", "cipher", "inner_type", "content_type")},
             "url": f"/api/mini/agents/{quote(source.source_name, safe='')}/assets/{item['token']}",
         },
     }
@@ -2774,13 +2855,14 @@ async def mini_agent_asset_download(
     if loaded is None or loaded[0].get("kind") not in {"screenshot", "file_download"}:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Временный файл недоступен")
     metadata, path = loaded
-    disposition = "inline" if metadata["kind"] == "screenshot" else "attachment"
+    sealed = str(metadata.get("cipher") or "").startswith("xass-sealed")
+    disposition = "inline" if metadata["kind"] == "screenshot" and not sealed else "attachment"
     return FileResponse(
         path,
-        media_type=metadata["content_type"],
+        media_type="application/x-xass-sealed" if sealed else metadata["content_type"],
         filename=metadata["filename"],
         content_disposition_type=disposition,
-        headers={"Cache-Control": "private, no-store"},
+        headers={"Cache-Control": "private, no-store", "X-XASS-Cipher": str(metadata.get("cipher") or "")},
     )
 
 
@@ -2813,6 +2895,8 @@ async def mini_agent_file_upload(
             content_type=request.headers.get("content-type", "application/octet-stream"),
             body=body,
             ttl_seconds=30 * 60,
+            cipher=request.headers.get("x-xass-cipher", ""),
+            inner_type=request.headers.get("x-xass-inner-type", ""),
         )
         command = await enqueue_agent_command(
             session,
@@ -3733,8 +3817,8 @@ async def mini_vk_url(
         base = "https://redvps.site"
     app_id = int(resolved_app_id)
     version = (settings.vk_api_version or "5.199").strip() or "5.199"
-    secret = (settings.setup_api_key or "").strip()
-    redirect_target = f"{base}/vk-auth.php?secret={quote(secret, safe='')}"
+    proof = issue_vk_connect_proof(settings, chat_id=chat_id)
+    redirect_target = f"{base}/vk-auth.php?secret={quote(proof, safe='')}"
     if chat_id:
         redirect_target += f"&chat_id={int(chat_id)}"
     oauth_url = (

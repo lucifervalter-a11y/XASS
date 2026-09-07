@@ -1,5 +1,7 @@
 # Перенос XASS на другой сервер
 
+Основной способ из Mini App — **зашифрованная копия `.xass-server` или одноразовый код**, описанный в [SERVER_MIGRATION.md](SERVER_MIGRATION.md). Ниже — дополнительный ручной способ: полный незашифрованный `.tar.gz` с проверкой SHA-256, переносимый даже без установленных Python-зависимостей. Форматы не взаимозаменяемы: `deploy/migrate.py` работает с зашифрованными копиями, `deploy/portable_migrate.py` — с `.tar.gz`.
+
 Перенос состоит из одного полного архива и восстановления на новом сервере. Архив содержит код именно этой установки, базу, настройки, ключи агентов, настройки входа iPhone, профиль, цитаты, проекты, аватары и серверные медиа. Повторно создавать бота и подключать каждый ПК не нужно, если сохранить тот же HTTPS-домен.
 
 Доступ SSH к обоим серверам и управление DNS всё равно нужны. XASS не переносит чужой VPS, аккаунт хостинга или доменную регистрацию. Архивы Telegram, сохранённые **на дисках Windows-агентов**, остаются на этих ПК; в перенос входят их настройки и серверный индекс, а не сами диски.
@@ -21,7 +23,7 @@ sudo bash deploy/backup.sh /opt/serverredus /opt/serverredus-backups
 Для произвольной папки и имени архива:
 
 ```bash
-/opt/serverredus/.venv/bin/python /opt/serverredus/deploy/migrate.py export \
+/opt/serverredus/.venv/bin/python /opt/serverredus/deploy/portable_migrate.py export \
   --root /opt/serverredus --output /opt/serverredus-backups/xass.tar.gz
 ```
 
@@ -47,7 +49,7 @@ scp ./xass.tar.gz user@NEW_IP:~/xass.tar.gz
 ```bash
 git clone https://github.com/lucifervalter-a11y/XASS.git ~/xass-tools
 cd ~/xass-tools
-python3 deploy/migrate.py inspect ~/xass.tar.gz
+python3 deploy/portable_migrate.py inspect ~/xass.tar.gz
 sudo bash deploy/restore.sh ~/xass.tar.gz /opt/serverredus example.com
 ```
 
@@ -55,7 +57,7 @@ sudo bash deploy/restore.sh ~/xass.tar.gz /opt/serverredus example.com
 
 Сначала проверяются формат, все размеры и SHA-256, пути и свободное место; затем данные распаковываются во временную закрытую папку и только после успешной проверки публикуются в целевой каталог. Симлинки, hardlink, обход `../`, абсолютные пути, дубликаты и повреждённые файлы отклоняются. По умолчанию распакованная копия ограничена 100 ГиБ; для больших архивов используйте ручной импорт с `--max-gib 500`.
 
-После импорта скрипт устанавливает зависимости, создаёт `.venv`, службу `serverredus-backend` и nginx/PHP-FPM, сохраняет исходные секреты и ждёт `/health`. Для новой службы режим перезапуска явно переключается на systemd, даже если старый сервер использовал Docker/PM2. Установленный код привязывается к исходной Git-ревизии для дальнейших обновлений, когда она доступна на GitHub. Архивный код не запускается самим `migrate.py`; запуск приложения выполняет только явно выбранный `restore.sh`.
+После импорта скрипт устанавливает зависимости, создаёт `.venv`, службу `serverredus-backend` и nginx/PHP-FPM, сохраняет исходные секреты и ждёт `/health`. Для новой службы режим перезапуска явно переключается на systemd, даже если старый сервер использовал Docker/PM2. Установленный код привязывается к исходной Git-ревизии для дальнейших обновлений, когда она доступна на GitHub. Архивный код не запускается самим `portable_migrate.py`; запуск приложения выполняет только явно выбранный `restore.sh`.
 
 Если установка зависимостей или службы прервалась, восстановленные данные уже находятся в `/opt/serverredus`. Не запускайте повторно импорт в эту папку: завершите настройку по секции ниже. Ошибка не требует удаления исходного сервера.
 
@@ -104,7 +106,7 @@ URL имеет вид `postgresql+asyncpg://USER:PASSWORD@HOST:5432/NEW_DATABASE
 Для уже подготовленной инфраструктуры или Windows доступен импорт без установки пакетов, запуска кода и изменения служб:
 
 ```bash
-python3 deploy/migrate.py restore /private/xass.tar.gz --target /new/xass
+python3 deploy/portable_migrate.py restore /private/xass.tar.gz --target /new/xass
 ```
 
 Далее создайте виртуальное окружение, установите `requirements.txt` и запустите `uvicorn app.main:app` из восстановленного каталога. **Не используйте интерактивный `install.sh` поверх восстановленного `.env`:** он предлагает заново записать настройки и стандартные пути. Для Linux можно взять службу из `deploy/systemd/` и изменить `WorkingDirectory`/`ExecStart` на новый каталог. Для nginx оставьте API на localhost:8000, PHP-сайт и `/assets/`; запретите доступ к `.env`, исходникам, `/data/` и бэкапам, кроме публичной папки аватаров. При нестандартных путях передайте PHP-FPM `PROFILE_JSON_PATH`, `PROJECTS_JSON_PATH`, `QUOTES_JSON_PATH`, `SITE_CONFIG_JSON_PATH` из восстановленного `.env`.

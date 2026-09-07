@@ -5,6 +5,8 @@ import unittest
 import sqlite3
 from pathlib import Path
 
+import httpx
+
 from pc_client import archive_store
 
 
@@ -135,6 +137,28 @@ class AgentArchiveTests(unittest.TestCase):
             recovered = archive_store.apply_archive_events(config, payload, client=FakeClient(), headers={})
             self.assertEqual(recovered["cursor"], 11)
             self.assertFalse(archive_store.archive_status(config)["pending_retry"])
+
+    def test_cyrillic_pc_identity_downloads_archive_media_via_utf8_query(self) -> None:
+        def respond(request):
+            self.assertEqual(request.url.path, "/agent/archive/media/9")
+            self.assertEqual(request.url.params["source_name"], "Домашний ПК")
+            self.assertEqual(request.url.params["existing"], "preserved")
+            self.assertNotIn("x-xass-source", request.headers)
+            self.assertEqual(request.headers["x-api-key"], "test-key")
+            return httpx.Response(200, content=b"image-data")
+
+        with tempfile.TemporaryDirectory() as raw_root, httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            config = {"server_url": "https://agent.invalid", "source_name": "Домашний ПК", "archive_folder": raw_root}
+            event = {
+                "event_id": 12, "event": "create", "message_id": 5, "telegram_message_id": 100,
+                "chat_id": 42, "chat_type": "private", "text": "Фото",
+                "media": [{"id": 9, "type": "photo", "mime_type": "image/jpeg", "file_name": "Фото.jpg",
+                           "download_path": "/agent/archive/media/9?existing=preserved", "file_size": 10}],
+            }
+            result = archive_store.apply_archive_events(config, {"archive_enabled": True, "archive_events": [event]}, client=client, headers={"X-Api-Key": "test-key"})
+            self.assertEqual(result["cursor"], 12)
+            self.assertEqual(result["errors"], 0)
+            self.assertEqual((Path(raw_root) / "media" / "42" / "100_Фото.jpg").read_bytes(), b"image-data")
 
 
 if __name__ == "__main__":

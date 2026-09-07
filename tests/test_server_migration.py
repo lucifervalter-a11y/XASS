@@ -1,218 +1,253 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import closing
+import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
-import subprocess
-import sys
 import tarfile
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from app.services.server_migration import (
-    MANIFEST, MigrationError, _env_text, _postgres_env, _restore_postgres,
-    export_server_archive, inspect_server_archive, restore_server_archive,
-)
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
+from app.config import Settings
+from app.db import get_session
+from app.server_migration_api import build_router
+from app.services.server_backup import create_snapshot, decrypt_file, encrypt_file, extract_verified_tar, restore_snapshot
+from app.services.server_transfers import TransferStore, decode_code, encode_code
+from app.telegram_handler import TelegramUpdateHandler
 
-class ServerMigrationTests(unittest.TestCase):
-    def fixture(self, directory: Path) -> tuple[Path, dict]:
-        root = directory / "old"
-        (root / "app").mkdir(parents=True)
-        (root / "data" / "avatars").mkdir(parents=True)
-        (root / "assets" / "projects").mkdir(parents=True)
-        (root / "data" / "media").mkdir()
-        (root / "data" / "migration_exports").mkdir()
-        (root / "pc_client").mkdir()
-        (root / "requirements.txt").write_text("", encoding="utf-8")
-        (root / "app" / "main.py").write_text("# fixture", encoding="utf-8")
-        (root / "proxy.config.php").write_text("<?php // private local frontend config", encoding="utf-8")
-        (root / "pc_client" / "config.json").write_text('{"api_key":"not-server-state"}', encoding="utf-8")
-        (root / "data" / "profile-custom.json").write_text('{"name":"Owner","quote":"My quote"}', encoding="utf-8")
-        (root / "data" / "avatars" / "owner.png").write_bytes(b"avatar")
-        (root / "assets" / "projects" / "cover.png").write_bytes(b"cover")
-        (root / "data" / "media" / "music.mp3").write_bytes(b"music")
-        (root / "data" / "migration_exports" / "old-secret.tar.gz").write_bytes(b"exclude recursive archives")
-        (root / "data" / "pwa_session_generation").write_text("9", encoding="utf-8")
-        external = directory / "external-quotes.json"
-        external.write_text('[{"text":"Keep this"}]', encoding="utf-8")
-        settings = {
-            "database_url": "sqlite+aiosqlite:///./data/live.db",
-            "bot_token": "original-secret-token", "setup_api_key": "original-session-secret",
-            "agent_api_key": "agent-secret", "owner_user_id": 42,
-            "pwa_vapid_private_key": "original-push-key", "pwa_session_generation_path": "./data/pwa_session_generation",
-            "profile_json_path": "./data/profile-custom.json", "quotes_json_path": str(external),
-            "profile_avatars_dir": "./data/avatars", "projects_assets_dir": "./assets/projects",
-            "media_root": "./data/media", "agent_migration_export_dir": "./data/migration_exports",
-        }
-        with closing(sqlite3.connect(root / "data" / "live.db")) as database, database:
-            database.executescript("""
-                CREATE TABLE media_assets (id INTEGER PRIMARY KEY, local_path TEXT);
-                CREATE TABLE agent_commands (id INTEGER PRIMARY KEY, status TEXT, result TEXT);
-                CREATE TABLE heartbeat_sources (id INTEGER PRIMARY KEY, is_online BOOLEAN);
-                CREATE TABLE agent_credentials (id INTEGER PRIMARY KEY, api_key_hash TEXT);
-            """)
-            database.execute("INSERT INTO media_assets VALUES (?, ?)", (1, str(root / "data" / "media" / "music.mp3")))
-            database.execute("INSERT INTO agent_commands VALUES (1, 'pending', '{}')")
-            database.execute("INSERT INTO agent_commands VALUES (2, 'completed', '{}')")
-            database.execute("INSERT INTO heartbeat_sources VALUES (1, 1)")
-            database.execute("INSERT INTO agent_credentials VALUES (1, 'device-hash')")
-        return root, settings
-
-    def mutate(self, source: Path, target: Path, change) -> None:
-        with tarfile.open(source, "r:gz") as archive:
-            members = [(member, archive.extractfile(member).read()) for member in archive]
-        members = change(members)
-        with tarfile.open(target, "w:gz") as archive:
-            for member, body in members:
-                member.size = len(body)
-                archive.addfile(member, io.BytesIO(body))
-
-    def test_complete_snapshot_round_trip_rebases_paths_and_preserves_credentials(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            root, settings = self.fixture(directory)
-            # Keep a WAL writer connected: committed pages must still be present.
-            database = sqlite3.connect(root / "data" / "live.db")
-            database.execute("PRAGMA journal_mode=WAL")
-            database.execute("INSERT INTO agent_credentials VALUES (2, 'committed-in-wal')")
-            database.commit()
-            archive = directory / "backup.tar.gz"
-            try:
-                exported = export_server_archive(root, archive, settings)
-            finally:
-                database.close()
-            self.assertEqual(exported["database"], "sqlite")
-            self.assertNotIn("original-secret", json.dumps(inspect_server_archive(archive)))
-            with tarfile.open(archive, "r:gz") as packaged:
-                names = packaged.getnames()
-            self.assertNotIn("pc_client/config.json", names)
-            self.assertNotIn("data/migration_exports/old-secret.tar.gz", names)
-            self.assertFalse(any(name.endswith(("-wal", "-shm")) for name in names))
-            new = directory / "new"
-            restore_server_archive(archive, new)
-            self.assertEqual((new / "data" / "avatars" / "owner.png").read_bytes(), b"avatar")
-            self.assertEqual((new / "assets" / "projects" / "cover.png").read_bytes(), b"cover")
-            self.assertTrue((new / "proxy.config.php").is_file())
-            self.assertEqual((new / "data" / "pwa_session_generation").read_text(), "9")
-            env = (new / ".env").read_text()
-            self.assertIn("original-session-secret", env)
-            self.assertIn("original-push-key", env)
-            self.assertIn("QUOTES_JSON_PATH='./data/imported/quotes_json_path/external-quotes.json'", env)
-            self.assertNotIn(str(root), env)
-            self.assertEqual(json.loads((new / "data" / "imported" / "quotes_json_path" / "external-quotes.json").read_text())[0]["text"], "Keep this")
-            with closing(sqlite3.connect(new / "data" / "serverredus.db")) as restored:
-                self.assertEqual(restored.execute("SELECT local_path FROM media_assets").fetchone()[0], "./data/media/music.mp3")
-                self.assertEqual(restored.execute("SELECT count(*) FROM agent_credentials").fetchone()[0], 2)
-                self.assertEqual(restored.execute("SELECT status FROM agent_commands WHERE id=1").fetchone()[0], "failed")
-                self.assertEqual(restored.execute("SELECT status FROM agent_commands WHERE id=2").fetchone()[0], "completed")
-                self.assertEqual(restored.execute("SELECT is_online FROM heartbeat_sources").fetchone()[0], 0)
-            with closing(sqlite3.connect(root / "data" / "live.db")) as original:
-                self.assertEqual(original.execute("SELECT status FROM agent_commands WHERE id=1").fetchone()[0], "pending")
-
-    def test_corruption_and_existing_target_leave_destination_untouched(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            root, settings = self.fixture(directory)
-            good, bad, target = directory / "good.tar.gz", directory / "bad.tar.gz", directory / "new"
-            export_server_archive(root, good, settings)
-            self.mutate(good, bad, lambda members: [(member, b"broken" if member.name == "data/avatars/owner.png" else body) for member, body in members])
-            with self.assertRaises(MigrationError):
-                restore_server_archive(bad, target)
-            self.assertFalse(target.exists())
-            target.mkdir()
-            marker = target / "keep.txt"
-            marker.write_text("user data")
-            with self.assertRaisesRegex(MigrationError, "empty"):
-                restore_server_archive(good, target)
-            self.assertEqual(marker.read_text(), "user data")
-            with self.assertRaisesRegex(MigrationError, "already exists"):
-                export_server_archive(root, good, settings)
-
-    def test_traversal_links_duplicates_and_size_limit_are_rejected_before_publish(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            root, settings = self.fixture(directory)
-            good = directory / "good.tar.gz"
-            export_server_archive(root, good, settings)
-            cases = [("../escape", tarfile.REGTYPE), ("C:/escape", tarfile.REGTYPE), ("data\\escape", tarfile.REGTYPE), ("linked", tarfile.SYMTYPE), ("hardlink", tarfile.LNKTYPE), (".env", tarfile.REGTYPE)]
-            for index, (name, kind) in enumerate(cases):
-                with self.subTest(name=name):
-                    bad = directory / f"bad-{index}.tar.gz"
-                    member = tarfile.TarInfo(name)
-                    member.type, member.linkname = kind, "../outside"
-                    self.mutate(good, bad, lambda members: members + [(member, b"")])
-                    with self.assertRaises(MigrationError):
-                        restore_server_archive(bad, directory / "new")
-                    self.assertFalse((directory / "new").exists())
-            with self.assertRaisesRegex(MigrationError, "limit"):
-                restore_server_archive(good, directory / "new", max_bytes=20)
-
-    def test_missing_database_cannot_produce_misleading_backup(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            root, settings = self.fixture(directory)
-            settings["database_url"] = "sqlite+aiosqlite:///./data/missing.db"
-            archive = directory / "backup.tar.gz"
-            with self.assertRaisesRegex(MigrationError, "does not exist"):
-                export_server_archive(root, archive, settings)
-            self.assertFalse(archive.exists())
-
-    def test_postgres_restore_is_explicit_empty_and_transactional(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            dump = Path(temporary) / "database.dump"
-            dump.write_bytes(b"fixture")
-            with patch("app.services.server_migration._pg_run", return_value="1") as run:
-                with self.assertRaisesRegex(MigrationError, "empty"):
-                    _restore_postgres(dump, "postgresql+asyncpg://user:password@localhost/new", {})
-                self.assertEqual(run.call_count, 1)
-            with patch("app.services.server_migration._pg_run", return_value="0") as run:
-                _restore_postgres(dump, "postgresql+asyncpg://user:password@localhost/new", {"/old/$xass$/'media": "data/media"})
-                commands = [call.args[0] for call in run.call_args_list]
-                self.assertEqual(commands[1][0], "pg_restore")
-                self.assertIn("--single-transaction", commands[-1])
-                self.assertEqual(commands[-1].count("-f"), 2)
-                self.assertNotIn("password", json.dumps(commands))
-            env = _postgres_env("postgresql+asyncpg://user:p%40ss@localhost:5433/new?sslmode=require")
-            self.assertEqual(env["PGPASSWORD"], "p@ss")
-            self.assertEqual(env["PGSSLMODE"], "require")
-
-    def test_dotenv_round_trip_and_literal_interpolation_cannot_mutate_a_secret(self):
-        from dotenv import dotenv_values
-        values = {"bot_token": "ordinary-secret", "setup_api_key": "a'b\\c\nd", "pwa_cookie_secure": True, "owner_user_id": 42, "authorized_user_ids": [1, 2]}
-        restored = dotenv_values(stream=io.StringIO(_env_text(values)))
-        self.assertEqual(restored["SETUP_API_KEY"], values["setup_api_key"])
-        self.assertEqual(restored["AUTHORIZED_USER_IDS"], "1,2")
-        with patch.dict("os.environ", {"XASS_TEST_EXPANSION": "different-secret"}):
-            with self.assertRaisesRegex(MigrationError, "literal"):
-                _env_text({"setup_api_key": "literal ${XASS_TEST_EXPANSION}"})
-            with patch("app.services.server_migration._restore_postgres") as restore:
-                with self.assertRaisesRegex(MigrationError, "literal"):
-                    restore_server_archive(Path("unused.tar.gz"), Path("unused-target"), postgres_url="postgresql://user:${SECRET}@host/database")
-                restore.assert_not_called()
-
-    def test_cli_export_inspect_restore_on_fixtures(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            root, settings = self.fixture(directory)
-            (root / ".env").write_text(_env_text(settings), encoding="utf-8")
-            archive, target = directory / "cli.tar.gz", directory / "restored"
-            script = Path(__file__).resolve().parents[1] / "deploy" / "migrate.py"
-            commands = [
-                ["export", "--root", str(root), "--output", str(archive)],
-                ["inspect", str(archive)],
-                ["restore", str(archive), "--target", str(target)],
-            ]
-            for arguments in commands:
-                completed = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True, check=False)
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertNotIn("original-session-secret", completed.stdout)
-                self.assertIsInstance(json.loads(completed.stdout), dict)
-            self.assertTrue((target / "data" / "serverredus.db").is_file())
+PASSWORD = 'test archive passphrase 2026'
 
 
-if __name__ == "__main__":
-    unittest.main()
+class SnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.root = self.base / 'source'
+        self.root.mkdir()
+        (self.root / 'data').mkdir()
+        (self.root / 'index.php').write_text('<?php echo "site";')
+        (self.root / '.env').write_text('BOT_TOKEN=source-secret\n')
+        (self.root / 'data/profile.json').write_text('{"name":"Test"}')
+        self.external = self.base / 'media'
+        self.external.mkdir()
+        (self.external / 'message.jpg').write_bytes(b'actual media')
+        self.db = sqlite3.connect(self.root / 'data/serverredus.db')
+        self.addCleanup(self.db.close)
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('CREATE TABLE media_assets(id INTEGER PRIMARY KEY, local_path TEXT)')
+        self.db.execute('INSERT INTO media_assets VALUES (1, ?)', (str(self.external / 'message.jpg'),))
+        self.db.commit()
+        self.settings = Settings(_env_file=None, bot_token='effective-secret', owner_user_id=42,
+                                 media_root=str(self.external), server_backup_dir=str(self.base / 'backups'))
+        self.archive = self.base / 'server.xass-server'
+
+    def test_roundtrip_wal_external_media_environment_and_site(self):
+        manifest = create_snapshot(self.root, self.settings, self.archive, password=PASSWORD)
+        self.assertEqual(manifest['database'], 'sqlite')
+        target = self.base / 'new-server'
+        restore_snapshot(self.archive, target, password=PASSWORD)
+        self.assertEqual((target / 'index.php').read_bytes(), (self.root / 'index.php').read_bytes())
+        self.assertEqual((target / 'restored/media_root/message.jpg').read_bytes(), b'actual media')
+        with closing(sqlite3.connect(target / 'data/serverredus.db')) as db:
+            self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            self.assertEqual(db.execute('SELECT local_path FROM media_assets').fetchone()[0], str(target / 'restored/media_root/message.jpg'))
+        restored = Settings(_env_file=target / '.env')
+        self.assertEqual(restored.bot_token, 'effective-secret')
+        self.assertEqual(restored.owner_user_id, 42)
+        self.assertFalse(restored.polling_drop_pending_updates)
+        self.assertEqual((target / '.env.source').read_text(), 'BOT_TOKEN=source-secret\n')
+        self.assertTrue((target / '.migration-pending').exists())
+        if os.name != 'nt':  # Windows chmod does not implement POSIX owner/group bits.
+            self.assertEqual((target / '.env').stat().st_mode & 0o777, 0o600)
+        self.assertFalse((target / 'data/serverredus.db-wal').exists())
+        with self.assertRaises(ValueError):
+            restore_snapshot(self.archive, target, password=PASSWORD)
+
+    def test_wrong_password_and_tamper_publish_no_plaintext(self):
+        create_snapshot(self.root, self.settings, self.archive, password=PASSWORD)
+        for password, tamper in [('incorrect password 123', False), (PASSWORD, True)]:
+            if tamper:
+                data = bytearray(self.archive.read_bytes()); data[-25] ^= 1; self.archive.write_bytes(data)
+            output = self.base / 'plaintext.tar.gz'
+            with self.assertRaises(ValueError):
+                decrypt_file(self.archive, output, password=password)
+            self.assertFalse(output.exists())
+
+    def test_rsa_delivery_encryption_and_existing_destination(self):
+        private = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        pub = private.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        key = private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        create_snapshot(self.root, self.settings, self.archive, public_key=pub)
+        restore_snapshot(self.archive, self.base / 'restored', private_key=key)
+        original = self.archive.read_bytes()
+        with self.assertRaises(FileExistsError):
+            encrypt_file(self.root / 'index.php', self.archive, password=PASSWORD)
+        self.assertEqual(self.archive.read_bytes(), original)
+
+    def test_live_database_is_not_copied_and_backups_are_excluded(self):
+        backup_dir = Path(self.settings.server_backup_dir); backup_dir.mkdir()
+        (backup_dir / 'secret-code').write_text('not part of a snapshot')
+        create_snapshot(self.root, self.settings, self.archive, password=PASSWORD)
+        plain = self.base / 'plain.tar.gz'; decrypt_file(self.archive, plain, password=PASSWORD)
+        with tarfile.open(plain) as tar:
+            names = tar.getnames()
+        self.assertIn('database/sqlite.db', names)
+        self.assertNotIn('payload/data/serverredus.db', names)
+        self.assertFalse(any('secret-code' in name for name in names))
+
+    def test_tar_traversal_symlinks_and_duplicate_members_rejected(self):
+        for index, name in enumerate(['../escape', '/absolute', 'payload/../../escape', 'payload/C:escape', 'payload/CON', 'payload/link', 'payload/a']):
+            archive = self.base / f'bad{index}.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tar:
+                item = tarfile.TarInfo(name)
+                if name.endswith('link'):
+                    item.type = tarfile.SYMTYPE; item.linkname = '/etc/passwd'
+                tar.addfile(item)
+                if name == 'payload/a': tar.addfile(item)
+            destination = self.base / f'unpack{index}'; destination.mkdir()
+            with self.assertRaises(ValueError): extract_verified_tar(archive, destination)
+        self.assertFalse((self.base / 'escape').exists())
+
+    def test_restore_cancels_old_commands_without_changing_original(self):
+        self.db.execute('CREATE TABLE agent_commands(id INTEGER PRIMARY KEY, status TEXT, result TEXT, completed_at TEXT)')
+        self.db.execute("INSERT INTO agent_commands VALUES(1, 'delivered', '{}', NULL)")
+        self.db.execute('CREATE TABLE heartbeat_sources(id INTEGER PRIMARY KEY, is_online BOOLEAN)')
+        self.db.execute('INSERT INTO heartbeat_sources VALUES(1, 1)')
+        self.db.commit()
+        create_snapshot(self.root, self.settings, self.archive, password=PASSWORD)
+        target = self.base / 'restored-command-state'
+        restore_snapshot(self.archive, target, password=PASSWORD)
+        with closing(sqlite3.connect(target / 'data/serverredus.db')) as db:
+            status, result, completed = db.execute('SELECT status, result, completed_at FROM agent_commands').fetchone()
+            self.assertEqual(status, 'failed')
+            self.assertEqual(json.loads(result)['details']['reason'], 'server_migration')
+            self.assertTrue(completed)
+            self.assertEqual(db.execute('SELECT is_online FROM heartbeat_sources').fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT status FROM agent_commands').fetchone()[0], 'delivered')
+
+    def test_interpolation_in_resolved_secrets_is_rejected_before_export(self):
+        self.settings.setup_api_key = '${UNRELATED_SECRET}'
+        with self.assertRaisesRegex(ValueError, 'literal'):
+            create_snapshot(self.root, self.settings, self.archive, password=PASSWORD)
+        self.assertFalse(self.archive.exists())
+
+    def test_encrypted_snapshot_omits_checkout_pc_keys_but_keeps_server_state(self):
+        workstation_secret = b"WORKSTATION_ONLY_KEY_SENTINEL"
+        names = ["config.json", "config.json.bak", ".config.json.1.2.tmp", ".xass-master.key", "data/.xass-master.key", ".command-results.json", "Archive/private.jpg", "logs/debug.txt", ".venv312/Lib/secret.py"]
+        for name in names:
+            path = self.root / 'pc_client' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(workstation_secret)
+        (self.root / 'pc_client/secret_store.py').write_text('# keep source')
+        (self.root / 'data/.xass-master.key').write_bytes(b'SERVER_KEY_MUST_SURVIVE')
+        (self.root / 'data/config.json.bak').write_bytes(b'SERVER_BACKUP_MUST_SURVIVE')
+        workspace = self.root / 'pc_client/Archive/server-workspace'
+        workspace.mkdir()
+        (workspace / 'upload.txt').write_bytes(b'SERVER_UPLOAD_MUST_SURVIVE')
+        self.settings.agent_workspace_dir = str(workspace)
+        create_snapshot(self.root, self.settings, self.archive, password=PASSWORD)
+        plain = self.base / 'verified.tar.gz'
+        decrypt_file(self.archive, plain, password=PASSWORD)
+        with tarfile.open(plain) as packaged:
+            members = set(packaged.getnames())
+            for name in names:
+                self.assertNotIn('payload/pc_client/' + name, members)
+            self.assertIn('payload/pc_client/secret_store.py', members)
+            self.assertEqual(packaged.extractfile('payload/data/.xass-master.key').read(), b'SERVER_KEY_MUST_SURVIVE')
+            self.assertEqual(packaged.extractfile('payload/data/config.json.bak').read(), b'SERVER_BACKUP_MUST_SURVIVE')
+            self.assertEqual(packaged.extractfile('payload/pc_client/Archive/server-workspace/upload.txt').read(), b'SERVER_UPLOAD_MUST_SURVIVE')
+            self.assertIn(b'effective-secret', packaged.extractfile('settings.json').read())
+            self.assertIn('database/sqlite.db', members)
+            self.assertIn('payload/restored/media_root/message.jpg', members)
+            for item in packaged:
+                self.assertNotIn(workstation_secret, packaged.extractfile(item).read())
+
+
+class TransferTests(unittest.TestCase):
+    def test_single_consumer_under_concurrency_expiry_and_revoke(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TransferStore(Path(tmp))
+            job = store.create(); store.path(job).write_bytes(b'encrypted'); store.finish(job)
+            ticket = store.ticket(job)
+            def claim(_):
+                try: store.consume(ticket); return True
+                except ValueError: return False
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                self.assertEqual(sum(pool.map(claim, range(8))), 1)
+            expired = store.ticket(job, ttl=-1)
+            with self.assertRaises(ValueError): store.consume(expired)
+            revoked = store.ticket(job); store.revoke(job)
+            with self.assertRaises(ValueError): store.consume(revoked)
+            self.assertNotIn(ticket, (Path(tmp) / 'transfers.sqlite3').read_bytes().decode(errors='ignore'))
+
+    def test_pending_copy_does_not_consume_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TransferStore(Path(tmp)); job = store.create(); ticket = store.ticket(job)
+            with self.assertRaises(ValueError): store.consume(ticket)
+            store.path(job).write_bytes(b'encrypted'); store.finish(job)
+            self.assertEqual(store.consume(ticket), store.path(job))
+
+    def test_codes_require_https_and_no_credentials_or_paths(self):
+        code = encode_code('https://xass.example', 'a' * 43, PASSWORD)
+        self.assertEqual(decode_code(code)['password'], PASSWORD)
+        for origin in ['http://xass.example', 'https://user:password@xass.example', 'https://xass.example/path', 'https://xass.example?token=1']:
+            with self.assertRaises(ValueError): encode_code(origin, 'a' * 43, PASSWORD)
+
+    def test_api_authorization_and_native_post_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TransferStore(Path(tmp)); job = store.create(); store.path(job).write_bytes(b'encrypted'); store.finish(job)
+            async def owner(): raise HTTPException(401)
+            proof = AsyncMock()
+            api = FastAPI(); api.include_router(build_router(Settings(_env_file=None, server_backup_dir=tmp), owner, proof, lambda req: ('xass.example','https://xass.example')))
+            async def session(): yield None
+            api.dependency_overrides[get_session] = session
+            with TestClient(api) as client:
+                self.assertEqual(client.get('/api/mini/server-backups/' + job).status_code, 401)
+                self.assertEqual(client.post('/api/mini/server-backups', json={'passphrase': PASSWORD}).status_code, 401)
+                self.assertEqual(client.post('/api/server-transfer/download', data={'ticket': 'fake'}).status_code, 410)
+                ticket = store.ticket(job)
+                r = client.post('/api/server-transfer/download', data={'ticket': ticket})
+                self.assertEqual(r.content, b'encrypted'); self.assertIn('no-store', r.headers['cache-control'])
+                self.assertEqual(client.post('/api/server-transfer/download', data={'ticket': ticket}).status_code, 410)
+                async def authorized(): return SimpleNamespace(user_id=42)
+                api.dependency_overrides[owner] = authorized
+                r = client.post('/api/mini/server-backups/' + job + '/download-ticket')
+                self.assertEqual(r.status_code, 200); proof.assert_awaited_once()
+
+
+class MinimalBotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_removes_keyboard_and_legacy_callbacks_redirect(self):
+        bot = AsyncMock(); settings = Settings(_env_file=None, owner_user_id=42, profile_public_url='https://xass.example')
+        handler = TelegramUpdateHandler(settings, bot)
+        config = SimpleNamespace(service_base_url='https://xass.example')
+        with patch('app.telegram_handler.get_or_create_app_config', AsyncMock(return_value=config)):
+            await handler._handle_command(None, {'from': {'id':42}, 'chat': {'id':42}}, '/start')
+            self.assertEqual(bot.send_message.call_args.kwargs['reply_markup'], {'remove_keyboard': True})
+            self.assertIn('/miniapp.php', bot.send_message.call_args.args[1])
+            await handler._handle_callback(None, {'id':'query', 'from': {'id':42}, 'message': {'chat': {'id':42}, 'message_id':1}, 'data':'panel:update'})
+            self.assertEqual(bot.edit_message_text.call_args.kwargs['reply_markup'], {'inline_keyboard': []})
+
+    async def test_business_deletion_still_logs_and_notifies_before_commands(self):
+        handler = TelegramUpdateHandler(Settings(_env_file=None), AsyncMock())
+        handler._cache_recent_message = AsyncMock(); handler._notify_edit_events = AsyncMock(); handler._notify_deleted_events = AsyncMock()
+        update = {'deleted_business_messages': {'business_connection_id':'business', 'chat': {'id':12}, 'message_ids':[1]}}
+        with patch('app.telegram_handler.get_or_create_app_config', AsyncMock(return_value=SimpleNamespace())), patch('app.telegram_handler.handle_update_logging', AsyncMock()) as log:
+            await handler.handle_update(None, update)
+            log.assert_awaited_once(); handler._notify_deleted_events.assert_awaited_once()
+
+
+if __name__ == '__main__': unittest.main()

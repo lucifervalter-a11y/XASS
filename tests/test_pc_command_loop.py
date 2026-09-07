@@ -16,6 +16,7 @@ if str(CLIENT_ROOT) not in sys.path:
 
 import client_agent
 import client_update
+from e2e_crypto import generate_keypair, seal_text, unseal_text
 
 
 class StopLoop(BaseException):
@@ -124,6 +125,49 @@ class PcCommandLoopTests(unittest.TestCase):
         self.assertEqual(self.payloads[0]["command_results"], self.payloads[1]["command_results"])
         self.assertEqual(self.payloads[2]["command_results"], [])
         self.assertEqual(self.payloads[2]["last_error"], "")
+
+    def configure_e2e(self):
+        owner_private, owner_public = generate_keypair()
+        agent_private, agent_public = generate_keypair()
+        self.config.update({"e2e_private_jwk": agent_private, "e2e_public_jwk": agent_public, "owner_e2e_public_jwk": owner_public})
+        return owner_private, agent_public
+
+    def test_clipboard_result_stays_encrypted_through_immediate_acknowledgement(self) -> None:
+        owner_private, agent_public = self.configure_e2e()
+        with patch.object(client_agent, "clipboard_get", return_value="секретный текст"):
+            self.run_responses([{"commands": [{"id": 21, "command": "clipboard_get"}]}, {}])
+        result = self.payloads[1]["command_results"][0]
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["details"]["sealed"])
+        self.assertNotIn("text", result["details"])
+        self.assertEqual(unseal_text(result["details"], private_jwk=owner_private, peer_public_jwk=agent_public, aad="clipboard"), "секретный текст")
+        self.assertEqual(self.sleeps[0], 0.1)
+
+    def test_sealed_clipboard_command_is_decrypted_with_the_clipboard_aad(self) -> None:
+        owner_private, agent_public = self.configure_e2e()
+        payload = seal_text("текст с iPhone", private_jwk=owner_private, peer_public_jwk=agent_public, aad="clipboard")
+        with patch.object(client_agent, "clipboard_set", return_value=13) as clipboard:
+            self.run_responses([{"commands": [{"id": 22, "command": "clipboard_set", "payload": payload}]}, {}])
+        clipboard.assert_called_once_with("текст с iPhone")
+        result = self.payloads[1]["command_results"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["details"], {"length": 13})
+
+    def test_sealed_clipboard_without_peer_keys_does_not_clear_local_clipboard(self) -> None:
+        with patch.object(client_agent, "clipboard_set") as clipboard:
+            self.run_responses([{"commands": [{"id": 23, "command": "clipboard_set", "payload": {"sealed": True, "blob": "unreadable"}}]}, {}])
+        clipboard.assert_not_called()
+        self.assertFalse(self.payloads[1]["command_results"][0]["ok"])
+
+    def test_ciphertext_for_another_purpose_is_rejected_without_modifying_clipboard(self) -> None:
+        owner_private, agent_public = self.configure_e2e()
+        payload = seal_text("must not appear", private_jwk=owner_private, peer_public_jwk=agent_public, aad="file_upload")
+        with patch.object(client_agent, "clipboard_set") as clipboard:
+            self.run_responses([{"commands": [{"id": 24, "command": "clipboard_set", "payload": payload}]}, {}])
+        clipboard.assert_not_called()
+        result = self.payloads[1]["command_results"][0]
+        self.assertFalse(result["ok"])
+        self.assertIn("расшифровать", result["message"])
 
 
 class ArchiveWorkerTests(unittest.TestCase):

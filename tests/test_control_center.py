@@ -82,8 +82,8 @@ class ControlCenterTests(unittest.TestCase):
 
         with (
             patch.object(client_agent.os, "name", "nt"),
-            patch.object(client_agent.ctypes, "WinDLL", return_value=SimpleNamespace(SetSuspendState=FakeSuspend())),
-            patch.object(client_agent.ctypes, "get_last_error", return_value=5),
+            patch.object(client_agent.ctypes, "WinDLL", return_value=SimpleNamespace(SetSuspendState=FakeSuspend()), create=True),
+            patch.object(client_agent.ctypes, "get_last_error", return_value=5, create=True),
             patch.object(client_agent, "store_command_result") as store,
         ):
             client_agent._sleep_workstation(10)

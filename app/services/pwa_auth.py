@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from app.services.miniapp import MiniAppUser
 MAX_LOGIN_AGE_SEC = 10 * 60
 SESSION_AGE_SEC = 30 * 24 * 60 * 60
 ACTION_PROOF_AGE_SEC = 2 * 60
+VK_CONNECT_PROOF_AGE_SEC = 15 * 60
 COOKIE_NAME = "xass_pwa"
 
 
@@ -158,3 +160,60 @@ def verify_action_proof(token: str, user_id: int, purpose: str, settings: Settin
         )
     except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
         return False
+
+
+def issue_vk_connect_proof(
+    settings: Settings,
+    *,
+    chat_id: int | None = None,
+    now: int | None = None,
+) -> str:
+    """Short-lived proof for VK OAuth redirect - never put SETUP_API_KEY in URLs."""
+    issued_at = int(time.time() if now is None else now)
+    payload: dict[str, Any] = {
+        "v": 1,
+        "purpose": "vk_connect",
+        "iat": issued_at,
+        "exp": issued_at + VK_CONNECT_PROOF_AGE_SEC,
+        "nonce": secrets.token_hex(8),
+    }
+    if chat_id is not None:
+        payload["chat_id"] = int(chat_id)
+    encoded = _b64_encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    signature = hmac.new(
+        _session_secret(settings),
+        b"vk." + encoded.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded}.{_b64_encode(signature)}"
+
+
+def verify_vk_connect_proof(
+    token: str,
+    settings: Settings,
+    *,
+    now: int | None = None,
+) -> dict[str, Any] | None:
+    """Validate a VK connect proof. Returns payload (may include chat_id) or None."""
+    try:
+        encoded, received_signature = (token or "").split(".", 1)
+        expected = hmac.new(
+            _session_secret(settings),
+            b"vk." + encoded.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(expected, _b64_decode(received_signature)):
+            return None
+        payload = json.loads(_b64_decode(encoded))
+        current = int(time.time() if now is None else now)
+        if int(payload.get("v") or 0) != 1:
+            return None
+        if str(payload.get("purpose") or "") != "vk_connect":
+            return None
+        if current >= int(payload.get("exp") or 0):
+            return None
+        if current + 60 < int(payload.get("iat") or 0):
+            return None
+        return payload if isinstance(payload, dict) else None
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+        return None

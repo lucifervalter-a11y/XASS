@@ -84,8 +84,20 @@ class DesktopConnectionStatusTests(unittest.TestCase):
             app.start_agent()
             app.stop_agent()
             app.restart_agent()
+            app.take_local_screenshot()
+            app.lock_workstation()
+            app.show_clipboard()
         launch.assert_not_called()
         process.assert_not_called()
+
+    def test_top_processes_exclude_idle_and_normalize_multicore_cpu(self) -> None:
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        idle = Mock(info={"pid": 0, "name": "System Idle Process", "memory_info": None})
+        active = Mock(info={"pid": 42, "name": "editor.exe", "memory_info": Mock(rss=1048576)})
+        active.cpu_percent.return_value = 200
+        with patch.object(desktop_app.psutil, "process_iter", return_value=[idle, active]), patch.object(desktop_app.psutil, "cpu_count", return_value=4):
+            rows = app._top_processes()
+        self.assertEqual(rows, [{"pid": 42, "name": "editor.exe", "cpu": 50, "ram_mb": 1}])
 
 
 class DesktopLayoutTests(unittest.TestCase):
@@ -101,7 +113,7 @@ class DesktopLayoutTests(unittest.TestCase):
             for width in (900, 1360):
                 root.geometry(f"{width}x620+20000+20000")
                 root.update()
-                for view in ("overview", "connection", "settings", "updates", "diagnostics", "archive"):
+                for view in ("overview", "connection", "commands", "files", "settings", "updates", "journal", "diagnostics", "archive"):
                     with self.subTest(width=width, view=view):
                         app.show_view(view)
                         root.update()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import zipfile
 from dataclasses import dataclass
@@ -40,25 +41,61 @@ def _version(client_root: Path) -> str:
     return str(payload.get("version") or "0.0.0").strip() or "0.0.0"
 
 
-def _package_files(client_root: Path) -> list[Path]:
-    ignored_parts = {".venv", ".build-venv", ".updates", "build", "dist", "__pycache__"}
-    ignored_names = {
-        "config.json",
-        ".command-results.json",
-        ".agent-status.json",
-        ".update-result.json",
-        ".installed-revision",
+def is_agent_runtime_path(relative: Path, *, directory: bool = False) -> bool:
+    """Keep a development agent's private state out of shared source packages.
+
+    Match runtime basenames, including atomic-write temporaries/backups, without
+    treating source templates such as config.example.json or assets as secrets.
+    This same predicate can be used by server snapshot exporters.
+    """
+    parts = tuple(part.casefold() for part in relative.parts)
+    if not parts:
+        return False
+    directories = parts if directory else parts[:-1]
+    ignored_dirs = {".git", ".ssh", ".build-venv", ".updates", "build", "dist", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"}
+    if any(part in ignored_dirs or part.startswith((".venv", "venv")) for part in directories):
+        return True
+    # Runtime storage lives alongside the source when running an unpackaged
+    # agent. Nested assets/data and documentation examples remain packageable.
+    if directories and directories[0] in {"data", "archive", "archives", "logs", "log", "cache", ".cache", "runtime", "env"}:
+        return True
+    if directory:
+        return False
+    name = parts[-1]
+    normalized = name.lstrip(".")
+    if name in {"config.json.example", "config.json.template", "config.json.sample"}:
+        return False
+    runtime_names = {
+        "config.json", "xass-master.key", "command-results.json", "agent-status.json",
+        "update-result.json", "installed-revision", "xass-archive-state.json",
+        "xass-archive.sqlite3", "xass-managed-files.json", "migration.json",
     }
+    if any(normalized == base or normalized.startswith((base + ".", base + "-")) for base in runtime_names):
+        return True
+    if name.startswith(".env") and name not in {".env.example", ".env.template"}:
+        return True
+    return bool(
+        re.search(r"\.log(?:\.[0-9]+)?$", name)
+        or (name.startswith(".xass") and name.endswith(".instance"))
+        or name.endswith(".pyc") or ".generated." in name
+    )
+
+
+def _package_files(client_root: Path) -> list[Path]:
     result: list[Path] = []
-    for path in client_root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(client_root)
-        if any(part in ignored_parts for part in relative.parts):
-            continue
-        if path.name in ignored_names or path.suffix.lower() == ".pyc" or ".generated." in path.name:
-            continue
-        result.append(path)
+    for current, directories, filenames in os.walk(client_root, followlinks=False):
+        directory = Path(current)
+        # Prune before descending: an archive/venv can contain millions of files.
+        directories[:] = [name for name in directories if not (
+            is_agent_runtime_path((directory / name).relative_to(client_root), directory=True)
+            or (directory / name).is_symlink()
+            or (hasattr(Path, "is_junction") and (directory / name).is_junction())
+        )]
+        for name in filenames:
+            path = directory / name
+            if path.is_symlink() or not path.is_file() or is_agent_runtime_path(path.relative_to(client_root)):
+                continue
+            result.append(path)
     return sorted(result, key=lambda item: item.relative_to(client_root).as_posix())
 
 

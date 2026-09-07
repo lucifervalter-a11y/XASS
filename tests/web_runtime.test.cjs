@@ -36,7 +36,7 @@ function worker(response = new Response('shell',{headers:{'Content-Type':'text/h
     URL, Response, console,
     self:{location:{origin:'https://xass.test'},addEventListener:(event,fn)=>handlers[event]=fn},
     fetch:async()=>response,
-    caches:{open:async()=>({put:async(...args)=>puts.push(args)}),match:async()=>new Response('saved app')},
+    caches:{open:async()=>({put:async(...args)=>puts.push(args),match:async()=>new Response('offline notice')})},
   });
   return {puts, async request(route,mode='navigate') {
     let promise;
@@ -48,9 +48,9 @@ function worker(response = new Response('shell',{headers:{'Content-Type':'text/h
 test('public profile navigation cannot replace the iPhone app shell',async()=>{
   const sw=worker();assert.equal(await sw.request('/profile.php'),undefined);assert.equal(sw.puts.length,0);
 });
-test('temporary server failure returns cached app shell, not nginx error page',async()=>{
+test('temporary server failure returns the public offline notice, not nginx error page',async()=>{
   const sw=worker(new Response('gateway',{status:503}));
-  assert.equal(await (await sw.request('/miniapp.php?standalone=1')).text(),'saved app');
+  assert.equal(await (await sw.request('/miniapp.php?standalone=1')).text(),'offline notice');
   assert.equal(sw.puts.length,0);
 });
 test('demo pages and private downloads do not pollute caches',async()=>{
@@ -59,7 +59,7 @@ test('demo pages and private downloads do not pollute caches',async()=>{
   assert.equal(await sw.request('/data/avatar-private.jpg','cors'),undefined);
   assert.equal(await sw.request('/proxy.php?_p=/api/pwa/config','cors'),undefined);
 });
-test('normal Mini App navigation refreshes only the dedicated shell key',async()=>{
-  const sw=worker();await sw.request('/miniapp.php?standalone=1');
-  assert.equal(sw.puts.length,1);assert.equal(sw.puts[0][0],'/miniapp.php?standalone=1');
+test('normal Mini App navigation is fresh and never persists authenticated HTML',async()=>{
+  const sw=worker();const response=await sw.request('/miniapp.php?standalone=1');
+  assert.equal(await response.text(),'shell');assert.equal(sw.puts.length,0);
 });

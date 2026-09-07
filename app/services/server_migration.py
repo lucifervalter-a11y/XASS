@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+from app.services.agent_updates import is_agent_runtime_path
+
 
 FORMAT = "xass-server-backup"
 VERSION = 1
@@ -167,9 +169,11 @@ def export_server_archive(root: Path, destination: Path, settings: Any) -> dict[
     excluded = [_path(root, values[key]) for key in REBUILDABLE_PATHS if values.get(key)]
     excluded += [destination]
 
-    def collect(source: Path, target: str) -> None:
+    def collect(source: Path, target: str, *, pc_source: bool = False) -> None:
         _safe_relative(target)
         if any(_inside(source, skip) for skip in excluded):
+            return
+        if pc_source and is_agent_runtime_path(Path(PurePosixPath(target).relative_to("pc_client")), directory=source.is_dir()):
             return
         _no_symlinks(source)
         if not source.exists():
@@ -178,7 +182,7 @@ def export_server_archive(root: Path, destination: Path, settings: Any) -> dict[
             for item in sorted(source.iterdir()):
                 if item.name in EXCLUDED_PARTS or item.name in {".updates", "build", "dist"}:
                     continue
-                collect(item, f"{target}/{item.name}")
+                collect(item, f"{target}/{item.name}", pc_source=pc_source)
         elif source.is_file():
             if source.suffix == ".pyc":
                 return
@@ -198,11 +202,7 @@ def export_server_archive(root: Path, destination: Path, settings: Any) -> dict[
             if item.name in SOURCE_DIRS or item.name in SOURCE_FILES or (item.is_file() and item.suffix in {".php", ".sh", ".bat", ".py", ".webmanifest", ".html", ".js"}):
                 if item.name in {"run-agent.sh"}:
                     continue
-                collect(item, item.name)
-        # No Windows client's personal configuration belongs in the server backup.
-        for name in list(files):
-            if name.startswith("pc_client/") and PurePosixPath(name).name in {"config.json", ".agent-status.json", ".command-results.json", ".update-result.json", ".installed-revision"}:
-                del files[name]
+                collect(item, item.name, pc_source=item.name == "pc_client")
         collect(root / "data", "data")
         for key in sorted(PATH_SETTINGS | REBUILDABLE_PATHS):
             if not values.get(key):
@@ -369,6 +369,9 @@ def _portable_media_path(value: str, mapping: dict[str, str]) -> str:
     for old, new in sorted(mapping.items(), key=lambda pair: len(pair[0]), reverse=True):
         prefix = old.replace("\\", "/").rstrip("/")
         if normalized == prefix or normalized.startswith(prefix + "/"):
+            if Path(new).is_absolute():
+                suffix = normalized[len(prefix):].lstrip("/")
+                return str(Path(new) / suffix) if suffix else str(Path(new))
             return "./" + new + normalized[len(prefix):]
     return value
 
@@ -407,7 +410,8 @@ def _restore_postgres(path: Path, url: str, mapping: dict[str, str]) -> None:
     edits = ["SET standard_conforming_strings = on;"]
     for old, new in sorted(mapping.items(), key=lambda pair: len(pair[0]), reverse=True):
         prefix = old.rstrip("/")
-        update = f"UPDATE media_assets SET local_path={literal('./' + new)} || substring(local_path from {len(prefix) + 1}) WHERE local_path={literal(prefix)} OR left(local_path, {len(prefix) + 1})={literal(prefix + '/')}"
+        target_prefix = new if Path(new).is_absolute() else './' + new
+        update = f"UPDATE media_assets SET local_path={literal(target_prefix)} || substring(local_path from {len(prefix) + 1}) WHERE local_path={literal(prefix)} OR left(local_path, {len(prefix) + 1})={literal(prefix + '/')}"
         # The quoted DO body is an SQL literal, so a path cannot terminate it.
         body = f"BEGIN IF to_regclass('media_assets') IS NOT NULL THEN EXECUTE {literal(update)}; END IF; END"
         edits.append(f"DO {literal(body)};")
@@ -473,6 +477,8 @@ def restore_server_archive(archive_path: Path, target: Path, *, postgres_url: st
             _restore_postgres(database_path, postgres_url, manifest.get("path_map", {}))
             with (stage / ".env").open("a", encoding="utf-8") as handle:
                 handle.write(postgres_environment)
+        with (stage / ".env").open("a", encoding="utf-8") as handle:
+            handle.write(_env_text({"server_backup_dir": "../." + target.name + "-backups"}))
         # Persist provenance, but omit source machine paths and any credentials.
         (stage / "data").mkdir(exist_ok=True)
         (stage / "data" / "migration-receipt.json").write_text(json.dumps({"format": FORMAT, "version": VERSION, "restored_at": datetime.now(timezone.utc).isoformat(), "archive_sha256": _hash_file(archive_path), "files": len(manifest["files"]), "source_revision": manifest.get("source_revision", "")}, indent=2), encoding="utf-8")

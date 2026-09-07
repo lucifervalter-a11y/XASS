@@ -85,6 +85,7 @@ def _library() -> dict[str, Any]:
             ResidentKeyRequirement,
             UserVerificationRequirement,
         )
+        from webauthn.helpers.exceptions import WebAuthnException
     except ImportError as exc:
         raise RuntimeError("Поддержка Passkey ещё не установлена на сервере") from exc
     return locals()
@@ -196,13 +197,16 @@ async def complete_registration(
 ) -> PasskeyCredential:
     pending = _consume(transaction, "register")
     lib = _library()
-    result = lib["verify_registration_response"](
-        credential=credential,
-        expected_challenge=pending.challenge,
-        expected_rp_id=pending.rp_id,
-        expected_origin=pending.origin,
-        require_user_verification=True,
-    )
+    try:
+        result = lib["verify_registration_response"](
+            credential=credential,
+            expected_challenge=pending.challenge,
+            expected_rp_id=pending.rp_id,
+            expected_origin=pending.origin,
+            require_user_verification=True,
+        )
+    except lib["WebAuthnException"] as exc:
+        raise ValueError("Не удалось проверить Passkey. Повторите добавление ключа на том же адресе XASS.") from exc
     encoded_id = _encode(result.credential_id)
     existing = await session.scalar(
         select(PasskeyCredential).where(PasskeyCredential.credential_id == encoded_id)
@@ -219,6 +223,8 @@ async def complete_registration(
         )
         session.add(existing)
     else:
+        if existing.owner_user_id != pending.owner_user_id:
+            raise ValueError("Этот Passkey принадлежит другому владельцу")
         existing.public_key = _encode(result.credential_public_key)
         existing.sign_count = int(result.sign_count or 0)
         existing.name = (name or existing.name or "Face ID / Passkey")[:120]
@@ -276,15 +282,18 @@ async def complete_authentication(
     if stored is None:
         raise ValueError("Этот Passkey не зарегистрирован в XASS")
     lib = _library()
-    result = lib["verify_authentication_response"](
-        credential=credential,
-        expected_challenge=pending.challenge,
-        expected_rp_id=pending.rp_id,
-        expected_origin=pending.origin,
-        credential_public_key=_decode(stored.public_key),
-        credential_current_sign_count=int(stored.sign_count or 0),
-        require_user_verification=True,
-    )
+    try:
+        result = lib["verify_authentication_response"](
+            credential=credential,
+            expected_challenge=pending.challenge,
+            expected_rp_id=pending.rp_id,
+            expected_origin=pending.origin,
+            credential_public_key=_decode(stored.public_key),
+            credential_current_sign_count=int(stored.sign_count or 0),
+            require_user_verification=True,
+        )
+    except lib["WebAuthnException"] as exc:
+        raise ValueError("Passkey не прошёл проверку. Повторите вход на том же адресе XASS.") from exc
     from datetime import datetime, timezone
 
     stored.sign_count = int(result.new_sign_count or stored.sign_count or 0)

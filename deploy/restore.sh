@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ $EUID -eq 0 ]] || { echo "Run this deployment command with sudo." >&2; exit 2; }
 command -v python3 >/dev/null || { echo "Install python3 (3.11+) first." >&2; exit 2; }
 python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
-command -v apt-get >/dev/null || { echo "Automatic setup supports Debian/Ubuntu. Other systems: use migrate.py restore and docs/MIGRATION.md." >&2; exit 2; }
+command -v apt-get >/dev/null || { echo "Automatic setup supports Debian/Ubuntu. Other systems: use portable_migrate.py restore and docs/MIGRATION.md." >&2; exit 2; }
 
 ARCHIVE="$(realpath -- "$1")"
 TARGET="$(realpath -m -- "$2")"
@@ -20,7 +20,7 @@ DOMAIN="$3"
 
 # Restore verifies all checksums and rejects a nonempty/symlink target before
 # installing packages or changing any service. It never runs archived code.
-python3 "$SCRIPT_DIR/migrate.py" restore "$ARCHIVE" --target "$TARGET"
+python3 "$SCRIPT_DIR/portable_migrate.py" restore "$ARCHIVE" --target "$TARGET"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -60,6 +60,11 @@ mapfile -t PUBLIC_PATHS <<< "$PUBLIC_CONFIG"
 chown -R www-data:www-data -- "$TARGET"
 chmod 755 -- "$TARGET"
 chmod 600 -- "$TARGET/.env"
+BACKUP_TARGET="$(dirname "$TARGET")/.$(basename "$TARGET")-backups"
+[[ ! -L "$BACKUP_TARGET" ]] || { echo "Backup directory must not be a symlink." >&2; exit 1; }
+if [[ ! -e "$BACKUP_TARGET" ]]; then
+    install -d -m 700 -o www-data -g www-data -- "$BACKUP_TARGET"
+fi
 
 cat > /etc/systemd/system/serverredus-backend.service <<EOF
 [Unit]

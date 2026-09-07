@@ -308,6 +308,13 @@ body.cc-device-open { overflow: hidden; }
 .cc-migration-steps p { color: var(--muted); font-size: 14px; margin: 6px 0 12px; }
 .cc-migration-steps pre { overflow-x: auto; padding: 14px; background: #05080e; border: 1px solid var(--cc-line); border-radius: 10px; margin-bottom: 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .cc-doc-link { display: inline-flex; align-items: center; text-decoration: none; }
+.cc-manual-migration { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--cc-line); }
+#serverMigrationTools > summary, .cc-manual-migration > summary, .cc-key-transfer > summary { cursor: pointer; min-height: 44px; font-size: 15px; font-weight: 600; }
+#serverMigrationTools .muted, .cc-key-transfer p { font-size: 14px; line-height: 1.7; color: var(--muted); }
+#serverMigrationTools .toolbar { flex-wrap: wrap; }
+.cc-key-transfer { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--cc-line); }
+.cc-key-transfer .toolbar { margin: 14px 0; flex-wrap: wrap; }
+.cc-key-transfer .mono { overflow-wrap: anywhere; }
 .screen { overflow-y: auto; padding: max(24px, env(safe-area-inset-top)) 24px max(24px, env(safe-area-inset-bottom)); }
 .login, .deny { margin: auto; }
 .login .ios-help { font-size: 13px; }

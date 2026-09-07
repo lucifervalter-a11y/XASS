@@ -202,9 +202,16 @@ def _download_media(
     if target.is_file() and target.stat().st_size > 0:
         return str(target), "", _sha256_file(target)
     url = f"{server_url.rstrip('/')}{str(media.get('download_path') or '')}"
+    request_headers = dict(headers)
+    source_name = request_headers.get("X-XASS-Source", "")
+    if source_name and not all(32 <= ord(char) < 127 for char in source_name):
+        # Keep Unicode PC names intact without putting non-ASCII bytes into
+        # HTTP headers. Merge rather than replace any existing download query.
+        request_headers.pop("X-XASS-Source")
+        url = str(httpx.URL(url).copy_merge_params({"source_name": source_name}))
     temporary = target.with_suffix(target.suffix + ".download")
     try:
-        with client.stream("GET", url, headers=headers, timeout=60) as response:
+        with client.stream("GET", url, headers=request_headers, timeout=60) as response:
             response.raise_for_status()
             with temporary.open("wb") as handle:
                 for chunk in response.iter_bytes(1024 * 256):

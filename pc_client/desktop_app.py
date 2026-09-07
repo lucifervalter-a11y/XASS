@@ -45,6 +45,8 @@ from client_agent import (
     normalize_server_url,
     save_config,
 )
+from e2e_crypto import can_seal, ensure_agent_keys
+from secret_store import cipher_label
 from client_update import (
     DATA_ROOT,
     UPDATE_MARKER,
@@ -65,6 +67,7 @@ from client_update import (
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 from archive_store import archive_root, archive_status, cleanup_archive, conversation_rows
 from network_client import create_http_client
+from remote_tools import ROOT_LABELS, clipboard_get, list_files
 try:
     from runtime_state import acquire_single_instance, append_log, configure_utf8_logging, read_log_tail
 except ModuleNotFoundError:
@@ -82,7 +85,6 @@ TEXT = "#f4f4f5"
 MUTED = "#9c9ca3"
 ACCENT = "#3b82f6"
 ACCENT_HOVER = "#2f73df"
-VIOLET = "#3b82f6"
 GREEN = "#61c554"
 AMBER = "#efb65c"
 RED = "#f36b76"
@@ -306,6 +308,8 @@ class XassDesktop:
         self.uptime_var = tk.StringVar(value="—")
         self.local_time_var = tk.StringVar(value="—")
         self.metric_bars: dict[str, tuple[tk.Canvas, int]] = {}
+        self._process_rows: list[dict[str, Any]] = []
+        self._process_sampling = False
 
         self._build_shell()
         if not preview:
@@ -406,11 +410,13 @@ class XassDesktop:
 
         for key, label in (
             ("overview", "Обзор"),
+            ("commands", "Команды"),
             ("connection", "Подключение"),
+            ("files", "Файлы"),
             ("archive", "Архив"),
+            ("journal", "Журнал"),
             ("updates", "Обновления"),
             ("settings", "Настройки"),
-            ("diagnostics", "Диагностика"),
         ):
             button = tk.Button(
                 self.sidebar,
@@ -424,7 +430,7 @@ class XassDesktop:
                 relief="flat",
                 borderwidth=0,
                 padx=18,
-                pady=10,
+                pady=4,
                 cursor="hand2",
                 font=("Segoe UI Semibold", 10),
             )
@@ -472,6 +478,15 @@ class XassDesktop:
         self.content.bind("<Configure>", self._on_content_configure)
         self.body_canvas.bind("<Configure>", self._on_canvas_configure)
         self.root.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        self.root.bind("<Configure>", self._on_window_resize, add="+")
+
+    def _on_window_resize(self, event: tk.Event[Any]) -> None:
+        if event.widget is self.root:
+            padding = 4 if event.height < 720 else 10
+            if padding != getattr(self, "_navigation_padding", None):
+                self._navigation_padding = padding
+                for button in self.nav_buttons.values():
+                    button.configure(pady=padding)
 
     def _on_content_configure(self, _event: tk.Event[Any]) -> None:
         self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
@@ -502,13 +517,17 @@ class XassDesktop:
         self._clear_content()
         if name == "connection":
             self._build_connection()
+        elif name == "commands":
+            self._build_commands()
+        elif name == "files":
+            self._build_files()
         elif name == "archive":
             self._build_archive()
         elif name == "updates":
             self._build_updates()
         elif name == "settings":
             self._build_settings()
-        elif name == "diagnostics":
+        elif name in {"journal", "diagnostics"}:
             self._build_diagnostics()
         else:
             self._build_overview()
@@ -633,10 +652,58 @@ class XassDesktop:
         self._button(connection, "Проверить доступность сервера", self.check_connection, kind="ghost").pack(fill="x", pady=(10, 0))
 
         tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
+        process_head = tk.Frame(self.content, bg=BG)
+        process_head.pack(fill="x", pady=(18, 10))
+        tk.Label(process_head, text="Топ-процессы", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
+        process_card = self._card(self.content, padding=0)
+        process_card.pack(fill="x", pady=(0, 4))
+        process_rows_frame = tk.Frame(process_card, bg=CARD)
+        process_rows_frame.pack(fill="x")
+        def process_row(values: tuple[str, ...], *, heading: bool = False) -> None:
+            row = tk.Frame(process_rows_frame, bg=CARD)
+            row.pack(fill="x", padx=16, pady=(12, 4) if heading else 4)
+            for index, value in enumerate(values):
+                weight = 3 if index == 0 else 1
+                row.columnconfigure(index, weight=weight, uniform="process")
+                label = tk.Label(row, text=value, bg=CARD, fg=MUTED if heading else TEXT, font=("Segoe UI", 9), anchor="w", justify="left")
+                label._row_value = True
+                label.grid(row=0, column=index, sticky="nw", padx=(0, 8))
+                row.bind("<Configure>", lambda event, item=label, ratio=weight: item.configure(wraplength=max(32, event.width * ratio // 6 - 12)), add="+")
+        def render_processes() -> None:
+            if not process_rows_frame.winfo_exists():
+                return
+            for child in process_rows_frame.winfo_children():
+                child.destroy()
+            process_row(("Имя", "PID", "CPU", "RAM"), heading=True)
+            for proc in self._process_rows:
+                process_row((proc["name"], str(proc["pid"]), f"{proc['cpu']:.1f}%", f"{proc['ram_mb']:.0f} МБ"))
+            if not self._process_rows:
+                tk.Label(process_rows_frame, text="Загружаем процессы…", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=12)
+        render_processes()
+        if not self._process_sampling:
+            self._process_sampling = True
+            def sample_processes() -> None:
+                try:
+                    self._process_rows = self._top_processes()
+                except (psutil.Error, OSError):
+                    self._process_rows = []
+                finally:
+                    self._process_sampling = False
+            threading.Thread(target=sample_processes, daemon=True).start()
+        def refresh_processes() -> None:
+            if self._closing or not process_rows_frame.winfo_exists():
+                return
+            if self._process_sampling:
+                self.root.after(150, refresh_processes)
+            else:
+                render_processes()
+        self.root.after(150, refresh_processes)
+
+        tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
         events_head = tk.Frame(self.content, bg=BG)
         events_head.pack(fill="x", pady=(18, 10))
         tk.Label(events_head, text="Последние события", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
-        self._button(events_head, "Открыть диагностику", lambda: self.show_view("diagnostics"), kind="ghost").pack(side="right")
+        self._button(events_head, "Открыть журнал", lambda: self.show_view("journal"), kind="ghost").pack(side="right")
         self.overview_log = DarkScrolledText(
             self.content,
             height=8,
@@ -752,6 +819,145 @@ class XassDesktop:
         entry.bind("<FocusOut>", lambda _event: border.configure(bg=LINE))
         return entry
 
+    def _top_processes(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        cpu_count = max(1, psutil.cpu_count() or 1)
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                info = proc.info
+                if not info.get("pid"):
+                    continue  # Windows idle time is not an application workload.
+                memory = info.get("memory_info")
+                rows.append(
+                    {
+                        "pid": int(info.get("pid") or 0),
+                        "name": str(info.get("name") or "—")[:42],
+                        "cpu": min(100.0, max(0.0, float(proc.cpu_percent(interval=None) or 0) / cpu_count)),
+                        "ram_mb": float(getattr(memory, "rss", 0) or 0) / (1024 * 1024),
+                    }
+                )
+            except (psutil.Error, TypeError, ValueError):
+                continue
+        rows.sort(key=lambda item: (item["cpu"], item["ram_mb"]), reverse=True)
+        return rows[:6]
+
+    def _build_commands(self) -> None:
+        self._header("Команды", "Локальные действия на этом ПК. Опасные операции подтверждаются.")
+        grid = tk.Frame(self.content, bg=BG)
+        grid.pack(fill="x")
+        actions = (
+            ("Проверить связь", self.check_connection, "primary"),
+            ("Снимок экрана", self.take_local_screenshot, "secondary"),
+            ("Буфер обмена", self.show_clipboard, "secondary"),
+            ("Заблокировать экран", self.lock_workstation, "danger"),
+            ("Перезапустить агент", self.restart_agent, "secondary"),
+            ("Проверить обновление", self.check_update, "ghost"),
+        )
+        for index, (label, command, kind) in enumerate(actions):
+            cell = tk.Frame(grid, bg=BG)
+            cell.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 8, 8 if index % 2 == 0 else 0), pady=6)
+            grid.columnconfigure(index % 2, weight=1)
+            self._button(cell, label, command, kind=kind).pack(fill="x")
+        hint = self._card(self.content, padding=18)
+        hint.pack(fill="x", pady=(16, 0))
+        tk.Label(hint, text="MINI APP", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(
+            hint,
+            text="Команды из Telegram Mini App приходят фоновому агенту. Здесь те же действия можно выполнить локально: снимок сохраняется в «Изображения\\XASS». После блокировки войти снова можно на самом ПК через Windows Hello / PIN.",
+            bg=CARD,
+            fg=MUTED,
+            justify="left",
+            wraplength=780,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(8, 0))
+
+    def _build_files(self) -> None:
+        self._header("Файлы", "Только разрешённые папки. Сервер не копирует байты на VPS без запроса.")
+        self._file_root = getattr(self, "_file_root", "desktop")
+        toolbar = tk.Frame(self.content, bg=BG)
+        toolbar.pack(fill="x", pady=(0, 12))
+        for key, label in ROOT_LABELS.items():
+            kind = "primary" if key == self._file_root else "ghost"
+            self._button(
+                toolbar,
+                label,
+                lambda item=key: self._open_file_root(item),
+                kind=kind,
+            ).pack(side="left", padx=(0, 8))
+        self._flow_actions(toolbar)
+        card = self._card(self.content, padding=8)
+        card.pack(fill="both", expand=True)
+        try:
+            listing = {"entries": []} if self.preview else list_files(DATA_ROOT, self._file_root, "")
+            entries = listing.get("entries") or []
+        except Exception as exc:
+            tk.Label(card, text=str(exc), bg=CARD, fg=RED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=16)
+            return
+        if not entries:
+            tk.Label(card, text="В этой папке пока пусто.", bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=16)
+            return
+        for item in entries:
+            row = tk.Frame(card, bg=CARD)
+            row.pack(fill="x", padx=10, pady=4)
+            mark = "папка" if item.get("type") == "directory" else self._format_bytes(int(item.get("size") or 0))
+            tk.Label(row, text=str(item.get("name") or "—"), bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 10)).pack(side="left")
+            tk.Label(row, text=mark, bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="right")
+
+    def _open_file_root(self, root_name: str) -> None:
+        self._file_root = root_name
+        self.show_view("files")
+
+    @staticmethod
+    def _format_bytes(size: int) -> str:
+        if size < 1024:
+            return f"{size} Б"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} КБ"
+        return f"{size / (1024 * 1024):.1f} МБ"
+
+    def take_local_screenshot(self) -> None:
+        if self.preview:
+            return
+        try:
+            from PIL import ImageGrab
+        except ImportError:
+            messagebox.showerror("XASS", "Для снимка экрана нужен Pillow.")
+            return
+        try:
+            image = ImageGrab.grab(all_screens=True)
+            folder = Path(os.environ.get("USERPROFILE") or Path.home()) / "Pictures" / "XASS"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"xass-{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg"
+            image.convert("RGB").save(path, "JPEG", quality=85)
+        except Exception as exc:
+            messagebox.showerror("XASS", f"Не удалось снять экран:\n{exc}")
+            return
+        self._log(f"снимок экрана сохранён: {path}")
+        messagebox.showinfo("XASS", f"Снимок сохранён:\n{path}")
+
+    def lock_workstation(self) -> None:
+        if self.preview:
+            return
+        if os.name != "nt":
+            messagebox.showinfo("XASS", "Блокировка экрана доступна только на Windows.")
+            return
+        if not messagebox.askyesno("XASS", "Заблокировать этот компьютер сейчас?", parent=self.root):
+            return
+        try:
+            ctypes.windll.user32.LockWorkStation()
+            self._log("экран заблокирован локально")
+        except Exception as exc:
+            messagebox.showerror("XASS", f"Не удалось заблокировать экран:\n{exc}")
+
+    def show_clipboard(self) -> None:
+        if self.preview:
+            return
+        try:
+            text = clipboard_get() or "Буфер пуст"
+        except Exception as exc:
+            text = str(exc)
+        messagebox.showinfo("XASS", text[:1200])
+
     def _build_connection(self) -> None:
         self._header("Подключение", "Привяжите этот компьютер к своему XASS за пару шагов")
         columns = ResponsiveColumns(self.content, bg=BG)
@@ -763,7 +969,7 @@ class XassDesktop:
         tk.Label(quick, text="Один файл — и готово", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 20)).pack(anchor="w", pady=(12, 5))
         tk.Label(
             quick,
-            text="1. Откройте «Агенты» → «Подключить ПК» в Telegram или веб-приложении.\n\n2. Скачайте файл подключения и выберите его здесь. Адрес и ключ заполнятся автоматически.",
+            text="1. Откройте «Агенты» → «Подключить ПК» в Telegram или веб-приложении.\n\n2. Скачайте xass-connect.xass и выберите его здесь. Адрес и ключ заполнятся автоматически.",
             bg=CARD,
             fg=MUTED,
             justify="left",
@@ -832,6 +1038,14 @@ class XassDesktop:
         self._connection_row(maintenance, "Ревизия", current_revision()[:16] or "локальная")
         self._connection_row(maintenance, "Python", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
         tk.Label(maintenance, text="Команды с телефона доступны, пока компьютер включён и агент работает. Закрытие окна сворачивает XASS в системный трей.", bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 10)).pack(fill="x", pady=(16, 0))
+        on_disk = {}
+        try:
+            if not self.preview:
+                on_disk = json.loads((DATA_ROOT / "config.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError):
+            pass
+        self._connection_row(maintenance, "Секрет на диске", cipher_label(on_disk) if isinstance(on_disk, dict) else "—")
+        self._connection_row(maintenance, "Канал Mini App", "E2E AES-256-GCM" if can_seal(self.config) else "открытый (перепривяжите ПК)")
         self._button(maintenance, "Проверить обновление", self.check_update, kind="ghost").pack(fill="x", pady=(22, 9))
         self._button(maintenance, "Перезапустить агент", self.restart_agent).pack(fill="x")
 
@@ -884,7 +1098,7 @@ class XassDesktop:
         ).pack(anchor="w", pady=(10, 0))
 
     def _build_diagnostics(self) -> None:
-        self._header("Диагностика", "Безопасный статус GUI, агента, сети и updater")
+        self._header("Журнал", "Безопасный статус GUI, агента, сети и updater")
         card = self._card(self.content, padding=21)
         card.pack(fill="x", pady=(0, 14))
         columns = ResponsiveColumns(card, bg=CARD, breakpoint=850)
@@ -1273,6 +1487,8 @@ class XassDesktop:
         if profile.source_name:
             self.name_var.set(profile.source_name)
         self.auto_update_var.set(profile.auto_update)
+        if profile.e2e_public_jwk:
+            self.config["owner_e2e_public_jwk"] = profile.e2e_public_jwk
         expires = profile.expires_at.astimezone().strftime("%H:%M")
         self.import_status_var.set(f"Конфиг из {source} принят · ключ действует до {expires}. Подключаю…")
         self._log(f"Импортирован файл подключения: {source}")
@@ -1283,7 +1499,7 @@ class XassDesktop:
             return
         code = self.pair_var.get().strip()
         if not code:
-            messagebox.showwarning("XASS", "Введите одноразовый ключ или импортируйте xass-connect.json")
+            messagebox.showwarning("XASS", "Введите одноразовый ключ или импортируйте xass-connect.xass")
             return
         if hasattr(self, "pair_button") and self.pair_button.winfo_exists():
             self.pair_button.configure(state="disabled", text="Подключение…")
@@ -1301,11 +1517,13 @@ class XassDesktop:
         def worker() -> None:
             try:
                 server = discover_backend_url(normalize_server_url(server_input))
+                ensure_agent_keys(self.config)
                 result = claim_pair_code(
                     server_url=server,
                     pair_code=code,
                     source_name=source_name,
                     source_type="PC_AGENT",
+                    e2e_public_jwk=self.config.get("e2e_public_jwk"),
                 )
                 self.config.update(
                     {
@@ -1318,6 +1536,8 @@ class XassDesktop:
                         "desktop_managed": True,
                     }
                 )
+                if result.get("owner_e2e_public_jwk"):
+                    self.config["owner_e2e_public_jwk"] = result.get("owner_e2e_public_jwk")
                 save_config(self.config)
                 self.root.after(0, lambda: self._paired_ok(server))
             except Exception as exc:
@@ -1338,7 +1558,7 @@ class XassDesktop:
         self.server_var.set(server)
         self.name_var.set(str(self.config.get("source_name") or ""))
         self.pair_var.set("")
-        self.import_status_var.set("Компьютер успешно привязан. Персональный API-ключ сохранён локально.")
+        self.import_status_var.set("Компьютер успешно привязан. Ключ зашифрован на этом Windows-аккаунте.")
         self._log("Pairing выполнен, персональный ключ сохранён локально")
         self._set_status("Подключён", GREEN)
         self.restart_agent()

@@ -14,6 +14,11 @@ import httpx
 import psutil
 
 try:
+    from e2e_crypto import SEALED_CONTENT_TYPE, is_sealed_blob, seal_bytes, unseal_bytes
+except ModuleNotFoundError:
+    from pc_client.e2e_crypto import SEALED_CONTENT_TYPE, is_sealed_blob, seal_bytes, unseal_bytes
+
+try:
     from PIL import ImageGrab
 except ImportError:  # pragma: no cover - dependency bootstrap handles this in builds
     ImageGrab = None
@@ -29,6 +34,18 @@ ROOT_LABELS = {
     "documents": "Документы",
     "xass_files": "XASS Files",
 }
+
+
+def _is_header_text(value: str) -> bool:
+    return all(32 <= ord(char) < 127 for char in value)
+
+
+def _source_transport(source_name: str) -> tuple[dict[str, str], dict[str, str]]:
+    # httpx encodes text headers as ASCII. Preserve Unicode identity in an
+    # ordinary UTF-8 URL parameter instead of corrupting the device name.
+    if _is_header_text(source_name):
+        return {"X-XASS-Source": source_name}, {}
+    return {}, {"source_name": source_name}
 
 
 def allowed_roots(data_root: Path) -> dict[str, Path]:
@@ -112,13 +129,15 @@ def download_migration_export(
     url = f"{endpoint.rstrip('/')}/agent/migration/export/{safe_name}"
     received = 0
     hasher = hashlib.sha256()
+    source_headers, source_params = _source_transport(source_name)
     try:
         with client.stream(
             "GET",
             url,
+            params=source_params,
             headers={
                 "X-Api-Key": api_key,
-                "X-XASS-Source": source_name,
+                **source_headers,
                 "Accept-Encoding": "identity",
                 "Cache-Control": "no-cache",
             },
@@ -225,15 +244,31 @@ def _upload_bytes(
     filename: str,
     content_type: str,
     body: bytes,
+    e2e_private_jwk: dict[str, Any] | None = None,
+    owner_e2e_public_jwk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    source_headers, params = _source_transport(source_name)
+    transmitted_name = filename[:180]
+    if not _is_header_text(transmitted_name):
+        params["filename"] = transmitted_name
+        suffix = Path(transmitted_name).suffix
+        transmitted_name = "xass-file" + (suffix if _is_header_text(suffix) and len(suffix) <= 16 else ".bin")
+    params["kind"] = kind
+    headers = {
+        "X-Api-Key": api_key, **source_headers,
+        "X-XASS-Filename": transmitted_name, "Content-Type": content_type,
+    }
+    payload = body
+    if e2e_private_jwk and owner_e2e_public_jwk:
+        payload = seal_bytes(body, private_jwk=e2e_private_jwk, peer_public_jwk=owner_e2e_public_jwk, aad=kind.encode("utf-8"))
+        headers["Content-Type"] = SEALED_CONTENT_TYPE
+        headers["X-XASS-Cipher"] = "xass-sealed-v1"
+        headers["X-XASS-Inner-Type"] = content_type
     response = client.post(
         f"{endpoint.rstrip('/')}/agent/workspace/assets/{int(command_id)}",
-        params={"kind": kind},
-        headers={
-            "X-Api-Key": api_key, "X-XASS-Source": source_name,
-            "X-XASS-Filename": filename[:180], "Content-Type": content_type,
-        },
-        content=body,
+        params=params,
+        headers=headers,
+        content=payload,
         timeout=60.0,
     )
     response.raise_for_status()
@@ -250,6 +285,8 @@ def capture_screenshot(
     api_key: str,
     source_name: str,
     command_id: int,
+    e2e_private_jwk: dict[str, Any] | None = None,
+    owner_e2e_public_jwk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if os.name != "nt" or ImageGrab is None:
         raise RuntimeError("Screenshot доступен только в Windows-сборке XASS")
@@ -263,6 +300,7 @@ def capture_screenshot(
     asset = _upload_bytes(
         client, endpoint=endpoint, api_key=api_key, source_name=source_name, command_id=command_id,
         kind="screenshot", filename=f"{source_name}-screen.jpg", content_type="image/jpeg", body=body,
+        e2e_private_jwk=e2e_private_jwk, owner_e2e_public_jwk=owner_e2e_public_jwk,
     )
     return {"asset_token": asset["token"], "size": asset["size"], "sha256": asset["sha256"], "created_at": asset["created_at"]}
 
@@ -277,6 +315,8 @@ def upload_requested_file(
     command_id: int,
     root_name: object,
     relative_path: object,
+    e2e_private_jwk: dict[str, Any] | None = None,
+    owner_e2e_public_jwk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root, target = _safe_target(data_root, root_name, relative_path)
     if target == root or not target.is_file():
@@ -288,6 +328,7 @@ def upload_requested_file(
         client, endpoint=endpoint, api_key=api_key, source_name=source_name, command_id=command_id,
         kind="file_download", filename=target.name,
         content_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream", body=target.read_bytes(),
+        e2e_private_jwk=e2e_private_jwk, owner_e2e_public_jwk=owner_e2e_public_jwk,
     )
     return {"asset_token": asset["token"], "filename": target.name, "size": size, "sha256": asset["sha256"]}
 
@@ -303,6 +344,8 @@ def receive_uploaded_file(
     relative_path: object,
     asset_token: object,
     filename: object,
+    e2e_private_jwk: dict[str, Any] | None = None,
+    owner_e2e_public_jwk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _, folder = _safe_target(data_root, root_name, relative_path, must_exist=False)
     folder.mkdir(parents=True, exist_ok=True)
@@ -318,16 +361,32 @@ def receive_uploaded_file(
     while target.exists():
         target = target.with_name(f"{stem} ({counter}){suffix}")
         counter += 1
+    source_headers, source_params = _source_transport(source_name)
     response = client.get(
         f"{endpoint.rstrip('/')}/agent/workspace/assets/{str(asset_token)}",
-        headers={"X-Api-Key": api_key, "X-XASS-Source": source_name}, timeout=60.0,
+        params=source_params,
+        headers={"X-Api-Key": api_key, **source_headers}, timeout=60.0,
     )
     response.raise_for_status()
     if len(response.content) > MAX_FILE_BYTES:
         raise ValueError("Файл превышает лимит 32 МБ")
+    content = response.content
+    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    encrypted = (
+        media_type == SEALED_CONTENT_TYPE
+        or response.headers.get("x-xass-cipher", "").startswith("xass-sealed")
+        or is_sealed_blob(content)
+    )
+    if encrypted:
+        if not e2e_private_jwk or not owner_e2e_public_jwk:
+            raise ValueError("Нет ключей для расшифровки файла. Обновите привязку ПК в XASS.")
+        try:
+            content = unseal_bytes(content, private_jwk=e2e_private_jwk, peer_public_jwk=owner_e2e_public_jwk, aad=b"file_upload")
+        except Exception as exc:
+            raise ValueError("Не удалось расшифровать файл. Проверьте ключи привязки ПК и повторите отправку.") from exc
     temporary = target.with_suffix(target.suffix + ".xass-downloading")
     try:
-        temporary.write_bytes(response.content)
+        temporary.write_bytes(content)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)

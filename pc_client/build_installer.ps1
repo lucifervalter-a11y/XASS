@@ -100,12 +100,18 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --add-data "$(Join-Path $ClientRoot 'assets\xass.ico');assets" `
     --add-data "$(Join-Path $ClientRoot 'assets\xass-icon.png');assets" `
     --collect-data tkinterdnd2 `
+    --collect-all cryptography `
     --hidden-import pystray._win32 `
     --distpath $DistRoot `
     --workpath $WorkRoot `
     --specpath $WorkRoot `
     (Join-Path $ClientRoot "desktop_app.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+# --add-data preserves the source filename, while the runtime reads this
+# stable name. Keep generated files out of the source package, but publish
+# usable revision metadata alongside the frozen modules.
+$RuntimeBuildInfo = Join-Path $DistRoot "XASS\_internal\build-info.json"
+Copy-Item -LiteralPath $BuildInfo -Destination $RuntimeBuildInfo -Force
 $BuiltExe = Join-Path $DistRoot "XASS\XASS.exe"
 & $BuiltExe --health-check --expected-version $Version
 if ($LASTEXITCODE -ne 0) {

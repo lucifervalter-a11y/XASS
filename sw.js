@@ -1,12 +1,14 @@
-const CACHE = 'xass-shell-v8';
+const CACHE = 'xass-shell-v11';
 const OFFLINE = '/offline.html';
 const SHELL = [
   OFFLINE,
-  '/miniapp.php?standalone=1',
   '/manifest.webmanifest',
   '/assets/miniapp-control-center.css?v=0140',
   '/assets/miniapp-control-center.js?v=0140',
   '/assets/miniapp-network.js?v=0140',
+  '/assets/miniapp-server-migration.js?v=0140',
+  '/assets/xass-e2e.js?v=0140',
+  '/assets/miniapp-device-key.js?v=0140',
   '/assets/xass-app-icon-96.png',
   '/assets/xass-app-icon-144.png',
   '/assets/xass-app-icon-180.png',
@@ -68,22 +70,18 @@ self.addEventListener('fetch', event => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname === '/proxy.php' || url.pathname.startsWith('/api/')) return;
 
-  if (request.mode === 'navigate') {
-    // A public profile/project page must never replace the authenticated app shell.
-    if (url.pathname !== '/miniapp.php') return;
+  if (request.mode === 'navigate' && url.pathname === '/miniapp.php') {
     event.respondWith((async () => {
       try {
         const response = await fetch(request);
-        if (response.ok && response.headers.get('content-type')?.includes('text/html') && !url.searchParams.has('demo')) {
-          const cache = await caches.open(CACHE);
-          await cache.put('/miniapp.php?standalone=1', response.clone());
-        }
-        if (response.status >= 500) {
-          return (await caches.match('/miniapp.php?standalone=1')) || (await caches.match(OFFLINE)) || response;
-        }
-        return response;
+        if (response.status < 500) return response;
+        throw new Error('Server unavailable');
       } catch (error) {
-        return (await caches.match('/miniapp.php?standalone=1')) || (await caches.match(OFFLINE));
+        const cache = await caches.open(CACHE);
+        return (await cache.match(OFFLINE)) || new Response('XASS сейчас без сети.', {
+          status: 503,
+          headers: {'Content-Type': 'text/plain; charset=utf-8'}
+        });
       }
     })());
     return;
@@ -93,17 +91,22 @@ self.addEventListener('fetch', event => {
   // temporary screenshots and arbitrary future endpoints are always network-only.
   if (!SHELL.some(item => new URL(item, self.location.origin).href === url.href)) return;
   event.respondWith((async () => {
-    const cached = await caches.match(request);
-    if (cached) return cached;
+    // Stable asset URLs can change during a deployment; cache-first would keep
+    // the old JavaScript forever even after the server has been updated.
     try {
-      const response = await fetch(request);
+      const response = await fetch(request, {cache: 'no-cache'});
       if (response.ok) {
-        const cache = await caches.open(CACHE);
-        await cache.put(request, response.clone());
+        try {
+          const cache = await caches.open(CACHE);
+          await cache.put(request, response.clone());
+        } catch (error) {
+          // Storage quota/private browsing must not break an online response.
+        }
       }
       return response;
     } catch (error) {
-      return new Response('', {status: 503, statusText: 'Offline'});
+      const cache = await caches.open(CACHE);
+      return (await cache.match(request)) || new Response('', {status: 503, statusText: 'Offline'});
     }
   })());
 });

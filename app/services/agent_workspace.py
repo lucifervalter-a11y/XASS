@@ -16,6 +16,7 @@ from app.config import Settings
 ALLOWED_ROOTS = {"desktop", "downloads", "documents", "xass_files"}
 ASSET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,80}$")
 SCREENSHOT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+SEALED_TYPE = "application/x-xass-sealed"
 DEFAULT_TTL_SECONDS = 30 * 60
 
 
@@ -102,16 +103,22 @@ def store_asset(
     body: bytes,
     command_id: int = 0,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    cipher: str = "",
+    inner_type: str = "",
 ) -> dict[str, Any]:
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind not in {"screenshot", "file_download", "file_upload"}:
         raise ValueError("Unsupported workspace asset")
     limit = settings.agent_screenshot_max_bytes if normalized_kind == "screenshot" else settings.agent_file_max_bytes
-    if not body or len(body) > int(limit):
-        raise ValueError(f"Файл пустой или превышает лимит {int(limit) // (1024 * 1024)} МБ")
     media_type = str(content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
-    if normalized_kind == "screenshot" and media_type not in SCREENSHOT_TYPES:
+    sealed = media_type == SEALED_TYPE or str(cipher or "").startswith("xass-sealed")
+    # Five-byte envelope, twelve-byte nonce and sixteen-byte authentication tag.
+    if not body or len(body) > int(limit) + (33 if sealed else 0):
+        raise ValueError(f"Файл пустой или превышает лимит {int(limit) // (1024 * 1024)} МБ")
+    if normalized_kind == "screenshot" and not sealed and media_type not in SCREENSHOT_TYPES:
         raise ValueError("Screenshot должен быть JPEG, PNG или WebP")
+    if sealed and (len(body) < 33 or body[:5] != b"XASS\x01"):
+        raise ValueError("Зашифрованный пакет повреждён")
     root = _workspace_root(settings)
     cleanup_expired_assets(settings)
     if normalized_kind == "screenshot":
@@ -128,12 +135,14 @@ def store_asset(
         "source_name": str(source_name)[:128],
         "kind": normalized_kind,
         "filename": safe_name,
-        "content_type": media_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream",
+        "content_type": (inner_type or media_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream") if sealed else (media_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"),
         "size": len(body),
         "sha256": hashlib.sha256(body).hexdigest(),
         "command_id": int(command_id or 0),
         "created_at": created_at,
         "expires_at": created_at + max(60, min(int(ttl_seconds), 24 * 60 * 60)),
+        "cipher": "xass-sealed-v1" if sealed else "",
+        "inner_type": str(inner_type or ("image/jpeg" if normalized_kind == "screenshot" else media_type)) if sealed else "",
     }
     _atomic_json(_metadata_path(root, token), metadata)
     return metadata

@@ -1,0 +1,105 @@
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import hmac
+ import ipaddress
+ import logging
+ import os
+@@ -92,8 +93,10 @@
+     authenticate_telegram_login as pwa_authenticate_login,
+     issue_session as issue_pwa_session,
+     issue_action_proof,
++    issue_vk_connect_proof,
+     rotate_session_generation,
+     verify_action_proof,
++    verify_vk_connect_proof,
+ )
+ from app.services.passkeys import (
+     authentication_options as passkey_authentication_options,
+@@ -197,7 +200,8 @@
+ def _verify_api_key(header_value: str | None, expected: str, reason: str) -> None:
+     if not expected:
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"{reason} key is not configured")
+-    if (header_value or "").strip() != expected:
++    incoming = (header_value or "").strip()
++    if not hmac.compare_digest(incoming, expected):
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid {reason} key")
+ 
+ 
+@@ -655,6 +659,9 @@
+     title="Serverredus Telegram Business Control",
+     version=APP_VERSION,
+     lifespan=lifespan,
++    docs_url=None,
++    redoc_url=None,
++    openapi_url=None,
+ )
+ 
+ 
+@@ -1096,7 +1103,7 @@
+     accepted = {key for key in (profile_key, env_key) if key}
+     if not accepted:
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="iphone now playing key is not configured")
+-    if incoming not in accepted:
++    if not any(hmac.compare_digest(incoming, key) for key in accepted):
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid iphone now playing key")
+     resolved_text = _resolve_external_now_playing_text(payload)
+     if not resolved_text:
+@@ -1115,13 +1122,21 @@
+ 
+ @app.post("/api/vk/save-token")
+ async def vk_save_token(payload: VkSaveTokenPayload) -> dict[str, Any]:
+-    if not settings.setup_api_key or (payload.secret or "").strip() != settings.setup_api_key:
+-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid secret")
++    proof = verify_vk_connect_proof((payload.secret or "").strip(), settings)
++    if proof is None:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired VK connect proof")
+     token = (payload.access_token or "").strip()
+     if len(token) < 20:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="access_token is too short")
+     if payload.user_id <= 0:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="user_id must be positive")
++
++    notify_chat_id = payload.chat_id
++    if notify_chat_id is None and proof.get("chat_id") is not None:
++        try:
++            notify_chat_id = int(proof["chat_id"])
++        except (TypeError, ValueError):
++            notify_chat_id = None
+ 
+     profile_path = Path(settings.profile_json_path)
+     ensure_profile_exists(profile_path)
+@@ -1132,10 +1147,10 @@
+     profile["vk_connected_at"] = datetime.now(timezone.utc).isoformat()
+     save_profile(profile_path, profile)
+ 
+-    if payload.chat_id and bot_client:
++    if notify_chat_id and bot_client:
+         try:
+             await bot_client.send_message(
+-                int(payload.chat_id),
++                int(notify_chat_id),
+                 (
+                     "✅ ВКонтакте подключён!\n\n"
+                     "Музыка из статуса ВК теперь будет обновляться автоматически.\n"
+@@ -1143,7 +1158,7 @@
+                 ),
+             )
+         except Exception:
+-            logger.warning("Failed to deliver VK connect confirmation to chat_id=%s", payload.chat_id)
++            logger.warning("Failed to deliver VK connect confirmation to chat_id=%s", notify_chat_id)
+ 
+     return {"ok": True}
+ 
+@@ -3693,8 +3708,8 @@
+         base = "https://redvps.site"
+     app_id = int(resolved_app_id)
+     version = (settings.vk_api_version or "5.199").strip() or "5.199"
+-    secret = (settings.setup_api_key or "").strip()
+-    redirect_target = f"{base}/vk-auth.php?secret={quote(secret, safe='')}"
++    proof = issue_vk_connect_proof(settings, chat_id=chat_id)
++    redirect_target = f"{base}/vk-auth.php?secret={quote(proof, safe='')}"
+     if chat_id:
+         redirect_target += f"&chat_id={int(chat_id)}"
+     oauth_url = (

@@ -26,6 +26,7 @@ class HeartbeatPayload(BaseModel):
     last_error_at: str = Field(default="", max_length=64)
     server_version_seen: str = Field(default="", max_length=32)
     system: dict[str, Any] = Field(default_factory=dict)
+    e2e_public_jwk: dict[str, Any] | None = None
 
 
 class HeartbeatResponse(BaseModel):
@@ -46,6 +47,7 @@ class AgentPairClaimPayload(BaseModel):
     pair_code: str = Field(min_length=4, max_length=64)
     source_name: str | None = Field(default=None, min_length=1, max_length=128)
     source_type: SourceType = SourceType.PC_AGENT
+    e2e_public_jwk: dict[str, Any] | None = None
 
 
 class AgentPairClaimResponse(BaseModel):
@@ -54,6 +56,7 @@ class AgentPairClaimResponse(BaseModel):
     source_type: SourceType
     agent_api_key: str
     issued_at: datetime
+    owner_e2e_public_jwk: dict[str, Any] | None = None
 
 
 class ExternalNowPlayingPayload(BaseModel):

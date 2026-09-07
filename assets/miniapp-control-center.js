@@ -63,13 +63,16 @@
 
   function renderMigrationPanel() {
     const host = $('ccDynamic-migration'); if (!host) return;
+    if (host.dataset.ready) return;
+    host.dataset.ready = 'true';
     const steps = [
       ['Создайте копию', 'В терминале старого сервера, из папки XASS. Архив включает настройки, ключи, сайт, базу и данные сервера.', 'sudo bash deploy/backup.sh /opt/serverredus /opt/serverredus-backups'],
       ['Перенесите архив', 'Скопируйте полученный .tar.gz на новый сервер через SFTP. Не публикуйте архив: внутри находятся ключи доступа. Медиа, хранящиеся только на ПК-агенте, остаются на этом ПК.', ''],
-      ['Проверьте и восстановите', 'На новом Debian/Ubuntu откройте папку свежей копии репозитория XASS. Замените путь к архиву и домен своими значениями. Папка назначения должна быть пустой.', 'python3 deploy/migrate.py inspect /private/xass.tar.gz\nsudo bash deploy/restore.sh /private/xass.tar.gz /opt/serverredus example.com'],
+      ['Проверьте и восстановите', 'На новом Debian/Ubuntu откройте папку свежей копии репозитория XASS. Замените путь к архиву и домен своими значениями. Папка назначения должна быть пустой.', 'python3 deploy/portable_migrate.py inspect /private/xass.tar.gz\nsudo bash deploy/restore.sh /private/xass.tar.gz /opt/serverredus example.com'],
       ['Переключите домен', 'Остановите старый сервер XASS, направьте DNS на новый IP и выпустите HTTPS-сертификат по инструкции. При сохранении домена агенты, ссылки и вход на iPhone продолжат использовать прежний адрес.', ''],
     ];
-    host.innerHTML = '<div class="cc-card-title">XASS на новом сервере</div><p class="cc-migration-intro">Код, данные и настройки в одной проверяемой копии.</p><ol class="cc-migration-steps">' + steps.map(([title, description, command], index) => '<li><h3>' + title + '</h3><p>' + description + '</p>' + (command ? '<pre><code>' + esc(command) + '</code></pre><button class="btn" data-copy-migration="' + index + '">Скопировать команду</button>' : '') + '</li>').join('') + '</ol><a class="btn cc-doc-link" target="_blank" rel="noopener noreferrer" href="https://github.com/lucifervalter-a11y/XASS/blob/main/docs/MIGRATION.md">Полная инструкция по переносу ↗</a>';
+    host.innerHTML = '<div class="cc-card-title">XASS на новом сервере</div><p class="cc-migration-intro">Создайте защищённую копию здесь и восстановите её на новом сервере. Адрес сайта лучше сохранить — агенты продолжат подключаться к нему.</p><div id="ccEncryptedMigration"></div><details class="cc-manual-migration"><summary>Альтернатива: перенос через терминал</summary><p class="cc-migration-intro">Этот ручной архив не зашифрован. Храните его приватно и передавайте только через защищённое соединение.</p><ol class="cc-migration-steps">' + steps.map(([title, description, command], index) => '<li><h3>' + title + '</h3><p>' + description + '</p>' + (command ? '<pre><code>' + esc(command) + '</code></pre><button class="btn" data-copy-migration="' + index + '">Скопировать команду</button>' : '') + '</li>').join('') + '</ol><a class="btn cc-doc-link" target="_blank" rel="noopener noreferrer" href="https://github.com/lucifervalter-a11y/XASS/blob/main/docs/MIGRATION.md">Полная инструкция по переносу ↗</a></details>';
+    document.dispatchEvent(new Event('xass:migration-panel'));
     host.querySelectorAll('[data-copy-migration]').forEach(button => button.onclick = async () => {
       try { await X.copyText(steps[Number(button.dataset.copyMigration)][2]); X.toast('Команда скопирована'); }
       catch (_) { X.toast('Не удалось скопировать. Выделите команду вручную.'); }
@@ -446,13 +449,19 @@
       const shot = response.data.screenshot;
       const raw = await rawRequest('agents/' + encodeURIComponent(source) + '/assets/' + encodeURIComponent(shot.token));
       if (!raw.ok) throw new Error('Не удалось загрузить снимок');
-      const blob = await raw.blob();
+      let blob = await raw.blob();
+      if (shot.cipher === 'xass-sealed-v1') {
+        const peer = XassE2E.agentPublic(source);
+        if (!peer) throw new Error('Нет ключа агента для расшифровки снимка');
+        const plain = await XassE2E.unsealBytes(await blob.arrayBuffer(), peer, 'screenshot');
+        blob = new Blob([plain], { type: shot.inner_type || shot.content_type || 'image/jpeg' });
+      }
       if (source !== ui.activeAgent || shell !== $('ccScreenshot')) return;
       const previous = shell.querySelector('img')?.src;
       if (previous) { URL.revokeObjectURL(previous); ui.objectUrls.delete(previous); }
       const url = URL.createObjectURL(blob); ui.objectUrls.add(url);
       shell.innerHTML = '<img src="' + url + '" alt="Последний снимок экрана ' + esc(source) + '">';
-      if (meta) meta.textContent = 'Получен ' + dateText(shot.created_at) + ' · временное хранение';
+      if (meta) meta.textContent = 'Получен ' + dateText(shot.created_at) + (shot.cipher === 'xass-sealed-v1' ? ' · зашифрован E2E' : ' · временное хранение');
       shell.querySelector('img').onclick = () => { $('ccLightboxImage').src = url; $('ccLightbox').classList.add('open'); };
     } catch (error) { shell.innerHTML = '<div class="cc-error">' + esc(error.message || 'Снимок недоступен') + '</div>'; }
   }
@@ -502,7 +511,14 @@
     try {
       const response = await rawRequest('agents/' + encodeURIComponent(source) + '/assets/' + encodeURIComponent(token));
       if (!response.ok) throw new Error('Временный файл недоступен');
-      const url = URL.createObjectURL(await response.blob()), anchor = document.createElement('a');
+      let blob = await response.blob();
+      const peer = XassE2E.agentPublic(source);
+      if (blob.type === 'application/x-xass-sealed' || response.headers.get('X-XASS-Cipher') === 'xass-sealed-v1') {
+        if (!peer) throw new Error('Ключ ПК недоступен. Обновите список устройств.');
+        const plain = await XassE2E.unsealBytes(await blob.arrayBuffer(), peer, 'file_download');
+        blob = new Blob([plain], { type: 'application/octet-stream' });
+      }
+      const url = URL.createObjectURL(blob), anchor = document.createElement('a');
       anchor.href = url; anchor.download = result.result.details.filename || name; document.body.appendChild(anchor); anchor.click(); anchor.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (error) { X.toast(error.message); }
@@ -522,7 +538,13 @@
     const upload = $('ccFileUpload'); if (upload) upload.disabled = true;
     try {
       const path = 'agents/' + encodeURIComponent(source) + '/files/upload?root=' + encodeURIComponent(ui.fileRoot) + '&path=' + encodeURIComponent(ui.filePath) + '&filename=' + encodeURIComponent(file.name);
-      const response = await rawRequest(path, { method: 'POST', headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-XASS-Filename': file.name }, body: file });
+      const peer = XassE2E.agentPublic(source);
+      let body = file, headers = { 'Content-Type': file.type || 'application/octet-stream' };
+      if (peer) {
+        body = await XassE2E.sealBytes(new Uint8Array(await file.arrayBuffer()), peer, 'file_upload');
+        headers = { 'Content-Type': 'application/x-xass-sealed', 'X-XASS-Cipher': 'xass-sealed-v1', 'X-XASS-Inner-Type': file.type || 'application/octet-stream' };
+      }
+      const response = await rawRequest(path, { method: 'POST', headers, body });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !data.ok) throw new Error(data.detail || 'Файл не принят');
       const result = X.demo ? demoCommand('file_upload', {}) : await waitForCommand(source, data.command.id);
@@ -544,20 +566,35 @@
   }
 
   async function getClipboard() {
-    const result = await runAgentCommand(ensureAgent(), 'clipboard_get', {}, $('ccClipboardGet'));
+    const source = ensureAgent();
+    try {
+    const result = await runAgentCommand(source, 'clipboard_get', {}, $('ccClipboardGet'));
     if (!result) return;
-    const text = String(result.result?.details?.text || '');
+    const details = result.result?.details || {};
+    let text = String(details.text || '');
+    if (details.sealed) {
+      const peer = XassE2E.agentPublic(source);
+      if (!peer) throw new Error('Ключ ПК недоступен. Обновите список устройств.');
+      text = await XassE2E.unsealText(details, peer);
+    }
+    if (source !== ui.activeAgent || !$('ccClipboardValue')) return;
     $('ccClipboardValue').textContent = text || 'Буфер ПК пуст.';
     $('ccClipboardCopy').disabled = !text;
     $('ccClipboardCopy').onclick = () => X.copyText(text).then(() => X.toast('Скопировано'));
     storeClipboard(text, 'ПК → XASS');
+    } catch (error) { X.toast(error.message || 'Не удалось получить буфер ПК'); }
   }
 
   async function setClipboard() {
     const text = $('ccClipboardSend').value;
     if (!text) return X.toast('Введите текст');
-    const result = await runAgentCommand(ensureAgent(), 'clipboard_set', { text }, $('ccClipboardSet'));
+    const source = ensureAgent();
+    try {
+    const peer = XassE2E.agentPublic(source);
+    const payload = peer ? await XassE2E.sealText(text, peer) : { text };
+    const result = await runAgentCommand(source, 'clipboard_set', payload, $('ccClipboardSet'));
     if (result) { storeClipboard(text, 'XASS → ПК'); X.toast('Текст отправлен в буфер ПК'); }
+    } catch (error) { X.toast(error.message || 'Не удалось отправить текст'); }
   }
 
   function renderClipboardHistory() {

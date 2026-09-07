@@ -17,6 +17,7 @@ class ConnectionProfile:
     source_name: str
     expires_at: datetime
     auto_update: bool
+    e2e_public_jwk: dict[str, str] | None = None
 
 
 def _server_origin(value: Any) -> str:
@@ -27,6 +28,18 @@ def _server_origin(value: Any) -> str:
     if parsed.username or parsed.password:
         raise ValueError("Адрес сервера не должен содержать логин или пароль")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _public_jwk(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("kty") != "EC" or value.get("crv") != "P-256":
+        raise ValueError("В файле подключения указан неверный ключ шифрования")
+    x = str(value.get("x") or "").strip()
+    y = str(value.get("y") or "").strip()
+    if not x or not y or value.get("d"):
+        raise ValueError("В файле подключения не должно быть закрытого ключа")
+    return {"kty": "EC", "crv": "P-256", "x": x, "y": y}
 
 
 def parse_connection_payload(payload: Any, *, now: datetime | None = None) -> ConnectionProfile:
@@ -56,6 +69,7 @@ def parse_connection_payload(payload: Any, *, now: datetime | None = None) -> Co
         source_name=str(payload.get("source_name") or "").strip()[:128],
         expires_at=expires_at,
         auto_update=bool(payload.get("auto_update", True)),
+        e2e_public_jwk=_public_jwk(payload.get("e2e_public_jwk")),
     )
 
 
