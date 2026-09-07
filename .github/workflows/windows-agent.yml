@@ -1,160 +1,41 @@
-name: Build Windows agent
-
-permissions:
-  contents: write
+name: Inspect XASS deployment
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "pc_client/**"
-      - "app/services/agent_installer.py"
-      - ".github/workflows/windows-agent.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: xass-windows-agent
-  cancel-in-progress: true
+  group: xass-readonly-deployment-diagnostics
+  cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            pc_client/requirements.txt
-            pc_client/build-requirements.txt
-      - name: Install Inno Setup
-        shell: powershell
-        run: choco install innosetup --no-progress -y
-      - name: Build installer
-        shell: powershell
-        run: .\pc_client\build_installer.ps1 -SkipToolInstall
-      - uses: actions/upload-artifact@v4
-        with:
-          name: xass-windows-installer
-          path: |
-            pc_client/dist/installer/XASS-Setup.exe
-            pc_client/dist/installer/XASS-Setup.json
-          if-no-files-found: error
-          retention-days: 30
-
-  deploy-installer:
-    needs: build
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: xass-windows-installer
-          path: release
-      - name: Resolve VPS host through DNS-over-HTTPS
-        id: vps
-        shell: bash
+      - name: Read-only server deployment diagnostics
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_FALLBACK_IP: 51.250.80.137
-        run: |
-          set -euo pipefail
-          if [[ "$SSH_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "host=$SSH_HOST" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          ip="$(curl --fail --silent --show-error --retry 3 \
-            -H 'accept: application/dns-json' \
-            "https://cloudflare-dns.com/dns-query?name=${SSH_HOST}&type=A" \
-            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next((item["data"] for item in data.get("Answer", []) if item.get("type") == 1), ""))')" || true
-          if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::warning::DNS lookup failed for ${SSH_HOST}; using the verified VPS fallback IP"
-            ip="$SSH_FALLBACK_IP"
-          fi
-          echo "host=$ip" >> "$GITHUB_OUTPUT"
-      - name: Publish installer to XASS server
-        shell: bash
-        env:
-          SSH_HOST: ${{ steps.vps.outputs.host }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
-        run: bash deploy/github_ssh.sh upload '${{ github.sha }}'
-      - name: Activate and verify immutable installer
-        shell: bash
-        env:
-          SSH_HOST: ${{ steps.vps.outputs.host }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
         run: |
-            bash deploy/github_ssh.sh exec <<'REMOTE'
-            set -e
-            cd /home/red/serverredus
-            for attempt in $(seq 1 120); do
-              if test -f deploy/publish_installer.py && test "$(git rev-parse HEAD)" = '${{ github.sha }}'; then break; fi
-              sleep 2
-            done
-            test "$(git rev-parse HEAD)" = '${{ github.sha }}' || { echo 'Matching backend revision is not deployed; installer kept in staging.'; exit 1; }
-            .venv/bin/python deploy/publish_installer.py --staging-dir 'data/releases/.incoming-${{ github.sha }}' --expected-revision '${{ github.sha }}'
-            .venv/bin/python - <<'PY'
-            import hashlib, json, os, time, urllib.parse
-            import httpx
-            from dotenv import dotenv_values
-            from app.config import Settings
-            from app.services.agent_installer import get_agent_installer
-            from pc_client.client_update import verify_manifest
-            settings = Settings()
-            port = int(os.environ.get('PORT') or dotenv_values('.env').get('PORT') or 8000)
-            artifact = get_agent_installer(settings)
-            assert artifact is not None, 'Installer metadata is not readable'
-            with httpx.Client(timeout=90, trust_env=False) as client:
-                for attempt in range(60):
-                    try:
-                        response = client.get(f'http://127.0.0.1:{port}/agent/update-manifest', params={'agent_distribution':'installer','agent_version':'0.13.5','agent_revision':'previous'}, headers={'X-Api-Key':settings.agent_api_key}, timeout=5)
-                        if response.status_code == 200: break
-                    except httpx.TransportError:
-                        pass
-                    time.sleep(2)
-                else: raise RuntimeError('Backend did not become ready for installer validation')
-                response.raise_for_status()
-                manifest = response.json()['installer_update']
-                assert manifest['available'] and verify_manifest(manifest, settings.agent_api_key), 'Update manifest is not valid'
-                assert manifest['sha256'] == artifact.sha256 and manifest['version'] == artifact.version
-                public = urllib.parse.urlsplit(manifest['url'])
-                assert public.scheme == 'https' and public.hostname == 'redvps.site', 'Public update origin needs correction'
-                digest = hashlib.sha256()
-                size = 0
-                with client.stream('GET', manifest['url'], headers={'X-Api-Key':settings.agent_api_key}) as download:
-                    download.raise_for_status()
-                    for chunk in download.iter_bytes(): digest.update(chunk); size += len(chunk)
-                assert digest.hexdigest() == artifact.sha256 and size == artifact.size, 'Downloaded installer checksum mismatch'
-                print(json.dumps({'ok': True, 'version': artifact.version, 'revision': artifact.revision, 'bytes': size, 'sha256': artifact.sha256, 'update_available': True}))
-            PY
-            REMOTE
-
-  publish-release:
-    needs: [build, deploy-installer]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: xass-windows-installer
-          path: release
-      - name: Publish stable public download
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: agent-latest
-          name: XASS for Windows — latest stable
-          body: |
-            Автоматически собранный стабильный установщик XASS для Windows.
-            Установщик обновляется при каждом выпуске агента и сохраняет рабочую конфигурацию предыдущей версии.
-          files: |
-            release/XASS-Setup.exe
-            release/XASS-Setup.json
-          overwrite_files: true
-          fail_on_unmatched_files: true
+          bash deploy/github_ssh.sh exec <<'REMOTE'
+          cd /home/red/serverredus
+          printf 'CHECKOUT\n'
+          git rev-parse HEAD
+          git status --short --untracked-files=no
+          printf 'PROCESSES (no arguments)\n'
+          ps -eo pid,etimes,pcpu,comm --sort=-pcpu | head -n 15
+          printf 'FILESYSTEM CAPACITY\n'
+          df -h
+          printf 'PREDEPLOY ARTIFACTS (filenames and sizes only)\n'
+          if [ -d /home/red/.xass-predeploy ]; then
+            find /home/red/.xass-predeploy -maxdepth 4 -type f \( -name before-revision -o -name server.xass-server -o -name server.tar.gz \) -printf '%f %s bytes\n'
+          fi
+          printf 'BACKEND STATUS\n'
+          systemctl is-active serverredus-backend.service || true
+          REMOTE
