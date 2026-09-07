@@ -75,16 +75,68 @@ jobs:
           fi
           echo "host=$ip" >> "$GITHUB_OUTPUT"
       - name: Publish installer to XASS server
-        continue-on-error: true
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ steps.vps.outputs.host }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
+          fingerprint: SHA256:ifEiwCEVHV1BCeMNFkWkyLU7nFSHuX8itfqAsIxZFcs
           source: "release/XASS-Setup.exe,release/XASS-Setup.json"
-          target: "/home/red/serverredus/data/releases"
+          target: "/home/red/serverredus/data/releases/.incoming-${{ github.sha }}"
           strip_components: 1
+      - name: Activate and verify immutable installer
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ steps.vps.outputs.host }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          fingerprint: SHA256:ifEiwCEVHV1BCeMNFkWkyLU7nFSHuX8itfqAsIxZFcs
+          command_timeout: 8m
+          script: |
+            set -e
+            cd /home/red/serverredus
+            for attempt in $(seq 1 120); do
+              if test -f deploy/publish_installer.py && test "$(git rev-parse HEAD)" = '${{ github.sha }}'; then break; fi
+              sleep 2
+            done
+            test "$(git rev-parse HEAD)" = '${{ github.sha }}' || { echo 'Matching backend revision is not deployed; installer kept in staging.'; exit 1; }
+            .venv/bin/python deploy/publish_installer.py --staging-dir 'data/releases/.incoming-${{ github.sha }}' --expected-revision '${{ github.sha }}'
+            .venv/bin/python - <<'PY'
+            import hashlib, json, os, time, urllib.parse
+            import httpx
+            from dotenv import dotenv_values
+            from app.config import Settings
+            from app.services.agent_installer import get_agent_installer
+            from pc_client.client_update import verify_manifest
+            settings = Settings()
+            port = int(os.environ.get('PORT') or dotenv_values('.env').get('PORT') or 8000)
+            artifact = get_agent_installer(settings)
+            assert artifact is not None, 'Installer metadata is not readable'
+            with httpx.Client(timeout=90, trust_env=False) as client:
+                for attempt in range(60):
+                    try:
+                        response = client.get(f'http://127.0.0.1:{port}/agent/update-manifest', params={'agent_distribution':'installer','agent_version':'0.13.5','agent_revision':'previous'}, headers={'X-Api-Key':settings.agent_api_key}, timeout=5)
+                        if response.status_code == 200: break
+                    except httpx.TransportError:
+                        pass
+                    time.sleep(2)
+                else: raise RuntimeError('Backend did not become ready for installer validation')
+                response.raise_for_status()
+                manifest = response.json()['installer_update']
+                assert manifest['available'] and verify_manifest(manifest, settings.agent_api_key), 'Update manifest is not valid'
+                assert manifest['sha256'] == artifact.sha256 and manifest['version'] == artifact.version
+                public = urllib.parse.urlsplit(manifest['url'])
+                assert public.scheme == 'https' and public.hostname == 'redvps.site', 'Public update origin needs correction'
+                digest = hashlib.sha256()
+                size = 0
+                with client.stream('GET', manifest['url'], headers={'X-Api-Key':settings.agent_api_key}) as download:
+                    download.raise_for_status()
+                    for chunk in download.iter_bytes(): digest.update(chunk); size += len(chunk)
+                assert digest.hexdigest() == artifact.sha256 and size == artifact.size, 'Downloaded installer checksum mismatch'
+                print(json.dumps({'ok': True, 'version': artifact.version, 'revision': artifact.revision, 'bytes': size, 'sha256': artifact.sha256, 'update_available': True}))
+            PY
 
   publish-release:
     needs: build

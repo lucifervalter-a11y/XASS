@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
@@ -47,14 +48,33 @@ def _hash_file(path_text: str, size: int, modified_ns: int) -> str:
 def get_agent_installer(settings: "Settings") -> AgentInstaller | None:
     path = _resolve_path(settings.agent_installer_path)
     metadata_path = _resolve_path(settings.agent_installer_metadata_path)
-    if not path.is_file() or not metadata_path.is_file():
-        return None
     try:
         metadata: dict[str, Any] = json.loads(metadata_path.read_text(encoding="utf-8"))
-        stat = path.stat()
-        sha256 = _hash_file(str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        if not isinstance(metadata, dict):
+            return None
         expected_sha = str(metadata.get("sha256") or "").strip().lower()
+        if "artifact_file" in metadata:
+            artifact_file = metadata["artifact_file"]
+            if not isinstance(artifact_file, str) or not re.fullmatch(
+                r"XASS-Setup-[0-9a-f]{64}\.exe", artifact_file
+            ) or artifact_file != f"XASS-Setup-{expected_sha}.exe":
+                return None
+            parent = path.parent.resolve()
+            path = parent / artifact_file
+            # Immutable artifacts must be real files in the configured directory,
+            # never links to mutable files elsewhere.
+            if path.is_symlink() or path.resolve().parent != parent:
+                return None
+        path = path.resolve()
+        if not path.is_file():
+            return None
+        stat = path.stat()
+        sha256 = _hash_file(str(path), stat.st_size, stat.st_mtime_ns)
         if not expected_sha or expected_sha != sha256:
+            return None
+        if "size" in metadata and (
+            type(metadata["size"]) is not int or metadata["size"] != stat.st_size
+        ):
             return None
         version = str(metadata.get("version") or "").strip()
         revision = str(metadata.get("revision") or sha256).strip()

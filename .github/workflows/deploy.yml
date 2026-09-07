@@ -11,7 +11,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Resolve VPS host through DNS-over-HTTPS
@@ -43,7 +43,27 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
+          fingerprint: SHA256:ifEiwCEVHV1BCeMNFkWkyLU7nFSHuX8itfqAsIxZFcs
+          command_timeout: 25m
           script: |
             set -e
             cd /home/red/serverredus
+            test -z "$(git status --porcelain --untracked-files=no)" || { echo 'Tracked server changes need review; deployment stopped.'; exit 1; }
+            umask 077
+            .venv/bin/python - '${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}' <<'PY'
+            import os, secrets, subprocess, sys
+            from pathlib import Path
+            from app.config import Settings
+            from app.services.server_backup import create_snapshot
+            root = Path.cwd().resolve()
+            directory = root.parent / '.xass-predeploy' / sys.argv[1]
+            directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+            os.chmod(directory.parent, 0o700)
+            password = secrets.token_urlsafe(48)
+            (directory / 'passphrase').write_text(password, encoding='utf-8')
+            (directory / 'before-revision').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True), encoding='utf-8')
+            create_snapshot(root, Settings(), directory / 'server.xass-server', password=password)
+            print('Private pre-deployment snapshot created; credentials remain on the VPS.')
+            PY
             bash deploy/update.sh
+            git merge-base --is-ancestor '${{ github.sha }}' HEAD

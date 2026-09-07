@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,7 @@ import client_agent
 import client_update
 import installer_helper
 from client_update import verify_manifest
+from deploy import publish_installer
 
 
 class AgentInstallerTests(unittest.TestCase):
@@ -189,6 +191,198 @@ class AgentInstallerTests(unittest.TestCase):
         ) as store:
             client_agent._lock_workstation(42)
         store.assert_called_once_with(42, True, "Экран Windows заблокирован")
+
+
+class ImmutableInstallerPublicationTests(unittest.TestCase):
+    REVISION = "a" * 40
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "pc_client").mkdir()
+        (self.root / "pc_client" / "version.json").write_text(
+            json.dumps({"version": "0.14.0"}), encoding="utf-8"
+        )
+        self.stage = self.root / "data" / "releases" / f".incoming-{self.REVISION}"
+        self.stage.mkdir(parents=True)
+        self.binary = self.root / "custom" / "downloads" / "XASS-Setup.exe"
+        self.metadata_path = self.root / "custom" / "metadata" / "installer.json"
+        self.binary.parent.mkdir(parents=True)
+        self.metadata_path.parent.mkdir(parents=True)
+        self.settings = SimpleNamespace(
+            agent_installer_path=str(self.binary),
+            agent_installer_metadata_path=str(self.metadata_path),
+        )
+
+    def stage_installer(self, data: bytes = b"MZ-new-installer", **overrides) -> dict:
+        (self.stage / "XASS-Setup.exe").write_bytes(data)
+        metadata = {
+            "version": "0.14.0", "revision": self.REVISION,
+            "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+            "local_build": False,
+        }
+        metadata.update(overrides)
+        (self.stage / "XASS-Setup.json").write_text(json.dumps(metadata), encoding="utf-8")
+        return metadata
+
+    def publish(self, revision: str | None = None) -> dict:
+        return publish_installer.publish_installer(
+            self.root, self.stage, revision or self.REVISION, settings=self.settings
+        )
+
+    def install_legacy(self) -> bytes:
+        self.binary.write_bytes(b"MZ-legacy-installer")
+        metadata = json.dumps({
+            "version": "0.13.0", "revision": "legacy-revision",
+            "sha256": hashlib.sha256(self.binary.read_bytes()).hexdigest(),
+        }).encode("utf-8")
+        self.metadata_path.write_bytes(metadata)
+        return metadata
+
+    def test_immutable_metadata_does_not_require_legacy_binary(self) -> None:
+        staged = self.stage_installer()
+        result = self.publish()
+        self.assertFalse(self.binary.exists())
+        artifact = get_agent_installer(self.settings)
+        self.assertIsNotNone(artifact)
+        self.assertEqual(artifact.path, self.binary.parent / f"XASS-Setup-{staged['sha256']}.exe")
+        self.assertTrue(artifact.path.is_absolute())
+        self.assertEqual(result["artifact_file"], artifact.path.name)
+
+    def test_invalid_artifact_names_and_sizes_are_not_served(self) -> None:
+        self.install_legacy()
+        metadata = json.loads(self.metadata_path.read_bytes())
+        for name in ("../XASS-Setup.exe", "sub/XASS-Setup.exe", "sub\\XASS-Setup.exe",
+                     str(self.binary), "XASS-Setup.exe", "", None,
+                     f"XASS-Setup-{'f' * 64}.exe"):
+            with self.subTest(name=name):
+                self.metadata_path.write_text(json.dumps({**metadata, "artifact_file": name}), encoding="utf-8")
+                self.assertIsNone(get_agent_installer(self.settings))
+        for size in (1, True, "18"):
+            self.metadata_path.write_text(json.dumps({**metadata, "size": size}), encoding="utf-8")
+            self.assertIsNone(get_agent_installer(self.settings))
+        self.metadata_path.write_text("[]", encoding="utf-8")
+        self.assertIsNone(get_agent_installer(self.settings))
+
+    def test_publications_keep_captured_paths_and_previous_metadata_unchanged(self) -> None:
+        legacy_metadata = self.install_legacy()
+        legacy = get_agent_installer(self.settings)
+        self.stage_installer()
+        self.publish()
+        previous_path = self.metadata_path.with_name(self.metadata_path.name + ".previous")
+        self.assertEqual(previous_path.read_bytes(), legacy_metadata)
+        first_metadata = self.metadata_path.read_bytes()
+        first = get_agent_installer(self.settings)
+        first_bytes = first.path.read_bytes()
+        self.stage_installer(b"MZ-second-installer", revision="b" * 40)
+        atomic_bytes = publish_installer._atomic_bytes
+
+        def inspect_before_switch(target: Path, content: bytes) -> None:
+            if target == self.metadata_path:
+                pending = json.loads(content)
+                self.assertTrue((self.binary.parent / pending["artifact_file"]).is_file())
+                self.assertEqual(get_agent_installer(self.settings), first)
+            atomic_bytes(target, content)
+
+        with patch.object(publish_installer, "_atomic_bytes", side_effect=inspect_before_switch):
+            self.publish("b" * 40)
+        second = get_agent_installer(self.settings)
+        self.assertNotEqual(first.path, second.path)
+        self.assertEqual(first.path.read_bytes(), first_bytes)
+        self.assertEqual(legacy.path.read_bytes(), b"MZ-legacy-installer")
+        self.assertEqual(previous_path.read_bytes(), first_metadata)
+        self.publish("b" * 40)
+        self.assertEqual(previous_path.read_bytes(), first_metadata, "Idempotent publish must retain rollback")
+
+    def test_invalid_staging_preserves_current_installer_and_metadata(self) -> None:
+        self.stage_installer()
+        self.publish()
+        current = get_agent_installer(self.settings)
+        metadata_before = self.metadata_path.read_bytes()
+        cases = (
+            {"sha256": "f" * 64}, {"size": 12345}, {"size": True},
+            {"revision": "b" * 40}, {"revision": self.REVISION + "-dirty"},
+            {"local_build": True}, {"version": "0.15.0"},
+        )
+        for values in cases:
+            with self.subTest(values=values):
+                self.stage_installer(b"MZ-invalid-staging", **values)
+                with self.assertRaises(ValueError):
+                    self.publish()
+                self.assertEqual(self.metadata_path.read_bytes(), metadata_before)
+                self.assertEqual(get_agent_installer(self.settings), current)
+        self.stage_installer(b"not-an-exe")
+        with self.assertRaisesRegex(ValueError, "Windows executable"):
+            self.publish()
+        (self.stage / "XASS-Setup.json").write_text("{broken", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.publish()
+        self.assertEqual(self.metadata_path.read_bytes(), metadata_before)
+        self.assertEqual(get_agent_installer(self.settings), current)
+
+    def test_existing_different_immutable_bytes_are_never_overwritten(self) -> None:
+        original = self.install_legacy()
+        metadata = self.stage_installer()
+        target = self.binary.parent / f"XASS-Setup-{metadata['sha256']}.exe"
+        target.write_bytes(b"conflicting-existing-file")
+        with self.assertRaisesRegex(ValueError, "not overwritten"):
+            self.publish()
+        self.assertEqual(target.read_bytes(), b"conflicting-existing-file")
+        self.assertEqual(self.metadata_path.read_bytes(), original)
+
+    def test_failed_metadata_switch_keeps_current_and_allows_retry(self) -> None:
+        original = self.install_legacy()
+        self.stage_installer()
+        atomic_bytes = publish_installer._atomic_bytes
+
+        def fail_switch(target: Path, content: bytes) -> None:
+            if target == self.metadata_path:
+                raise OSError("simulated replace failure")
+            atomic_bytes(target, content)
+
+        with patch.object(publish_installer, "_atomic_bytes", side_effect=fail_switch):
+            with self.assertRaises(OSError):
+                self.publish()
+        self.assertEqual(self.metadata_path.read_bytes(), original)
+        self.assertEqual(get_agent_installer(self.settings).revision, "legacy-revision")
+        self.publish()
+        self.assertEqual(get_agent_installer(self.settings).revision, self.REVISION)
+
+    def test_expected_revision_rejects_dirty_and_short_builds(self) -> None:
+        self.stage_installer()
+        for revision in ("abc123", self.REVISION + "-dirty", "../x", "f" * 41):
+            with self.subTest(revision=revision), self.assertRaises(ValueError):
+                self.publish(revision)
+        self.assertFalse(self.metadata_path.exists())
+
+    def test_settings_are_loaded_from_root_and_relative_paths_stay_there(self) -> None:
+        self.stage_installer()
+        (self.root / ".env").write_text(
+            "AGENT_INSTALLER_PATH=custom/downloads/XASS-Setup.exe\n"
+            "AGENT_INSTALLER_METADATA_PATH=custom/metadata/installer.json\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            publish_installer.publish_installer(self.root, self.stage.relative_to(self.root), self.REVISION)
+        self.assertEqual(get_agent_installer(self.settings).revision, self.REVISION)
+
+    def test_staging_change_during_copy_does_not_publish(self) -> None:
+        original = self.install_legacy()
+        metadata = self.stage_installer()
+        digest = publish_installer._file_digest
+
+        def change_after_initial_hash(path: Path) -> tuple[str, int]:
+            result = digest(path)
+            if path == self.stage / "XASS-Setup.exe":
+                path.write_bytes(b"MZ-changed-upload")
+            return result
+
+        with patch.object(publish_installer, "_file_digest", side_effect=change_after_initial_hash):
+            with self.assertRaisesRegex(ValueError, "changed during publication"):
+                self.publish()
+        self.assertEqual(self.metadata_path.read_bytes(), original)
+        self.assertFalse((self.binary.parent / f"XASS-Setup-{metadata['sha256']}.exe").exists())
 
 
 if __name__ == "__main__":
