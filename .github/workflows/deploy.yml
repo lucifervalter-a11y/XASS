@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - uses: actions/checkout@v4
       - name: Resolve VPS host through DNS-over-HTTPS
         id: vps
         shell: bash
@@ -37,15 +38,14 @@ jobs:
           echo "host=$ip" >> "$GITHUB_OUTPUT"
 
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ steps.vps.outputs.host }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          fingerprint: SHA256:ifEiwCEVHV1BCeMNFkWkyLU7nFSHuX8itfqAsIxZFcs
-          command_timeout: 25m
-          script: |
+        shell: bash
+        env:
+          SSH_HOST: ${{ steps.vps.outputs.host }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+            bash deploy/github_ssh.sh exec <<'REMOTE'
             set -e
             cd /home/red/serverredus
             test -z "$(git status --porcelain --untracked-files=no)" || { echo 'Tracked server changes need review; deployment stopped.'; exit 1; }
@@ -67,3 +67,4 @@ jobs:
             PY
             bash deploy/update.sh
             git merge-base --is-ancestor '${{ github.sha }}' HEAD
+            REMOTE

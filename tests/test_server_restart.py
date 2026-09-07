@@ -252,7 +252,12 @@ class UpdateStatusTests(unittest.TestCase):
         self.assertIn("bootstrap_server_dependencies.py", update_script)
         self.assertIn("/health", update_script)
         publish_step = windows_workflow.split("- name: Publish installer to XASS server", maxsplit=1)[1]
-        self.assertIn("continue-on-error: true", publish_step.split("publish-release:", maxsplit=1)[0])
+        publication = publish_step.split("publish-release:", maxsplit=1)[0]
+        self.assertNotIn("continue-on-error: true", publication)
+        self.assertIn(".incoming-${{ github.sha }}", publication)
+        self.assertIn("deploy/publish_installer.py", publication)
+        self.assertIn("verify_manifest", publication)
+        self.assertIn("Downloaded installer checksum mismatch", publication)
 
 
 if __name__ == "__main__":
