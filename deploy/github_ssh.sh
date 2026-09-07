@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GitHub runner transport. Public host keys are pinned, never learned on first use.
+# GitHub runner transport. The received key must match the historical trust pin.
 set -Eeuo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${SSH_HOST:?}" "${SSH_USER:?}" "${SSH_PRIVATE_KEY:?}" "${RUNNER_TEMP:?}"
@@ -11,13 +11,12 @@ key_file="$ssh_dir/key"
 known_hosts="$ssh_dir/known_hosts"
 trap 'rm -f -- "$key_file" "$known_hosts"; rmdir -- "$ssh_dir"' EXIT
 printf '%s\n' "$SSH_PRIVATE_KEY" > "$key_file"
-host_label="$SSH_HOST"
-if [[ "$port" != 22 ]]; then host_label="[$SSH_HOST]:$port"; fi
-while IFS= read -r key || [[ -n "$key" ]]; do
-  [[ -n "$key" && "$key" != \#* ]] || continue
-  printf '%s %s\n' "$host_label" "$key" >> "$known_hosts"
-done < "$root/deploy/xass-host-keys.pub"
-options=(-i "$key_file" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts" -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+expected="$(grep '^SHA256:' "$root/deploy/xass-host-fingerprint" | tr -d '\r')"
+[[ "$expected" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || { echo 'Invalid trusted host fingerprint'; exit 1; }
+ssh-keyscan -T 15 -t ed25519 -p "$port" "$SSH_HOST" 2>/dev/null > "$known_hosts"
+actual="$(ssh-keygen -lf "$known_hosts" -E sha256 | awk '{print $2}' | sort -u)"
+[[ "$actual" == "$expected" ]] || { echo 'SSH host fingerprint does not match the independently verified pin'; exit 1; }
+options=(-i "$key_file" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o "UserKnownHostsFile=$known_hosts" -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 case "${1:-}" in
   exec)
     ssh -p "$port" "${options[@]}" "$SSH_USER@$SSH_HOST" 'bash -se'
