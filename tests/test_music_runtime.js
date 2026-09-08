@@ -7,15 +7,15 @@ const {webcrypto} = require('node:crypto');
 const source = fs.readFileSync(path.join(__dirname,'../assets/miniapp-music.js'),'utf8');
 
 function runtime(api, options={}) {
-  const nodes=new Map(),events={},requests=[],toasts=[];
+  const nodes=new Map(),events={},requests=[],toasts=[],intervals=[];
   function node(id='') {return {id,innerHTML:'',textContent:'',value:0,hidden:false,dataset:{},style:{setProperty(){}},classList:{toggle(){},contains(){return false;}},handlers:{},addEventListener(name,fn){this.handlers[name]=fn;},setAttribute(){},removeAttribute(){},append(){},focus(){},click(){},close(){this.open=false;},showModal(){this.open=true;},querySelector(){return node();},querySelectorAll(){return[];},play(){return Promise.resolve();},pause(){},load(){}};}
   const get=id=>{if(!nodes.has(id))nodes.set(id,node(id));return nodes.get(id);};
   const X={state:{boot:{}},esc:value=>String(value??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x])),toast:value=>toasts.push(value),ask:(_message,done)=>done(false),api:async(p,o)=>{requests.push({path:p,...o});return api?api(p,o):{status:200,data:{ok:true}};}};
   const window={XASS:X,addEventListener:(name,fn)=>{events[name]=fn;}};
   const document={getElementById:get,createElement:tag=>get(tag==='audio'?'audio':tag),body:node('body'),addEventListener(){},querySelectorAll(){return[];}};
-  const context=vm.createContext({window,document,navigator:{userAgent:'QA'},location:{origin:'https://xass.example'},crypto:webcrypto,URL,URLSearchParams,FormData,Uint8Array,Promise,Number,Math,Date,setInterval(){},setTimeout:options.fastTimers?(fn,ms)=>setTimeout(fn,Math.min(ms,10)):setTimeout,clearTimeout,btoa:raw=>Buffer.from(raw,'latin1').toString('base64')});
+  const context=vm.createContext({window,document,navigator:{userAgent:'QA'},location:{origin:'https://xass.example'},crypto:webcrypto,URL,URLSearchParams,FormData,Uint8Array,Promise,Number,Math,Date,setInterval(fn){intervals.push(fn);},setTimeout:options.fastTimers?(fn,ms)=>setTimeout(fn,Math.min(ms,10)):setTimeout,clearTimeout,btoa:raw=>Buffer.from(raw,'latin1').toString('base64')});
   vm.runInContext(source,context);
-  return{music:X.music,X,window,nodes,events,requests,toasts};
+  return{music:X.music,X,window,nodes,events,requests,toasts,intervals};
 }
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
@@ -95,4 +95,80 @@ test('native bridge sends session and a bounded queue containing tracks beyond t
 test('playback timeout is bounded and there is no repeated PC status command in the timer',()=>{
   assert.match(source,/function startBrowserAudio\(/);assert.match(source,/12000\)/);
   assert.match(source,/request\('players'\)/);assert(!/control\('status'/.test(source));
+});
+
+test('site sharing stays confirmed OFF on 503 and never tells native to publish speculatively',async()=>{
+  let finish;const commands=[];
+  const r=runtime(()=>new Promise(resolve=>{finish=resolve;}));
+  r.window.XASS_NATIVE_AUDIO=true;r.window.webkit={messageHandlers:{xassAudio:{postMessage:message=>commands.push(message)}}};
+  r.music.state.current={id:1,title:'Fixture',duration:10};r.music.state.sessionOwned=true;
+  const input=r.nodes.get('xmShareSite');input.checked=true;const changed=input.handlers.change();
+  assert.equal(input.checked,false);assert.equal(input.disabled,true);assert.equal(r.music.state.shareSite,false);assert.equal(commands.length,0);
+  r.events['xass:native-audio']({detail:{state:'paused',position:1,duration:10}});
+  assert.equal(input.checked,false);assert.equal(input.disabled,true,'a playback render must not unlock the pending switch');
+  finish({status:503,data:{detail:'Сервис временно недоступен'}});await changed;
+  assert.equal(input.checked,false);assert.equal(input.disabled,false);assert.equal(r.music.state.shareSite,false);assert.equal(commands.length,0);
+  assert.match(r.toasts.at(-1),/Не удалось изменить публикацию.*Сервис временно недоступен/);
+  assert.equal(r.requests.length,1);assert.equal(r.requests[0].body.share_site,true);
+});
+
+test('network failure preserves confirmed ON when disabling and allows a later acknowledged retry',async()=>{
+  let failing=true;const commands=[];
+  const r=runtime(async()=>{if(failing)throw new Error('Network unavailable');return{status:200,data:{ok:true}};});
+  r.window.XASS_NATIVE_AUDIO=true;r.window.webkit={messageHandlers:{xassAudio:{postMessage:message=>commands.push(message)}}};
+  Object.assign(r.music.state,{current:{id:1,title:'Fixture'},sessionOwned:true,shareSite:true});
+  const input=r.nodes.get('xmShareSite');input.checked=false;await input.handlers.change();
+  assert.equal(input.checked,true);assert.equal(input.disabled,false);assert.equal(r.music.state.shareSite,true);assert.equal(commands.length,0);assert.match(r.toasts.at(-1),/Network unavailable/);
+  failing=false;input.checked=false;await input.handlers.change();
+  assert.equal(input.checked,false);assert.equal(input.disabled,false);assert.equal(r.music.state.shareSite,false);
+  assert.equal(commands.length,1);assert.equal(commands[0].action,'session');assert.equal(commands[0].session.share_site,false);
+});
+
+test('a sharing write survives a background snapshot, ignores double-toggle and reaches the next track claim',async()=>{
+  const pending=[];let inFlight=0,maxInFlight=0;
+  const r=runtime(async(p,o)=>{
+    if(p==='music/session'&&o.method==='POST'){
+      inFlight++;maxInFlight=Math.max(maxInFlight,inFlight);
+      await new Promise(resolve=>pending.push(resolve));inFlight--;
+      return{status:200,data:{ok:true}};
+    }
+    return{status:200,data:{ok:true,path:'/api/music/tracks/2/stream?ticket=qa-ticket'}};
+  });
+  const one={id:1,title:'One',duration:10},two={id:2,title:'Two',duration:10};
+  Object.assign(r.music.state,{current:one,tracks:[one,two],sessionOwned:true});
+  r.nodes.get('audio').handlers.playing();
+  const input=r.nodes.get('xmShareSite');input.checked=true;const changed=input.handlers.change();
+  input.checked=true;await input.handlers.change();
+  const nextTrack=r.music.play(two);
+  assert.equal(r.requests.length,1);assert.equal(input.checked,false);assert.equal(input.disabled,true);
+  pending.shift()();await tick();
+  const sessions=()=>r.requests.filter(q=>q.path==='music/session');
+  assert.equal(sessions().length,2);assert.equal(sessions()[1].body.share_site,true);assert.equal(sessions()[1].body.takeover,false);
+  assert.equal(input.checked,false);assert.equal(r.music.state.shareSite,false);
+  // The periodic snapshot must coalesce rather than overwrite the explicit write.
+  r.music.state.lastPublish=0;
+  await Promise.all([r.intervals[0](),r.intervals[0](),r.intervals[0]()]);
+  assert.equal(sessions().length,2);
+  pending.shift()();await changed;await tick();
+  assert.equal(input.checked,true);assert.equal(input.disabled,false);assert.equal(sessions().length,3);
+  assert.equal(sessions()[2].body.share_site,true,'the next track must use the committed sharing value');
+  pending.shift()();await nextTrack;
+  assert.equal(maxInFlight,1);assert.equal(sessions().length,3);assert.equal(r.music.state.current.id,2);
+});
+
+test('losing session ownership while waiting prevents the queued sharing write',async()=>{
+  let finish;const r=runtime(()=>new Promise(resolve=>{finish=resolve;}));
+  Object.assign(r.music.state,{current:{id:1,title:'Fixture'},sessionOwned:true});
+  r.nodes.get('audio').handlers.playing();
+  const input=r.nodes.get('xmShareSite');input.checked=true;const changed=input.handlers.change();
+  finish({status:409,data:{detail:'Другое устройство'}});await changed;
+  assert.equal(r.requests.length,1);assert.equal(r.music.state.sessionOwned,false);assert.equal(input.checked,false);assert.equal(input.disabled,false);
+  assert.match(r.toasts.at(-1),/Управление изменилось/);
+});
+
+test('fullscreen player escapes retained view transforms and keeps its background and notices',()=>{
+  const css=fs.readFileSync(path.join(__dirname,'../assets/miniapp-music.css'),'utf8');
+  assert.match(css,/\.xm-player-open #view-music\{animation:none;transform:none\}/);
+  assert.match(css,/\.xm-player\{height:max-content\}/);
+  assert.match(css,/\.xm-player-open #toast\{z-index:140\}/);
 });

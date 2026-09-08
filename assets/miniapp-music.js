@@ -27,7 +27,7 @@
   const key = Array.from(crypto.getRandomValues(new Uint8Array(20)),b=>b.toString(16).padStart(2,'0')).join('');
   const s = {tracks:[],playlists:[],filter:'all',playlist:null,query:'',limit:50,loaded:false,loading:false,error:'',
     current:null,queue:[],shuffle:false,repeat:'off',state:'stopped',position:0,duration:0,volume:70,
-    device:'local',output:'default',outputs:[],shareSite:false,shareDiscord:false,playerOpen:false,playGeneration:0,
+    device:'local',output:'default',outputs:[],shareSite:false,shareSaving:false,shareDiscord:false,playerOpen:false,playGeneration:0,
     pcPolling:false,sessionOwned:false,publishing:false,lastPublish:0,upload:null,downloads:new Set(),busy:false};
   const audio = document.createElement('audio');
   audio.preload='metadata'; audio.setAttribute('playsinline',''); audio.id='xmAudio';
@@ -50,7 +50,7 @@
     <div class="xm-transport">${button('shuffle','Перемешивание','shuffle','id="xmShuffle"')}${button('prev','Предыдущий трек','prev')}${button('toggle','Воспроизвести','play','id="xmMainPlay"')}${button('next','Следующий трек','next')}${button('repeat','Повтор выключен','repeat','id="xmRepeat"')}</div>
     <button class="xm-device" data-xm="devices">${icon('volume')}<span id="xmDeviceName"></span>${icon('chevron')}</button>
     <label class="xm-volume">${icon('volume')}<input id="xmVolume" type="range" min="0" max="100" step="1" value="70" aria-label="Громкость">${icon('speaker')}</label>
-    <div class="xm-sharing"><label><input id="xmShareSite" type="checkbox" role="switch"><span class="xm-switch"></span>На сайте</label><button class="xm-text" data-xm="discord-help">Звук в Discord</button></div>
+    <div class="xm-sharing"><label><input id="xmShareSite" type="checkbox" role="switch" aria-label="Публиковать музыку на сайте"><span class="xm-switch"></span><span id="xmShareSiteText" aria-live="polite">На сайте</span></label><button class="xm-text" data-xm="discord-help">Звук в Discord</button></div>
     <button class="xm-download" data-xm="download-current">${icon('download')}<span id="xmDownloadLabel">Скачать трек</span></button>
   </section></div>
   <dialog id="xmDialog" class="xm-dialog"><div class="xm-dialog-head"><h2 id="xmDialogTitle"></h2>${button('close-dialog','Закрыть','close')}</div><div id="xmDialogBody"></div></dialog>`;
@@ -95,7 +95,12 @@
     }catch(error){s.error=error.message;}finally{s.loading=false;renderLibrary();renderPlayer();}
   }
   function deviceName(){return s.device==='local'?localLabel():s.device.slice(6);}
+  function renderSharing(){
+    const input=$('xmShareSite');input.checked=s.shareSite;input.disabled=s.shareSaving;input.setAttribute('aria-busy',String(s.shareSaving));
+    $('xmShareSiteText').textContent=s.shareSaving?'Сохраняю…':'На сайте';
+  }
   function renderPlayer(){
+    renderSharing();
     const t=s.current;if(!t){$('xmMini').hidden=true;return;}
     const playing=s.state==='playing';
     $('xmMini').hidden=false;$('xmMiniTitle').textContent=t.title;$('xmMiniDevice').textContent=deviceName();
@@ -105,7 +110,6 @@
     $('xmDeviceName').textContent=deviceName()+(s.device!=='local'&&s.output!=='default'?' · '+(s.outputs.find(o=>o.id===s.output)?.name||'Выбранный выход'):'');
     $('xmShuffle').classList.toggle('xm-active',s.shuffle);$('xmShuffle').setAttribute('aria-pressed',String(s.shuffle));
     $('xmRepeat').classList.toggle('xm-active',s.repeat!=='off');$('xmRepeat').setAttribute('aria-label','Повтор: '+({off:'выключен',all:'вся очередь',one:'один трек'}[s.repeat]));$('xmRepeat').dataset.repeat=s.repeat;
-    $('xmShareSite').checked=s.shareSite;
     $('xmVolume').value=s.volume;$('xmDownloadLabel').textContent=s.downloads.has(t.id)?'Сохранено в приложении':'Скачать трек';
     $('xmPlayerStatus').textContent=s.error||({loading:'Загрузка трека…',paused:'На паузе',ended:'Трек завершён',stopped:'Воспроизведение остановлено'}[s.state]||'');
     renderProgress();
@@ -134,16 +138,31 @@
     return list.map(t=>({trackId:t.id,title:t.title,artist:t.artist||''}));
   }
   let publication = null;
-  async function publish(takeover=false){
-    if(!s.current||(!takeover&&!s.sessionOwned))return;
-    while(publication){if(!takeover){await publication.catch(()=>{});return;}await publication.catch(()=>{});}
+  async function publish(takeover=false,options={}){
+    const explicitShare=typeof options.shareSite==='boolean',mustWrite=takeover||explicitShare;
+    if(!s.current||(!takeover&&!s.sessionOwned)){if(explicitShare)throw new Error('Сначала запустите трек на этом устройстве');return;}
+    // Background snapshots coalesce; explicit settings must get their own
+    // acknowledged write after an in-flight snapshot, never inherit its result.
+    while(publication){if(!mustWrite){await publication.catch(()=>{});return;}await publication.catch(()=>{});}
+    if(!s.current||(!takeover&&!s.sessionOwned)){if(explicitShare)throw new Error('Управление изменилось. Запустите трек на этом устройстве и повторите');return;}
     s.publishing=true;
-    publication=request('session','POST',{session_key:key,takeover,track_id:s.current.id,device:s.device,state:s.state,position:Math.max(0,finite(s.position)),share_site:s.shareSite,share_discord:s.shareDiscord});
-    try{await publication;s.sessionOwned=true;s.lastPublish=Date.now();}
+    publication=request('session','POST',{session_key:key,takeover,track_id:s.current.id,device:s.device,state:s.state,position:Math.max(0,finite(s.position)),share_site:explicitShare?options.shareSite:s.shareSite,share_discord:s.shareDiscord});
+    try{await publication;s.sessionOwned=true;s.lastPublish=Date.now();if(explicitShare)s.shareSite=options.shareSite;}
     catch(error){
       if(error.status===409){s.sessionOwned=false;audio.pause();if(native())nativeSend('pause');s.state='paused';s.error='Управление перешло на другое устройство. Нажмите воспроизведение, чтобы продолжить здесь.';renderPlayer();}
-      if(takeover)throw error;
+      if(mustWrite)throw error;
     }finally{s.publishing=false;publication=null;}
+  }
+  async function changeSiteSharing(){
+    const desired=$('xmShareSite').checked;
+    // The switch and native reporter always reflect the last confirmed value.
+    if(s.shareSaving){renderSharing();return;}
+    if(!s.sessionOwned){renderSharing();X.toast('Сначала запустите трек на этом устройстве');return;}
+    if(desired===s.shareSite){renderSharing();return;}
+    s.shareSaving=true;renderSharing();
+    try{await publish(false,{shareSite:desired});if(native()&&s.device==='local')nativeSend('session',{session:nativeSession()});}
+    catch(error){notice(new Error('Не удалось изменить публикацию на сайте. '+error.message));}
+    finally{s.shareSaving=false;renderSharing();}
   }
   async function control(action,extra={},device=s.device){
     if(!device.startsWith('agent:'))throw new Error('Выберите компьютер');
@@ -340,7 +359,7 @@
   $('xmVolume').addEventListener('input',()=>{s.volume=Number($('xmVolume').value);if(s.device==='local'){if(native())nativeSend('volume',{volume:s.volume});else audio.volume=s.volume/100;}renderProgress();});
   $('xmVolume').addEventListener('change',()=>{if(s.device!=='local')control('volume',{volume:s.volume}).catch(notice);});
   root.addEventListener('change',event=>{if(event.target.id==='xmOutput'){s.output=event.target.value;renderPlayer();if(s.current)play(s.current,{keepQueue:true,position:s.position}).catch(notice);}});
-  $('xmShareSite').addEventListener('change',()=>{if(!s.sessionOwned){$('xmShareSite').checked=s.shareSite;X.toast('Сначала запустите трек на этом устройстве');return;}s.shareSite=$('xmShareSite').checked;if(native()&&s.device==='local')nativeSend('session',{session:nativeSession()});publish();});
+  $('xmShareSite').addEventListener('change',changeSiteSharing);
   audio.addEventListener('loadedmetadata',()=>{if(s.device!=='local'||native())return;s.duration=finite(audio.duration);renderProgress();});
   audio.addEventListener('timeupdate',()=>{if(s.device!=='local'||native())return;s.position=finite(audio.currentTime);renderProgress();});
   audio.addEventListener('playing',()=>{if(s.device!=='local'||native())return;s.state='playing';s.error='';renderPlayer();publish();});

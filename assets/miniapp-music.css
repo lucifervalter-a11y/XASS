@@ -1,4 +1,8 @@
 /* Music uses the accepted black/blue XASS library/player design. */
+.xm-player-open #toast{z-index:140}
+/* A retained view-animation transform would trap the fixed player inside it. */
+.xm-player-open #view-music{animation:none;transform:none}
+.xm-player{height:max-content}
 .xm-instructions{padding-left:22px;font-size:14px;line-height:1.65}.xm-instructions li{padding:0 0 10px 3px}
 @media(max-width:759px) and (min-height:760px){#xassMusic .xm-art{max-width:305px;margin-bottom:17px}#xassMusic .xm-volume{margin-block:21px}}
 #xassMusic{--xm-bg:#070b0e;--xm-surface:#121920;--xm-line:#26313e;--xm-text:#f5f6fa;--xm-muted:#a9b3c8;--xm-blue:#2875ff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;color:var(--xm-text);padding-top:26px;padding-bottom:28px}

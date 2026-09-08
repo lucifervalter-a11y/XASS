@@ -34,6 +34,13 @@ jobs:
         working-directory: ios
         run: |
           set -euo pipefail
+          # XCTest may run on a temporary clone and shut down the requested device.
+          simulator_state=$(xcrun simctl list devices available --json | python3 -c 'import json,os,sys; d=json.load(sys.stdin); print(next(x["state"] for devices in d["devices"].values() for x in devices if x["udid"] == os.environ["XASS_SIMULATOR_ID"]))')
+          if [ "$simulator_state" != "Booted" ]; then
+            xcrun simctl boot "$XASS_SIMULATOR_ID"
+          fi
+          xcrun simctl bootstatus "$XASS_SIMULATOR_ID" -b
+          xcrun simctl install "$XASS_SIMULATOR_ID" build/simulator/Build/Products/Debug-iphonesimulator/XASS.app
           xcrun simctl launch --terminate-running-process "$XASS_SIMULATOR_ID" app.xass.mobile
           sleep 2
           mkdir -p build/package
