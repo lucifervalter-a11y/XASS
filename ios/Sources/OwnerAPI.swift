@@ -113,7 +113,8 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         }
         guard (200..<300).contains(code) else {
             if code == 401 { throw OwnerAPIError.signedOut }
-            let detail = (object?["detail"] as? String).map { String($0.prefix(500)) }
+            let detailObject = object?["detail"] as? [String: Any]
+            let detail = ((object?["detail"] as? String) ?? (detailObject?["message"] as? String)).map { String($0.prefix(500)) }
             throw OwnerAPIError(status: code, message: detail ?? (code >= 500 ? "Сервер временно недоступен. Повторите позже." : "Сервер не разрешил действие. Обновите данные и повторите."), detail: object?["detail"] as? [String: Any])
         }
         guard let object = object, object["ok"] as? Bool == true else { throw OwnerAPIError.invalidResponse }

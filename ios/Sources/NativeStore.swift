@@ -46,9 +46,11 @@ import UIKit
     private var pendingReport: [String: Any]?
     private var pollTask: Task<Void, Never>?
     private var sessionWrite: Task<[String: Any], Error>?
+    private var sessionWriteID = UUID()
     private var generation = UUID()
     private var inboxBusy = false
     private var transferPending = false
+    private var outputRequest = UUID()
     private var acknowledgedCommands: [String: [String: Any]] = [:]
     private let imageCache = NSCache<NSNumber, UIImage>()
     private var missingArtwork = Set<Int>()
@@ -63,6 +65,10 @@ import UIKit
         audio.configure(api.origin)
         audio.emit = { [weak self] event in self?.audioEvent(event) }
         audio.reportSession = { [weak self] snapshot in self?.queueReport(snapshot) }
+        audio.canResumePlayback = { [weak self] in
+            guard let self = self else { return false }
+            return !self.transferPending && (self.ownsSession || self.offlinePlayback)
+        }
         audio.requestTicket = { [weak self] id, done in
             Task { @MainActor in
                 guard let self = self else { done(.failure(OwnerAPIError.signedOut)); return }
@@ -77,11 +83,12 @@ import UIKit
         try? SecureStore.save(Data(value.utf8), name: name); return value
     }
     var currentTrack: LibraryTrack? {
-        tracks.first(where: { $0.id == currentID }) ?? audio.downloads.first(where: { $0.id == currentID }).map(LibraryTrack.init)
+        tracks.first(where: { $0.id == currentID }) ?? audio.downloads.first(where: { $0.id == currentID }).map(LibraryTrack.init) ?? audio.cachedTracks.first(where: { $0.id == currentID }).map { LibraryTrack($0.track) }
     }
-    var otherLocal: Bool { selectedDevice == "local" && !canonicalSessionKey.isEmpty && canonicalSessionKey != sessionKey && canonicalClientID != clientID }
+    var otherLocal: Bool { selectedDevice == "local" && !canonicalSessionKey.isEmpty && (canonicalSessionKey != sessionKey || (!canonicalClientID.isEmpty && canonicalClientID != clientID)) }
     var deviceLabel: String { selectedDevice == "local" ? (otherLocal ? "Другое устройство" : "Этот iPhone") : String(selectedDevice.dropFirst(6)) }
     var playing: Bool { playbackState == "playing" }
+    var canEditQueue: Bool { selectedDevice == "local" && !otherLocal }
     var enrolled: Bool { authorization.identity.enrolled }
     func rows(filter: String, query: String, playlist: LibraryPlaylist? = nil) -> [LibraryTrack] {
         var rows = playlist.map { p in p.trackIDs.compactMap { id in tracks.first { $0.id == id } } } ?? tracks
@@ -105,8 +112,17 @@ import UIKit
         do {
             let bootstrap = try await api.request("/api/mini/bootstrap", method: "GET", body: nil)
             devices = (bootstrap["sources"] as? [[String: Any]] ?? []).compactMap(NativeDevice.init)
-            let library = try await api.request("/api/mini/music/library", method: "GET", body: nil)
-            tracks = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+            let library = try await api.request("/api/mini/music/library?limit=2000&offset=0", method: "GET", body: nil)
+            var loaded = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+            var page = library, offset = 0
+            while page["has_more"] as? Bool == true {
+                try Task.checkCancellation()
+                guard let next = page["next_offset"] as? Int, next > offset, next <= 100000 else { throw OwnerAPIError.invalidResponse }
+                offset = next
+                page = try await api.request("/api/mini/music/library?limit=2000&offset=\(offset)", method: "GET", body: nil)
+                loaded.append(contentsOf: (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init))
+            }
+            var seen = Set<Int>(); tracks = loaded.filter { seen.insert($0.id).inserted }
             playlists = (library["playlists"] as? [[String: Any]] ?? []).compactMap(LibraryPlaylist.init)
             maxUpload = library["max_upload_bytes"] as? Int ?? maxUpload
             authorized = true; showLogin = false; error = nil
@@ -136,7 +152,7 @@ import UIKit
         let session = response["session"] as? [String: Any] ?? [:]
         let serverKey = session["session_key"] as? String
         if ownsSession && serverKey != nil && serverKey != sessionKey {
-            ownsSession = false; suppressReports = true; audio.pause(); suppressReports = false; pendingReport = nil
+            generation = UUID(); ownsSession = false; suppressReports = true; audio.pause(); suppressReports = false; pendingReport = nil
         }
         if !offlinePlayback && (!ownsSession || selectedDevice != "local") { applySession(session) }
         let result = try await api.request("/api/mini/music/players", method: "GET", body: nil)
@@ -158,10 +174,12 @@ import UIKit
         position = NativeValue.number(value["position"]); duration = currentTrack?.duration ?? 0
         outputID = value["output_id"] as? String ?? "default"; volume = NativeValue.number(value["volume"], fallback: volume)
         if !shareSaving { shareSite = value["share_site"] as? Bool ?? shareSite }
+        if let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } } }
+        if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { repeatMode = mode }
     }
     private func audioEvent(_ value: [String: Any]) {
         if value["action"] != nil { objectWillChange.send(); return }
-        guard selectedDevice == "local" else { return }
+        guard selectedDevice == "local", ownsSession || offlinePlayback || transferPending else { return }
         if let id = value["trackId"] as? Int, id > 0 { currentID = id }
         playbackState = value["state"] as? String ?? playbackState
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
@@ -203,15 +221,18 @@ import UIKit
         if device != "local", tracks.first(where: { $0.id == chosenID })?.pcSupported == false {
             throw OwnerAPIError(status: 415, message: "Этот формат доступен на iPhone. Для ПК загрузите MP3 или WAV.")
         }
-        let actualPosition = ownsSession && selectedDevice == "local" ? audio.exactPosition() : position
-        if ownsSession && selectedDevice == "local" {
+        let ownedSource = selectedDevice == "local" && (ownsSession || canonicalSessionKey == sessionKey)
+        let actualPosition = ownedSource && audio.hasPlayableItem ? audio.exactPosition() : position
+        if ownedSource {
             suppressReports = true; audio.pause(); suppressReports = false
             _ = try await writeSession(snapshot(state: "paused", position: actualPosition), explicit: true)
+            ownsSession = false; pendingReport = nil
         }
         var body: [String: Any] = ["session_key": sessionKey, "client_id": clientID, "device": device,
-            "output_id": output ?? (device == selectedDevice ? outputID : "default"), "track_id": chosenID, "volume": Int(volume), "autoplay": true]
+            "output_id": output ?? (device == selectedDevice ? outputID : "default"), "track_id": chosenID, "volume": Int(volume), "autoplay": true,
+            "queue": Array(queue.prefix(2000)).map(\.id), "repeat_mode": repeatMode]
         if let start = startPosition { body["position"] = start }
-        else if ownsSession && selectedDevice == "local" { body["position"] = actualPosition }
+        else if ownedSource { body["position"] = actualPosition }
         let started = try await api.request("/api/mini/music/transfers", method: "POST", body: body)
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
         let deadline = Date().addingTimeInterval(30)
@@ -227,7 +248,12 @@ import UIKit
         if selectedDevice == "local" {
             guard let track = currentTrack else { throw OwnerAPIError.invalidResponse }
             let url: String
-            if audio.downloads.contains(where: { $0.id == chosenID }) { url = "" } else { url = try await ticket(chosenID) }
+            do { if audio.downloads.contains(where: { $0.id == chosenID }) || audio.cachedTracks.contains(where: { $0.id == chosenID }) { url = "" } else { url = try await ticket(chosenID) } }
+            catch {
+                playbackState = "error"
+                _ = try? await writeSession(snapshot(state: "error"), explicit: true)
+                throw error
+            }
             guard generation == nextGeneration else { return }
             ownsSession = true
             let list = shuffle ? queue.shuffled() : queue
@@ -253,7 +279,7 @@ import UIKit
     func setVolume(_ value: Double) async throws {
         if otherLocal { try await remoteControl("volume", extra: ["volume": Int(value)]); return }
         let bounded = min(100, max(0, value))
-        if selectedDevice == "local" { audio.handle(try NativeAudioCommand(["action": "volume", "volume": bounded])) }
+        if selectedDevice == "local" { volume = bounded; audio.handle(try NativeAudioCommand(["action": "volume", "volume": bounded])) }
         else { _ = try await control("volume", extra: ["volume": Int(bounded)]) }
         volume = bounded
     }
@@ -279,17 +305,20 @@ import UIKit
         if let id = currentID { result["track_id"] = id }; return result
     }
     private func writeSession(_ body: [String: Any], explicit: Bool = false) async throws -> [String: Any] {
-        while let current = sessionWrite {
-            if !explicit { return try await current.value }
-            _ = try? await current.value
+        if !explicit, let current = sessionWrite { return try await current.value }
+        let previous = sessionWrite, operationID = UUID()
+        let operation = Task {
+            if let previous = previous { _ = try? await previous.value }
+            try Task.checkCancellation()
+            return try await api.request("/api/mini/music/session", method: "POST", body: body)
         }
-        let operation = Task { try await api.request("/api/mini/music/session", method: "POST", body: body) }
+        sessionWriteID = operationID
         sessionWrite = operation
-        defer { sessionWrite = nil }
+        defer { if sessionWriteID == operationID { sessionWrite = nil } }
         return try await operation.value
     }
     private func queueReport(_ body: [String: Any]) {
-        guard ownsSession, !suppressReports else { return }
+        guard ownsSession, !suppressReports, !transferPending else { return }
         var value = body; value["client_id"] = clientID; value["volume"] = Int(volume); value["output_id"] = outputID
         // Sharing is a shared server setting, not a stale player heartbeat field.
         value.removeValue(forKey: "share_site"); value.removeValue(forKey: "share_discord")
@@ -309,14 +338,17 @@ import UIKit
                             do { _ = try await self.api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/ack", method: "POST", body: ["session_key": self.sessionKey, "position": position]) }
                             catch { self.handle(error) }
                         }
-                    } else if (error as? OwnerAPIError)?.status == 401 { self.ownsSession = false; self.handle(error) }
+                    } else if (error as? OwnerAPIError)?.status == 401 {
+                        self.generation = UUID(); self.ownsSession = false; self.pendingReport = nil
+                        self.suppressReports = true; self.audio.pause(); self.suppressReports = false; self.handle(error)
+                    }
                     // A network outage does not kill a locally buffered track.
                 }
             }
         }
     }
     private func remoteControl(_ action: String, extra: [String: Any] = [:]) async throws {
-        guard !busy, !canonicalSessionKey.isEmpty else { return }; busy = true; defer { busy = false }
+        guard !busy, !canonicalSessionKey.isEmpty else { return }; busy = true; defer { busy = false; notice = nil }
         var body: [String: Any] = ["target_key": canonicalSessionKey, "action": action]; body.merge(extra) { _, new in new }
         let response = try await api.request("/api/mini/music/session/control", method: "POST", body: body)
         guard let id = NativeValue.identifier(response["command_id"]) else { throw OwnerAPIError.invalidResponse }
@@ -350,7 +382,11 @@ import UIKit
                         do {
                             var body: [String: Any] = ["action": action]
                             if let value = command["position"] { body["position"] = value }; if let value = command["volume"] { body["volume"] = value }
-                            audio.handle(try NativeAudioCommand(body))
+                            let value = try NativeAudioCommand(body)
+                            if action == "seek" { await audio.seekConfirmed(value.position) }
+                            else { audio.handle(value) }
+                            guard inboxGeneration == generation, !transferPending, ownsSession else { return }
+                            if action == "volume" { volume = value.volume }
                             ack = ["session_key": sessionKey, "ok": audio.state != "error", "state": audio.state, "position": audio.exactPosition()]
                         } catch { ack = ["session_key": sessionKey, "ok": false, "state": audio.state, "position": audio.exactPosition(), "error": "Некорректная команда отклонена"] }
                     }
@@ -395,8 +431,9 @@ import UIKit
         throw OwnerAPIError(status: 408, message: "ПК не ответил вовремя. Проверьте агент.")
     }
     func loadOutputs(source: String) async throws {
-        outputs = []
+        let requestID = UUID(); outputRequest = requestID; outputs = []
         let result = try await control("outputs", source: source)
+        guard requestID == outputRequest else { return }
         outputs = (result["outputs"] as? [[String: Any]] ?? []).compactMap(PlayerOutput.init)
     }
     func favorite(_ track: LibraryTrack) async throws {
@@ -416,7 +453,7 @@ import UIKit
         if currentID == track.id && ownsSession { audio.stop(); ownsSession = false; currentID = nil }
     }
     func download(_ track: LibraryTrack) async throws {
-        let url = try await ticket(track.id, purpose: "download")
+        let url = audio.cachedTracks.contains(where: { $0.id == track.id }) ? "" : try await ticket(track.id, purpose: "download")
         audio.handle(try NativeAudioCommand(["action": "download", "trackId": track.id, "url": url, "title": track.title, "artist": track.artist]))
     }
     func upload(_ url: URL) async throws {

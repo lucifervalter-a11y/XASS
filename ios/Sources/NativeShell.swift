@@ -224,18 +224,31 @@ import SwiftUI
     @ObservedObject var store: NativeStore
     @ObservedObject var audio: AudioController
     @State private var remove: DownloadedTrack?
+    @State private var offline: DownloadedTrack?
     var body: some View {
         NavigationStack {
             List {
-                if audio.downloads.isEmpty { ContentUnavailableView("Музыка без интернета", systemImage: "arrow.down.circle", description: Text("Сохраните треки из плеера. Они доступны в этом приложении без сети.")) }
+                if audio.downloads.isEmpty && audio.cachedTracks.isEmpty { ContentUnavailableView("Музыка без интернета", systemImage: "arrow.down.circle", description: Text("Сохраните треки из плеера. Они доступны в этом приложении без сети.")) }
                 if !audio.downloadIDs.isEmpty { ProgressView("Сохраняю треки: \(audio.downloadIDs.count)") }
                 ForEach(audio.downloads) { track in
                     HStack(spacing: 12) {
                         Button {
-                            if store.authorized { store.run { try await store.transfer(to: "local", trackID: track.id, startPosition: 0) } }
+                            if store.authorized { store.run { do { try await store.transfer(to: "local", trackID: track.id, startPosition: 0) } catch { offline = track; throw error } } }
                             else { store.playOffline(track) }
                         } label: { HStack(spacing: 12) { TrackArtwork(store: store, trackID: track.id).frame(width: 44, height: 44); VStack(alignment: .leading, spacing: 3) { Text(track.title).foregroundStyle(.primary); Text(track.artist.isEmpty ? "На этом iPhone" : track.artist).font(.caption).foregroundStyle(.secondary) }; Spacer() } }.buttonStyle(.plain)
                         Button { remove = track } label: { Image(systemName: "ellipsis").frame(width: 40, height: 44) }.buttonStyle(.borderless).accessibilityLabel("Удалить локальную копию")
+                    }
+                }
+                if !audio.cachedTracks.isEmpty {
+                    Section("Автоматический кэш") {
+                        ForEach(audio.cachedTracks.filter { entry in !audio.downloads.contains(where: { $0.id == entry.id }) }) { entry in
+                            Button {
+                                if store.authorized { store.run { do { try await store.transfer(to: "local", trackID: entry.id, startPosition: 0) } catch { offline = entry.track; throw error } } }
+                                else { store.playOffline(entry.track) }
+                            } label: {
+                                HStack { VStack(alignment: .leading) { Text(entry.track.title).foregroundStyle(.primary); Text(entry.track.artist).font(.caption).foregroundStyle(.secondary) }; Spacer(); Text(ByteCountFormatter.string(fromByteCount: entry.bytes, countStyle: .file)).font(.caption).foregroundStyle(.secondary) }
+                            }
+                        }
                     }
                 }
                 NativeMessage(store: store)
@@ -243,6 +256,10 @@ import SwiftUI
                 .confirmationDialog("Удалить только копию с iPhone? На сервере трек останется.", isPresented: Binding(get: { remove != nil }, set: { if !$0 { remove = nil } }), titleVisibility: .visible) {
                     Button("Удалить локальную копию", role: .destructive) { if let track = remove { audio.removeDownload(track) }; remove = nil }
                 }
+                .confirmationDialog("Слушать только на этом iPhone?", isPresented: Binding(get: { offline != nil }, set: { if !$0 { offline = nil } }), titleVisibility: .visible) {
+                    Button("Слушать локальную копию") { if let track = offline { store.playOffline(track) }; offline = nil }
+                    Button("Отмена", role: .cancel) { offline = nil }
+                } message: { Text("Сервер не подтвердил переключение. В офлайн-режиме XASS не может остановить музыку на другом устройстве. Продолжайте только если там ничего не играет.") }
         }
     }
 }

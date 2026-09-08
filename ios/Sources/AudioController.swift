@@ -117,9 +117,14 @@ struct NativePlaybackQueue {
     @Published private(set) var downloadIDs: Set<Int> = []
     @Published var error: String?
     @Published var showRoutes = false
+    @Published private(set) var cachedTracks: [CachedAudio] = []
+    @Published private(set) var cacheBytes: Int64 = 0
+    @Published private(set) var cacheLimitMB = 256
+    @Published private(set) var cacheWorking = false
     var emit: (([String: Any]) -> Void)?
     var reportSession: (([String: Any]) -> Void)?
     var requestTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
+    var canResumePlayback: () -> Bool = { true }
     private let player = AVPlayer()
     private var loader: SecureMediaLoader?
     private var origin: ServerOrigin?
@@ -134,6 +139,11 @@ struct NativePlaybackQueue {
     private var resumeAfterInterruption = false
     private var queue: NativePlaybackQueue?
     private var transition = UUID()
+    private var automaticCache: AudioCache?
+    private var cacheGeneration = UUID()
+    private var cacheDownload: PrivateDownload?
+    private var cacheDownloadID: Int?
+    private var recordedPlay = false
 
     init() {
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
@@ -143,6 +153,7 @@ struct NativePlaybackQueue {
             Task { @MainActor in
                 guard let self = self, self.player.currentItem != nil, self.state != "ended", self.state != "error" else { return }
                 self.state = player.timeControlStatus == .playing ? "playing" : player.timeControlStatus == .waitingToPlayAtSpecifiedRate ? "loading" : "paused"
+                if self.state == "playing" { self.recordCachePlay() }
                 self.publish()
             }
         }
@@ -180,11 +191,21 @@ struct NativePlaybackQueue {
     func configure(_ origin: ServerOrigin) {
         if self.origin == origin { return }
         stop(); jobs.values.forEach { $0.cancel() }; jobs.removeAll(); downloadIDs.removeAll()
+        resetCache()
         self.origin = origin; library = try? OfflineLibrary(origin: origin)
         downloads = library?.tracks() ?? []; sessionSnapshot = nil
+        let token = cacheGeneration
+        Task { [weak self] in
+            do {
+                let cache = try AudioCache(origin: origin), value = try await cache.load()
+                guard let self = self, self.cacheGeneration == token, self.origin == origin else { return }
+                self.automaticCache = cache; self.applyCache(value)
+            } catch { /* Cache availability must never block streaming or pinned downloads. */ }
+        }
     }
     func disconnect() {
         stop(); jobs.values.forEach { $0.cancel() }; jobs.removeAll(); downloadIDs.removeAll()
+        resetCache()
         origin = nil; library = nil; downloads = []; sessionSnapshot = nil
     }
     func handle(_ command: NativeAudioCommand) {
@@ -222,6 +243,8 @@ struct NativePlaybackQueue {
         let nextLoader: SecureMediaLoader?
         if let library = library, let track = downloads.first(where: { $0.id == command.trackID }), FileManager.default.fileExists(atPath: library.file(for: track).path) {
             item = AVPlayerItem(url: library.file(for: track)); nextLoader = nil
+        } else if let cache = automaticCache, let entry = cachedTracks.first(where: { $0.id == command.trackID }) {
+            item = AVPlayerItem(url: cache.file(entry.id, suffix: entry.track.fileExtension ?? "audio")); nextLoader = nil
         } else {
             let url = try origin.mediaURL(command.rawURL, trackID: command.trackID)
             let created = SecureMediaLoader(origin: origin, trackID: command.trackID, url: url)
@@ -230,7 +253,7 @@ struct NativePlaybackQueue {
         try activateAudio()
         transition = UUID()
         player.pause(); player.replaceCurrentItem(with: nil); loader?.invalidate(); loader = nextLoader
-        state = "loading"; title = command.title; artist = command.artist; trackID = command.trackID
+        state = "loading"; title = command.title; artist = command.artist; trackID = command.trackID; recordedPlay = false
         position = command.position; duration = 0; error = nil
         player.volume = Float(command.volume / 100)
         itemObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -246,14 +269,17 @@ struct NativePlaybackQueue {
     func playOffline(_ track: DownloadedTrack) {
         stop()
         sessionSnapshot = nil
-        let index = downloads.firstIndex(where: { $0.id == track.id }) ?? 0
-        let start = min(index, max(0, downloads.count - 200))
-        let window = downloads.dropFirst(start).prefix(200)
+        var seen = Set<Int>()
+        let available = (downloads + cachedTracks.map(\.track)).filter { seen.insert($0.id).inserted }
+        let index = available.firstIndex(where: { $0.id == track.id }) ?? 0
+        let start = min(index, max(0, available.count - 200))
+        let window = available.dropFirst(start).prefix(200)
         guard let command = try? NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist, "queue": window.map(\.bridge)]) else { return }
         handle(command)
     }
     func pause() { transition = UUID(); player.pause(); if trackID > 0 { state = "paused"; publish(forceReport: true) } }
     func resume() {
+        guard canResumePlayback() else { return }
         transition = UUID()
         guard player.currentItem != nil else { return }
         do { try activateAudio(); if state == "ended" { player.seek(to: .zero) }; state = "playing"; player.play(); publish(forceReport: true) }
@@ -277,6 +303,16 @@ struct NativePlaybackQueue {
         return current.isFinite ? max(0, current) : position
     }
     var hasPlayableItem: Bool { player.currentItem != nil }
+    func seekConfirmed(_ seconds: Double) async {
+        guard seconds.isFinite, seconds >= 0, player.currentItem != nil else { return }
+        let request = UUID(); transition = request
+        let value = duration > 0 ? min(seconds, duration) : min(seconds, 86400)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            player.seek(to: CMTime(seconds: value, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { _ in done.resume() }
+        }
+        guard transition == request else { return }
+        position = exactPosition(); publish(forceReport: true)
+    }
     private func updateTime() {
         guard player.currentItem != nil else { return }
         let current = player.currentTime().seconds, total = player.currentItem?.duration.seconds ?? 0
@@ -303,6 +339,7 @@ struct NativePlaybackQueue {
         if position > 3 { seek(0) } else { advance(direction: -1) }
     }
     private func advance(direction: Int, automatic: Bool = false) {
+        guard canResumePlayback() else { return }
         guard let track = queue?.next(currentID: trackID, direction: direction, automatic: automatic) else { return }
         let generation = UUID(); transition = generation
         let start: (String) -> Void = { [weak self] url in
@@ -313,6 +350,7 @@ struct NativePlaybackQueue {
             } catch { self.state = "error"; self.error = "Не удалось включить следующий трек. Проверьте сеть или сохраните очередь на iPhone."; self.publish(forceReport: true) }
         }
         if let library = library, let saved = downloads.first(where: { $0.id == track.id }), FileManager.default.fileExists(atPath: library.file(for: saved).path) { start(""); return }
+        if cachedTracks.contains(where: { $0.id == track.id }) { start(""); return }
         guard let request = requestTicket else { state = "error"; error = "Для следующего трека нужен вход на сервер."; publish(forceReport: true); return }
         state = "loading"; publish()
         request(track.id) { [weak self] result in
@@ -336,7 +374,20 @@ struct NativePlaybackQueue {
     }
     private func download(_ command: NativeAudioCommand) throws {
         guard let origin = origin, let library = library else { throw XASSErr.invalidOrigin }
-        guard jobs[command.trackID] == nil else { return }
+        guard jobs[command.trackID] == nil, !downloadIDs.contains(command.trackID) else { return }
+        if let cache = automaticCache, let entry = cachedTracks.first(where: { $0.id == command.trackID }) {
+            downloadIDs.insert(command.trackID)
+            Task { [weak self] in
+                do {
+                    let values = try await cache.promote(entry, to: library)
+                    guard let self = self, self.origin == origin else { return }
+                    self.downloadIDs.remove(command.trackID); self.downloads = values
+                    self.emit?(["action": "download", "trackId": command.trackID, "downloaded": true])
+                } catch { self?.downloadIDs.remove(command.trackID); self?.error = "Не удалось сохранить трек из кэша." }
+            }
+            return
+        }
+        if cacheDownloadID == command.trackID { cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil }
         let url = try origin.mediaURL(command.rawURL, trackID: command.trackID)
         let free = try? library.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
         if let free = free, free < PrivateDownload.maxBytes + 32 * 1024 * 1024 { throw URLError(.cannotWriteToFile) }
@@ -359,5 +410,60 @@ struct NativePlaybackQueue {
     func removeDownload(_ track: DownloadedTrack) {
         do { try library?.remove(track); downloads = library?.tracks() ?? []; emit?(["action": "downloads", "downloads": downloads.map(\.bridge)]) }
         catch { self.error = "Не удалось удалить локальную копию." }
+    }
+    private func resetCache() {
+        cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil
+        automaticCache = nil; cachedTracks = []; cacheBytes = 0; recordedPlay = false
+    }
+    private func applyCache(_ value: AudioCacheSnapshot) {
+        cachedTracks = value.entries; cacheBytes = value.bytes; cacheLimitMB = value.limitMB
+        emit?(["action": "cache", "bytes": value.bytes, "count": value.entries.count])
+    }
+    func setCacheLimit(_ megabytes: Int) async throws {
+        guard let cache = automaticCache, !cacheWorking else { return }; cacheWorking = true; defer { cacheWorking = false }
+        cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil
+        let token = cacheGeneration, value = try await cache.setLimit(megabytes, protectedID: trackID)
+        guard token == cacheGeneration else { return }; applyCache(value)
+    }
+    func clearAutomaticCache() async throws {
+        guard let cache = automaticCache, !cacheWorking else { return }; cacheWorking = true; defer { cacheWorking = false }
+        cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil; cachedTracks = []; cacheBytes = 0
+        let token = cacheGeneration, value = try await cache.clear()
+        guard token == cacheGeneration else { return }; applyCache(value)
+    }
+    private func recordCachePlay() {
+        guard !recordedPlay, trackID > 0, let cache = automaticCache else { return }; recordedPlay = true
+        let id = trackID, title = title, artist = artist, length = duration, token = cacheGeneration
+        Task { [weak self] in
+            do {
+                let needed = try await cache.recordPlay(id)
+                guard let self = self, self.cacheGeneration == token else { return }
+                self.applyCache(await cache.snapshot())
+                guard needed, await cache.hasSpaceForDownload(), self.cacheGeneration == token,
+                      !self.downloads.contains(where: { $0.id == id }), self.jobs[id] == nil,
+                      self.cacheDownloadID == nil, let request = self.requestTicket, let origin = self.origin else { return }
+                self.cacheDownloadID = id
+                request(id) { [weak self] result in
+                    guard let self = self, self.cacheGeneration == token, self.cacheDownloadID == id else { return }
+                    do {
+                        let url = try origin.mediaURL(result.get(), trackID: id)
+                        let job = PrivateDownload(origin: origin, trackID: id, destination: cache.file(id))
+                        self.cacheDownload = job
+                        job.start(url: url) { [weak self] result in
+                            Task { @MainActor in
+                                guard let self = self, self.cacheGeneration == token else { return }
+                                self.cacheDownload = nil; self.cacheDownloadID = nil
+                                do {
+                                    let file = try result.get()
+                                    let entry = DownloadedTrack(id: id, title: title, artist: artist, duration: length, fileExtension: file.pathExtension)
+                                    let snapshot = try await cache.insert(entry, protectedID: self.trackID)
+                                    guard self.cacheGeneration == token else { return }; self.applyCache(snapshot)
+                                } catch { /* An optional cache miss does not fail the active player. */ }
+                            }
+                        }
+                    } catch { self.cacheDownload = nil; self.cacheDownloadID = nil }
+                }
+            } catch { /* No user action is required for an optional automatic cache. */ }
+        }
     }
 }

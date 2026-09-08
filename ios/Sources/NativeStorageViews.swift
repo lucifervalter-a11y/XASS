@@ -7,13 +7,19 @@ import UniformTypeIdentifiers
     @State private var importFiles = false
     @State private var info: String?
     @State private var folderImport = false
+    @State private var clearCache = false
     var body: some View {
         List {
             Section("На iPhone") {
+                Picker("Автоматический кэш", selection: Binding(get: { store.audio.cacheLimitMB }, set: { limit in store.run { try await store.audio.setCacheLimit(limit) } })) {
+                    Text("Выключен").tag(0); Text("256 МБ").tag(256); Text("512 МБ").tag(512); Text("1 ГБ").tag(1024)
+                }.disabled(store.audio.cacheWorking)
+                HStack { Label("Музыка в кэше", systemImage: "music.note"); Spacer(); Text(ByteCountFormatter.string(fromByteCount: store.audio.cacheBytes, countStyle: .file)).foregroundStyle(.secondary) }
+                Button("Очистить кэш музыки", role: .destructive) { clearCache = true }.disabled(store.audio.cacheWorking)
                 HStack { Label("Кэш обложек", systemImage: "externaldrive"); Spacer(); Text("В памяти").foregroundStyle(.secondary) }
                 Button { store.clearArtworkCache() } label: { Label("Очистить кэш обложек", systemImage: "trash") }
                 HStack { Label("Скачано вручную", systemImage: "doc"); Spacer(); Text("\(store.audio.downloads.count) треков").foregroundStyle(.secondary) }
-                Text("Ручные загрузки доступны без сети и удаляются отдельно во вкладке «Загрузки». Автоматического кэша аудио пока нет.").font(.caption).foregroundStyle(.secondary)
+                Text("Кэш сохраняет трек после двух запусков. При заполнении удаляется давно не звучавшая музыка; ручные загрузки не затрагиваются. Все данные привязаны к этому серверу.").font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 ForEach(store.tracks) { track in
@@ -31,6 +37,10 @@ import UniformTypeIdentifiers
         }.navigationTitle("Хранение")
             .fileImporter(isPresented: $importFiles, allowedContentTypes: [.audio, .zip], allowsMultipleSelection: true) { result in switch result { case .success(let urls): store.run { for url in urls { try await store.upload(url) } }; case .failure(let error): store.handle(error) } }
             .alert("Импорт музыки", isPresented: Binding(get: { info != nil }, set: { if !$0 { info = nil } })) { Button("Понятно", role: .cancel) {} } message: { Text(info ?? "") }
+            .confirmationDialog("Очистить автоматический кэш музыки?", isPresented: $clearCache, titleVisibility: .visible) {
+                Button("Очистить кэш", role: .destructive) { store.run { try await store.audio.clearAutomaticCache(); store.notice = "Автоматический кэш очищен. Ручные загрузки сохранены." } }
+                Button("Отмена", role: .cancel) {}
+            } message: { Text("Сохранённые вручную треки и файлы на сервере не удаляются.") }
             .sheet(isPresented: $folderImport) { if let source = source { NativeFolderImportView(store: store, source: source) } }
     }
 }

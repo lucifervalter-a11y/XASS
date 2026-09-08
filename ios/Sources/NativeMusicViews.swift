@@ -169,7 +169,7 @@ enum XASSStyle {
                         }
                         if store.busy || store.playbackState == "loading" { HStack { ProgressView(); Text(store.busy ? "Переключаю устройство…" : "Загрузка трека…").font(.caption) }.accessibilityIdentifier("nativePlayerLoading") }
                         HStack {
-                            Button { store.shuffle.toggle(); store.updateQueue() } label: { Image(systemName: "shuffle").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.shuffle ? XASSStyle.accent : XASSStyle.secondary).accessibilityLabel("Перемешивание")
+                            Button { store.shuffle.toggle(); store.updateQueue() } label: { Image(systemName: "shuffle").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.shuffle ? XASSStyle.accent : XASSStyle.secondary).accessibilityLabel("Перемешивание").disabled(!store.canEditQueue)
                             Spacer()
                             Button { store.run { try await store.step(-1) } } label: { Image(systemName: "backward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Предыдущий трек")
                             Spacer()
@@ -177,7 +177,7 @@ enum XASSStyle {
                             Spacer()
                             Button { store.run { try await store.step(1) } } label: { Image(systemName: "forward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Следующий трек")
                             Spacer()
-                            Button { store.repeatMode = store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off"; store.updateQueue() } label: { Image(systemName: store.repeatMode == "one" ? "repeat.1" : "repeat").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.repeatMode == "off" ? XASSStyle.secondary : XASSStyle.accent).accessibilityLabel("Повтор: \(store.repeatMode)")
+                            Button { store.repeatMode = store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off"; store.updateQueue() } label: { Image(systemName: store.repeatMode == "one" ? "repeat.1" : "repeat").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.repeatMode == "off" ? XASSStyle.secondary : XASSStyle.accent).accessibilityLabel("Повтор: \(store.repeatMode)").disabled(!store.canEditQueue)
                         }.foregroundStyle(.white).disabled(store.busy)
                         if store.otherLocal { Text("Команды выполняются после ответа другого устройства. Для переноса выберите «Этот iPhone» ниже.").font(.caption).foregroundStyle(.secondary) }
                         Button { showDevices = true } label: { HStack(spacing: 12) { Image(systemName: store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer").font(.title3); Text(store.deviceLabel).foregroundStyle(.white); Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary) }.padding(16).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.07))) }.accessibilityIdentifier("nativePlayerDevices")
@@ -234,7 +234,7 @@ enum XASSStyle {
                 Button { store.run { try await store.download(track) }; dismiss() } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }
                 Section("Добавить в плейлист") {
                     if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
-                    ForEach(store.playlists) { playlist in Button(playlist.name) { store.run { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: Array(Set(playlist.trackIDs + [track.id]))) }; dismiss() } }
+                    ForEach(store.playlists) { playlist in Button(playlist.name) { store.run { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) }; dismiss() } }
                 }
                 Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
             }.navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() } }
@@ -277,7 +277,7 @@ enum XASSStyle {
                 Section("Треки") { ForEach(store.tracks) { track in Toggle(track.title, isOn: Binding(get: { selected.contains(track.id) }, set: { if $0 { selected.insert(track.id) } else { selected.remove(track.id) } })) } }
                 NativeMessage(store: store)
             }.navigationTitle(playlist == nil ? "Новый плейлист" : "Изменить плейлист")
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { saving = true; store.run { defer { saving = false }; let ids = store.tracks.filter { selected.contains($0.id) }.map(\.id); try await store.savePlaylist(id: playlist?.id, name: String(name.prefix(160)), trackIDs: ids); dismiss() } }.disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { saving = true; store.run { defer { saving = false }; let preserved = (playlist?.trackIDs ?? []).filter { selected.contains($0) }; let ids = preserved + store.tracks.filter { selected.contains($0.id) && !preserved.contains($0.id) }.map(\.id); try await store.savePlaylist(id: playlist?.id, name: String(name.prefix(160)), trackIDs: ids); dismiss() } }.disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
                 .onAppear { name = playlist?.name ?? ""; selected = Set(playlist?.trackIDs ?? []) }
         }
     }
