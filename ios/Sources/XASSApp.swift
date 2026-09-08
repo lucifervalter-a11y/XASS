@@ -1,7 +1,7 @@
 import SwiftUI
 import AVKit
 
-@main struct XASSApp: App {
+@main @MainActor struct XASSApp: App {
     @StateObject private var app = AppState()
     @Environment(\.scenePhase) private var scenePhase
     var body: some Scene {
@@ -15,7 +15,7 @@ import AVKit
     }
 }
 
-struct RootView: View {
+@MainActor struct RootView: View {
     @ObservedObject var app: AppState
     @ObservedObject var audio: AudioController
     @State private var showDownloads = false
@@ -52,14 +52,13 @@ struct RootView: View {
 
 struct BrandMark: View {
     var body: some View {
-        Image(systemName: "waveform.path").font(.system(size: 44, weight: .medium))
-            .foregroundStyle(.white).frame(width: 104, height: 104)
-            .background(LinearGradient(colors: [Color.blue.opacity(0.6), Color.indigo.opacity(0.25)], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 30))
+        Image("XASSBrand").resizable().scaledToFit().frame(width: 104, height: 104)
+            .background(Color.black, in: RoundedRectangle(cornerRadius: 30)).clipShape(RoundedRectangle(cornerRadius: 30))
             .overlay(RoundedRectangle(cornerRadius: 30).stroke(.white.opacity(0.13)))
     }
 }
 
-struct ConnectView: View {
+@MainActor struct ConnectView: View {
     @ObservedObject var app: AppState
     @State private var address = ""
     @State private var pair = ""
@@ -82,7 +81,7 @@ struct ConnectView: View {
                 if let error = app.error { Text(error).font(.callout).foregroundStyle(.orange).accessibilityIdentifier("connectionError") }
                 Button { app.connect(address: address, pair: pair); if app.origin != nil { pair = "" } } label: {
                     HStack { Text("Подключить XASS").fontWeight(.semibold); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 10)
-                }.buttonStyle(.borderedProminent).disabled(address.trimmingCharacters(in: .whitespaces).isEmpty).accessibilityIdentifier("connectServer")
+                }.buttonStyle(.borderedProminent).disabled(address.trimmingCharacters(in: .whitespaces).isEmpty || app.clearingSession).accessibilityIdentifier("connectServer")
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Как войти", systemImage: "key.horizontal").font(.subheadline.weight(.semibold))
                     Text("Откройте XASS в Telegram → Инструменты → iPhone и веб-приложение → создайте защищённую ссылку. Вставьте её здесь. Ключ одноразовый и не сохраняется.")
@@ -94,7 +93,7 @@ struct ConnectView: View {
     }
 }
 
-struct LockView: View {
+@MainActor struct LockView: View {
     @ObservedObject var app: AppState
     var body: some View {
         VStack(spacing: 22) {
@@ -110,7 +109,7 @@ struct LockView: View {
     }
 }
 
-struct DownloadsView: View {
+@MainActor struct DownloadsView: View {
     @ObservedObject var audio: AudioController
     @Environment(\.dismiss) private var dismiss
     @State private var removing: DownloadedTrack?
@@ -151,7 +150,7 @@ struct DownloadsView: View {
     }
 }
 
-struct AppSettingsView: View {
+@MainActor struct AppSettingsView: View {
     @ObservedObject var app: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var confirmForget = false

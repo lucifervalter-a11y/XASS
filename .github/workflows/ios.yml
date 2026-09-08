@@ -28,7 +28,16 @@ jobs:
         run: |
           set -euo pipefail
           simulator_id=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for devices in d["devices"].values() for x in devices if x["name"].startswith("iPhone")))')
+          echo "XASS_SIMULATOR_ID=$simulator_id" >> "$GITHUB_ENV"
           xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO
+      - name: Capture first-run native UI (no account or server)
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcrun simctl launch --terminate-running-process "$XASS_SIMULATOR_ID" app.xass.mobile
+          sleep 2
+          mkdir -p build/package
+          xcrun simctl io "$XASS_SIMULATOR_ID" screenshot build/package/iOS-first-connection.png
       - name: Build unsigned iPhone application
         working-directory: ios
         run: |
@@ -47,6 +56,7 @@ jobs:
             ios/build/package/XASS-unsigned.ipa
             ios/build/package/XASS-unsigned.ipa.sha256
             ios/build/package/UNSIGNED.md
+            ios/build/package/iOS-first-connection.png
           if-no-files-found: error
           retention-days: 30
       - uses: actions/upload-artifact@v4
@@ -56,3 +66,28 @@ jobs:
           path: ios/build/Tests.xcresult
           if-no-files-found: ignore
           retention-days: 14
+
+  publish:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: XASS-iOS-UNSIGNED-requires-signing
+          path: release
+      - name: Publish explicitly unsigned iOS release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view ios-latest >/dev/null 2>&1; then
+            gh release edit ios-latest --title "XASS iOS — unsigned, requires your signing" --notes-file ios/UNSIGNED.md --prerelease
+          else
+            gh release create ios-latest --target "$GITHUB_SHA" --title "XASS iOS — unsigned, requires your signing" --notes-file ios/UNSIGNED.md --prerelease
+          fi
+          gh release upload ios-latest release/XASS-unsigned.ipa release/XASS-unsigned.ipa.sha256 release/UNSIGNED.md --clobber

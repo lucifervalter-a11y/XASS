@@ -11,6 +11,7 @@ import WebKit
     @Published private(set) var hasUnlocked = false
     @Published var error: String?
     @Published var showSettings = false
+    @Published private(set) var clearingSession = false
     let audio = AudioController()
     private var authContext: LAContext?
     private var authGeneration = UUID()
@@ -23,6 +24,7 @@ import WebKit
         }
     }
     func connect(address: String, pair: String) {
+        guard !clearingSession else { error = "Завершаю выход из предыдущего сервера…"; return }
         do {
             let server = try ServerOrigin(address)
             // A pasted complete pair link can be used directly as the address.
@@ -71,16 +73,35 @@ import WebKit
     func forgetServer() {
         // Explicit settings confirmation revokes this app's local login only.
         // Server data and the user's downloaded audio are not deleted.
+        guard !clearingSession else { return }
+        clearingSession = true
         if let origin = origin { SecureStore.remove("session-" + origin.namespace) }
         SecureStore.remove("origin"); audio.disconnect(); origin = nil; entryURL = nil
         hasUnlocked = false; locked = true; showSettings = false; error = nil
-        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {}
+        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
+            Task { @MainActor in self?.clearingSession = false }
+        }
     }
 }
 
 struct SavedSession: Codable {
     let value: String
     let expires: Date
+}
+
+enum ServerEnvelope {
+    static func decode(_ data: Data, httpStatus: Int) throws -> [String: Any] {
+        guard (200..<300).contains(httpStatus), data.count <= 32 * 1024,
+              let outer = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw XASSErr.invalidMedia }
+        // PHP proxy.php uses _s and JSON-in-string _b, unlike the direct API.
+        if outer["_s"] != nil || outer["_b"] != nil {
+            guard let status = outer["_s"] as? Int, (200..<300).contains(status),
+                  let text = outer["_b"] as? String, let inner = text.data(using: .utf8), inner.count <= 32 * 1024,
+                  let body = try JSONSerialization.jsonObject(with: inner) as? [String: Any] else { throw XASSErr.invalidMedia }
+            return body
+        }
+        return outer
+    }
 }
 
 /// Session-cookie persistence never passes the HttpOnly cookie into JavaScript.
@@ -100,20 +121,38 @@ struct SavedSession: Codable {
         flush()
     }
     private func flush() {
-        guard !busy, let body = pending,
-              let data = SecureStore.load("session-" + origin.namespace),
+        guard !busy, let body = pending, let request = makeRequest(path: "/api/mini/music/session", body: body) else { return }
+        pending = nil; busy = true
+        session.dataTask(with: request) { [weak self] _, _, _ in
+            Task { @MainActor in self?.busy = false; self?.flush() }
+        }.resume()
+    }
+    private func makeRequest(path: String, body: [String: Any]) -> URLRequest? {
+        guard let data = SecureStore.load("session-" + origin.namespace),
               let saved = try? JSONDecoder().decode(SavedSession.self, from: data), saved.expires > Date(),
-              !saved.value.contains("\r"), !saved.value.contains("\n"), saved.value.count < 8192 else { return }
+              !saved.value.contains("\r"), !saved.value.contains("\n"), saved.value.count < 8192 else { return nil }
         var parts = URLComponents(url: origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
-        parts.queryItems = [URLQueryItem(name: "_p", value: "/api/mini/music/session")]
+        parts.queryItems = [URLQueryItem(name: "_p", value: path)]
         var request = URLRequest(url: parts.url!)
         request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("xass_pwa=" + saved.value, forHTTPHeaderField: "Cookie")
         request.setValue(origin.url.absoluteString, forHTTPHeaderField: "Origin")
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        pending = nil; busy = true
-        session.dataTask(with: request) { [weak self] _, _, _ in
-            Task { @MainActor in self?.busy = false; self?.flush() }
+        return request
+    }
+    func ticket(trackID: Int, completion: @escaping (Result<String, Error>) -> Void) {
+        guard trackID > 0, let request = makeRequest(path: "/api/mini/music/tracks/\(trackID)/ticket", body: ["purpose": "listen"]) else { completion(.failure(XASSErr.invalidMedia)); return }
+        session.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor in
+                guard let self = self, error == nil, let response = response as? HTTPURLResponse, response.statusCode == 200,
+                      let data = data,
+                      let body = try? ServerEnvelope.decode(data, httpStatus: response.statusCode) else { completion(.failure(XASSErr.invalidMedia)); return }
+                guard body["ok"] as? Bool == true, let path = body["path"] as? String,
+                      (try? self.origin.mediaURL(path, trackID: trackID)) != nil else { completion(.failure(XASSErr.invalidMedia)); return }
+                var parts = URLComponents(url: self.origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
+                parts.queryItems = [.init(name: "_binary", value: "1"), .init(name: "_media", value: "1"), .init(name: "_p", value: path)]
+                completion(.success(parts.url!.absoluteString))
+            }
         }.resume()
     }
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {

@@ -10,6 +10,7 @@ import WebKit
     private weak var app: AppState?
     private let reporter: SessionReporter
     private var cookieReady = false
+    private var closed = false
 
     init(app: AppState, origin: ServerOrigin) {
         self.app = app; self.origin = origin; reporter = SessionReporter(origin: origin)
@@ -29,9 +30,14 @@ import WebKit
         configuration.userContentController.add(self, name: "xassAudio")
         app.audio.emit = { [weak self] detail in self?.sendEvent(detail) }
         app.audio.reportSession = { [weak self] body in self?.reporter.post(body) }
+        app.audio.requestTicket = { [weak self] id, completion in
+            guard let self = self else { completion(.failure(XASSErr.invalidMedia)); return }
+            self.reporter.ticket(trackID: id, completion: completion)
+        }
         restoreSession()
     }
     func close() {
+        closed = true; cookieReady = false
         webView.stopLoading(); popup?.stopLoading(); popup = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "xassAudio")
         webView.configuration.websiteDataStore.httpCookieStore.remove(self)
@@ -40,8 +46,9 @@ import WebKit
     private func restoreSession() {
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { [weak self] cookies in
-            guard let self = self else { return }
+            guard let self = self, !self.closed, self.app?.origin == self.origin else { return }
             let ready = {
+                guard !self.closed, self.app?.origin == self.origin else { return }
                 self.cookieReady = true; store.add(self); self.cookiesDidChange(in: store)
                 self.webView.load(URLRequest(url: self.app?.entryURL ?? self.origin.entryURL))
             }
@@ -60,7 +67,7 @@ import WebKit
     func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
         guard cookieReady else { return }
         cookieStore.getAllCookies { [weak self] cookies in
-            guard let self = self, self.app?.origin == self.origin else { return }
+            guard let self = self, !self.closed, self.app?.origin == self.origin else { return }
             if let cookie = cookies.first(where: { self.isSession($0) && ($0.expiresDate ?? .distantFuture) > Date() }) {
                 let saved = SavedSession(value: cookie.value, expires: cookie.expiresDate ?? Date().addingTimeInterval(30 * 86400))
                 if let data = try? JSONEncoder().encode(saved) { try? SecureStore.save(data, name: "session-" + self.origin.namespace) }
@@ -81,7 +88,7 @@ import WebKit
     private func sendEvent(_ detail: [String: Any]) {
         guard UIApplication.shared.applicationState == .active, let current = webView.url, origin.contains(current),
               let data = try? JSONSerialization.data(withJSONObject: detail), let json = String(data: data, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("document.dispatchEvent(new CustomEvent('xass:native-audio',{detail:" + json + "}));", completionHandler: nil)
+        webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('xass:native-audio',{detail:" + json + "}));", completionHandler: nil)
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
@@ -126,9 +133,10 @@ struct WebSurface: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
-struct WebContainer: View {
+@MainActor struct WebContainer: View {
     @StateObject private var controller: WebController
-    init(app: AppState, origin: ServerOrigin) { _controller = StateObject(wrappedValue: WebController(app: app, origin: origin)) }
+    @ObservedObject private var app: AppState
+    init(app: AppState, origin: ServerOrigin) { self.app = app; _controller = StateObject(wrappedValue: WebController(app: app, origin: origin)) }
     var body: some View {
         ZStack {
             WebSurface(webView: controller.webView)
@@ -141,6 +149,7 @@ struct WebContainer: View {
         .sheet(isPresented: Binding(get: { controller.popup != nil }, set: { if !$0 { controller.popup?.stopLoading(); controller.popup = nil } })) {
             NavigationStack { if let popup = controller.popup { WebSurface(webView: popup).navigationTitle("Вход через Telegram").navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { controller.popup = nil } } } }
         }
+        .onChange(of: app.locked) { _, locked in if locked { controller.popup?.stopLoading(); controller.popup = nil } }
         .onDisappear { controller.close() }
     }
 }

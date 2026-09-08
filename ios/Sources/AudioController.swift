@@ -51,10 +51,12 @@ struct NativeAudioCommand {
     let artist: String
     let rawURL: String
     let session: [String: Any]?
-    static let actions: Set<String> = ["play", "pause", "resume", "stop", "seek", "volume", "download", "downloads", "route", "session"]
+    let queue: NativePlaybackQueue?
+    static let actions: Set<String> = ["play", "pause", "resume", "stop", "seek", "volume", "download", "downloads", "route", "session", "queue", "next", "previous"]
     init(_ body: [String: Any]) throws {
         guard let action = body["action"] as? String, Self.actions.contains(action),
-              let encoded = try? JSONSerialization.data(withJSONObject: body), encoded.count <= 32 * 1024 else { throw XASSErr.invalidCommand }
+              JSONSerialization.isValidJSONObject(body),
+              let encoded = try? JSONSerialization.data(withJSONObject: body), encoded.count <= 256 * 1024 else { throw XASSErr.invalidCommand }
         self.action = action
         let id = (body["trackId"] as? NSNumber)?.doubleValue ?? 0
         let position = (body["position"] as? NSNumber)?.doubleValue ?? 0
@@ -68,6 +70,34 @@ struct NativeAudioCommand {
         artist = String((body["artist"] as? String ?? "").prefix(300))
         rawURL = body["url"] as? String ?? ""
         session = body["session"] as? [String: Any]
+        queue = body["queue"] == nil ? nil : try NativePlaybackQueue(body["queue"], repeatMode: body["repeat"] as? String ?? "off")
+    }
+}
+
+struct NativePlaybackQueue {
+    let tracks: [DownloadedTrack]
+    let repeatMode: String
+    init(_ raw: Any?, repeatMode: String = "off") throws {
+        guard let items = raw as? [[String: Any]], items.count <= 200,
+              ["off", "all", "one"].contains(repeatMode) else { throw XASSErr.invalidCommand }
+        var tracks: [DownloadedTrack] = [], ids = Set<Int>()
+        for item in items {
+            guard let number = item["trackId"] as? NSNumber else { throw XASSErr.invalidCommand }
+            let value = number.doubleValue
+            guard value.isFinite, value > 0, value <= Double(Int32.max), value.rounded() == value,
+                  ids.insert(Int(value)).inserted else { throw XASSErr.invalidCommand }
+            tracks.append(DownloadedTrack(id: Int(value), title: String((item["title"] as? String ?? "Музыка XASS").prefix(300)),
+                artist: String((item["artist"] as? String ?? "").prefix(300)), duration: 0))
+        }
+        self.tracks = tracks; self.repeatMode = repeatMode
+    }
+    func next(currentID: Int, direction: Int, automatic: Bool) -> DownloadedTrack? {
+        guard let index = tracks.firstIndex(where: { $0.id == currentID }) else { return nil }
+        if automatic && repeatMode == "one" { return tracks[index] }
+        let next = index + (direction < 0 ? -1 : 1)
+        if tracks.indices.contains(next) { return tracks[next] }
+        if repeatMode == "all" { return direction < 0 ? tracks.last : tracks.first }
+        return nil
     }
 }
 
@@ -84,6 +114,7 @@ struct NativeAudioCommand {
     @Published var showRoutes = false
     var emit: (([String: Any]) -> Void)?
     var reportSession: (([String: Any]) -> Void)?
+    var requestTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
     private let player = AVPlayer()
     private var loader: SecureMediaLoader?
     private var origin: ServerOrigin?
@@ -96,6 +127,8 @@ struct NativeAudioCommand {
     private var sessionSnapshot: [String: Any]?
     private var lastReport = Date.distantPast
     private var resumeAfterInterruption = false
+    private var queue: NativePlaybackQueue?
+    private var transition = UUID()
 
     init() {
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
@@ -111,7 +144,7 @@ struct NativeAudioCommand {
         observers.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             Task { @MainActor in
                 guard let self = self, let item = note.object as? AVPlayerItem, item === self.player.currentItem else { return }
-                self.state = "ended"; self.publish(forceReport: true)
+                self.state = "ended"; self.publish(forceReport: true); self.advance(direction: 1, automatic: true)
             }
         })
         observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
@@ -132,6 +165,8 @@ struct NativeAudioCommand {
         remote.pauseCommand.addTarget { [weak self] _ in Task { @MainActor in self?.pause() }; return .success }
         remote.togglePlayPauseCommand.addTarget { [weak self] _ in Task { @MainActor in guard let self = self else { return }; self.state == "playing" ? self.pause() : self.resume() }; return .success }
         remote.stopCommand.addTarget { [weak self] _ in Task { @MainActor in self?.stop() }; return .success }
+        remote.nextTrackCommand.addTarget { [weak self] _ in Task { @MainActor in self?.advance(direction: 1) }; return .success }
+        remote.previousTrackCommand.addTarget { [weak self] _ in Task { @MainActor in self?.previous() }; return .success }
         remote.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
             Task { @MainActor in self?.seek(event.positionTime) }; return .success
@@ -151,7 +186,7 @@ struct NativeAudioCommand {
         if let snapshot = command.session { setSession(snapshot) }
         do {
             switch command.action {
-            case "play": try play(command)
+            case "play": queue = command.queue; try play(command)
             case "pause": pause()
             case "resume": resume()
             case "stop": stop()
@@ -161,6 +196,9 @@ struct NativeAudioCommand {
             case "downloads": emit?(["action": "downloads", "downloads": downloads.map(\.bridge)])
             case "route": showRoutes = true
             case "session": publish(forceReport: true)
+            case "queue": queue = command.queue; publish()
+            case "next": advance(direction: 1)
+            case "previous": previous()
             default: throw XASSErr.invalidCommand
             }
         } catch {
@@ -185,6 +223,7 @@ struct NativeAudioCommand {
             item = AVPlayerItem(asset: created.asset()); nextLoader = created
         }
         try activateAudio()
+        transition = UUID()
         player.pause(); player.replaceCurrentItem(with: nil); loader?.invalidate(); loader = nextLoader
         state = "loading"; title = command.title; artist = command.artist; trackID = command.trackID
         position = command.position; duration = 0; error = nil
@@ -200,17 +239,23 @@ struct NativeAudioCommand {
         player.play(); publish(forceReport: true)
     }
     func playOffline(_ track: DownloadedTrack) {
+        stop()
         sessionSnapshot = nil
-        guard let command = try? NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist]) else { return }
+        let index = downloads.firstIndex(where: { $0.id == track.id }) ?? 0
+        let start = min(index, max(0, downloads.count - 200))
+        let window = downloads.dropFirst(start).prefix(200)
+        guard let command = try? NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist, "queue": window.map(\.bridge)]) else { return }
         handle(command)
     }
-    func pause() { player.pause(); if trackID > 0 { state = "paused"; publish(forceReport: true) } }
+    func pause() { transition = UUID(); player.pause(); if trackID > 0 { state = "paused"; publish(forceReport: true) } }
     func resume() {
+        transition = UUID()
         guard player.currentItem != nil else { return }
         do { try activateAudio(); if state == "ended" { player.seek(to: .zero) }; state = "playing"; player.play(); publish(forceReport: true) }
         catch { self.error = "Не удалось включить аудио. Проверьте устройство вывода."; state = "error"; publish() }
     }
     func stop() {
+        transition = UUID()
         player.pause(); player.replaceCurrentItem(with: nil); itemObserver = nil; loader?.invalidate(); loader = nil
         state = "stopped"; position = 0; publish(forceReport: true)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -218,15 +263,19 @@ struct NativeAudioCommand {
     }
     func seek(_ seconds: Double) {
         guard seconds.isFinite, seconds >= 0, player.currentItem != nil else { return }
+        transition = UUID()
         let value = duration > 0 ? min(seconds, duration) : min(seconds, 86400)
         player.seek(to: CMTime(seconds: value, preferredTimescale: 600)); position = value; publish(forceReport: true)
     }
     private func updateTime() {
+        guard player.currentItem != nil else { return }
         let current = player.currentTime().seconds, total = player.currentItem?.duration.seconds ?? 0
         position = current.isFinite ? max(0, current) : 0; duration = total.isFinite ? max(0, total) : 0
         if trackID > 0 { publish() }
     }
     private func publish(forceReport: Bool = false) {
+        MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled = queue?.next(currentID: trackID, direction: 1, automatic: false) != nil
+        MPRemoteCommandCenter.shared().previousTrackCommand.isEnabled = player.currentItem != nil
         var event: [String: Any] = ["state": state, "position": position, "duration": duration, "trackId": trackID, "native": true]
         if let error = error { event["error"] = error }
         emit?(event)
@@ -238,6 +287,32 @@ struct NativeAudioCommand {
         if var snapshot = sessionSnapshot, forceReport || Date().timeIntervalSince(lastReport) >= 5 {
             snapshot["state"] = state; snapshot["position"] = position; snapshot["track_id"] = trackID
             lastReport = Date(); reportSession?(snapshot)
+        }
+    }
+    private func previous() {
+        if position > 3 { seek(0) } else { advance(direction: -1) }
+    }
+    private func advance(direction: Int, automatic: Bool = false) {
+        guard let track = queue?.next(currentID: trackID, direction: direction, automatic: automatic) else { return }
+        let generation = UUID(); transition = generation
+        let start: (String) -> Void = { [weak self] url in
+            guard let self = self, self.transition == generation else { return }
+            do {
+                let command = try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist, "url": url, "volume": Double(self.player.volume) * 100])
+                try self.play(command)
+            } catch { self.state = "error"; self.error = "Не удалось включить следующий трек. Проверьте сеть или сохраните очередь на iPhone."; self.publish(forceReport: true) }
+        }
+        if let library = library, downloads.contains(where: { $0.id == track.id }), FileManager.default.fileExists(atPath: library.file(track.id).path) { start(""); return }
+        guard let request = requestTicket else { state = "error"; error = "Для следующего трека нужен вход на сервер."; publish(forceReport: true); return }
+        state = "loading"; publish()
+        request(track.id) { [weak self] result in
+            Task { @MainActor in
+                guard let self = self, self.transition == generation else { return }
+                switch result {
+                case .success(let url): start(url)
+                case .failure: self.state = "error"; self.error = "Следующий трек недоступен. Проверьте сеть или войдите заново."; self.publish(forceReport: true)
+                }
+            }
         }
     }
     private func setSession(_ value: [String: Any]) {

@@ -37,10 +37,12 @@ window.webkit.messageHandlers.xassAudio.postMessage({
 });
 ```
 
-Actions: `play`, `pause`, `resume`, `stop`, `seek`, `volume`, `route`, `download`, `downloads`, `session`.
+Actions: `play`, `pause`, `resume`, `stop`, `seek`, `volume`, `route`, `download`, `downloads`, `session`, `queue`, `next`, `previous`.
 `url:''` допустим для `play` только если уже существует локальная копия этого trackId в текущем origin. `route` открывает native sheet с системным AVRoutePickerView; выбор маршрута требует нажатия владельца.
 
-Событие `document` `xass:native-audio` содержит `detail:{state,position,duration,trackId,native:true,error?}`. States: loading/playing/paused/stopped/ended/error. Download: `{action:'download',trackId,downloaded,error?}`. Каталог: `{action:'downloads',downloads:[{trackId,title,artist,duration}]}`.
+Событие `window` `xass:native-audio` содержит `detail:{state,position,duration,trackId,native:true,error?}`. States: loading/playing/paused/stopped/ended/error. Download: `{action:'download',trackId,downloaded,error?}`. Каталог: `{action:'downloads',downloads:[{trackId,title,artist,duration}]}`.
+
+`play` / `queue` могут передать `queue:[{trackId,title,artist}]` (не более 200 разных треков) и `repeat:'off'|'all'|'one'`. Очередь уже должна быть в желаемом порядке shuffle. Переход после конца трека и next/previous с экрана блокировки выполняет native, без JavaScript; для следующего несохранённого трека native запрашивает свежий ticket с HttpOnly cookie. При потере сети доступна только сохранённая очередь.
 
 Native обновляет переданный music session в фоне каждые 5 секунд воспроизведения и сразу при pause/stop/end с тем же session_key, без takeover. Cookie берётся из Keychain и не отправляется в JS. Ошибка сети не останавливает локальное воспроизведение; состояние сервера в отсутствие связи обновить невозможно.
 

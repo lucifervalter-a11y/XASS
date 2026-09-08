@@ -8,9 +8,10 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
     private let origin: ServerOrigin
     private let trackID: Int
     private let mediaURL: URL
+    private let configuration: URLSessionConfiguration
     private var requests: [Int: Transfer] = [:]
     private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
+        let config = configuration
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         config.urlCache = nil
@@ -26,8 +27,9 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
             self.request = request; self.task = task
         }
     }
-    init(origin: ServerOrigin, trackID: Int, url: URL) {
+    init(origin: ServerOrigin, trackID: Int, url: URL, configuration: URLSessionConfiguration = .ephemeral) {
         self.origin = origin; self.trackID = trackID; mediaURL = url
+        self.configuration = configuration
         super.init()
     }
     func asset() -> AVURLAsset {
@@ -43,7 +45,7 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
         var request = URLRequest(url: mediaURL)
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         let data = loadingRequest.dataRequest
-        let start = max(0, data?.currentOffset ?? data?.requestedOffset ?? 0)
+        let start = max(0, max(data?.currentOffset ?? 0, data?.requestedOffset ?? 0))
         if let data = data, data.requestsAllDataToEndOfResource {
             request.setValue("bytes=\(start)-", forHTTPHeaderField: "Range")
         } else {
@@ -97,6 +99,7 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
         completionHandler(.allow)
     }
     static func parseRange(_ header: String) -> (start: Int64, total: Int64)? {
+        guard header.hasPrefix("bytes ") else { return nil }
         let components = header.replacingOccurrences(of: "bytes ", with: "").split(separator: "/")
         guard components.count == 2, let total = Int64(components[1]), total > 0,
               let first = components[0].split(separator: "-").first,
@@ -161,7 +164,7 @@ final class PrivateDownload: NSObject, URLSessionDownloadDelegate {
         guard let response = downloadTask.response as? HTTPURLResponse, response.statusCode == 200,
               let url = response.url, (try? origin.mediaURL(url.absoluteString, trackID: trackID)) != nil,
               let size = try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              size > 0 && size <= Self.maxBytes,
+              size > 0 && Int64(size) <= Self.maxBytes,
               (response.mimeType?.hasPrefix("audio/") == true || response.mimeType == "application/ogg") else {
             complete(.failure(XASSErr.invalidMedia)); return
         }

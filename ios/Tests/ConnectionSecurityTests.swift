@@ -41,7 +41,8 @@ final class ConnectionSecurityTests: XCTestCase {
     }
     func testCommandBoundsAndKnownActions() throws {
         XCTAssertEqual(try NativeAudioCommand(["action": "play", "trackId": 7, "position": 1.5, "volume": 80]).trackID, 7)
-        for body: [String: Any] in [["action": "eval"], ["action": "play"], ["action": "play", "trackId": -1], ["action": "play", "trackId": 1.5], ["action": "volume", "volume": 101], ["action": "seek", "position": -1], ["action": "seek", "position": Double.infinity]] {
+        let invalid: [[String: Any]] = [["action": "eval"], ["action": "play"], ["action": "play", "trackId": -1], ["action": "play", "trackId": 1.5], ["action": "volume", "volume": 101], ["action": "seek", "position": -1], ["action": "seek", "position": Double.infinity]]
+        for body in invalid {
             XCTAssertThrowsError(try NativeAudioCommand(body))
         }
         XCTAssertNoThrow(try NativeAudioCommand(["action": "downloads"]))
@@ -56,5 +57,34 @@ final class ConnectionSecurityTests: XCTestCase {
         XCTAssertTrue(WebController.telegramLogin(URL(string: "https://oauth.telegram.org/auth")!))
         XCTAssertFalse(WebController.telegramLogin(URL(string: "https://oauth.telegram.org.attacker.invalid/auth")!))
         XCTAssertFalse(WebController.telegramLogin(URL(string: "https://user@oauth.telegram.org/auth")!))
+    }
+    func testNativeQueueAdvancesWithoutJSAndRepeatModesAreExplicit() throws {
+        let tracks: [[String: Any]] = [["trackId": 1], ["trackId": 2], ["trackId": 3]]
+        let off = try NativePlaybackQueue(tracks)
+        XCTAssertEqual(off.next(currentID: 1, direction: 1, automatic: true)?.id, 2)
+        XCTAssertNil(off.next(currentID: 3, direction: 1, automatic: true))
+        XCTAssertEqual(off.next(currentID: 3, direction: -1, automatic: false)?.id, 2)
+        let all = try NativePlaybackQueue(tracks, repeatMode: "all")
+        XCTAssertEqual(all.next(currentID: 3, direction: 1, automatic: true)?.id, 1)
+        let one = try NativePlaybackQueue(tracks, repeatMode: "one")
+        XCTAssertEqual(one.next(currentID: 2, direction: 1, automatic: true)?.id, 2)
+        XCTAssertEqual(one.next(currentID: 2, direction: 1, automatic: false)?.id, 3)
+        XCTAssertThrowsError(try NativePlaybackQueue([["trackId": 1], ["trackId": 1]]))
+        XCTAssertThrowsError(try NativePlaybackQueue(tracks, repeatMode: "unknown"))
+        XCTAssertThrowsError(try NativePlaybackQueue(Array(repeating: ["trackId": 1], count: 201)))
+    }
+    func testRealPHPEnvelopeDecodedWithoutTreatingHTTP200AsAuthorized() throws {
+        let body = Data(#"{"ok":true,"path":"/api/music/tracks/7/stream?ticket=abc"}"#.utf8)
+        let wrapped = try JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(data: body, encoding: .utf8)!])
+        XCTAssertEqual(try ServerEnvelope.decode(wrapped, httpStatus: 200)["path"] as? String, "/api/music/tracks/7/stream?ticket=abc")
+        XCTAssertEqual(try ServerEnvelope.decode(body, httpStatus: 200)["ok"] as? Bool, true)
+        let denied = try JSONSerialization.data(withJSONObject: ["_s": 401, "_b": String(data: body, encoding: .utf8)!])
+        XCTAssertThrowsError(try ServerEnvelope.decode(denied, httpStatus: 200))
+        XCTAssertThrowsError(try ServerEnvelope.decode(wrapped, httpStatus: 403))
+        XCTAssertThrowsError(try ServerEnvelope.decode(Data(#"{"_s":200,"_b":"invalid"}"#.utf8), httpStatus: 200))
+    }
+    func testFullCyrillicQueueFitsBoundedBridge() throws {
+        let items = (1...200).map { ["trackId": $0, "title": String(repeating: "Я", count: 240), "artist": String(repeating: "Ж", count: 240)] as [String: Any] }
+        XCTAssertNoThrow(try NativeAudioCommand(["action": "play", "trackId": 1, "queue": items]))
     }
 }

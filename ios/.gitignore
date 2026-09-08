@@ -2,5 +2,6 @@ XASS.xcodeproj/
 Generated/
 build/
 Resources/Assets.xcassets/AppIcon.appiconset/Icon.png
+Resources/Assets.xcassets/XASSBrand.imageset/Brand.png
 *.xcuserstate
 xcuserdata/
