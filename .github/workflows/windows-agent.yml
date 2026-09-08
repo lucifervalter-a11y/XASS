@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  recover:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Stop only confirmed orphan snapshot and reclaim its incomplete files
+      - name: Read-only publication permissions and backend timeout diagnostics
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -25,119 +25,22 @@ jobs:
         run: |
           bash deploy/github_ssh.sh exec <<'REMOTE'
           cd /home/red/serverredus
-          python3 - <<'PY_RECOVER'
-          import json, os, select, signal, stat, subprocess, time
-          from pathlib import Path
-          root = Path("/home/red/serverredus")
-          scope = Path("/home/red/.xass-predeploy/9663f007b0facf8d3c6625eb4189c7b3d16ef7e5-34169586139-1")
-          archive = scope / ".snapshot-qakktlrg" / "server.tar.gz"
-          encrypted = scope / "server.xass-server"
-          pid = 522841
-          old_head = "0febf036824ede0e38099bc58cee0b1150166fb7"
-          head = lambda: subprocess.check_output(["git", "-c", "safe.directory=/home/red/serverredus", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-          def validate_paths():
-              if scope.is_symlink() or scope.resolve(strict=True) != scope:
-                  raise RuntimeError("Snapshot scope is linked or moved; refusing action")
-              owner = scope.stat()
-              if owner.st_uid != os.getuid() or stat.S_IMODE(owner.st_mode) != 0o700:
-                  raise RuntimeError("Snapshot scope is not privately owned by this SSH account")
-              for target in (archive, encrypted):
-                  if target.is_symlink() or target.resolve() != target:
-                      raise RuntimeError("Target is linked or outside its exact expected location")
-                  if target.exists() and not stat.S_ISREG(target.stat().st_mode):
-                      raise RuntimeError("Target is not a regular file")
-          def identity():
-              proc = Path("/proc") / str(pid)
-              if proc.stat().st_uid != os.getuid():
-                  raise RuntimeError("Backup process does not belong to this SSH account")
-              argv = (proc / "cmdline").read_bytes().split(b"\0")
-              if argv.count(scope.name.encode()) != 1 or b"-" not in argv:
-                  raise RuntimeError("PID no longer matches the exact backup run")
-              if Path(os.readlink(proc / "cwd")) != root:
-                  raise RuntimeError("Backup cwd no longer matches")
-              matching = []
-              for fd in (proc / "fd").iterdir():
-                  try:
-                      link = os.readlink(fd)
-                  except FileNotFoundError:
-                      continue
-                  if link.startswith(str(scope) + "/"):
-                      matching.append(link)
-              if not matching:
-                  raise RuntimeError("PID no longer has an open file in the exact snapshot scope")
-              start = (proc / "stat").read_text().rsplit(") ", 1)[1].split()[19]
-              return start
-          validate_paths()
-          print(json.dumps({"head_before": head(), "pid_digits": list(str(pid))}), flush=True)
-          interrupted = False
-          try:
-              handle = os.pidfd_open(pid, 0)
-          except ProcessLookupError:
-              handle = None
-          if handle is not None:
-              try:
-                  if not select.select([handle], [], [], 0)[0]:
-                      started = identity()
-                      signal.pidfd_send_signal(handle, signal.SIGTERM)
-                      interrupted = True
-                      print("Sent TERM to verified snapshot pidfd", flush=True)
-                      if not select.select([handle], [], [], 8)[0]:
-                          if identity() != started:
-                              raise RuntimeError("Process identity changed; refusing escalation")
-                          signal.pidfd_send_signal(handle, signal.SIGKILL)
-                          print("Sent KILL to the same reverified snapshot pidfd", flush=True)
-                          if not select.select([handle], [], [], 5)[0]:
-                              raise RuntimeError("Snapshot process has not exited; no files removed")
-                  print("Snapshot pidfd confirms process exit", flush=True)
-              finally:
-                  os.close(handle)
-          else:
-              print("Snapshot process was already absent", flush=True)
-          # Never remove a potentially completed backup when its temporary archive is gone.
-          validate_paths()
-          current_head = head()
-          if not archive.exists():
-              print(json.dumps({"cleanup": "preserved_finished_or_unknown_backup", "head_after": current_head}), flush=True)
-          elif not interrupted and (current_head != old_head or (encrypted.exists() and encrypted.stat().st_size >= archive.stat().st_size)):
-              print(json.dumps({"cleanup": "preserved_without_proof_of_interruption", "head_after": current_head}), flush=True)
-          else:
-              # The private 0700 scope belongs to this user; inspect every same-owner process.
-              holders = []
-              for proc in Path("/proc").iterdir():
-                  if not proc.name.isdecimal():
-                      continue
-                  try:
-                      if proc.stat().st_uid != os.getuid():
-                          continue
-                      descriptors = list((proc / "fd").iterdir())
-                  except FileNotFoundError:
-                      continue
-                  for fd in descriptors:
-                      try:
-                          link = os.readlink(fd)
-                      except FileNotFoundError:
-                          continue
-                      if link == str(scope) or link.startswith(str(scope) + "/"):
-                          holders.append(list(proc.name))
-                          break
-              if holders:
-                  print(json.dumps({"remaining_holder_pid_digits": holders}), flush=True)
-                  raise RuntimeError("Snapshot files are still open; no files removed")
-              validate_paths()
-              removed = []
-              for target in (archive, encrypted):
-                  if target.exists():
-                      info = target.stat()
-                      target.unlink()
-                      removed.append({"file": str(target), "bytes": info.st_size, "allocated_bytes": info.st_blocks * 512})
-              print(json.dumps({"cleanup": "removed_exact_incomplete_artifacts", "files": removed,
-                                "total_bytes_removed": sum(item["bytes"] for item in removed), "head_after": head()}), flush=True)
-          PY_RECOVER
-          printf 'HEAD AFTER\n'
+          printf 'CHECKOUT\n'
           git rev-parse HEAD
-          printf 'BACKEND HEALTH\n'
-          systemctl is-active serverredus-backend.service
-          curl --fail --silent --show-error --max-time 8 http://127.0.0.1:8000/health
-          printf '\nFILESYSTEM CAPACITY\n'
-          df -h
+          git status --short --untracked-files=no
+          printf 'PUBLIC PATH PERMISSIONS (no file contents)\n'
+          for target in /home /home/red /home/red/serverredus /home/red/serverredus/miniapp.php /home/red/serverredus/assets /home/red/serverredus/assets/miniapp-device-key.js /home/red/serverredus/proxy.php /home/red/serverredus/sw.js; do
+            stat -Lc '%A mode=%a owner=%U group=%G path=%n' "$target" || true
+          done
+          printf 'LOCAL HTTPS STATUS (no response contents)\n'
+          for path in /miniapp.php /health /assets/miniapp-device-key.js /sw.js; do
+            printf 'path=%s ' "$path"
+            curl --silent --show-error --connect-timeout 5 --max-time 12 --resolve redvps.site:443:127.0.0.1 -o /dev/null -w 'status=%{http_code} content_type=%{content_type} seconds=%{time_total}\n' "https://redvps.site$path" || true
+          done
+          printf 'LOCAL BACKEND HEALTH\n'
+          curl --silent --show-error --connect-timeout 5 --max-time 8 -o /dev/null -w 'status=%{http_code} seconds=%{time_total}\n' http://127.0.0.1:8000/health || true
+          printf 'BACKEND USER AND TIMEOUTS\n'
+          systemctl show serverredus-backend.service --property=User --property=Group --property=TimeoutStopUSec --property=TimeoutStartUSec
+          printf 'BACKEND UNIT AND DROP-IN PATHS ONLY (no unit contents)\n'
+          systemctl show serverredus-backend.service --property=FragmentPath --property=DropInPaths
           REMOTE
