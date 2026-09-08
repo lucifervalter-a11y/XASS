@@ -9,7 +9,11 @@ $requestPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH)
 $requestPath = is_string($requestPath) ? rawurldecode($requestPath) : '/';
 if ($requestPath === '/health' || str_starts_with($requestPath, '/agent/')) {
     $_GET['_p'] = $requestPath;
-    if (
+    if (preg_match('#^/agent/music/tracks/[1-9][0-9]*/stream$#D', $requestPath) === 1) {
+        $_GET['_p'] .= '?' . http_build_query(['ticket' => is_string($_GET['ticket'] ?? null) ? $_GET['ticket'] : '']);
+        $_GET['_binary'] = '1';
+        $_GET['_media'] = '1';
+    } elseif (
         str_starts_with($requestPath, '/agent/update/package') ||
         str_starts_with($requestPath, '/agent/installer/') ||
         str_starts_with($requestPath, '/agent/migration/export/')

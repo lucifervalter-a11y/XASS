@@ -1,10 +1,12 @@
-const CACHE = 'xass-shell-v12';
+const CACHE = 'xass-shell-v13';
 const OFFLINE = '/offline.html';
 const SHELL = [
   OFFLINE,
   '/manifest.webmanifest',
-  '/assets/miniapp-control-center.css?v=0150',
-  '/assets/miniapp-control-center.js?v=0150',
+  '/assets/miniapp-control-center.css?v=0160',
+  '/assets/miniapp-control-center.js?v=0160',
+  '/assets/miniapp-music.css?v=0160',
+  '/assets/miniapp-music.js?v=0160',
   '/assets/miniapp-network.js?v=0140',
   '/assets/miniapp-server-migration.js?v=0140',
   '/assets/xass-e2e.js?v=0140',

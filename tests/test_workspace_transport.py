@@ -17,7 +17,7 @@ class WorkspaceTransportTests(unittest.IsolatedAsyncioTestCase):
         command = SimpleNamespace(id=7, command="file_download", source_name="Мой ПК", status="delivered")
         request = Request({"type": "http", "headers": [(b"content-type", b"application/octet-stream")]})
         request._body = b"example"
-        session = SimpleNamespace(get=AsyncMock(return_value=command))
+        session = SimpleNamespace(get=AsyncMock(return_value=command), scalar=AsyncMock(return_value=True))
         with patch.object(main, "authenticate_agent_api_key", AsyncMock(return_value=auth)), patch.object(main, "store_workspace_asset", return_value={"token": "test"}) as store:
             result = await main.agent_workspace_asset_upload(
                 7, request, kind="file_download", filename="Заметки.txt", source_name="Мой ПК",

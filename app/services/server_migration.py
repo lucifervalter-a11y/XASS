@@ -33,7 +33,7 @@ MANIFEST = "xass-manifest.json"
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_FILES = 200_000
 PATH_SETTINGS = {
-    "media_root", "export_root", "profile_json_path", "profile_backups_dir",
+    "media_root", "music_root", "export_root", "profile_json_path", "profile_backups_dir",
     "profile_audit_log_path", "profile_avatars_dir", "conversation_avatar_cache_dir",
     "projects_json_path", "site_config_json_path", "quotes_json_path", "scenarios_json_path",
     "rules_json_path", "projects_backups_dir", "projects_audit_log_path",

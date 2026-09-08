@@ -45,6 +45,7 @@ function xass_source_label(string $source): string
         'iphone' => 'iPhone',
         'vk' => 'VK Music',
         'pc_agent' => 'Windows',
+        'xass_music' => 'XASS Music',
         default => $source !== '' ? $source : 'Источник',
     };
 }
@@ -472,13 +473,18 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
 
     <?php if ($widgetVisible('music')): ?><section class="section" id="music" aria-labelledby="music-heading">
         <div class="shell">
-            <div class="section-head reveal"><h2 id="music-heading">Музыка</h2><p class="section-copy">Трек, который действительно передал выбранный источник. Веб‑страницы и заголовки приложений сюда не попадают.</p></div>
+            <div class="section-head reveal"><h2 id="music-heading">Музыка</h2><p class="section-copy">Мой саундтрек прямо сейчас. Когда трансляция включена, можно присоединиться и слушать вместе.</p></div>
             <div class="music-layout reveal" data-delay="1">
                 <div class="now-playing">
                     <img class="album-art" id="albumArt" src="/assets/xass-app-icon-512.png" alt="" data-track="<?= xass_escape($musicAvailable ? $nowPlaying : '') ?>">
                     <div><div class="eyebrow">Сейчас играет</div><div class="track-name"><?= xass_escape($musicDisplay) ?></div><div class="track-source"><strong><?= xass_escape($musicSource) ?></strong><?php if ($musicUpdatedAt !== ''): ?> · <time id="musicTime" datetime="<?= xass_escape($musicUpdatedAt) ?>">обновлено недавно</time><?php endif; ?></div></div>
                 </div>
                 <div class="service-list"><?php foreach ($musicLinks as $label => $url): ?><a class="row-link" href="<?= xass_escape($url) ?>" target="_blank" rel="noopener"><span><?= xass_escape($label) ?></span><span class="row-action"><span>Открыть</span><?= xass_icon('arrow-up-right') ?></span></a><?php endforeach; ?></div>
+            </div>
+            <div id="xassPublicMusic" hidden class="public-music">
+                <div><span class="eyebrow">В эфире · XASS Music</span><p id="xassPublicTrack"></p></div>
+                <button id="xassPublicListen" type="button">Слушать вместе</button>
+                <span id="xassPublicMusicStatus" role="status" aria-live="polite"></span>
             </div>
         </div>
     </section><?php endif; ?>
@@ -581,5 +587,7 @@ $identityLabel = $username !== '' ? '@' . $username : $name;
     }
 })();
 </script>
+<link rel="stylesheet" href="/assets/profile-music.css?v=0160">
+<script src="/assets/profile-music.js?v=0160" defer></script>
 </body>
 </html>

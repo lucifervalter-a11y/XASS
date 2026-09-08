@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AgentArchiveTarget, HeartbeatSource, MediaAsset, MessageLog, MessageRevision
+from app.services.agent_lifecycle import ensure_agent_attached
 from app.services.message_logging import forwarded_from_label
 
 
@@ -21,6 +22,7 @@ async def set_archive_target(
     enabled: bool,
     actor_user_id: int,
 ) -> AgentArchiveTarget:
+    await ensure_agent_attached(session, source_name)
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == source_name))
     if source is None:
         raise ValueError("Агент не найден")

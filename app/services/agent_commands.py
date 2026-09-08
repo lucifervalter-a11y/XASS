@@ -7,6 +7,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AdminAction, AgentCommand
+from app.services.agent_lifecycle import ensure_agent_attached
 from app.services.app_config import prepare_audit_payload
 from app.services.notifications import emit_notification
 
@@ -29,6 +30,8 @@ ALLOWED_AGENT_COMMANDS = {
     "clipboard_get",
     "clipboard_set",
     "migration_download",
+    "music_outputs", "music_play", "music_pause", "music_resume", "music_stop",
+    "music_seek", "music_volume", "music_status",
 }
 DANGEROUS_AGENT_COMMANDS = {
     "lock", "sleep", "reboot", "shutdown", "restart", "update",
@@ -52,6 +55,7 @@ async def enqueue_agent_command(
     normalized = (command or "").strip().lower()
     if normalized not in ALLOWED_AGENT_COMMANDS:
         raise ValueError(f"Unsupported agent command: {normalized}")
+    await ensure_agent_attached(session, source_name)
     if normalized == "update" and not_before_at is None:
         existing = await session.scalar(
             select(AgentCommand)
@@ -65,6 +69,7 @@ async def enqueue_agent_command(
             .limit(1)
         )
         if existing is not None:
+            await session.commit()
             return existing
     item = AgentCommand(
         source_name=source_name,
@@ -88,7 +93,7 @@ async def acknowledge_agent_commands(
 ) -> None:
     if not results:
         return
-    changed = False
+    await ensure_agent_attached(session, source_name)
     completed: list[tuple[str, str, bool, str, int]] = []
     for result in results[:50]:
         try:
@@ -127,9 +132,7 @@ async def acknowledge_agent_commands(
                 )
             )
         completed.append((item.command, item.source_name, ok, item.result["message"], item.id))
-        changed = True
-    if changed:
-        await session.commit()
+    await session.commit()
     for command, device, ok, message, command_id in completed:
         if command in DANGEROUS_AGENT_COMMANDS:
             await emit_notification(
@@ -158,6 +161,7 @@ async def acknowledge_agent_commands(
 
 
 async def deliver_agent_commands(session: AsyncSession, *, source_name: str) -> list[dict[str, Any]]:
+    await ensure_agent_attached(session, source_name)
     due = or_(AgentCommand.not_before_at.is_(None), AgentCommand.not_before_at <= _now_utc())
     pending = list(
         await session.scalars(
@@ -190,16 +194,15 @@ async def deliver_agent_commands(session: AsyncSession, *, source_name: str) -> 
     )
     rows = pending[:10 - len(retries)] + retries
     now = _now_utc()
-    changed = False
     result: list[dict[str, Any]] = []
     for item in rows:
         if item.status == "pending":
             item.status = "delivered"
         item.delivered_at = now
-        changed = True
         result.append({"id": item.id, "command": item.command, "payload": item.payload or {}})
-    if changed:
-        await session.commit()
+    # Release the lifecycle lock even for an empty queue, before heartbeat
+    # performs archive/manifest work outside this transaction.
+    await session.commit()
     return result
 
 

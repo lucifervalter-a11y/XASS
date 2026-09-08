@@ -7,9 +7,9 @@ import tkinter as tk
 from tkinter import font as tkfont
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageOps, ImageTk
 
-from desktop_widgets import ModernButton, RoundedPanel, icon_image
+from desktop_widgets import ModernButton, RoundedPanel, icon_image, rounded_image
 
 BG, CARD, LINE = "#202022", "#2b2b2f", "#3b3b42"
 TEXT, MUTED, BLUE, LILAC = "#f5f5f7", "#b1b1bb", "#829cff", "#c495f4"
@@ -43,6 +43,9 @@ class HomeHero(tk.Canvas):
         self.app = app
         self._pending = None
         self._photo = None
+        self._render_size = None
+        self._title_font = tkfont.Font(self, family="Segoe UI Semibold", size=27)
+        self._title_font_size = 27
         self._source = None
         resource = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         path = resource / "assets" / "xass-desktop-hero.png"
@@ -68,6 +71,8 @@ class HomeHero(tk.Canvas):
             self._pending = None
 
     def _schedule_draw(self, _event=None) -> None:
+        if _event is not None and (_event.width, _event.height) == self._render_size:
+            return  # Scroll/move Configure events do not change any artwork.
         if not self._pending and self.winfo_exists():
             self._pending = self.after(35, self._draw)
 
@@ -76,35 +81,36 @@ class HomeHero(tk.Canvas):
         width, height = max(1, self.winfo_width()), max(1, self.winfo_height())
         if width < 3 or height < 3:
             return
-        # Asset fitting is rendering, not a baked UI: all text remains native.
-        picture = ImageOps.fit(self._source, (width, height), Image.Resampling.LANCZOS) if self._source else Image.new("RGB", (width, height), "#000000")
-        mask = Image.new("L", (width * 2, height * 2), 0)
-        draw = ImageDraw.Draw(mask)
-        draw.rounded_rectangle((2, 2, width * 2 - 3, height * 2 - 3), radius=32, fill=255)
-        canvas = Image.new("RGB", (width, height), BG)
-        canvas.paste(picture, (0, 0), mask.resize((width, height), Image.Resampling.LANCZOS))
-        border = Image.new("RGBA", (width * 2, height * 2))
-        edge = Image.new("L", border.size)
-        ImageDraw.Draw(edge).rounded_rectangle((2, 2, width * 2 - 3, height * 2 - 3), radius=32, outline=255, width=2)
-        painter = ImageDraw.Draw(border)
-        for x in range(width * 2):
-            fraction = x / max(1, width * 2 - 1)
-            color = tuple(round(a + (b - a) * fraction) for a, b in zip((130, 156, 255), (196, 149, 244)))
-            painter.line((x, 0, x, height * 2), fill=(*color, 255))
-        border.putalpha(edge)
-        canvas = canvas.convert("RGBA")
-        canvas.alpha_composite(border.resize((width, height), Image.Resampling.LANCZOS))
-        self._photo = ImageTk.PhotoImage(canvas, master=self)
-        self.itemconfigure(self._art, image=self._photo)
-        title_font = tkfont.Font(self, family="Segoe UI Semibold", size=27 if width > 760 else 23)
+        if self._render_size != (width, height):
+            self._photo = ImageTk.PhotoImage(self._render_backdrop(width, height), master=self)
+            self.itemconfigure(self._art, image=self._photo)
+            self._render_size = (width, height)
+        size = 27 if width > 760 else 23
+        if size != self._title_font_size:
+            self._title_font.configure(size=size)
+            self._title_font_size = size
         name = self.app.name_var.get().strip() or "Мой компьютер"
         available = width - 64 if width < 690 else max(190, int(width * .56) - 35)
-        while len(name) > 2 and title_font.measure(name) > available:
+        while len(name) > 2 and self._title_font.measure(name) > available:
             name = name[:-2].rstrip("…") + "…"
-        self.itemconfigure(self._heading, text=name, font=title_font)
+        self.itemconfigure(self._heading, text=name, font=self._title_font)
         self.itemconfigure(self._description, width=max(250, int(width * .53)))
         self.open_button.place(x=32, y=height - 92)
         self.connect_button.place(x=32 + self.open_button.winfo_reqwidth() + 12, y=height - 92)
+
+    def _render_backdrop(self, width: int, height: int) -> Image.Image:
+        # Asset fitting is rendering, not a baked UI: all text remains native.
+        picture = ImageOps.fit(self._source, (width, height), Image.Resampling.LANCZOS) if self._source else Image.new("RGB", (width, height), "#000000")
+        mask = rounded_image(width, height, fill="#ffffff", radius=16).getchannel("A")
+        canvas = Image.new("RGB", (width, height), BG)
+        canvas.paste(picture, (0, 0), mask)
+        edge = rounded_image(width, height, fill="#000000", radius=16, border_color="#ffffff", border_width=1)
+        edge_mask = ImageChops.multiply(edge.convert("L"), edge.getchannel("A"))
+        gradient = Image.new("RGB", (width, 1))
+        gradient.putdata([tuple(round(a + (b-a) * x / max(1, width-1))
+                               for a, b in zip((130, 156, 255), (196, 149, 244))) for x in range(width)])
+        canvas.paste(gradient.resize((width, height), Image.Resampling.NEAREST), (0, 0), edge_mask)
+        return canvas
 
 
 class HomeGrid(tk.Frame):

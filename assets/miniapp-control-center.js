@@ -378,10 +378,12 @@
       '<div class="cc-action-group"><div class="cc-action-label">Архив</div><div class="cc-action-grid">' + action('open_archive', 'Открыть архив', '▤') + action('cleanup_archive', 'Очистить медиа', '⌫') + '<button class="cc-action wide" id="ccArchiveToggle"><span class="cc-action-icon">◉</span><span>' + (item.archive_enabled ? 'Не хранить архив на этом ПК' : 'Хранить архив на этом ПК') + '</span></button></div></div>' +
       '<div class="cc-action-group"><div class="cc-action-label">Опасные</div><div class="cc-action-grid">' + action('reboot', 'Перезагрузить ПК', '↻', 'danger') + action('shutdown', 'Выключить ПК', '⏻', 'danger') + '</div></div><div class="cc-command-status" id="ccCommandStatus"></div></div>' +
       '<div class="cc-card"><div class="cc-card-title"><span>Экран</span><button class="btn" id="ccScreenshotRefresh">Обновить снимок</button></div><div class="cc-screenshot-shell" id="ccScreenshot"><div class="cc-screenshot-empty">Снимок загружается только по вашему запросу и временно хранится на сервере.</div></div><div class="cc-card-note" id="ccScreenshotMeta" style="margin-top:8px"></div></div>' +
-      '<div class="cc-card" id="ccCommandHistory" style="display:none"><div class="cc-card-title"><span>История команд</span><button class="btn" id="ccHistoryClose">Скрыть</button></div><div id="ccCommandHistoryList"></div></div>';
+      '<div class="cc-card" id="ccCommandHistory" style="display:none"><div class="cc-card-title"><span>История команд</span><button class="btn" id="ccHistoryClose">Скрыть</button></div><div id="ccCommandHistoryList"></div></div>' +
+      (X.state.boot?.user?.is_owner ? '<section class="cc-card cc-agent-detach"><div><h3>Подключение к XASS</h3><p>Отвязка удалит устройство из списка и отзовёт его ключ. Файлы на ПК и сохранённые архивы останутся на месте.</p><p>Для повторного подключения понадобится новый код привязки.</p></div><button type="button" class="btn danger" id="ccAgentDetach">Отвязать агент</button><div id="ccDetachStatus" role="status" aria-live="polite"></div></section>' : '');
   }
 
   function bindAgentDetail(item) {
+    if ($('ccAgentDetach')) $('ccAgentDetach').onclick = () => detachAgent(item, $('ccAgentDetach'));
     $('ccAgentBody').querySelectorAll('[data-cc-command]').forEach(button => button.onclick = () => {
       const command = button.dataset.ccCommand;
       if (command === 'history') return loadCommandHistory(item.source_name);
@@ -397,6 +399,41 @@
       X.toast(enabled ? 'Локальный архив включён' : 'Локальный архив выключен');
       await X.loadBoot(); openAgent(item.source_name);
     };
+  }
+
+  async function detachAgent(item, button) {
+    if (!X.state.boot?.user?.is_owner) return;
+    if (X.demo) return X.toast('Отвязка недоступна в демонстрации. Ваши устройства не изменены.');
+    const key = item.source_name + ':detach';
+    if (pendingCommands.has(key)) return;
+    if (!Number.isSafeInteger(item.id) || item.id <= 0) return X.toast('Обновите список устройств перед отвязкой.');
+    pendingCommands.set(key, true);
+    button.disabled = true;
+    const status = $('ccDetachStatus');
+    if (status) status.textContent = '';
+    try {
+      if (!await confirmAction('Отвязать «' + item.source_name + '» от XASS? Ключ доступа будет отозван, ожидающие команды отменены. Уже выполняемое действие остановить нельзя. Файлы и архивы не удаляются.')) return;
+      const current = (X.state.boot?.sources || []).find(source => source.source_name === item.source_name);
+      if (!current || current.id !== item.id) throw new Error('Подключение изменилось. Обновите список и выберите агент заново.');
+      if (status) status.textContent = 'Подтверждаю отвязку…';
+      const proof = await X.passkeyAction('agent:detach:' + item.id + ':' + item.source_name);
+      if (status) status.textContent = 'Отзываю доступ…';
+      const response = await ccApi('agents/' + encodeURIComponent(item.source_name), {
+        method: 'DELETE', body: {source_id: item.id, confirm_name: item.source_name, action_proof: proof},
+      });
+      if (!response.data?.ok || !response.data?.detached) throw new Error(response.data?.detail || 'Не удалось отвязать агент. Проверьте связь и повторите.');
+      X.state.boot.sources = (X.state.boot.sources || []).filter(source => source.id !== item.id || source.source_name !== item.source_name);
+      closeAgent(); ui.activeAgent = ''; ensureAgent(); renderCompactAgents();
+      X.toast('Агент отвязан. Файлы и архивы сохранены.');
+      try { await X.loadBoot(); } catch (_) { X.toast('Агент отвязан. Обновите список, когда связь восстановится.'); }
+    } catch (error) {
+      const message = error?.name === 'NotAllowedError' ? 'Подтверждение отменено. Агент остаётся подключён.' : error.message || 'Нет связи с сервером. Повторите отвязку после проверки сети.';
+      if (status) status.textContent = message;
+      X.toast(message);
+    } finally {
+      pendingCommands.delete(key);
+      button.disabled = false;
+    }
   }
 
   async function runAgentCommand(source, command, payload = {}, button = null, after = null) {

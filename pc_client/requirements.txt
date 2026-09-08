@@ -4,3 +4,4 @@ Pillow==11.3.0
 pystray==0.19.5
 tkinterdnd2==0.4.3
 cryptography==50.0.0
+miniaudio==1.71

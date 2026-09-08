@@ -96,8 +96,10 @@ class DesktopConnectionStatusTests(unittest.TestCase):
         active = Mock(info={"pid": 42, "name": "editor.exe", "memory_info": Mock(rss=1048576)})
         active.cpu_percent.return_value = 200
         with patch.object(desktop_app.psutil, "process_iter", return_value=[idle, active]), patch.object(desktop_app.psutil, "cpu_count", return_value=4):
-            rows = app._top_processes()
+            rows = app._collect_process_rows()
         self.assertEqual(rows, [{"pid": 42, "name": "editor.exe", "cpu": 50, "ram_mb": 1}])
+        self.assertEqual(active.cpu_percent.call_count, 2)
+        idle.cpu_percent.assert_not_called()
 
 
 class DesktopLayoutTests(unittest.TestCase):

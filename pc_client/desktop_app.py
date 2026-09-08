@@ -345,6 +345,9 @@ class XassDesktop:
         self.metric_bars: dict[str, tuple[tk.Canvas, int]] = {}
         self._process_rows: list[dict[str, Any]] = []
         self._process_sampling = False
+        self._process_sampled_at = 0.0
+        self._metrics_results: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self._metrics_sampling = False
 
         self._build_shell()
         if not preview:
@@ -542,10 +545,16 @@ class XassDesktop:
                     button.configure(pady=padding)
 
     def _on_content_configure(self, _event: tk.Event[Any]) -> None:
-        self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
+        bounds = self.body_canvas.bbox("all")
+        if bounds != getattr(self, "_scroll_bounds", None):
+            self._scroll_bounds = bounds
+            self.body_canvas.configure(scrollregion=bounds)
 
     def _on_canvas_configure(self, event: tk.Event[Any]) -> None:
-        self.body_canvas.itemconfigure(self.content_window, width=max(1, event.width))
+        width = max(1, event.width)
+        if width != getattr(self, "_content_width", None):
+            self._content_width = width
+            self.body_canvas.itemconfigure(self.content_window, width=width)
 
     def _on_mousewheel(self, event: tk.Event[Any]) -> None:
         widget = event.widget
@@ -590,16 +599,30 @@ class XassDesktop:
         self.body_canvas.yview_moveto(0)
 
     def _wrap_labels(self, parent: tk.Misc) -> None:
+        labels = []
         for widget in parent.winfo_children():
             if isinstance(widget, (tk.Label, tk.Checkbutton)) and (widget.cget("text") or widget.cget("textvariable")):
                 if not getattr(widget, "_row_value", False):
-                    def resize(_event: Any = None, item: tk.Widget = widget) -> None:
-                        if item.winfo_exists():
-                            padding = item.master.winfo_pixels(item.master.cget("padx"))
-                            width = max(80, item.master.winfo_width() - 2 * padding - 8)
-                            item.configure(wraplength=width, justify="left")
-                    widget.master.bind("<Configure>", resize, add="+")
+                    labels.append(widget)
             self._wrap_labels(widget)
+        if not labels:
+            return
+        parent._xass_wrap_labels = labels
+        if getattr(parent, "_xass_wrap_bound", False):
+            return
+        parent._xass_wrap_bound = True
+
+        def resize(event: Any = None) -> None:
+            parent_width = event.width if event is not None else parent.winfo_width()
+            padding = parent.winfo_pixels(parent.cget("padx"))
+            width = max(80, parent_width - 2 * padding - 8)
+            if width == getattr(parent, "_xass_wrap_width", None):
+                return
+            parent._xass_wrap_width = width
+            for item in parent._xass_wrap_labels:
+                if item.winfo_exists() and item.winfo_pixels(str(item.cget("wraplength") or 0)) != width:
+                    item.configure(wraplength=width, justify="left")
+        parent.bind("<Configure>", resize, add="+")
 
     @staticmethod
     def _flow_actions(parent: tk.Frame) -> None:
@@ -608,6 +631,10 @@ class XassDesktop:
             button.pack_forget()
         def arrange(event: Any = None) -> None:
             available = max(1, parent.winfo_width())
+            layout_key = (available, tuple(button.winfo_reqwidth() for button in buttons))
+            if layout_key == getattr(parent, "_xass_actions_layout", None):
+                return
+            parent._xass_actions_layout = layout_key
             column, row, used = 0, 0, 0
             for button in buttons:
                 width = button.winfo_reqwidth() + 10
@@ -773,9 +800,10 @@ class XassDesktop:
             for proc in self._process_rows:
                 process_row((proc["name"], str(proc["pid"]), f"{proc['cpu']:.1f}%", f"{proc['ram_mb']:.0f} МБ"))
             if not self._process_rows:
-                tk.Label(process_rows_frame, text="Загружаем процессы…", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=12)
+                message = "Не удалось получить список процессов. Откройте раздел позже." if self._process_sampled_at else "Загружаем процессы…"
+                tk.Label(process_rows_frame, text=message, bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=12)
         render_processes()
-        if not self._process_sampling:
+        if not self._process_sampling and time.monotonic() - self._process_sampled_at > 10:
             self._process_sampling = True
             def sample_processes() -> None:
                 try:
@@ -783,6 +811,7 @@ class XassDesktop:
                 except (psutil.Error, OSError):
                     self._process_rows = []
                 finally:
+                    self._process_sampled_at = time.monotonic()
                     self._process_sampling = False
             threading.Thread(target=sample_processes, daemon=True).start()
         def refresh_processes() -> None:
@@ -860,25 +889,58 @@ class XassDesktop:
         row.bind("<Configure>", lambda event: (key_label.configure(wraplength=max(70, event.width // 2 - 16)), value_label.configure(wraplength=max(70, event.width // 2 - 4))))
 
     def _refresh_local_metrics(self) -> None:
+        if self._closing:
+            return
+        if not self._metrics_sampling and not self._hidden_to_tray:
+            self._metrics_sampling = True
+            def sample() -> None:
+                try:
+                    snapshot = self._collect_local_metrics()
+                except Exception:
+                    snapshot = {}  # A failed sample must not strand the UI poller.
+                self._metrics_results.put_nowait(snapshot)
+            threading.Thread(target=sample, daemon=True, name="xass-desktop-metrics").start()
+            self.root.after(40, self._apply_local_metrics)
+        self.root.after(1800, self._refresh_local_metrics)
+
+    @staticmethod
+    def _collect_local_metrics() -> dict[str, Any]:
+        # These Windows/system calls can stall; never run them in a Tk callback.
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage("C:\\" if os.name == "nt" else "/")
+        # A new worker has no previous per-thread psutil CPU sample.
+        return {"cpu": float(psutil.cpu_percent(interval=0.1)), "memory": memory,
+                "disk": disk, "boot_time": psutil.boot_time()}
+
+    def _apply_local_metrics(self) -> None:
+        if self._closing:
+            return
         try:
+            snapshot = self._metrics_results.get_nowait()
+        except queue.Empty:
+            self.root.after(40, self._apply_local_metrics)
+            return
+        self._metrics_sampling = False
+        if not snapshot:
+            return
+        try:
+            memory, disk = snapshot["memory"], snapshot["disk"]
             values = {
-                "cpu": float(psutil.cpu_percent(interval=None)),
-                "memory": float(psutil.virtual_memory().percent),
-                "disk": float(psutil.disk_usage("C:\\" if os.name == "nt" else "/").percent),
+                "cpu": snapshot["cpu"], "memory": float(memory.percent), "disk": float(disk.percent),
             }
-            self.cpu_var.set(f"{values['cpu']:.0f}%")
-            self.memory_var.set(f"{values['memory']:.0f}%")
-            self.disk_var.set(f"{values['disk']:.0f}%")
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage("C:\\" if os.name == "nt" else "/")
-            self.memory_detail_var.set(f"{memory.used / (1024**3):.1f} / {memory.total / (1024**3):.1f} ГБ")
-            self.disk_detail_var.set(f"{disk.used / (1024**3):.0f} / {disk.total / (1024**3):.0f} ГБ")
-            uptime = max(0, int(time.time() - psutil.boot_time()))
+            updates = [(self.cpu_var, f"{values['cpu']:.0f}%"), (self.memory_var, f"{values['memory']:.0f}%"),
+                       (self.disk_var, f"{values['disk']:.0f}%"),
+                       (self.memory_detail_var, f"{memory.used / (1024**3):.1f} / {memory.total / (1024**3):.1f} ГБ"),
+                       (self.disk_detail_var, f"{disk.used / (1024**3):.0f} / {disk.total / (1024**3):.0f} ГБ")]
+            uptime = max(0, int(time.time() - snapshot["boot_time"]))
             days, remainder = divmod(uptime, 86400)
             hours, remainder = divmod(remainder, 3600)
             minutes = remainder // 60
-            self.uptime_var.set(f"{days} д. {hours} ч. {minutes} мин.")
-            self.local_time_var.set(datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+            updates.extend([(self.uptime_var, f"{days} д. {hours} ч. {minutes} мин."),
+                            (self.local_time_var, datetime.now().strftime("%d.%m.%Y %H:%M:%S"))])
+            for variable, value in updates:
+                if variable.get() != value:
+                    variable.set(value)
             for key, percent in values.items():
                 item = self.metric_bars.get(key)
                 if not item:
@@ -890,8 +952,6 @@ class XassDesktop:
                 canvas.coords(bar, 0, 0, width * min(100.0, max(0.0, percent)) / 100.0, 6)
         except (OSError, psutil.Error, tk.TclError):
             pass
-        if not self._closing:
-            self.root.after(1800, self._refresh_local_metrics)
 
     def _field(self, parent: tk.Misc, label: str, variable: tk.StringVar, *, secret: bool = False) -> tk.Entry:
         tk.Label(parent, text=label, bg=parent.cget("bg"), fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(15, 7))
@@ -915,9 +975,40 @@ class XassDesktop:
         return entry
 
     def _top_processes(self) -> list[dict[str, Any]]:
+        # psutil Windows fallbacks can hold the GIL for seconds across hundreds
+        # of processes. A thread alone cannot isolate that from Tk rendering.
+        command = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            command.append(str(Path(__file__).resolve()))
+        try:
+            # Windowed PyInstaller executables have no Python stdout. A private,
+            # short-lived result file works in both source and frozen builds.
+            with tempfile.TemporaryDirectory(prefix="xass-process-sample-") as folder:
+                output = Path(folder) / "processes.json"
+                result = subprocess.run([*command, "--desktop-process-sample", str(output)],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+                payload = json.loads(output.read_text(encoding="utf-8")) if result.returncode == 0 and output.stat().st_size <= 65536 else []
+            return payload[:6] if isinstance(payload, list) else []
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return []
+
+    @staticmethod
+    def _collect_process_rows() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         cpu_count = max(1, psutil.cpu_count() or 1)
-        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+        processes = list(psutil.process_iter(["pid", "name", "memory_info"]))
+        # The isolated helper is short-lived: prime each process counter before
+        # measuring, otherwise every first nonblocking CPU result would be zero.
+        for proc in processes:
+            if proc.info.get("pid"):
+                try:
+                    proc.cpu_percent(interval=None)
+                except psutil.Error:
+                    pass
+        if processes:
+            time.sleep(0.1)
+        for proc in processes:
             try:
                 info = proc.info
                 if not info.get("pid"):
@@ -2046,6 +2137,20 @@ class XassDesktop:
 
 
 def main() -> None:
+    if "--desktop-process-sample" in sys.argv:
+        # Private read-only helper: no config loading, GUI, agent or PC actions.
+        try:
+            index = sys.argv.index("--desktop-process-sample")
+            output = Path(sys.argv[index + 1])
+            if (output.name != "processes.json" or output.parent.is_symlink()
+                    or not output.parent.name.startswith("xass-process-sample-")
+                    or output.parent.parent.resolve() != Path(tempfile.gettempdir()).resolve()):
+                return
+            with output.open("x", encoding="utf-8") as stream:
+                json.dump(XassDesktop._collect_process_rows(), stream, ensure_ascii=True)
+        except (IndexError, OSError, psutil.Error):
+            pass
+        return
     if "--health-check" in sys.argv:
         try:
             version = current_version()

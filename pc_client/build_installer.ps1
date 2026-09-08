@@ -102,6 +102,7 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --add-data "$(Join-Path $ClientRoot 'assets\xass-desktop-hero.png');assets" `
     --collect-data tkinterdnd2 `
     --collect-all cryptography `
+    --collect-all miniaudio `
     --hidden-import pystray._win32 `
     --distpath $DistRoot `
     --workpath $WorkRoot `

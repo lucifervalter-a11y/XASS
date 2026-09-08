@@ -46,6 +46,7 @@ from remote_tools import (
     upload_requested_file,
 )
 from network_client import create_http_client
+from music_player import MUSIC_COMMANDS, handle_music_command, music_snapshot
 try:
     from e2e_crypto import can_seal, ensure_agent_keys, is_public_jwk, seal_text, unseal_text
     from secret_store import seal_config, unseal_config
@@ -788,6 +789,7 @@ def run_agent(config: dict[str, Any]) -> str:
                 "last_error": _last_heartbeat_error,
                 "last_error_at": _last_heartbeat_error_at,
                 "server_version_seen": _last_server_version,
+                "music_player": music_snapshot(),
             }
             sent_result_ids = [
                 int(item.get("id"))
@@ -858,6 +860,15 @@ def run_agent(config: dict[str, Any]) -> str:
                     # Persist before execution. If the process dies after a power or
                     # lock command, the same server delivery cannot execute it twice.
                     mark_command_processed(command_id, command_name)
+                    if command_name in MUSIC_COMMANDS:
+                        try:
+                            music_details = handle_music_command(command_name, command_payload, config)
+                            store_command_result(command_id, True, "Музыкальный плеер: команда принята", music_details)
+                        except Exception as exc:
+                            from music_player import MusicError
+                            message = str(exc) if isinstance(exc, MusicError) else "Не удалось выполнить музыкальную команду. Проверьте аудиовыход Windows"
+                            store_command_result(command_id, False, message, music_snapshot())
+                        continue
                     if command_name == "lock":
                         _lock_workstation(command_id)
                         continue

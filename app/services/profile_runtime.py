@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.config import Settings
 from app.models import HeartbeatSource
 from app.services.music_card import normalize_track_input
+from app.services.music_broadcast import sync_music_profile
 from app.services.profile_editor import ensure_profile_exists, save_profile
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -306,6 +307,8 @@ async def sync_profile_now_playing_from_heartbeat(
     settings: Settings,
     heartbeat_timeout_minutes: int,
 ) -> bool:
+    if await sync_music_profile(session, settings):
+        return True
     profile_path = Path(settings.profile_json_path)
     profile = ensure_profile_exists(profile_path)
     if not _to_bool(profile.get("now_listening_auto_enabled"), True):

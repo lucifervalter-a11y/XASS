@@ -75,6 +75,25 @@ class PcCommandLoopTests(unittest.TestCase):
         self.assertEqual(self.payloads[2]["command_results"], [])
         self.telemetry.assert_called_once()
 
+    def test_music_commands_are_not_replayed_and_status_refreshes_each_heartbeat(self) -> None:
+        snapshots = [{"state": "idle"}, {"state": "loading"}, {"state": "playing"}, {"state": "paused"}]
+        with patch.object(client_agent, "handle_music_command", return_value={"state": "loading"}) as handle, \
+                patch.object(client_agent, "music_snapshot", side_effect=snapshots):
+            command = {"id": 800, "command": "music_play", "payload": {"track_id": 7}}
+            self.run_responses([{"commands": [command]}, {"commands": [command]}, {}])
+        handle.assert_called_once_with("music_play", {"track_id": 7}, self.config)
+        self.assertEqual([row["music_player"]["state"] for row in self.payloads[:3]], ["idle", "loading", "playing"])
+        self.assertEqual(self.payloads[1]["command_results"][0]["details"]["state"], "loading")
+        self.telemetry.assert_called_once()
+
+    def test_music_exception_reports_failed_command_not_failed_heartbeat_or_token(self) -> None:
+        with patch.object(client_agent, "handle_music_command", side_effect=RuntimeError("secret ticket")):
+            self.run_responses([{"commands": [{"id": 801, "command": "music_play"}]}, {}])
+        result = self.payloads[1]["command_results"][0]
+        self.assertFalse(result["ok"])
+        self.assertNotIn("secret", result["message"])
+        self.assertEqual(self.status.call_args.args[0], "online")
+
     def test_duplicate_update_commands_all_receive_results_and_only_one_update_runs(self) -> None:
         def update(_config, _manifest, command_id):
             client_agent.store_command_result(command_id, True, "Обновление проверено")

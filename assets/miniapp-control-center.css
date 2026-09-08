@@ -350,6 +350,13 @@ body.cc-device-open { overflow: hidden; }
   .cc-card { padding: 14px; }
 }
 
+.cc-agent-detach { border-color: rgba(226, 105, 111, .24); }
+.cc-agent-detach h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+.cc-agent-detach p { margin: 0 0 10px; color: var(--muted, #9da2ad); font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.cc-agent-detach > button { min-height: 44px; margin-top: 4px; }
+.cc-agent-detach [role="status"] { color: #edb8bb; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.cc-agent-detach [role="status"]:not(:empty) { margin-top: 12px; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

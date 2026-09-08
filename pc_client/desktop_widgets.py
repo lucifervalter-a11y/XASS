@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Any, Callable
@@ -18,19 +19,37 @@ def _parent_background(parent):
         return BG
 
 
-def rounded_image(width, height, *, fill, radius=12, border_color=None, border_width=1):
-    """Transparent anti-aliased corners; no screenshot/bitmap UI labels."""
-    width, height = max(1, int(width)), max(1, int(height))
+@lru_cache(maxsize=128)
+def _rounded_corners(radius, fill, border_color, border_width):
+    """Only curved corners need supersampling, not every pixel of a large card."""
     scale = 3
-    image = Image.new("RGBA", (width * scale, height * scale))
+    edge = radius + border_width + 3
+    image = Image.new("RGBA", (edge * 2 * scale, edge * 2 * scale))
     draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((0, 0, image.width - 1, image.height - 1), radius=radius * scale,
+                           fill=fill, outline=border_color if border_width else None, width=border_width * scale)
+    return image.resize((edge * 2, edge * 2), Image.Resampling.LANCZOS)
+
+
+def rounded_image(width, height, *, fill, radius=12, border_color=None, border_width=1):
+    """Nine-slice rounded surface: constant-size anti-aliased corner work."""
+    width, height = max(1, int(width)), max(1, int(height))
     border = max(0, int(border_width)) if border_color else 0
     radius = max(0, min(int(radius), width // 2, height // 2))
-    draw.rounded_rectangle((0, 0, width * scale - 1, height * scale - 1), radius=radius * scale,
-                           fill=fill, outline=border_color if border else None, width=border * scale)
-    return image.resize((width, height), Image.Resampling.LANCZOS)
+    image = Image.new("RGBA", (width, height), fill)
+    if border:
+        ImageDraw.Draw(image).rectangle((0, 0, width - 1, height - 1), outline=border_color, width=border)
+    if radius:
+        corners = _rounded_corners(radius, fill, border_color, border)
+        edge = min(corners.width // 2, width // 2, height // 2)
+        for x, y in ((0, 0), (width-edge, 0), (0, height-edge), (width-edge, height-edge)):
+            left = corners.width-edge if x else 0
+            top = corners.height-edge if y else 0
+            image.paste(corners.crop((left, top, left+edge, top+edge)), (x, y))
+    return image
 
 
+@lru_cache(maxsize=128)
 def _icon_raster(name, size=22, color=TEXT):
     aliases = {"overview": "home", "computer": "monitor", "pc": "monitor", "device": "monitor",
                "connection": "link", "files": "folder", "logs": "journal", "updates": "update",
@@ -174,6 +193,8 @@ class RoundedPanel(tk.Frame):
     config = configure
 
     def _schedule_paint(self, _event=None):
+        if _event is not None and self._last_paint and (_event.width, _event.height) == self._last_paint[:2]:
+            return
         if self._paint_job is None:
             self._paint_job = self.after_idle(self._paint)
 
@@ -218,6 +239,9 @@ class ModernButton(tk.Canvas):
                          takefocus=self._values["takefocus"], cursor=self._values["cursor"])
         self._hover = self._pressed = self._focused = self._armed = False
         self._paint_job = self._background_image = self._icon_image = None
+        self._paint_key = self._font_spec = None
+        self._background_cache = {}
+        self._icon_cache = {}
         self._variable_trace = self._variable = None
         self.bind("<Configure>", self._schedule_paint, add="+")
         self.bind("<Enter>", lambda _: self._set_hover(True), add="+")
@@ -250,7 +274,9 @@ class ModernButton(tk.Canvas):
             self._variable_trace = self._variable.trace_add("write", lambda *_: self._resize_request())
 
     def _resize_request(self):
-        self._font = tkfont.Font(root=self, font=self._values["font"])
+        if self._font_spec != self._values["font"]:
+            self._font_spec = self._values["font"]
+            self._font = tkfont.Font(root=self, font=self._font_spec)
         line_height = self._font.metrics("linespace")
         image = self._values["image"]
         icon_width = int(self._values["icon_size"]) if self._values["icon"] else (image.width() if image else 0)
@@ -271,11 +297,13 @@ class ModernButton(tk.Canvas):
             options = dict(cnf, **options)
         if not options:
             return {key: (key, key, key, value, value) for key, value in self._values.items()}
-        native = {}
+        native, changed = {}, set()
         for original, value in options.items():
             key = self._ALIASES.get(original, original)
             if key in self._values:
-                self._values[key] = value
+                if self._values[key] != value:
+                    self._values[key] = value
+                    changed.add(key)
             elif key == "parent_bg":
                 self._parent_bg = value
                 native["bg"] = value
@@ -283,11 +311,18 @@ class ModernButton(tk.Canvas):
                 native[original] = value
         if native:
             super().configure(**native)
+        if not changed:
+            return
         if self._values["state"] == "disabled":
             self._armed = self._pressed = False
         if "textvariable" in options:
             self._watch_variable()
-        self._resize_request()
+        if changed & {"text", "textvariable", "font", "padx", "pady", "width", "height", "icon", "icon_size", "image"}:
+            self._resize_request()
+        else:
+            super().configure(cursor="arrow" if self._values["state"] == "disabled" else self._values["cursor"],
+                              takefocus=0 if self._values["state"] == "disabled" else self._values["takefocus"])
+            self._schedule_paint()
 
     config = configure
 
@@ -349,19 +384,30 @@ class ModernButton(tk.Canvas):
         self._paint_job = None
         width, height = self.winfo_width(), self.winfo_height()
         if width < 2 or height < 2:
-            return
+            return False
         disabled = self._values["state"] == "disabled"
         highlighted = (self._hover or self._pressed) and not disabled
         fill = self._values["activebackground"] if highlighted else self._values["bg"]
         fg = self._values["disabledforeground"] if disabled else (
             self._values["activeforeground"] if highlighted else self._values["fg"])
         border = self._values["highlightcolor"] if self._focused and not disabled else self._values["border_color"]
-        self._background_image = ImageTk.PhotoImage(rounded_image(width, height, fill=fill,
-            radius=self._values["radius"], border_color=border,
-            border_width=1 if self._focused and not disabled else self._values["border_width"]), master=self)
+        border_width = 1 if self._focused and not disabled else self._values["border_width"]
+        text, icon, supplied = self._text(), self._values["icon"], self._values["image"]
+        paint_key = (width, height, fill, fg, border, border_width, text, icon, str(supplied),
+                     self._font_spec, self._values["padx"], self._values["radius"], self._values["anchor"],
+                     self._values["icon_size"], self._pressed, self._values["active"])
+        if paint_key == self._paint_key:
+            return False
+        self._paint_key = paint_key
+        background_key = (width, height, fill, self._values["radius"], border, border_width)
+        if background_key not in self._background_cache:
+            if len(self._background_cache) >= 4:
+                self._background_cache.clear()
+            self._background_cache[background_key] = ImageTk.PhotoImage(rounded_image(width, height, fill=fill,
+                radius=self._values["radius"], border_color=border, border_width=border_width), master=self)
+        self._background_image = self._background_cache[background_key]
         self.delete("all")
         self.create_image(0, 0, anchor="nw", image=self._background_image)
-        text, icon, supplied = self._text(), self._values["icon"], self._values["image"]
         icon_width = int(self._values["icon_size"]) if icon else (supplied.width() if supplied else 0)
         available = max(0, width - 2 * int(self._values["padx"]) - (icon_width + 10 if icon_width else 0))
         while text and self._font.measure(text) > available:
@@ -372,10 +418,16 @@ class ModernButton(tk.Canvas):
             width - int(self._values["padx"]) - group_width if anchor in {"e", "ne", "se", "right"} else (width - group_width) / 2)
         shift = 1 if self._pressed and not disabled else 0
         if icon or supplied:
-            self._icon_image = icon_image(self, icon, icon_width, fg) if icon else supplied
+            icon_key = (icon, icon_width, fg)
+            if icon and icon_key not in self._icon_cache:
+                if len(self._icon_cache) >= 6:
+                    self._icon_cache.clear()
+                self._icon_cache[icon_key] = icon_image(self, icon, icon_width, fg)
+            self._icon_image = self._icon_cache[icon_key] if icon else supplied
             self.create_image(start + icon_width / 2, height / 2 + shift, image=self._icon_image)
             start += icon_width + (10 if text else 0)
         self.create_text(start, height / 2 + shift, text=text, anchor="w", fill=fg, font=self._font, tags="label")
+        return True
 
     def _on_destroy(self, event):
         if event.widget is not self:
@@ -419,7 +471,8 @@ class NavButton(ModernButton):
     config = configure
 
     def _paint(self):
-        super()._paint()
+        if not super()._paint():
+            return
         if self._nav_active and self.winfo_height() > 4:
             center = self.winfo_height() / 2
             self.create_line(2, center - 10, 2, center + 10, fill=LILAC, width=3,

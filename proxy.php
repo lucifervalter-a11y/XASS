@@ -8,6 +8,7 @@ declare(strict_types=1);
 $BACKEND = 'http://127.0.0.1:8000';
 
 $binaryMode = isset($_GET['_binary']) && (string)$_GET['_binary'] === '1';
+$mediaMode = $binaryMode && isset($_GET['_media']) && (string)$_GET['_media'] === '1';
 $passthroughMode = isset($_GET['_passthrough']) && (string)$_GET['_passthrough'] === '1';
 header('Cache-Control: private, no-store');
 if (!$binaryMode && !$passthroughMode) {
@@ -16,7 +17,10 @@ if (!$binaryMode && !$passthroughMode) {
 http_response_code(200);
 
 function proxy_error(int $status, string $detail): void {
-    global $binaryMode, $passthroughMode;
+    global $binaryMode, $passthroughMode, $mediaMode;
+    if ($mediaMode) {
+        http_response_code($status);
+    }
     if ($binaryMode || $passthroughMode) {
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: private, no-store');
@@ -43,6 +47,11 @@ $rawPath = preg_replace('#/+#', '/', $rawPath) ?? $rawPath;
 
 if ($rawPath !== '/health' && strpos($rawPath, '/api/') !== 0 && strpos($rawPath, '/agent/') !== 0) {
     proxy_error(400, 'invalid proxy path');
+}
+// Only audio may opt out of the installer-compatible HTTP-200 envelope.
+// Safari requires real 206/416 responses and Content-Range for seeking.
+if ($mediaMode && preg_match('#^/(?:api|agent)/music/tracks/[1-9][0-9]*/stream(?:\?[^\r\n]*)?$#D', $rawPath) !== 1) {
+    proxy_error(400, 'invalid media path');
 }
 
 $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string)$_SERVER['REQUEST_METHOD']) : 'GET';
@@ -74,6 +83,9 @@ $forwardHeaders[] = 'X-Forwarded-Proto: ' . $publicProto;
 
 if (function_exists('getallheaders')) {
     $allowed = ['content-type', 'x-telegram-init-data', 'x-xass-action-proof', 'x-api-key', 'authorization', 'cookie'];
+    if ($mediaMode) {
+        $allowed = array_merge($allowed, ['range', 'if-range']);
+    }
     foreach (getallheaders() as $name => $val) {
         if (in_array(strtolower((string)$name), $allowed, true)) {
             $forwardHeaders[] = $name . ': ' . $val;
@@ -91,6 +103,10 @@ $serverMap = [
     'HTTP_CONTENT_TYPE'         => 'Content-Type',
     'CONTENT_TYPE'              => 'Content-Type',
 ];
+if ($mediaMode) {
+    $serverMap['HTTP_RANGE'] = 'Range';
+    $serverMap['HTTP_IF_RANGE'] = 'If-Range';
+}
 foreach ($serverMap as $key => $headerName) {
     if (!empty($_SERVER[$key])) {
         $lower = strtolower($headerName) . ':';
@@ -112,6 +128,7 @@ $opts = [
         'content'       => $body,
         'timeout'       => 90,
         'ignore_errors' => true,   // return body even on 4xx/5xx
+        'follow_location' => 0,
     ],
 ];
 
@@ -123,15 +140,16 @@ if ($binaryMode) {
     // Large migration exports may take several minutes. Keep streaming as long
     // as the client remains connected instead of inheriting PHP's short limit.
     @set_time_limit(0);
-    ignore_user_abort(true);
+    ignore_user_abort(!$mediaMode);
     $responseStream = @fopen($url, 'rb', false, $context);
     if ($responseStream === false) {
         proxy_error(502, 'Backend unavailable: could not connect to ' . $url);
     }
-    $responseHeaders = $http_response_header ?? [];
+    $responseHeaders = (function_exists('http_get_last_response_headers')
+        ? http_get_last_response_headers() : (${'http_response_header'} ?? [])) ?: [];
     $httpCode = 200;
     $contentType = 'application/octet-stream';
-    $contentDisposition = 'attachment; filename="XASS-Setup.exe"';
+    $contentDisposition = $mediaMode ? 'inline' : 'attachment; filename="XASS-Setup.exe"';
     $contentLength = '';
     if (!empty($responseHeaders) && preg_match('#HTTP/\S+\s+(\d+)#', $responseHeaders[0], $m)) {
         $httpCode = (int)$m[1];
@@ -143,7 +161,15 @@ if ($binaryMode) {
             $contentDisposition = trim(substr($headerLine, strlen('Content-Disposition:')));
         } elseif (stripos($headerLine, 'Content-Length:') === 0) {
             $contentLength = trim(substr($headerLine, strlen('Content-Length:')));
+        } elseif ($mediaMode && preg_match('/^(?:Content-Range|Accept-Ranges|ETag|Last-Modified):/i', $headerLine)) {
+            header($headerLine);
         }
+    }
+    if ($mediaMode) {
+        http_response_code($httpCode);
+        header('X-Accel-Buffering: no');
+        header('X-Content-Type-Options: nosniff');
+        header('Referrer-Policy: no-referrer');
     }
     header('Content-Type: ' . $contentType);
     header('Content-Disposition: ' . $contentDisposition);
@@ -152,7 +178,7 @@ if ($binaryMode) {
     }
     header('Cache-Control: private, no-store');
     header('X-XASS-Status: ' . $httpCode);
-    while (!feof($responseStream)) {
+    while ($method !== 'HEAD' && !feof($responseStream)) {
         $chunk = fread($responseStream, 1024 * 1024);
         if ($chunk === false) {
             break;
@@ -173,18 +199,20 @@ if ($responseBody === false) {
     proxy_error(502, 'Backend unavailable: could not connect to ' . $url);
 }
 
-// $http_response_header is set by file_get_contents after a successful call.
+// PHP 8.4+ exposes the headers without the deprecated scoped variable.
+$responseHeaders = (function_exists('http_get_last_response_headers')
+    ? http_get_last_response_headers() : (${'http_response_header'} ?? [])) ?: [];
 $httpCode = 200;
-if (!empty($http_response_header)) {
+if (!empty($responseHeaders)) {
     // First line: "HTTP/1.1 200 OK"
-    if (preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
+    if (preg_match('#HTTP/\S+\s+(\d+)#', $responseHeaders[0], $m)) {
         $httpCode = (int)$m[1];
     }
 }
 
 if ($passthroughMode) {
     $contentType = 'application/json; charset=utf-8';
-    foreach ($http_response_header as $headerLine) {
+    foreach ($responseHeaders as $headerLine) {
         if (stripos($headerLine, 'Content-Type:') === 0) {
             $contentType = trim(substr($headerLine, strlen('Content-Type:')));
         } elseif (stripos($headerLine, 'Set-Cookie:') === 0) {

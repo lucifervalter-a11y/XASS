@@ -1,0 +1,52 @@
+name: Tests and interface contracts
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pc_client/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install PHP and headless native test support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk
+          php --version
+      - name: Install pinned Python dependencies
+        run: python -m pip install -r requirements.txt -r pc_client/requirements.txt
+      - name: Python backend, media proxy and native regressions
+        env:
+          PYTHONUTF8: '1'
+          XASS_TEST_PHP: /usr/bin/php
+        run: xvfb-run -a python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Browser runtime and security contracts
+        run: node --test tests/*.cjs tests/*.js
+      - name: PHP syntax
+        run: |
+          php -l proxy.php
+          php -l index.php
+          php -l miniapp.php
+          php -l profile.php

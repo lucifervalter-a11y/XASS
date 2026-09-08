@@ -31,7 +31,7 @@ CHUNK = 1024 * 1024
 MAX_BYTES = 32 * 1024**3
 IGNORED = {".git", ".venv", ".venv312", ".build-venv", "__pycache__", "node_modules", ".pytest_cache", ".mypy_cache"}
 PATH_FIELDS = (
-    "media_root", "export_root", "profile_json_path", "profile_backups_dir",
+    "media_root", "music_root", "export_root", "profile_json_path", "profile_backups_dir",
     "profile_audit_log_path", "profile_avatars_dir", "conversation_avatar_cache_dir",
     "projects_json_path", "site_config_json_path", "quotes_json_path", "scenarios_json_path",
     "rules_json_path", "projects_backups_dir", "projects_audit_log_path", "projects_assets_dir",

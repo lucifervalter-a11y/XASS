@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.models import AgentArchiveTarget, AgentCredential, AgentStateSnapshot, AppConfig, HeartbeatSource
 from app.schemas import HeartbeatPayload
+from app.services.agent_lifecycle import detach_agent, ensure_agent_attached
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ async def process_heartbeat(
     session: AsyncSession,
     payload: HeartbeatPayload,
 ) -> tuple[HeartbeatSource, bool, bool]:
+    await ensure_agent_attached(session, payload.source_name)
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == payload.source_name))
     recovered = False
     is_new = source is None
@@ -101,8 +103,7 @@ async def process_heartbeat(
         source.went_offline_at = None
         source.last_payload = raw_payload
 
-    await session.commit()
-    await session.refresh(source)
+    await session.flush()
     latest_snapshot = await session.scalar(
         select(AgentStateSnapshot)
         .where(AgentStateSnapshot.source_name == source.source_name)
@@ -125,7 +126,7 @@ async def process_heartbeat(
                 last_error=str(raw_payload.get("last_error") or "")[:1000] or None,
             )
         )
-        await session.commit()
+    await session.commit()
     return source, recovered, is_new
 
 
@@ -196,15 +197,8 @@ async def delete_source_by_id(session: AsyncSession, source_id: int) -> Heartbea
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.id == source_id))
     if source is None:
         return None
-    credential = await session.scalar(select(AgentCredential).where(AgentCredential.source_name == source.source_name))
-    archive_target = await session.scalar(select(AgentArchiveTarget).where(AgentArchiveTarget.source_name == source.source_name))
-    if credential is not None:
-        await session.delete(credential)
-    if archive_target is not None:
-        await session.delete(archive_target)
-    await session.delete(source)
-    await session.commit()
-    return source
+    result = await detach_agent(session, source_name=source.source_name, source_id=source.id)
+    return result.source
 
 
 def format_source_line(source: HeartbeatSource, timeout_minutes: int) -> str:

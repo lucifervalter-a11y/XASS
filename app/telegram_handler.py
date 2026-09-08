@@ -1886,7 +1886,7 @@ class TelegramUpdateHandler:
         return str(profile.get("now_listening_source") or self.settings.now_playing_source_default or "pc_agent").strip().lower()
 
     def _display_now_source(self, value: str) -> str:
-        mapping = {"pc_agent": "PC", "iphone": "iPhone", "vk": "VK"}
+        mapping = {"pc_agent": "PC", "iphone": "iPhone", "vk": "VK", "xass_music": "XASS Music"}
         return mapping.get(value, value or "pc_agent")
 
     def _now_source_switch_keyboard(self, current_source: str) -> dict[str, Any]:

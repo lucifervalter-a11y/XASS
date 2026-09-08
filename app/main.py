@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,7 @@ from app.config import Settings, get_settings
 from app.db import SessionLocal, get_session, init_db
 from app.poller import telegram_polling_loop
 from app.server_migration_api import build_router as build_server_migration_router
+from app.music_api import build_router as build_music_router
 from app.schemas import (
     AgentPairClaimPayload,
     AgentPairClaimResponse,
@@ -42,6 +43,7 @@ from app.services.agent_commands import (
     latest_agent_commands,
 )
 from app.services.agent_connection import build_connection_profile, normalize_server_origin
+from app.services.agent_lifecycle import AgentDetachedError, detach_agent, ensure_agent_attached
 from app.services.agent_archive import archive_events_after, archive_summary, archive_target_map, is_archive_target, set_archive_target
 from app.services.agent_installer import (
     build_installer_manifest,
@@ -182,7 +184,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.15.0"
+APP_VERSION = "0.16.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -265,6 +267,12 @@ class MiniMovePayload(BaseModel):
 class MiniAgentCommandPayload(BaseModel):
     command: str = Field(min_length=1, max_length=32)
     payload: dict[str, Any] | None = None
+    action_proof: str = Field(default="", max_length=2048)
+
+
+class MiniAgentDetachPayload(BaseModel):
+    source_id: int = Field(gt=0)
+    confirm_name: str = Field(min_length=1, max_length=128)
     action_proof: str = Field(default="", max_length=2048)
 
 
@@ -676,6 +684,11 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(AgentDetachedError)
+async def agent_detached_error(request: Request, exc: AgentDetachedError) -> JSONResponse:
+    return JSONResponse(status_code=status.HTTP_410_GONE, content={"detail": str(exc)}, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -772,6 +785,7 @@ async def agent_heartbeat(
     # For per-agent keys we pin source_name on server side to keep identity stable.
     if auth.source_name and payload.source_name != auth.source_name:
         payload = payload.model_copy(update={"source_name": auth.source_name})
+    await ensure_agent_attached(session, payload.source_name, lock=False)
 
     if auth.credential_id and payload.e2e_public_jwk:
         credential = await session.get(AgentCredential, auth.credential_id)
@@ -930,6 +944,7 @@ async def agent_workspace_asset_upload(
     source_name = str(auth.source_name or requested_source).strip()
     if not source_name or (auth.source_name and requested_source and auth.source_name != requested_source):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
+    await ensure_agent_attached(session, source_name, lock=False)
     command = await session.get(AgentCommand, int(command_id))
     expected_kind = {"screenshot": "screenshot", "file_download": "file_download"}.get(command.command if command else "")
     if command is None or command.source_name != source_name or command.status != "delivered" or expected_kind != kind:
@@ -971,6 +986,7 @@ async def agent_workspace_asset_download(
     if auth.source_name and requested_source and auth.source_name != requested_source:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
     source_name = str(auth.source_name or requested_source).strip()
+    await ensure_agent_attached(session, source_name, lock=False)
     loaded = await asyncio.to_thread(load_workspace_asset, settings, token, source_name=source_name)
     if loaded is None or loaded[0].get("kind") != "file_upload":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Temporary upload is unavailable")
@@ -1003,6 +1019,7 @@ async def agent_archive_media(
     if auth.source_name and requested_source and requested_source != auth.source_name:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent source mismatch")
     source_name = str(auth.source_name or requested_source).strip()
+    await ensure_agent_attached(session, source_name, lock=False)
     if not source_name or not await is_archive_target(session, source_name):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Archive is disabled for this agent")
     asset = await session.get(MediaAsset, asset_id)
@@ -1303,6 +1320,7 @@ def _public_origin(request: Request) -> tuple[str, str]:
 
 
 app.include_router(build_server_migration_router(settings, require_mini_owner, _require_pwa_action_proof, _public_origin))
+app.include_router(build_music_router(settings, require_mini_owner, _public_origin))
 
 
 @app.get("/api/pwa/config")
@@ -1663,7 +1681,7 @@ async def mini_passkey_delete(
 
 
 def _now_source_label(value: str) -> str:
-    return {"pc_agent": "PC", "iphone": "iPhone", "vk": "VK"}.get(value, value or "pc_agent")
+    return {"pc_agent": "PC", "iphone": "iPhone", "vk": "VK", "xass_music": "XASS Music"}.get(value, value or "pc_agent")
 
 
 def _build_mini_status(profile: dict[str, Any]) -> dict[str, Any]:
@@ -2898,6 +2916,32 @@ async def mini_agent_file_upload(
         {"source_name": source.source_name, "root": root_name, "path": relative_path, "filename": metadata["filename"], "command_id": command.id},
     )
     return {"ok": True, "command": {"id": command.id, "status": command.status}, "filename": metadata["filename"]}
+
+
+@app.delete("/api/mini/agents/{source_name}")
+async def mini_agent_detach(
+    source_name: str,
+    payload: MiniAgentDetachPayload,
+    x_telegram_init_data: str | None = Header(default=None),
+    user: MiniAppUser = Depends(require_mini_owner),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    if payload.confirm_name != source_name:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Подтвердите отвязку выбранного агента")
+    await _require_pwa_action_proof(
+        session=session, user=user, telegram_init_data=x_telegram_init_data or "",
+        action_proof=payload.action_proof, purpose=f"agent:detach:{payload.source_id}:{source_name}",
+    )
+    try:
+        result = await detach_agent(
+            session, source_name=source_name, source_id=payload.source_id, actor_user_id=user.user_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {"ok": True, "detached": True, "already_detached": result.source is None,
+            "cancelled_commands": result.cancelled_commands, "archives_preserved": True}
 
 
 @app.post("/api/mini/agents/{source_name}/commands")

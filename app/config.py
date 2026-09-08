@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Annotated, Any
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -40,6 +40,9 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./data/serverredus.db"
     media_root: str = "./data/media"
+    music_root: str = "./data/music-library"
+    music_max_upload_bytes: int = Field(default=128 * 1024 * 1024, gt=0, le=256 * 1024 * 1024)
+    music_min_free_bytes: int = Field(default=512 * 1024 * 1024, ge=0)
     export_root: str = "./data/exports"
     profile_json_path: str = "./data/profile.json"
     profile_backups_dir: str = "./data/backups"
