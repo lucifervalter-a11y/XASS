@@ -27,6 +27,8 @@ targets:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: XASS
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSFaceIDUsageDescription: "Защитить управление устройствами XASS и вашу библиотеку."
         UIBackgroundModes: [audio]
         UILaunchScreen: {}

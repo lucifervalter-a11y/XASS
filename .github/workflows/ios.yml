@@ -29,7 +29,8 @@ jobs:
           set -euo pipefail
           simulator_id=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for devices in d["devices"].values() for x in devices if x["name"].startswith("iPhone")))')
           echo "XASS_SIMULATOR_ID=$simulator_id" >> "$GITHUB_ENV"
-          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO
+          # One short test bundle exercises the system audio session; extra simulator clones add no value.
+          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO
       - name: Capture first-run native UI (no account or server)
         working-directory: ios
         run: |
@@ -50,10 +51,14 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild build -project XASS.xcodeproj -scheme XASS -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          expected_version=$(python3 -c 'import pathlib,re; print(re.search(r"MARKETING_VERSION: \"([^\"]+)\"", pathlib.Path("project.yml").read_text()).group(1))')
+          actual_version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' build/device/Build/Products/Release-iphoneos/XASS.app/Info.plist)
+          test "$actual_version" = "$expected_version" || { echo "Packaged version does not match project.yml"; exit 1; }
           mkdir -p build/package/Payload
           cp -R build/device/Build/Products/Release-iphoneos/XASS.app build/package/Payload/
           cd build/package
           ditto -c -k --sequesterRsrc --keepParent Payload XASS-unsigned.ipa
+          python3 -c 'import plistlib,sys,zipfile; archive=zipfile.ZipFile("XASS-unsigned.ipa"); info=plistlib.loads(archive.read("Payload/XASS.app/Info.plist")); assert info["CFBundleShortVersionString"] == sys.argv[1], "IPA version mismatch"; assert info["CFBundleSupportedPlatforms"] == ["iPhoneOS"], "IPA is not an iPhone device build"' "$expected_version"
           shasum -a 256 XASS-unsigned.ipa > XASS-unsigned.ipa.sha256
           cp ../../UNSIGNED.md .
       - uses: actions/upload-artifact@v4
