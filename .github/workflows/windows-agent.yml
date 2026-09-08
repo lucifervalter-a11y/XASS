@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  inspect:
+  recover:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Read-only orphan snapshot diagnostics
+      - name: Stop only confirmed orphan snapshot and reclaim its incomplete files
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -25,60 +25,112 @@ jobs:
         run: |
           bash deploy/github_ssh.sh exec <<'REMOTE'
           cd /home/red/serverredus
-          printf 'CHECKOUT\n'
-          git rev-parse HEAD
-          git status --short --untracked-files=no
-          printf 'BACKEND STATUS\n'
-          systemctl is-active serverredus-backend.service || true
-          printf 'FILESYSTEM CAPACITY\n'
-          df -h
-          printf 'TARGETED SNAPSHOT INSPECTION\n'
-          python3 - <<'PY_READONLY'
-          import json, os, subprocess, time
+          sudo -n python3 - <<'PY_RECOVER'
+          import json, os, select, signal, stat, subprocess, time
           from pathlib import Path
+          root = Path("/home/red/serverredus")
           scope = Path("/home/red/.xass-predeploy/9663f007b0facf8d3c6625eb4189c7b3d16ef7e5-34169586139-1")
-          token = scope.name.encode()
-          print(json.dumps({"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "snapshot_scope": str(scope), "exists": scope.is_dir()}))
-          found = []
-          for proc in Path("/proc").iterdir():
-              if not proc.name.isdecimal():
-                  continue
+          archive = scope / ".snapshot-qakktlrg" / "server.tar.gz"
+          encrypted = scope / "server.xass-server"
+          pid = 522841
+          old_head = "0febf036824ede0e38099bc58cee0b1150166fb7"
+          head = lambda: subprocess.check_output(["git", "-c", "safe.directory=/home/red/serverredus", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+          def validate_paths():
+              if scope.is_symlink() or scope.resolve(strict=True) != scope:
+                  raise RuntimeError("Snapshot scope is linked or moved; refusing action")
+              for target in (archive, encrypted):
+                  if target.is_symlink() or target.resolve() != target:
+                      raise RuntimeError("Target is linked or outside its exact expected location")
+                  if target.exists() and not stat.S_ISREG(target.stat().st_mode):
+                      raise RuntimeError("Target is not a regular file")
+          def identity():
+              proc = Path("/proc") / str(pid)
+              argv = (proc / "cmdline").read_bytes().split(b"\0")
+              if argv.count(scope.name.encode()) != 1 or b"-" not in argv:
+                  raise RuntimeError("PID no longer matches the exact backup run")
+              if Path(os.readlink(proc / "cwd")) != root:
+                  raise RuntimeError("Backup cwd no longer matches")
+              matching = []
+              for fd in (proc / "fd").iterdir():
+                  try:
+                      link = os.readlink(fd)
+                  except FileNotFoundError:
+                      continue
+                  if link.startswith(str(scope) + "/"):
+                      matching.append(link)
+              if not matching:
+                  raise RuntimeError("PID no longer has an open file in the exact snapshot scope")
+              start = (proc / "stat").read_text().rsplit(") ", 1)[1].split()[19]
+              return start
+          validate_paths()
+          print(json.dumps({"head_before": head(), "pid_digits": list(str(pid))}), flush=True)
+          interrupted = False
+          try:
+              handle = os.pidfd_open(pid, 0)
+          except ProcessLookupError:
+              handle = None
+          if handle is not None:
               try:
-                  argv = (proc / "cmdline").read_bytes().split(b"\0")
-                  descriptor_paths = []
-                  for fd in (proc / "fd").iterdir():
+                  if not select.select([handle], [], [], 0)[0]:
+                      started = identity()
+                      signal.pidfd_send_signal(handle, signal.SIGTERM)
+                      interrupted = True
+                      print("Sent TERM to verified snapshot pidfd", flush=True)
+                      if not select.select([handle], [], [], 8)[0]:
+                          if identity() != started:
+                              raise RuntimeError("Process identity changed; refusing escalation")
+                          signal.pidfd_send_signal(handle, signal.SIGKILL)
+                          print("Sent KILL to the same reverified snapshot pidfd", flush=True)
+                          if not select.select([handle], [], [], 5)[0]:
+                              raise RuntimeError("Snapshot process has not exited; no files removed")
+                  print("Snapshot pidfd confirms process exit", flush=True)
+              finally:
+                  os.close(handle)
+          else:
+              print("Snapshot process was already absent", flush=True)
+          # Never remove a potentially completed backup when its temporary archive is gone.
+          validate_paths()
+          current_head = head()
+          if not archive.exists():
+              print(json.dumps({"cleanup": "preserved_finished_or_unknown_backup", "head_after": current_head}), flush=True)
+          elif not interrupted and (current_head != old_head or (encrypted.exists() and encrypted.stat().st_size >= archive.stat().st_size)):
+              print(json.dumps({"cleanup": "preserved_without_proof_of_interruption", "head_after": current_head}), flush=True)
+          else:
+              # Run as root so inaccessible process descriptors cannot hide another writer.
+              holders = []
+              for proc in Path("/proc").iterdir():
+                  if not proc.name.isdecimal():
+                      continue
+                  try:
+                      descriptors = list((proc / "fd").iterdir())
+                  except FileNotFoundError:
+                      continue
+                  for fd in descriptors:
                       try:
                           link = os.readlink(fd)
-                          if link == str(scope) or link.startswith(str(scope) + "/"):
-                              descriptor_paths.append({"fd": fd.name, "path": link})
-                      except OSError:
-                          pass
-                  if token not in argv and not descriptor_paths:
-                      continue
-                  status = dict(line.split(":", 1) for line in (proc / "status").read_text().splitlines() if ":" in line)
-                  parent = status.get("PPid", "").strip()
-                  metrics = subprocess.check_output(["ps", "-p", proc.name, "-o", "etimes=,pcpu=,stat="], text=True).strip()
-                  found.append({"pid_digits": list(proc.name), "parent_pid_digits": list(parent),
-                                "name": status.get("Name", "").strip(), "elapsed_cpu_state": metrics,
-                                "cwd": os.readlink(proc / "cwd"), "exact_snapshot_argument_match": token in argv,
-                                "open_snapshot_files": descriptor_paths})
-              except (OSError, subprocess.CalledProcessError):
-                  continue
-          print(json.dumps({"matched_processes": found}, ensure_ascii=True))
-          if scope.is_dir():
-              for directory, children, files in os.walk(scope, followlinks=False):
-                  relative = Path(directory).relative_to(scope)
-                  if len(relative.parts) >= 2:
-                      children[:] = []
-                  for child in children:
-                      if child.startswith(".snapshot-"):
-                          print(json.dumps({"snapshot_work_directory": str(Path(directory) / child)}))
-                  for name in files:
-                      if name not in {"before-revision", "server.tar.gz", "server.xass-server"}:
+                      except FileNotFoundError:
                           continue
-                      path = Path(directory) / name
-                      if not path.is_symlink():
-                          info = path.stat()
-                          print(json.dumps({"file": str(path), "bytes": info.st_size, "modified_epoch": info.st_mtime}))
-          PY_READONLY
+                      if link == str(scope) or link.startswith(str(scope) + "/"):
+                          holders.append(list(proc.name))
+                          break
+              if holders:
+                  print(json.dumps({"remaining_holder_pid_digits": holders}), flush=True)
+                  raise RuntimeError("Snapshot files are still open; no files removed")
+              validate_paths()
+              removed = []
+              for target in (archive, encrypted):
+                  if target.exists():
+                      info = target.stat()
+                      target.unlink()
+                      removed.append({"file": str(target), "bytes": info.st_size, "allocated_bytes": info.st_blocks * 512})
+              print(json.dumps({"cleanup": "removed_exact_incomplete_artifacts", "files": removed,
+                                "total_bytes_removed": sum(item["bytes"] for item in removed), "head_after": head()}), flush=True)
+          PY_RECOVER
+          printf 'HEAD AFTER\n'
+          git rev-parse HEAD
+          printf 'BACKEND HEALTH\n'
+          systemctl is-active serverredus-backend.service
+          curl --fail --silent --show-error --max-time 8 http://127.0.0.1:8000/health
+          printf '\nFILESYSTEM CAPACITY\n'
+          df -h
           REMOTE
