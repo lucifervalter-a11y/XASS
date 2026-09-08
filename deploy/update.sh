@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 022
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -10,6 +11,13 @@ echo "[INFO] Fetching origin/main..."
 before="$(git rev-parse HEAD)"
 git fetch --prune origin main
 git merge --ff-only origin/main
+echo "[INFO] Restoring readable permissions on tracked public web files..."
+if [[ -x ".venv/bin/python" ]]; then
+  .venv/bin/python deploy/repair_public_permissions.py
+else
+  command -v python3 >/dev/null 2>&1 || { echo "[ERROR] python3 is not installed"; exit 1; }
+  python3 deploy/repair_public_permissions.py
+fi
 after="$(git rev-parse HEAD)"
 mapfile -t changed_files < <(git diff --name-only "$before" "$after")
 

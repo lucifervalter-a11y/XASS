@@ -56,6 +56,14 @@ jobs:
             echo '[INFO] Fetching release for bounded rollback backup...'
             git fetch --prune origin main
             git show '${{ github.sha }}:deploy/predeploy_backup.py' | .venv/bin/python - '${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}'
+            # Backup files stay private; new public checkout files must be readable by PHP-FPM/nginx.
+            umask 022
             bash deploy/update.sh
+            # Also covers upgrading from an older, already-running update.sh.
+            .venv/bin/python deploy/repair_public_permissions.py
             git merge-base --is-ancestor '${{ github.sha }}' HEAD
+            for path in miniapp.php assets/miniapp-device-key.js health; do
+              curl --fail --silent --show-error --retry 2 --retry-all-errors --connect-timeout 8 --max-time 20 "https://redvps.site/$path" > /dev/null
+            done
+            echo '[OK] Public Mini App, assets and backend are reachable.'
             REMOTE

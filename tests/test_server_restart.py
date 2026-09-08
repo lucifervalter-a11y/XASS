@@ -267,6 +267,7 @@ class UpdateStatusTests(unittest.TestCase):
         self.assertIn("deploy/predeploy_backup.py", workflow)
         self.assertIn("set -euo pipefail", workflow)
         self.assertNotIn("create_snapshot", workflow)
+        self.assertIn("umask 022\n            bash deploy/update.sh", workflow)
 
 
 if __name__ == "__main__":
