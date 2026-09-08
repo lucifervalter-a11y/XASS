@@ -13,7 +13,7 @@
   <a href="https://redvps.site">Сайт</a> ·
   <a href="https://redvps.site/miniapp.php">Mini App</a> ·
   <a href="https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe">Скачать для Windows</a> ·
-  <a href="./ios/README.md">iPhone / IPA</a> ·
+  <a href="https://github.com/lucifervalter-a11y/XASS/releases/download/ios-latest/XASS-unsigned.ipa">Скачать IPA (нужна подпись)</a> ·
   <a href="./docs/OPERATIONS.md">Документация</a>
 </p>
 
@@ -275,6 +275,8 @@ GitHub Actions автоматически:
 - [Перенос сервера](./docs/SERVER_MIGRATION.md)
 - [Шаблон конфигурации](./.env.example)
 - [Последняя стабильная версия Windows](https://github.com/lucifervalter-a11y/XASS/releases/tag/agent-latest)
+- [iPhone: IPA в Releases — требуется своя подпись](https://github.com/lucifervalter-a11y/XASS/releases/tag/ios-latest)
+- [Установка и настройка iOS-приложения](./ios/README.md)
 
 ---
 
