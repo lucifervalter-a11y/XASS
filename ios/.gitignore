@@ -1,0 +1,6 @@
+XASS.xcodeproj/
+Generated/
+build/
+Resources/Assets.xcassets/AppIcon.appiconset/Icon.png
+*.xcuserstate
+xcuserdata/

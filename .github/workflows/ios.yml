@@ -1,0 +1,58 @@
+name: Build XASS iOS (unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "codex/**"]
+    paths: ["ios/**", ".github/workflows/ios.yml", "assets/xass-app-icon-source.png"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install project generator
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: bash ios/prepare.sh
+      - name: Simulator regression tests
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          simulator_id=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for devices in d["devices"].values() for x in devices if x["name"].startswith("iPhone")))')
+          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO
+      - name: Build unsigned iPhone application
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild build -project XASS.xcodeproj -scheme XASS -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          mkdir -p build/package/Payload
+          cp -R build/device/Build/Products/Release-iphoneos/XASS.app build/package/Payload/
+          cd build/package
+          ditto -c -k --sequesterRsrc --keepParent Payload XASS-unsigned.ipa
+          shasum -a 256 XASS-unsigned.ipa > XASS-unsigned.ipa.sha256
+          cp ../../UNSIGNED.md .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XASS-iOS-UNSIGNED-requires-signing
+          path: |
+            ios/build/package/XASS-unsigned.ipa
+            ios/build/package/XASS-unsigned.ipa.sha256
+            ios/build/package/UNSIGNED.md
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: XASS-iOS-simulator-test-results
+          path: ios/build/Tests.xcresult
+          if-no-files-found: ignore
+          retention-days: 14
