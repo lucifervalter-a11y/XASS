@@ -25,7 +25,7 @@ jobs:
         run: |
           bash deploy/github_ssh.sh exec <<'REMOTE'
           cd /home/red/serverredus
-          sudo -n python3 - <<'PY_RECOVER'
+          python3 - <<'PY_RECOVER'
           import json, os, select, signal, stat, subprocess, time
           from pathlib import Path
           root = Path("/home/red/serverredus")
@@ -38,6 +38,9 @@ jobs:
           def validate_paths():
               if scope.is_symlink() or scope.resolve(strict=True) != scope:
                   raise RuntimeError("Snapshot scope is linked or moved; refusing action")
+              owner = scope.stat()
+              if owner.st_uid != os.getuid() or stat.S_IMODE(owner.st_mode) != 0o700:
+                  raise RuntimeError("Snapshot scope is not privately owned by this SSH account")
               for target in (archive, encrypted):
                   if target.is_symlink() or target.resolve() != target:
                       raise RuntimeError("Target is linked or outside its exact expected location")
@@ -45,6 +48,8 @@ jobs:
                       raise RuntimeError("Target is not a regular file")
           def identity():
               proc = Path("/proc") / str(pid)
+              if proc.stat().st_uid != os.getuid():
+                  raise RuntimeError("Backup process does not belong to this SSH account")
               argv = (proc / "cmdline").read_bytes().split(b"\0")
               if argv.count(scope.name.encode()) != 1 or b"-" not in argv:
                   raise RuntimeError("PID no longer matches the exact backup run")
@@ -96,12 +101,14 @@ jobs:
           elif not interrupted and (current_head != old_head or (encrypted.exists() and encrypted.stat().st_size >= archive.stat().st_size)):
               print(json.dumps({"cleanup": "preserved_without_proof_of_interruption", "head_after": current_head}), flush=True)
           else:
-              # Run as root so inaccessible process descriptors cannot hide another writer.
+              # The private 0700 scope belongs to this user; inspect every same-owner process.
               holders = []
               for proc in Path("/proc").iterdir():
                   if not proc.name.isdecimal():
                       continue
                   try:
+                      if proc.stat().st_uid != os.getuid():
+                          continue
                       descriptors = list((proc / "fd").iterdir())
                   except FileNotFoundError:
                       continue
