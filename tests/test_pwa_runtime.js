@@ -193,3 +193,20 @@ test('inline and external application scripts are syntactically valid', () => {
     new vm.Script(fs.readFileSync(path.join(root, match[1]), 'utf8'));
   }
 });
+
+test('music release references match the new shell cache without changing control center URLs', async () => {
+  const h = workerHarness();
+  await h.install();
+  assert.deepEqual(await h.caches.keys(), ['xass-shell-v14']);
+  for (const extension of ['css', 'js']) {
+    const music = `/assets/miniapp-music.${extension}?v=0170`;
+    assert(pageSource.includes('"' + music + '"'), 'page must request the new music release');
+    assert.equal(await (await h.caches.match(music)).text(), 'cached:' + music);
+    const old = `/assets/miniapp-music.${extension}?v=0160`;
+    assert(!pageSource.includes(old));
+    assert.equal(await h.caches.match(old), undefined);
+    const control = `/assets/miniapp-control-center.${extension}?v=0160`;
+    assert(pageSource.includes('"' + control + '"'));
+    assert.equal(await (await h.caches.match(control)).text(), 'cached:' + control);
+  }
+});

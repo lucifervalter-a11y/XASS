@@ -52,7 +52,7 @@ body{font-size:15px;background:radial-gradient(70% 30% at 50% -8%,rgba(48,88,214
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style>
 <link rel="stylesheet" href="/assets/miniapp-control-center.css?v=0160">
-<link rel="stylesheet" href="/assets/miniapp-music.css?v=0160">
+<link rel="stylesheet" href="/assets/miniapp-music.css?v=0170">
 </head>
 <body>
 <div class="screen" id="gate"><div class="loader" id="loader"><div class="spin"></div><span>Подключение к XASS…</span></div><div class="login" id="login"><img src="/assets/xass-app-icon-512.png" alt="XASS"><h1>XASS</h1><p>Войдите Telegram-аккаунтом владельца, чтобы управлять системой с iPhone и рабочего стола.</p><div class="widget" id="telegramWidget"></div><button class="btn primary passkey-login" id="passkeyLoginBtn">Войти с Face ID / Passkey</button><div class="ios-help">На iPhone после входа: «Поделиться» → «На экран Домой». XASS откроется как отдельное приложение.</div></div><div class="deny" id="deny"><h2>Нет доступа</h2><p id="denyText">Не удалось подключиться.</p><button class="btn" id="retryBtn">Повторить</button></div></div>
@@ -326,7 +326,7 @@ demo||initData?loadBoot():initPwa();
 </script>
 <script src="/assets/xass-e2e.js?v=0140"></script>
 <script src="/assets/miniapp-control-center.js?v=0160"></script>
-<script src="/assets/miniapp-music.js?v=0160"></script>
+<script src="/assets/miniapp-music.js?v=0170"></script>
 <script src="/assets/miniapp-server-migration.js?v=0140"></script>
 <script src="/assets/miniapp-device-key.js?v=0140"></script>
 </body></html>
