@@ -6,7 +6,8 @@ on:
 
 concurrency:
   group: xass-production
-  cancel-in-progress: true
+  # Interrupting an SSH client can leave a remote deployment running.
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -46,25 +47,15 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
         run: |
             bash deploy/github_ssh.sh exec <<'REMOTE'
-            set -e
+            set -euo pipefail
             cd /home/red/serverredus
             test -z "$(git status --porcelain --untracked-files=no)" || { echo 'Tracked server changes need review; deployment stopped.'; exit 1; }
             umask 077
-            .venv/bin/python - '${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}' <<'PY'
-            import os, secrets, subprocess, sys
-            from pathlib import Path
-            from app.config import Settings
-            from app.services.server_backup import create_snapshot
-            root = Path.cwd().resolve()
-            directory = root.parent / '.xass-predeploy' / sys.argv[1]
-            directory.mkdir(parents=True, exist_ok=False, mode=0o700)
-            os.chmod(directory.parent, 0o700)
-            password = secrets.token_urlsafe(48)
-            (directory / 'passphrase').write_text(password, encoding='utf-8')
-            (directory / 'before-revision').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True), encoding='utf-8')
-            create_snapshot(root, Settings(), directory / 'server.xass-server', password=password)
-            print('Private pre-deployment snapshot created; credentials remain on the VPS.')
-            PY
+            exec 9> /home/red/.xass-deployment.lock
+            flock -w 120 9 || { echo 'Another server deployment is still running.'; exit 1; }
+            echo '[INFO] Fetching release for bounded rollback backup...'
+            git fetch --prune origin main
+            git show '${{ github.sha }}:deploy/predeploy_backup.py' | .venv/bin/python - '${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}'
             bash deploy/update.sh
             git merge-base --is-ancestor '${{ github.sha }}' HEAD
             REMOTE

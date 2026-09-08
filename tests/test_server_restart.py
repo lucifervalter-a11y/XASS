@@ -259,6 +259,15 @@ class UpdateStatusTests(unittest.TestCase):
         self.assertIn("verify_manifest", publication)
         self.assertIn("Downloaded installer checksum mismatch", publication)
 
+    def test_deployment_backup_does_not_copy_media_or_cancel_remote_work(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("flock -w 120", workflow)
+        self.assertIn("deploy/predeploy_backup.py", workflow)
+        self.assertIn("set -euo pipefail", workflow)
+        self.assertNotIn("create_snapshot", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
