@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Read-only configured site probe
+      - name: Read-only deployed 0.15 status verification
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -21,53 +21,84 @@ jobs:
         run: |
           bash deploy/github_ssh.sh exec <<'REMOTE'
           cd /home/red/serverredus
-          .venv/bin/python - <<'PY_PROBE'
-          import asyncio, json, socket, subprocess
-          from urllib.parse import urlsplit, urlunsplit
+          .venv/bin/python - <<'PY_VERIFY'
+          import asyncio, json, subprocess, sys
+          from collections import Counter
+          expected = "fabd9974879b9463646530f29af6f0aac259f48e"
+          current = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          print(json.dumps({"expected_revision": expected, "actual_revision": current, "revision_matches": current == expected}), flush=True)
+          if current != expected:
+              raise SystemExit("Expected deployment is not present; no probes were run")
           import httpx
-          from sqlalchemy import select
+          from sqlalchemy import event, select
+          from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
           from app.config import Settings
-          from app.db import SessionLocal, engine
-          from app.models import AppConfig
-          def safe_url(raw):
-              try:
-                  parts = urlsplit(raw)
-                  return urlunsplit((parts.scheme, parts.hostname or "", parts.path, "", ""))
-              except ValueError:
-                  return "invalid"
+          from app.models import AppConfig, HeartbeatSource
+          from app.services.agent_installer import installer_public_info
+          from app.services.control_status import PublicSiteProbe, agent_attention, source_is_online, summarize_control_status
+          from app.services.monitoring import collect_server_metrics
+          from app.services.notifications import EVENT_TYPES, notification_review_groups, unread_notification_count
           async def main():
               settings = Settings()
-              async with SessionLocal() as session:
-                  service_url = await session.scalar(select(AppConfig.service_base_url).limit(1)) or ""
-              raw = (settings.profile_public_url or service_url).strip()
-              print(json.dumps({"profile_public_url": safe_url(settings.profile_public_url), "service_base_url": safe_url(service_url)}), flush=True)
-              parts = urlsplit(raw)
-              if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
-                  print("Configured target invalid or credential-bearing; no probe performed")
-                  return
-              target = raw if parts.path.strip("/") else raw.rstrip("/") + "/profile.php"
-              started = asyncio.get_running_loop().time()
+              async with httpx.AsyncClient(timeout=8, trust_env=False) as client:
+                  health_response = await client.get("http://127.0.0.1:8000/health")
+                  version_response = await client.get("http://127.0.0.1:8000/api/mini/ping")
+              live_version = version_response.json().get("app_version") if version_response.status_code == 200 else ""
+              print(json.dumps({"live_backend_status": health_response.status_code, "live_app_version": live_version}), flush=True)
+              if health_response.status_code != 200 or live_version != "0.15.0":
+                  raise RuntimeError("New backend is not ready")
+              engine = create_async_engine(settings.database_url, echo=False)
+              @event.listens_for(engine.sync_engine, "before_cursor_execute")
+              def read_only(connection, cursor, statement, parameters, context, executemany):
+                  if not statement.lstrip().upper().startswith("SELECT"):
+                      raise RuntimeError("Non-SELECT database statement blocked")
               try:
-                  async with httpx.AsyncClient(timeout=3, follow_redirects=True, trust_env=False) as client:
-                      response = await client.get(target)
-                  print(json.dumps({"probe": "current_backend_httpx", "url": safe_url(target), "status": response.status_code,
-                                    "seconds": round(asyncio.get_running_loop().time()-started,3)}), flush=True)
-              except Exception as exc:
-                  chain = []
-                  cause = exc
-                  dns = False
-                  while cause is not None and len(chain) < 8:
-                      chain.append(type(cause).__name__)
-                      dns = dns or isinstance(cause, socket.gaierror) or "name resolution" in str(cause).lower()
-                      cause = cause.__cause__
-                  print(json.dumps({"probe": "current_backend_httpx", "url": safe_url(target), "errors": chain, "dns_error": dns,
-                                    "seconds": round(asyncio.get_running_loop().time()-started,3)}), flush=True)
-              resolve = f"{parts.hostname}:{parts.port or (443 if parts.scheme == 'https' else 80)}:127.0.0.1"
-              response = subprocess.run(["curl", "--silent", "--show-error", "--connect-timeout", "5", "--max-time", "8",
-                                         "--resolve", resolve, "-o", "/dev/null", "-w", "%{http_code} %{time_total}", target],
-                                         capture_output=True, text=True)
-              print(json.dumps({"probe": "same_host_loopback_tls", "status_seconds": response.stdout.strip(), "exit_code": response.returncode}), flush=True)
-              await engine.dispose()
-          asyncio.run(main())
-          PY_PROBE
+                  async with AsyncSession(engine, expire_on_commit=False) as session:
+                      database_ok = bool(await session.scalar(select(1)))
+                      config = await session.scalar(select(AppConfig).where(AppConfig.id == 1))
+                      if config is None:
+                          raise RuntimeError("Application config missing; no initialization attempted")
+                      sources = list(await session.scalars(select(HeartbeatSource)))
+                      public_site = await PublicSiteProbe()((settings.profile_public_url or config.service_base_url or "").strip())
+                      installer = installer_public_info(settings)
+                      latest = str(installer.get("version") or "0.0.0")
+                      rows = []
+                      for source in sources:
+                          online = source_is_online(source, config.heartbeat_timeout_minutes)
+                          reasons, update = agent_attention(source.last_payload if isinstance(source.last_payload, dict) else {},
+                                                            is_online=online, latest_version=latest if source.source_type == "PC_AGENT" else "")
+                          rows.append({"source_name": source.source_name, "is_online": online,
+                                       "attention_reasons": reasons, "requires_update": update})
+                      reviews = await notification_review_groups(session, source_names=[row["source_name"] for row in rows])
+                      unread = await unread_notification_count(session)
+                      system = {"backend": {"available": True, "status": "online"},
+                                "database": {"available": database_ok, "status": "online" if database_ok else "error"},
+                                "telegram_bot": {"available": bool(settings.bot_token), "status": "online" if settings.bot_token else "not_configured"},
+                                "public_site": public_site}
+                      health, attention = summarize_control_status(system, rows, metrics=collect_server_metrics(top_processes_limit=0), review_groups=reviews)
+                      known_reasons = {"offline", "high_cpu", "high_ram", "low_disk", "agent_error", "archive_error",
+                                       "http_error", "invalid_url", "not_configured", "connection_refused", "tls_error", "redirect_loop", "unavailable"}
+                      reasons = Counter()
+                      for issue in attention["active_issues"]:
+                          codes = issue.get("reasons") or [issue.get("reason_code") or issue.get("reason")]
+                          for code in codes:
+                              reasons[code if code in known_reasons else "other"] += 1
+                      review_types = Counter()
+                      for group in reviews:
+                          review_types[group["event_type"] if group["event_type"] in EVENT_TYPES else "other"] += group["count"]
+                      print(json.dumps({"public_site": {key: public_site.get(key) for key in
+                                       ("status", "available", "http_status", "reason", "error", "latency_ms", "cached")}}), flush=True)
+                      print(json.dumps({"health_summary": health, "notifications_unread": unread,
+                                        "attention_counts": {key: attention[key] for key in ("active_count", "review_count", "update_count", "affected_sources")},
+                                        "active_issue_reason_counts": dict(reasons), "review_event_counts": dict(review_types),
+                                        "sources_total": len(rows), "sources_online": sum(row["is_online"] for row in rows),
+                                        "installer_version": latest}), flush=True)
+              finally:
+                  await engine.dispose()
+          try:
+              asyncio.run(main())
+          except Exception as exc:
+              print(json.dumps({"verification_failed_type": type(exc).__name__}), flush=True)
+              raise SystemExit(1)
+          PY_VERIFY
           REMOTE
