@@ -18,34 +18,19 @@ import AVKit
 @MainActor struct RootView: View {
     @ObservedObject var app: AppState
     @ObservedObject var audio: AudioController
-    @State private var showDownloads = false
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let origin = app.origin {
-                VStack(spacing: 0) {
-                    HStack(spacing: 14) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("XASS").font(.headline)
-                            Text(origin.host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                        Spacer()
-                        Button { showDownloads = true } label: { Image(systemName: "arrow.down.circle").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel("Загрузки музыки")
-                        Button { audio.showRoutes = true } label: { Image(systemName: "airplayaudio").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel("Вывод звука AirPlay")
-                        Button { app.showSettings = true } label: { Image(systemName: "gearshape").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel("Настройки приложения")
-                    }.padding(.horizontal, 18).background(Color(.secondarySystemBackground))
-                    if app.hasUnlocked { WebContainer(app: app, origin: origin).id(origin.namespace) }
-                    else { Spacer() }
-                }
+            if let store = app.native {
+                if app.hasUnlocked { NativeShell(app: app, store: store).id(store.api.origin.namespace) }
                 if app.locked || app.privacyCovered { LockView(app: app).zIndex(10) }
             } else { ConnectView(app: app) }
         }
         .background(WindowPrivacyShield().frame(width: 0, height: 0))
-        .sheet(isPresented: $showDownloads) { DownloadsView(audio: audio) }
         .sheet(isPresented: $audio.showRoutes) { RouteSheet().presentationDetents([.height(280)]) }
         .sheet(isPresented: $app.showSettings) { AppSettingsView(app: app) }
         .onChange(of: app.locked) { _, locked in
-            if locked { showDownloads = false; audio.showRoutes = false; app.showSettings = false }
+            if locked { audio.showRoutes = false; app.showSettings = false }
         }
     }
 }

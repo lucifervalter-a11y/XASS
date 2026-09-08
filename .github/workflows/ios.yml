@@ -31,7 +31,7 @@ jobs:
           echo "XASS_SIMULATOR_ID=$simulator_id" >> "$GITHUB_ENV"
           # One short test bundle exercises the system audio session; extra simulator clones add no value.
           xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO
-      - name: Capture first-run native UI (no account or server)
+      - name: Capture real native screens (isolated simulator data, no account or audio)
         working-directory: ios
         run: |
           set -euo pipefail
@@ -46,6 +46,11 @@ jobs:
           sleep 2
           mkdir -p build/package
           xcrun simctl io "$XASS_SIMULATOR_ID" screenshot build/package/iOS-first-connection.png
+          for screen in library player devices routes storage; do
+            xcrun simctl launch --terminate-running-process "$XASS_SIMULATOR_ID" app.xass.mobile --native-ui-fixture --native-ui-screen "$screen"
+            sleep 3
+            xcrun simctl io "$XASS_SIMULATOR_ID" screenshot "build/package/iOS-native-$screen.png"
+          done
       - name: Build unsigned iPhone application
         working-directory: ios
         run: |
@@ -69,6 +74,7 @@ jobs:
             ios/build/package/XASS-unsigned.ipa.sha256
             ios/build/package/UNSIGNED.md
             ios/build/package/iOS-first-connection.png
+            ios/build/package/iOS-native-*.png
           if-no-files-found: error
           retention-days: 30
       - uses: actions/upload-artifact@v4

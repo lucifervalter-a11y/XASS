@@ -272,6 +272,11 @@ struct NativePlaybackQueue {
         let value = duration > 0 ? min(seconds, duration) : min(seconds, 86400)
         player.seek(to: CMTime(seconds: value, preferredTimescale: 600)); position = value; publish(forceReport: true)
     }
+    func exactPosition() -> Double {
+        let current = player.currentTime().seconds
+        return current.isFinite ? max(0, current) : position
+    }
+    var hasPlayableItem: Bool { player.currentItem != nil }
     private func updateTime() {
         guard player.currentItem != nil else { return }
         let current = player.currentTime().seconds, total = player.currentItem?.duration.seconds ?? 0
@@ -324,6 +329,7 @@ struct NativePlaybackQueue {
         guard let key = value["session_key"] as? String, key.count >= 16, key.count <= 64,
               key.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else { return }
         var snapshot: [String: Any] = ["session_key": key, "device": "local", "takeover": false]
+        if let client = value["client_id"] as? String, client.count <= 160 { snapshot["client_id"] = client }
         if let share = value["share_site"] as? Bool { snapshot["share_site"] = share }
         if let share = value["share_discord"] as? Bool { snapshot["share_discord"] = share }
         sessionSnapshot = snapshot

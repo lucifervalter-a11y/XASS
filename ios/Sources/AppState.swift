@@ -11,16 +11,28 @@ import WebKit
     @Published private(set) var hasUnlocked = false
     @Published var error: String?
     @Published var showSettings = false
+    @Published var native: NativeStore?
+    @Published var nativeConfirmation = false
     @Published private(set) var clearingSession = false
     let audio = AudioController()
     private var authContext: LAContext?
     private var authGeneration = UUID()
     private var foreground = false
     private var pendingUnlock = false
+    private var pendingNativePair: String?
 
     init() {
+        #if DEBUG && targetEnvironment(simulator)
+        if NativeFixture.enabled, let server = try? ServerOrigin("https://native-fixture.invalid") {
+            origin = server; entryURL = server.entryURL
+            native = NativeStore(api: NativeFixture(origin: server), audio: audio)
+            native?.installFixture(); locked = false; privacyCovered = false; hasUnlocked = true
+            return
+        }
+        #endif
         if let data = SecureStore.load("origin"), let text = String(data: data, encoding: .utf8), let server = try? ServerOrigin(text) {
             origin = server; entryURL = server.entryURL; audio.configure(server)
+            configureNative(server)
         }
     }
     func connect(address: String, pair: String) {
@@ -29,27 +41,52 @@ import WebKit
             let server = try ServerOrigin(address)
             // A pasted complete pair link can be used directly as the address.
             let input = pair.isEmpty && address.contains("#pair=") ? address : pair
-            let entry = try server.loginURL(pairInput: input)
+            _ = try server.loginURL(pairInput: input)
             try SecureStore.save(Data(server.url.absoluteString.utf8), name: "origin")
-            origin = server; entryURL = entry; audio.configure(server)
+            origin = server; entryURL = server.entryURL; audio.configure(server); configureNative(server)
+            pendingNativePair = input.isEmpty ? nil : input
             error = nil; locked = true; authenticate()
         } catch { self.error = error.localizedDescription }
     }
     func scene(_ phase: ScenePhase) {
+        #if DEBUG && targetEnvironment(simulator)
+        if NativeFixture.enabled { return }
+        #endif
         foreground = phase == .active
         if phase == .background {
+            native?.foreground(false)
             privacyCovered = true; locked = true; pendingUnlock = false
             authGeneration = UUID(); authContext?.invalidate(); authenticating = false
         } else if phase == .inactive {
             privacyCovered = true
-            if !authenticating { locked = true }
+            if !authenticating && !nativeConfirmation { locked = true }
         } else {
             privacyCovered = false
-            if pendingUnlock { pendingUnlock = false; locked = false; hasUnlocked = true }
+            if pendingUnlock { pendingUnlock = false; locked = false; hasUnlocked = true; activateNative() }
             else if origin != nil && locked && !authenticating { authenticate() }
+            else if !locked { native?.foreground(true) }
         }
     }
-    func cover() { privacyCovered = true; if !authenticating { locked = true } }
+    func cover() {
+        #if DEBUG && targetEnvironment(simulator)
+        if NativeFixture.enabled { return }
+        #endif
+        privacyCovered = true; if !authenticating && !nativeConfirmation { locked = true }
+    }
+    private func configureNative(_ origin: ServerOrigin) {
+        native?.disconnect()
+        let store = NativeStore(api: OwnerAPI(origin: origin), audio: audio)
+        store.confirmationActivity = { [weak self] active in self?.nativeConfirmation = active }
+        store.canSendActions = { [weak self] in guard let self = self else { return false }; return !self.locked && !self.privacyCovered && UIApplication.shared.applicationState == .active }
+        native = store
+    }
+    private func activateNative() {
+        guard let store = native else { return }
+        if let pair = pendingNativePair {
+            pendingNativePair = nil
+            store.run { try await store.enroll(pairInput: pair); store.foreground(true) }
+        } else { store.foreground(true) }
+    }
     func authenticate() {
         guard origin != nil, !authenticating else { return }
         let context = LAContext(); context.localizedCancelTitle = "Отмена"
@@ -64,7 +101,7 @@ import WebKit
                 guard let self = self, self.authGeneration == generation else { return }
                 self.authenticating = false; self.authContext = nil
                 if success {
-                    if self.foreground { self.locked = false; self.hasUnlocked = true }
+                    if self.foreground { self.locked = false; self.hasUnlocked = true; self.activateNative() }
                     else { self.pendingUnlock = true }
                 } else { self.locked = true; self.error = "Подтверждение отменено. Нажмите «Открыть XASS», чтобы повторить." }
             }
@@ -76,7 +113,7 @@ import WebKit
         guard !clearingSession else { return }
         clearingSession = true
         if let origin = origin { SecureStore.remove("session-" + origin.namespace) }
-        SecureStore.remove("origin"); audio.disconnect(); origin = nil; entryURL = nil
+        SecureStore.remove("origin"); native?.disconnect(); native = nil; audio.disconnect(); origin = nil; entryURL = nil; pendingNativePair = nil
         hasUnlocked = false; locked = true; showSettings = false; error = nil
         WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             Task { @MainActor in self?.clearingSession = false }

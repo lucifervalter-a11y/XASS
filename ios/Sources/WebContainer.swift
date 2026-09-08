@@ -5,14 +5,18 @@ import WebKit
     @Published var error: String?
     @Published var loading = true
     @Published var popup: WKWebView?
+    @Published var confirmationMessage: String?
+    private var confirmation: ((Bool) -> Void)?
     let webView: WKWebView
     let origin: ServerOrigin
     private weak var app: AppState?
     private let reporter: SessionReporter
     private var cookieReady = false
     private var closed = false
+    private let bridgeEnabled: Bool
 
-    init(app: AppState, origin: ServerOrigin) {
+    init(app: AppState, origin: ServerOrigin, allowsAudioBridge: Bool = false) {
+        bridgeEnabled = allowsAudioBridge
         self.app = app; self.origin = origin; reporter = SessionReporter(origin: origin)
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
@@ -26,18 +30,21 @@ import WebKit
         // The bridge is only advertised on the configured origin, never Telegram frames.
         let quoted = String(data: try! JSONSerialization.data(withJSONObject: [origin.url.absoluteString]), encoding: .utf8)!
         let script = "if(window.top===window && location.origin===" + quoted + "[0]){window.XASS_NATIVE_AUDIO=true;}"
-        configuration.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        configuration.userContentController.add(self, name: "xassAudio")
-        app.audio.emit = { [weak self] detail in self?.sendEvent(detail) }
-        app.audio.reportSession = { [weak self] body in self?.reporter.post(body) }
-        app.audio.requestTicket = { [weak self] id, completion in
-            guard let self = self else { completion(.failure(XASSErr.invalidMedia)); return }
-            self.reporter.ticket(trackID: id, completion: completion)
+        if bridgeEnabled {
+            configuration.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            configuration.userContentController.add(self, name: "xassAudio")
+            app.audio.emit = { [weak self] detail in self?.sendEvent(detail) }
+            app.audio.reportSession = { [weak self] body in self?.reporter.post(body) }
+            app.audio.requestTicket = { [weak self] id, completion in
+                guard let self = self else { completion(.failure(XASSErr.invalidMedia)); return }
+                self.reporter.ticket(trackID: id, completion: completion)
+            }
         }
         restoreSession()
     }
     func close() {
         closed = true; cookieReady = false
+        resolveConfirmation(false)
         webView.stopLoading(); popup?.stopLoading(); popup = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "xassAudio")
         webView.configuration.websiteDataStore.httpCookieStore.remove(self)
@@ -71,12 +78,13 @@ import WebKit
             if let cookie = cookies.first(where: { self.isSession($0) && ($0.expiresDate ?? .distantFuture) > Date() }) {
                 let saved = SavedSession(value: cookie.value, expires: cookie.expiresDate ?? Date().addingTimeInterval(30 * 86400))
                 if let data = try? JSONEncoder().encode(saved) { try? SecureStore.save(data, name: "session-" + self.origin.namespace) }
+                Task { @MainActor in await self.app?.native?.refresh() }
             } else { SecureStore.remove("session-" + self.origin.namespace) }
         }
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         let frame = message.frameInfo
-        guard let app = app, !app.locked, !app.privacyCovered, app.origin == origin,
+        guard bridgeEnabled, let app = app, !app.locked, !app.privacyCovered, app.origin == origin,
               message.name == "xassAudio", frame.isMainFrame,
               frame.securityOrigin.protocol == "https", frame.securityOrigin.host.lowercased() == origin.host,
               (frame.securityOrigin.port == 0 ? 443 : frame.securityOrigin.port) == origin.port,
@@ -113,6 +121,17 @@ import WebKit
         return child
     }
     func webViewDidClose(_ webView: WKWebView) { if webView === popup { popup = nil } }
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        guard frame.isMainFrame, let url = webView.url, origin.contains(url) else { completionHandler(false); return }
+        resolveConfirmation(false); confirmationMessage = String(message.prefix(1500)); confirmation = completionHandler
+    }
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        guard frame.isMainFrame, let url = webView.url, origin.contains(url) else { completionHandler(); return }
+        resolveConfirmation(false); confirmationMessage = String(message.prefix(1500)); confirmation = { _ in completionHandler() }
+    }
+    func resolveConfirmation(_ accepted: Bool) {
+        let done = confirmation; confirmation = nil; confirmationMessage = nil; done?(accepted)
+    }
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { if webView === self.webView { loading = true; error = nil } }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if webView === self.webView { loading = false; app?.entryURL = origin.entryURL }
@@ -150,6 +169,10 @@ struct WebSurface: UIViewRepresentable {
             NavigationStack { if let popup = controller.popup { WebSurface(webView: popup).navigationTitle("Вход через Telegram").navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { controller.popup = nil } } } }
         }
         .onChange(of: app.locked) { _, locked in if locked { controller.popup?.stopLoading(); controller.popup = nil } }
+        .alert("Подтверждение сайта", isPresented: Binding(get: { controller.confirmationMessage != nil }, set: { if !$0 { controller.resolveConfirmation(false) } })) {
+            Button("Отмена", role: .cancel) { controller.resolveConfirmation(false) }
+            Button("Продолжить") { controller.resolveConfirmation(true) }
+        } message: { Text(controller.confirmationMessage ?? "") }
         .onDisappear { controller.close() }
     }
 }

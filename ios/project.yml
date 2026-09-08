@@ -6,7 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.16.0"
+    MARKETING_VERSION: "0.17.0"
     CURRENT_PROJECT_VERSION: "1"
     TARGETED_DEVICE_FAMILY: "1,2"
     SUPPORTS_MACCATALYST: NO
@@ -41,7 +41,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: false
     scheme:
-      testTargets: [XASSTests]
+      testTargets: [XASSTests, XASSUITests]
       gatherCoverageData: true
   XASSTests:
     type: bundle.unit-test
@@ -53,3 +53,13 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: app.xass.mobile.tests
+  XASSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: XASS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: app.xass.mobile.uitests
