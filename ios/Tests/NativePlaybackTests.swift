@@ -56,17 +56,19 @@ final class NativePlaybackTests: XCTestCase {
     @MainActor func testOfflineAutoNextUsesNativeQueueWithoutAnyWebView() async throws {
         let origin = try ServerOrigin("https://offline-\(UUID().uuidString.lowercased()).invalid")
         let library = try OfflineLibrary(origin: origin)
-        let tracks = [DownloadedTrack(id: 101, title: "First", artist: "Fixture", duration: 0.35), DownloadedTrack(id: 102, title: "Second", artist: "Fixture", duration: 0.35)]
-        for track in tracks { try silenceWAV().write(to: library.file(track.id), options: .atomic) }
+        let tracks = [DownloadedTrack(id: 101, title: "First", artist: "Fixture", duration: 0.35, fileExtension: "wav"), DownloadedTrack(id: 102, title: "Second", artist: "Fixture", duration: 0.35, fileExtension: "wav")]
+        for track in tracks { try silenceWAV().write(to: library.file(for: track), options: .atomic) }
         try library.save(tracks)
         defer { try? FileManager.default.removeItem(at: library.directory) }
+        let playable = try await AVURLAsset(url: library.file(for: tracks[0])).load(.isPlayable)
+        XCTAssertTrue(playable, "Generated local WAV must be recognized by AVFoundation before testing the queue")
         let audio = AudioController(); audio.configure(origin)
         let second = expectation(description: "Native end event advances to second local track")
         var fulfilled = false
         let observer = audio.$trackID.sink { id in if id == 102 && !fulfilled { fulfilled = true; second.fulfill() } }
         audio.playOffline(tracks[0])
         await fulfillment(of: [second], timeout: 15)
-        XCTAssertEqual(audio.trackID, 102)
+        XCTAssertEqual(audio.trackID, 102, "state=\(audio.state) position=\(audio.position) duration=\(audio.duration) error=\(audio.error ?? "none")")
         audio.stop(); observer.cancel()
     }
 }

@@ -8,6 +8,7 @@ struct DownloadedTrack: Codable, Identifiable {
     var title: String
     var artist: String
     var duration: Double
+    var fileExtension: String? = nil
     var trackID: Int { id }
     var bridge: [String: Any] { ["trackId": id, "title": title, "artist": artist, "duration": duration] }
 }
@@ -22,12 +23,16 @@ struct OfflineLibrary {
         var location = directory; var values = URLResourceValues(); values.isExcludedFromBackup = true
         try location.setResourceValues(values)
     }
-    func file(_ id: Int) -> URL { directory.appendingPathComponent("\(id).audio") }
+    func file(_ id: Int, extension suffix: String = "audio") -> URL {
+        let safe = ["audio", "mp3", "m4a", "wav", "flac", "ogg"].contains(suffix) ? suffix : "audio"
+        return directory.appendingPathComponent("\(id).\(safe)")
+    }
+    func file(for track: DownloadedTrack) -> URL { file(track.id, extension: track.fileExtension ?? "audio") }
     func tracks() -> [DownloadedTrack] {
         guard let data = try? Data(contentsOf: directory.appendingPathComponent("index.json")),
               data.count <= 2 * 1024 * 1024,
               let items = try? JSONDecoder().decode([DownloadedTrack].self, from: data) else { return [] }
-        return items.filter { $0.id > 0 && FileManager.default.fileExists(atPath: file($0.id).path) }
+        return items.filter { $0.id > 0 && FileManager.default.fileExists(atPath: file(for: $0).path) }
     }
     func save(_ items: [DownloadedTrack]) throws {
         let data = try JSONEncoder().encode(items)
@@ -36,7 +41,7 @@ struct OfflineLibrary {
     func remove(_ track: DownloadedTrack) throws {
         guard track.id > 0 else { return }
         // The only removable path is an app-created numeric audio file in this origin's sandbox.
-        let path = file(track.id)
+        let path = file(for: track)
         if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
         try save(tracks().filter { $0.id != track.id })
     }
@@ -215,8 +220,8 @@ struct NativePlaybackQueue {
         guard let origin = origin else { throw XASSErr.invalidOrigin }
         let item: AVPlayerItem
         let nextLoader: SecureMediaLoader?
-        if let library = library, downloads.contains(where: { $0.id == command.trackID }), FileManager.default.fileExists(atPath: library.file(command.trackID).path) {
-            item = AVPlayerItem(url: library.file(command.trackID)); nextLoader = nil
+        if let library = library, let track = downloads.first(where: { $0.id == command.trackID }), FileManager.default.fileExists(atPath: library.file(for: track).path) {
+            item = AVPlayerItem(url: library.file(for: track)); nextLoader = nil
         } else {
             let url = try origin.mediaURL(command.rawURL, trackID: command.trackID)
             let created = SecureMediaLoader(origin: origin, trackID: command.trackID, url: url)
@@ -302,7 +307,7 @@ struct NativePlaybackQueue {
                 try self.play(command)
             } catch { self.state = "error"; self.error = "Не удалось включить следующий трек. Проверьте сеть или сохраните очередь на iPhone."; self.publish(forceReport: true) }
         }
-        if let library = library, downloads.contains(where: { $0.id == track.id }), FileManager.default.fileExists(atPath: library.file(track.id).path) { start(""); return }
+        if let library = library, let saved = downloads.first(where: { $0.id == track.id }), FileManager.default.fileExists(atPath: library.file(for: saved).path) { start(""); return }
         guard let request = requestTicket else { state = "error"; error = "Для следующего трека нужен вход на сервер."; publish(forceReport: true); return }
         state = "loading"; publish()
         request(track.id) { [weak self] result in
@@ -336,9 +341,9 @@ struct NativePlaybackQueue {
                 guard let self = self, self.origin == origin else { return }
                 self.jobs.removeValue(forKey: command.trackID); self.downloadIDs.remove(command.trackID)
                 do {
-                    _ = try result.get()
+                    let file = try result.get()
                     var tracks = library.tracks().filter { $0.id != command.trackID }
-                    tracks.append(DownloadedTrack(id: command.trackID, title: command.title, artist: command.artist, duration: self.trackID == command.trackID ? self.duration : 0))
+                    tracks.append(DownloadedTrack(id: command.trackID, title: command.title, artist: command.artist, duration: self.trackID == command.trackID ? self.duration : 0, fileExtension: file.pathExtension))
                     try library.save(tracks); self.downloads = tracks
                     self.emit?(["action": "download", "trackId": command.trackID, "downloaded": true])
                 } catch { self.error = "Загрузка не завершена. Проверьте сеть и свободное место, затем повторите."; self.emit?(["action": "download", "trackId": command.trackID, "downloaded": false, "error": self.error!]) }

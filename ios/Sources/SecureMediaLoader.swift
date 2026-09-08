@@ -170,13 +170,18 @@ final class PrivateDownload: NSObject, URLSessionDownloadDelegate {
         }
         do {
             let manager = FileManager.default
+            // Preserve the actual container type for AVFoundation's local-file detection.
+            let types = ["audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mp4": "m4a", "audio/x-m4a": "m4a",
+                "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/flac": "flac",
+                "audio/x-flac": "flac", "audio/ogg": "ogg", "application/ogg": "ogg"]
+            let target = destination.deletingPathExtension().appendingPathExtension(types[response.mimeType ?? ""] ?? "audio")
             try manager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             try manager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: location.path)
-            if manager.fileExists(atPath: destination.path) { _ = try manager.replaceItemAt(destination, withItemAt: location) }
-            else { try manager.moveItem(at: location, to: destination) }
-            var file = destination; var values = URLResourceValues(); values.isExcludedFromBackup = true
+            if manager.fileExists(atPath: target.path) { _ = try manager.replaceItemAt(target, withItemAt: location) }
+            else { try manager.moveItem(at: location, to: target) }
+            var file = target; var values = URLResourceValues(); values.isExcludedFromBackup = true
             try file.setResourceValues(values)
-            complete(.success(destination))
+            complete(.success(target))
         } catch { complete(.failure(error)) }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
