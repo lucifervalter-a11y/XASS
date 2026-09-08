@@ -99,6 +99,7 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --add-data "$BuildInfo;." `
     --add-data "$(Join-Path $ClientRoot 'assets\xass.ico');assets" `
     --add-data "$(Join-Path $ClientRoot 'assets\xass-icon.png');assets" `
+    --add-data "$(Join-Path $ClientRoot 'assets\xass-desktop-hero.png');assets" `
     --collect-data tkinterdnd2 `
     --collect-all cryptography `
     --hidden-import pystray._win32 `

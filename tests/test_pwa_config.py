@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import BackgroundTasks, Response
 from starlette.requests import Request
@@ -34,6 +34,12 @@ def make_request(*, host: str, proto: str) -> Request:
 
 
 class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def sessions(public_url: str = "") -> MagicMock:
+        factory = MagicMock()
+        factory.return_value.__aenter__.return_value = SimpleNamespace(scalar=AsyncMock(return_value=public_url))
+        return factory
+
     async def test_reports_local_readiness_without_claiming_botfather_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             settings = SimpleNamespace(
@@ -47,6 +53,7 @@ class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "bot_client", None),
                 patch.object(main, "pwa_authenticate_session", return_value=None),
                 patch.object(main, "passkey_count_credentials", AsyncMock(return_value=0)),
+                patch.object(main, "SessionLocal", self.sessions()),
             ):
                 payload = await main.pwa_config(make_request(host="xass.example", proto="https"))
 
@@ -71,11 +78,25 @@ class PwaConfigTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "bot_client", None),
                 patch.object(main, "pwa_authenticate_session", return_value=None),
                 patch.object(main, "passkey_count_credentials", AsyncMock(return_value=0)),
+                patch.object(main, "SessionLocal", self.sessions()),
             ):
                 payload = await main.pwa_config(make_request(host="xass.example", proto="http"))
 
         self.assertFalse(payload["login_ready"])
         self.assertFalse(payload["requirements"]["https"])
+
+    async def test_returns_canonical_miniapp_url_for_legacy_backend_address(self) -> None:
+        settings = SimpleNamespace(bot_token="", telegram_bot_username="xass_bot", owner_user_id=0,
+                                   profile_public_url="redvps.site")
+        with (
+            patch.object(main, "settings", settings),
+            patch.object(main, "bot_client", None),
+            patch.object(main, "pwa_authenticate_session", return_value=None),
+            patch.object(main, "SessionLocal", self.sessions("https://xass.example/profile.php?private=query")),
+        ):
+            payload = await main.pwa_config(make_request(host="redvps.site:8000", proto="http"))
+        self.assertEqual(payload["web_app_url"], "https://xass.example/miniapp.php?standalone=1")
+        self.assertNotIn("private", payload["web_app_url"])
 
     def test_miniapp_contains_one_time_ios_pairing_flow(self) -> None:
         template = Path("miniapp.php").read_text(encoding="utf-8")

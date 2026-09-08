@@ -34,13 +34,13 @@ class ControlCenterTests(unittest.TestCase):
                 "last_error": "network",
                 "archive_status": {"last_error": "disk"},
             },
-            is_online=False,
+            is_online=True,
             latest_version="0.10.0",
         )
         self.assertTrue(needs_update)
         self.assertEqual(
             set(reasons),
-            {"offline", "high_cpu", "high_ram", "low_disk", "agent_error", "archive_error", "update_available"},
+            {"high_cpu", "high_ram", "low_disk", "agent_error", "archive_error", "update_available"},
         )
 
     def test_audit_payload_redacts_credentials_and_is_bounded(self) -> None:

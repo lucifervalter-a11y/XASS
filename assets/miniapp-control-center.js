@@ -183,6 +183,53 @@
     }
   }
 
+  function serviceHealth(key, label, value) {
+    const status = String(value?.status || '').toLowerCase();
+    const unknown = !value || ['unknown', 'not_checked', 'checking', 'unchecked'].includes(status) ||
+      (status === 'not_configured' && value.available !== false);
+    const tone = !unknown && value.available === true ? 'ok' : !unknown && value.available === false ? 'error' : 'unknown';
+    const text = status === 'not_configured' ? 'Не настроен' : tone === 'ok' ? 'Работает' : tone === 'error' ? status === 'invalid_config' ? 'Проверьте адрес' : status === 'error' ? 'Ошибка' : 'Нет связи' : 'Не проверен';
+    return { key, label, tone, text };
+  }
+
+  function overviewSnapshot(boot, demo = false) {
+    const sources = Array.isArray(boot.sources) ? boot.sources : [];
+    const system = boot.system_status || (demo ? Object.fromEntries(
+      ['backend', 'database', 'telegram_bot', 'public_site'].map(key => [key, { available: true, status: 'online' }])
+    ) : {});
+    const services = [['backend', 'Backend'], ['database', 'База'], ['telegram_bot', 'Telegram'], ['public_site', 'Сайт']]
+      .map(([key, label]) => serviceHealth(key, label, system[key]));
+    const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+    const reported = boot.health_summary || {};
+    const measuredChecked = services.filter(item => item.tone !== 'unknown').length;
+    const measuredHealthy = services.filter(item => item.tone === 'ok').length;
+    const validSummary = count(reported.total_services) === services.length && reported.checked_services === measuredChecked && reported.healthy_services === measuredHealthy;
+    const checked = validSummary ? reported.checked_services : measuredChecked;
+    const healthy = validSummary ? reported.healthy_services : measuredHealthy;
+    const total = services.length;
+    const complete = checked === total;
+    // A percentage describes checked services, never notification history or PC count.
+    // Partial checks show coverage instead of implying that the whole system is healthy.
+    const percent = complete ? Math.round(healthy / total * 100) : null;
+    const fallbackIssues = services.filter(item => item.tone === 'error').map(item => ({ reason: item.label + ': ' + item.text.toLowerCase() }));
+    for (const source of sources) {
+      const reasons = Array.isArray(source.attention_reasons) ? [...new Set(source.attention_reasons)].filter(reason => reason !== 'update_available') : [];
+      if (reasons.length) fallbackIssues.push({ source_name: source.source_name, reason: reasons.map(reason => REASONS[reason] || reason).join(', ') });
+      else if (source.requires_attention && !source.requires_update && !source.attention_reasons?.includes('update_available')) fallbackIssues.push({ source_name: source.source_name, reason: 'Требуется проверка устройства' });
+    }
+    const attention = boot.attention_summary || {};
+    const active = count(attention.active_count) ?? fallbackIssues.length;
+    const issues = Array.isArray(attention.active_issues) ? attention.active_issues : fallbackIssues;
+    const review = count(attention.review_count) ?? 0;
+    const updates = count(attention.update_count) ?? sources.filter(source => source.requires_update).length;
+    const online = sources.filter(source => source.is_online).length;
+    const statuses = [...services,
+      { label: 'Агенты', tone: sources.length ? online === sources.length ? 'ok' : 'warn' : 'unknown', text: sources.length ? online + ' / ' + sources.length + ' в сети' : 'Не добавлены' },
+      { label: 'Проблемы', tone: active ? 'warn' : complete ? 'ok' : 'unknown', text: active ? String(active) : complete ? 'Нет активных' : 'Нет данных' },
+    ];
+    return { services, statuses, total, checked, healthy, complete, percent, active, issues, review, updates };
+  }
+
   function renderHomeOverview() {
     const home = $('view-home');
     if (!home || !X.state.boot) return;
@@ -192,21 +239,18 @@
       host.className = 'cc-home-overview';
       home.querySelector('.intro')?.appendChild(host);
     }
-    const boot = X.state.boot, sources = boot.sources || [], online = sources.filter(x => x.is_online).length;
-    const system = boot.system_status || (X.demo ? {
-      backend: { available: true, status: 'online' }, database: { available: true, status: 'online' },
-      telegram_bot: { available: true, status: 'online' }, public_site: { available: true, status: 'online' },
-    } : {});
-    const attention = sources.filter(x => x.requires_attention).length + Number(boot.notifications_unread || 0);
-    const statuses = [
-      ['Backend', system.backend], ['База', system.database],
-      ['Telegram', system.telegram_bot], ['Сайт', system.public_site],
-      ['Агенты', { available: online > 0, status: online + ' / ' + sources.length }],
-      ['Внимание', { available: attention === 0, status: attention ? String(attention) : 'нет' }],
-    ];
-    const healthy = statuses.filter(([, value]) => value?.available).length;
-    const health = Math.round(healthy / statuses.length * 100);
-    host.innerHTML = '<div class="cc-overview-card"><div class="cc-overview-head"><div class="cc-health-ring" style="--health:' + health + '">' + health + '%</div><div><div class="cc-overview-title">Общий статус XASS</div><div class="cc-overview-copy">Сервер, сервисы и устройства в одной сводке</div></div><div class="cc-attention ' + (attention ? '' : 'ok') + '">' + (attention ? attention + ' требуют внимания' : 'Всё спокойно') + '</div></div><div class="cc-status-grid">' + statuses.map(([label, value]) => '<div class="cc-service ' + (value?.available ? 'ok' : '') + '"><div class="cc-service-label">' + label + '</div><div class="cc-service-value"><i class="cc-service-dot"></i><span>' + esc(value?.status === 'online' ? 'Работает' : value?.status || 'Недоступно') + '</span></div></div>').join('') + '</div></div>';
+    const summary = overviewSnapshot(X.state.boot, X.demo);
+    const expanded = Boolean(host.querySelector('.cc-health-details')?.open);
+    const ringText = summary.complete ? summary.percent + '%' : summary.checked ? summary.checked + '/' + summary.total : '—';
+    const copy = summary.complete ? 'Работают ' + summary.healthy + ' из ' + summary.total + ' сервисов' : 'Проверено ' + summary.checked + ' из ' + summary.total + ' сервисов';
+    const tone = summary.active ? 'warn' : !summary.complete ? 'unknown' : summary.review ? 'info' : 'ok';
+    const attentionText = summary.active ? 'Текущие проблемы: ' + summary.active : !summary.complete ? 'Проверка не завершена' : summary.review ? 'Есть события к проверке' : 'Активных проблем нет';
+    const notes = summary.services.filter(item => item.tone === 'unknown').map(item => item.label + ': ' + item.text.toLowerCase());
+    notes.push(...summary.issues.slice(0, 6).map(item => [item.source_name, REASONS[item.reason] || item.reason || 'Требуется проверка'].filter(Boolean).join(': ')));
+    if (summary.active > Math.min(summary.issues.length, 6)) notes.push('Другие текущие проблемы: ' + (summary.active - Math.min(summary.issues.length, 6)));
+    if (summary.review) notes.push('События к проверке в уведомлениях: ' + summary.review);
+    if (summary.updates) notes.push('Доступны обновления для ПК: ' + summary.updates);
+    host.innerHTML = '<div class="cc-overview-card"><div class="cc-overview-head"><div class="cc-health-ring ' + (summary.complete ? summary.percent < 100 ? 'warn' : '' : 'unknown') + '" style="--health:' + (summary.percent ?? Math.round(summary.checked / summary.total * 100)) + '" aria-label="' + esc(copy) + '">' + ringText + '</div><div><div class="cc-overview-title">Общий статус XASS</div><div class="cc-overview-copy">' + copy + '</div></div><div class="cc-attention ' + tone + '">' + attentionText + '</div></div><div class="cc-status-grid">' + summary.statuses.map(item => '<div class="cc-service ' + item.tone + '"><div class="cc-service-label">' + item.label + '</div><div class="cc-service-value"><i class="cc-service-dot" aria-hidden="true"></i><span>' + esc(item.text) + '</span></div></div>').join('') + '</div><details class="cc-health-details"' + (expanded ? ' open' : '') + '><summary>Подробнее о состоянии</summary><div class="cc-health-notes">' + (notes.length ? '<ul>' + notes.map(note => '<li>' + esc(note) + '</li>').join('') + '</ul>' : '') + '<p>Сводка учитывает текущие проверки сервисов и проблемы устройств. Непрочитанные уведомления — история событий, они не снижают состояние системы.</p></div></details></div>';
   }
 
   const toolDefinitions = [

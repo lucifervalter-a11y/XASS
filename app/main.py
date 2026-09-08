@@ -31,7 +31,7 @@ from app.schemas import (
 )
 from app.scheduler import offline_check_loop
 from app.enums import SaveMode
-from app.models import AgentCommand, AgentCredential, AgentStateSnapshot, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
+from app.models import AgentCommand, AgentCredential, AgentStateSnapshot, AppConfig, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
 from app.services.agent_commands import (
     DANGEROUS_AGENT_COMMANDS,
     acknowledge_agent_commands,
@@ -118,6 +118,13 @@ from app.services.passkeys import (
 )
 from app.services.pwa_pairing import PwaPairingError, consume_pwa_pair_token, issue_pwa_pair_token
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
+from app.services.control_status import (
+    agent_attention as _agent_attention,
+    canonical_web_app_url,
+    public_site_status as _public_site_status,
+    source_is_online,
+    summarize_control_status,
+)
 from app.services.music_card import build_music_card, build_search_links, fallback_music_card
 from app.services.notifications import (
     EVENT_TYPES as NOTIFICATION_EVENT_TYPES,
@@ -126,6 +133,7 @@ from app.services.notifications import (
     list_preferences as list_notification_preferences,
     mark_all_read as mark_all_notifications_read,
     notification_json,
+    notification_review_groups,
     save_preference as save_notification_preference,
     set_notification_status,
     unread_notification_count,
@@ -174,7 +182,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.14.0"
+APP_VERSION = "0.15.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -1327,12 +1335,21 @@ async def pwa_config(request: Request) -> dict[str, Any]:
     login_ready = all(requirements.values())
     async with SessionLocal() as passkey_session:
         passkey_count = await passkey_count_credentials(passkey_session, settings.owner_user_id) if settings.owner_user_id else 0
+        configured_public_url = await passkey_session.scalar(select(AppConfig.service_base_url).limit(1))
+    try:
+        request_origin = _public_origin(request)[1]
+    except ValueError:
+        request_origin = ""
+    web_app_url = canonical_web_app_url(
+        configured_public_url or "", getattr(settings, "profile_public_url", ""), request_origin
+    )
     return {
         "ok": True,
         "authenticated": bool(session_user),
         "bot_username": bot_username,
         "login_ready": login_ready,
         "domain": public_host,
+        "web_app_url": web_app_url,
         "domain_verification": "telegram_only",
         "requirements": requirements,
         "passkey_available": bool(passkey_count),
@@ -1686,61 +1703,6 @@ def _build_mini_status(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _public_site_status(public_url: str) -> dict[str, Any]:
-    url = (public_url or "").strip()
-    if not url:
-        return {"status": "not_configured", "available": False, "url": "", "latency_ms": None}
-    if not urlsplit(url).path.strip("/"):
-        url = url.rstrip("/") + "/profile.php"
-    started = asyncio.get_running_loop().time()
-    try:
-        async with httpx.AsyncClient(timeout=3, follow_redirects=True, trust_env=False) as client:
-            response = await client.get(url)
-        latency = round((asyncio.get_running_loop().time() - started) * 1000, 1)
-        return {
-            "status": "online" if response.status_code < 500 else "error",
-            "available": response.status_code < 500,
-            "url": url,
-            "http_status": response.status_code,
-            "latency_ms": latency,
-        }
-    except (httpx.HTTPError, OSError) as exc:
-        return {
-            "status": "offline",
-            "available": False,
-            "url": url,
-            "latency_ms": None,
-            "error": type(exc).__name__,
-        }
-
-
-def _agent_attention(payload: dict[str, Any], *, is_online: bool, latest_version: str) -> tuple[list[str], bool]:
-    reasons: list[str] = []
-    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-    archive = payload.get("archive_status") if isinstance(payload.get("archive_status"), dict) else {}
-    version = str(payload.get("agent_version") or "0.0.0")
-    requires_update = bool(latest_version and latest_version != "0.0.0" and version != latest_version)
-    if not is_online:
-        reasons.append("offline")
-    for key, threshold, label in (
-        ("cpu_percent", 95, "high_cpu"),
-        ("ram_used_percent", 95, "high_ram"),
-        ("disk_used_percent", 92, "low_disk"),
-    ):
-        try:
-            if float(metrics.get(key) or 0) >= threshold:
-                reasons.append(label)
-        except (TypeError, ValueError):
-            continue
-    if str(payload.get("last_error") or "").strip():
-        reasons.append("agent_error")
-    if str(archive.get("last_error") or "").strip():
-        reasons.append("archive_error")
-    if requires_update:
-        reasons.append("update_available")
-    return reasons, requires_update
-
-
 def _admin_action_json(item: Any) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -1949,7 +1911,7 @@ async def mini_diagnostics(
             "weather_sync": "enabled",
             "telegram_updates": "polling" if settings.use_polling else "webhook",
         },
-        "archive": {**archive, "online_targets": sum(1 for item in sources if item.is_online)},
+        "archive": {**archive, "online_targets": sum(source_is_online(item, config.heartbeat_timeout_minutes) for item in sources)},
         "updates": {
             "branch": update_status.branch,
             "has_updates": update_status.has_updates,
@@ -2080,17 +2042,18 @@ async def mini_bootstrap(
     source_rows: list[dict[str, Any]] = []
     for item in sources:
         last_payload = item.last_payload if isinstance(item.last_payload, dict) else {}
+        is_online = source_is_online(item, config.heartbeat_timeout_minutes)
         attention_reasons, requires_update = _agent_attention(
             last_payload,
-            is_online=bool(item.is_online),
-            latest_version=latest_agent_version,
+            is_online=is_online,
+            latest_version=latest_agent_version if item.source_type == "PC_AGENT" else "",
         )
         source_rows.append(
             {
                 "id": item.id,
                 "source_name": item.source_name,
                 "source_type": item.source_type,
-                "is_online": item.is_online,
+                "is_online": is_online,
                 "last_seen_at": item.last_seen_at.isoformat() if item.last_seen_at else None,
                 "went_offline_at": item.went_offline_at.isoformat() if item.went_offline_at else None,
                 "last_payload": last_payload,
@@ -2098,7 +2061,7 @@ async def mini_bootstrap(
                 "agent_revision": str(last_payload.get("agent_revision") or ""),
                 "system": last_payload.get("system") if isinstance(last_payload.get("system"), dict) else {},
                 "requires_update": requires_update,
-                "requires_attention": bool(attention_reasons),
+                "requires_attention": any(reason != "update_available" for reason in attention_reasons),
                 "attention_reasons": attention_reasons,
                 "latest_command": (
                     {
@@ -2115,9 +2078,28 @@ async def mini_bootstrap(
             }
         )
 
+    system_status = {
+        "backend": {"status": "online", "available": True, "version": APP_VERSION},
+        "database": {"status": "online", "available": True},
+        "telegram_bot": {
+            "status": "online" if bot_client is not None else "not_configured",
+            "available": bot_client is not None,
+        },
+        "public_site": public_site,
+        "interface": {"status": "online", "available": True, "version": APP_VERSION},
+    }
+    review_groups = (
+        await notification_review_groups(session, source_names=[row["source_name"] for row in source_rows])
+        if user.is_owner else []
+    )
+    health_summary, attention_summary = summarize_control_status(
+        system_status, source_rows, metrics=metrics, review_groups=review_groups
+    )
     return {
         "ok": True,
         "app_version": APP_VERSION,
+        "health_summary": health_summary,
+        "attention_summary": attention_summary,
         "user": {
             "id": user.user_id,
             "first_name": user.first_name,
@@ -2142,16 +2124,7 @@ async def mini_bootstrap(
         "sources": source_rows,
         "metrics": metrics,
         "services": services,
-        "system_status": {
-            "backend": {"status": "online", "available": True, "version": APP_VERSION},
-            "database": {"status": "online", "available": True},
-            "telegram_bot": {
-                "status": "online" if bot_client is not None else "not_configured",
-                "available": bot_client is not None,
-            },
-            "public_site": public_site,
-            "interface": {"status": "online", "available": True, "version": APP_VERSION},
-        },
+        "system_status": system_status,
         "windows_installer": windows_installer,
         "quotes_count": len(quotes),
         "archive": archive,

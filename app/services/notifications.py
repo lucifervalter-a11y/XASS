@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, not_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -162,6 +162,34 @@ async def unread_notification_count(session: AsyncSession) -> int:
         )
         or 0
     )
+
+
+async def notification_review_groups(session: AsyncSession, *, source_names: list[str] | None = None) -> list[dict[str, Any]]:
+    """Pending human reviews, not thousands of past device-state transitions.
+
+    Device state is checked from fresh heartbeats by control_status. Other explicit
+    action items (e.g. failed logins/commands) remain visible until acknowledged;
+    no age cutoff silently clears them and no inbox rows are mutated.
+    """
+    live_state_events = {"agent_connected", "agent_offline", "agent_recovered", "high_load",
+                         "low_disk", "archive_error", "update_available", "update_completed"}
+    represented_by_current_state = and_(
+        InternalNotification.event_type.in_(live_state_events),
+        InternalNotification.device.is_not(None),
+        InternalNotification.device.in_(source_names or []),
+    )
+    rows = await session.execute(
+        select(InternalNotification.event_type, InternalNotification.device,
+               func.count(InternalNotification.id), func.max(InternalNotification.created_at))
+        .where(InternalNotification.status.in_(["new", "action"]),
+               InternalNotification.requires_action.is_(True),
+               not_(represented_by_current_state))
+        .group_by(InternalNotification.event_type, InternalNotification.device)
+        .order_by(func.max(InternalNotification.created_at).desc())
+    )
+    return [{"event_type": event_type, "device": device or "", "count": int(count),
+             "latest_at": latest.isoformat() if latest else None}
+            for event_type, device, count, latest in rows]
 
 
 async def set_notification_status(
