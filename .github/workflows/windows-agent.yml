@@ -1,22 +1,18 @@
 name: Inspect XASS deployment
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: xass-readonly-deployment-diagnostics
   cancel-in-progress: false
-
 jobs:
   inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Read-only publication permissions and backend timeout diagnostics
+      - name: Read-only configured site probe
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -25,22 +21,53 @@ jobs:
         run: |
           bash deploy/github_ssh.sh exec <<'REMOTE'
           cd /home/red/serverredus
-          printf 'CHECKOUT\n'
-          git rev-parse HEAD
-          git status --short --untracked-files=no
-          printf 'PUBLIC PATH PERMISSIONS (no file contents)\n'
-          for target in /home /home/red /home/red/serverredus /home/red/serverredus/miniapp.php /home/red/serverredus/assets /home/red/serverredus/assets/miniapp-device-key.js /home/red/serverredus/proxy.php /home/red/serverredus/sw.js; do
-            stat -Lc '%A mode=%a owner=%U group=%G path=%n' "$target" || true
-          done
-          printf 'LOCAL HTTPS STATUS (no response contents)\n'
-          for path in /miniapp.php /health /assets/miniapp-device-key.js /sw.js; do
-            printf 'path=%s ' "$path"
-            curl --silent --show-error --connect-timeout 5 --max-time 12 --resolve redvps.site:443:127.0.0.1 -o /dev/null -w 'status=%{http_code} content_type=%{content_type} seconds=%{time_total}\n' "https://redvps.site$path" || true
-          done
-          printf 'LOCAL BACKEND HEALTH\n'
-          curl --silent --show-error --connect-timeout 5 --max-time 8 -o /dev/null -w 'status=%{http_code} seconds=%{time_total}\n' http://127.0.0.1:8000/health || true
-          printf 'BACKEND USER AND TIMEOUTS\n'
-          systemctl show serverredus-backend.service --property=User --property=Group --property=TimeoutStopUSec --property=TimeoutStartUSec
-          printf 'BACKEND UNIT AND DROP-IN PATHS ONLY (no unit contents)\n'
-          systemctl show serverredus-backend.service --property=FragmentPath --property=DropInPaths
+          .venv/bin/python - <<'PY_PROBE'
+          import asyncio, json, socket, subprocess
+          from urllib.parse import urlsplit, urlunsplit
+          import httpx
+          from sqlalchemy import select
+          from app.config import Settings
+          from app.db import SessionLocal, engine
+          from app.models import AppConfig
+          def safe_url(raw):
+              try:
+                  parts = urlsplit(raw)
+                  return urlunsplit((parts.scheme, parts.hostname or "", parts.path, "", ""))
+              except ValueError:
+                  return "invalid"
+          async def main():
+              settings = Settings()
+              async with SessionLocal() as session:
+                  service_url = await session.scalar(select(AppConfig.service_base_url).limit(1)) or ""
+              raw = (settings.profile_public_url or service_url).strip()
+              print(json.dumps({"profile_public_url": safe_url(settings.profile_public_url), "service_base_url": safe_url(service_url)}), flush=True)
+              parts = urlsplit(raw)
+              if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+                  print("Configured target invalid or credential-bearing; no probe performed")
+                  return
+              target = raw if parts.path.strip("/") else raw.rstrip("/") + "/profile.php"
+              started = asyncio.get_running_loop().time()
+              try:
+                  async with httpx.AsyncClient(timeout=3, follow_redirects=True, trust_env=False) as client:
+                      response = await client.get(target)
+                  print(json.dumps({"probe": "current_backend_httpx", "url": safe_url(target), "status": response.status_code,
+                                    "seconds": round(asyncio.get_running_loop().time()-started,3)}), flush=True)
+              except Exception as exc:
+                  chain = []
+                  cause = exc
+                  dns = False
+                  while cause is not None and len(chain) < 8:
+                      chain.append(type(cause).__name__)
+                      dns = dns or isinstance(cause, socket.gaierror) or "name resolution" in str(cause).lower()
+                      cause = cause.__cause__
+                  print(json.dumps({"probe": "current_backend_httpx", "url": safe_url(target), "errors": chain, "dns_error": dns,
+                                    "seconds": round(asyncio.get_running_loop().time()-started,3)}), flush=True)
+              resolve = f"{parts.hostname}:{parts.port or (443 if parts.scheme == 'https' else 80)}:127.0.0.1"
+              response = subprocess.run(["curl", "--silent", "--show-error", "--connect-timeout", "5", "--max-time", "8",
+                                         "--resolve", resolve, "-o", "/dev/null", "-w", "%{http_code} %{time_total}", target],
+                                         capture_output=True, text=True)
+              print(json.dumps({"probe": "same_host_loopback_tls", "status_seconds": response.stdout.strip(), "exit_code": response.returncode}), flush=True)
+              await engine.dispose()
+          asyncio.run(main())
+          PY_PROBE
           REMOTE
