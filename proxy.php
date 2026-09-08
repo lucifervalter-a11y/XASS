@@ -210,6 +210,16 @@ if (!empty($responseHeaders)) {
     }
 }
 
+// Native enrollment uses the ordinary JSON envelope, but its HttpOnly owner
+// cookie must still reach the same-origin client. Never put it in JSON/JS.
+if (!$passthroughMode) {
+    foreach ($responseHeaders as $headerLine) {
+        if (preg_match('/^(?i:Set-Cookie):\\s*xass_pwa=/', $headerLine) === 1) {
+            header($headerLine, false);
+        }
+    }
+}
+
 if ($passthroughMode) {
     $contentType = 'application/json; charset=utf-8';
     foreach ($responseHeaders as $headerLine) {

@@ -12,6 +12,7 @@ class HeartbeatPayload(BaseModel):
     metrics: dict[str, Any] = Field(default_factory=dict)
     now_playing: str | None = None
     music_player: dict[str, Any] | None = None
+    music_storage: dict[str, Any] | None = None
     active_app: str | None = None
     activity: dict[str, Any] = Field(default_factory=dict)
     processes: list[dict[str, Any]] = Field(default_factory=list)

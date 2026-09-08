@@ -25,6 +25,7 @@ import UIKit
     @Published var selectedDevice = "local"
     @Published private(set) var canonicalClientID = ""
     private var canonicalSessionKey = ""
+    private var canonicalDetail: String?
     @Published var outputID = "default"
     @Published var playbackState = "stopped"
     @Published var position: Double = 0
@@ -33,12 +34,14 @@ import UIKit
     @Published var shareSite = false
     @Published var shareSaving = false
     @Published var shuffle = false
+    @Published var queueSaving = false
     @Published var repeatMode = "off"
     @Published var uploadName: String?
     @Published var uploadProgress: Double = 0
     var confirmationActivity: ((Bool) -> Void)?
     var canSendActions: () -> Bool = { UIApplication.shared.applicationState == .active }
     private(set) var queue: [LibraryTrack] = []
+    private var baseQueue: [LibraryTrack] = []
     private var ownsSession = false
     private var offlinePlayback = false
     private var suppressReports = false
@@ -88,7 +91,7 @@ import UIKit
     var otherLocal: Bool { selectedDevice == "local" && !canonicalSessionKey.isEmpty && (canonicalSessionKey != sessionKey || (!canonicalClientID.isEmpty && canonicalClientID != clientID)) }
     var deviceLabel: String { selectedDevice == "local" ? (otherLocal ? "Другое устройство" : "Этот iPhone") : String(selectedDevice.dropFirst(6)) }
     var playing: Bool { playbackState == "playing" }
-    var canEditQueue: Bool { selectedDevice == "local" && !otherLocal }
+    var canEditQueue: Bool { !queueSaving && !busy && (authorized || offlinePlayback) }
     var enrolled: Bool { authorization.identity.enrolled }
     func rows(filter: String, query: String, playlist: LibraryPlaylist? = nil) -> [LibraryTrack] {
         var rows = playlist.map { p in p.trackIDs.compactMap { id in tracks.first { $0.id == id } } } ?? tracks
@@ -155,26 +158,33 @@ import UIKit
             generation = UUID(); ownsSession = false; suppressReports = true; audio.pause(); suppressReports = false; pendingReport = nil
         }
         if !offlinePlayback && (!ownsSession || selectedDevice != "local") { applySession(session) }
+        else if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
+            let mode = session["repeat_mode"] as? String ?? repeatMode
+            if ids != queue.map(\.id) || mode != repeatMode {
+                queue = ids.compactMap { id in tracks.first { $0.id == id } }; baseQueue = queue; repeatMode = mode
+                applyNativeQueue()
+            }
+        }
         let result = try await api.request("/api/mini/music/players", method: "GET", body: nil)
         players = (result["players"] as? [[String: Any]] ?? []).compactMap(RemotePlayer.init)
         for index in devices.indices { if let player = players.first(where: { $0.id == devices[index].name }) { devices[index].online = player.online } }
-        if selectedDevice.hasPrefix("agent:"), let player = players.first(where: { "agent:" + $0.id == selectedDevice }) {
-            if let id = player.trackID { currentID = id }
-            playbackState = player.state; position = player.position; duration = player.duration
-            volume = player.volume; outputID = player.outputID
-            if !player.online { error = "Компьютер не в сети. Последнее состояние может быть устаревшим." }
-            else if let message = player.error { error = message }
-        }
+        // /session reconciles queue-command ACKs with heartbeat freshness.
+        // /players supplies discovery/capabilities only: its raw heartbeat can
+        // still describe the previous track during server-owned auto-advance.
     }
     private func applySession(_ value: [String: Any]) {
         currentID = value["track_id"] as? Int
         canonicalClientID = value["client_id"] as? String ?? ""; canonicalSessionKey = value["session_key"] as? String ?? ""
         selectedDevice = value["device"] as? String ?? "local"
         playbackState = value["state"] as? String ?? "stopped"
+        let detail = value["detail"] as? String
+        if let detail = detail { error = detail }
+        else if error == canonicalDetail { error = nil }
+        canonicalDetail = detail
         position = NativeValue.number(value["position"]); duration = currentTrack?.duration ?? 0
         outputID = value["output_id"] as? String ?? "default"; volume = NativeValue.number(value["volume"], fallback: volume)
         if !shareSaving { shareSite = value["share_site"] as? Bool ?? shareSite }
-        if let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } } }
+        if !queueSaving, let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } }; if baseQueue.isEmpty { baseQueue = queue } }
         if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { repeatMode = mode }
     }
     private func audioEvent(_ value: [String: Any]) {
@@ -207,9 +217,15 @@ import UIKit
         audio.playOffline(track); suppressReports = false; showPlayer = true
     }
     func play(_ track: LibraryTrack, rows: [LibraryTrack]? = nil) async throws {
-        if let rows = rows { queue = rows }; if queue.isEmpty { queue = tracks }
+        if let rows = rows { baseQueue = rows; queue = shuffle ? rows.shuffled() : rows }
+        if queue.isEmpty { baseQueue = tracks; queue = shuffle ? tracks.shuffled() : tracks }
         if !queue.contains(where: { $0.id == track.id }) { queue.insert(track, at: 0) }
         try await transfer(to: selectedDevice, trackID: track.id, startPosition: 0)
+    }
+    func playAll(_ rows: [LibraryTrack], shuffled: Bool) async throws {
+        guard !rows.isEmpty, !busy else { return }
+        shuffle = shuffled; baseQueue = rows; queue = shuffled ? rows.shuffled() : rows
+        if let track = queue.first { try await play(track) }
     }
     func transfer(to device: String, trackID: Int? = nil, startPosition: Double? = nil, output: String? = nil) async throws {
         guard !busy else { return }; busy = true; defer { busy = false }
@@ -256,9 +272,8 @@ import UIKit
             }
             guard generation == nextGeneration else { return }
             ownsSession = true
-            let list = shuffle ? queue.shuffled() : queue
             audio.handle(try NativeAudioCommand(["action": "play", "trackId": chosenID, "title": track.title, "artist": track.artist,
-                "url": url, "position": position, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(list, currentID: chosenID), "repeat": repeatMode]))
+                "url": url, "position": position, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: chosenID), "repeat": repeatMode]))
         } else { ownsSession = false }
     }
     func toggle() async throws {
@@ -292,11 +307,21 @@ import UIKit
         if list.indices.contains(next) { try await play(list[next], rows: list) }
         else if repeatMode == "all", let track = direction < 0 ? list.last : list.first { try await play(track, rows: list) }
     }
-    func updateQueue() {
+    private func applyNativeQueue() {
         if selectedDevice == "local" && (ownsSession || offlinePlayback), let id = currentID {
-            let list = shuffle ? queue.shuffled() : queue
-            if let command = try? NativeAudioCommand(["action": "queue", "queue": NativeValue.queue(list, currentID: id), "repeat": repeatMode]) { audio.handle(command) }
+            if let command = try? NativeAudioCommand(["action": "queue", "queue": NativeValue.queue(queue, currentID: id), "repeat": repeatMode]) { audio.handle(command) }
         }
+    }
+    func setQueueMode(shuffled: Bool? = nil, repeatMode desiredMode: String? = nil) async throws {
+        guard canEditQueue else { return }; queueSaving = true; defer { queueSaving = false }
+        let nextShuffle = shuffled ?? shuffle, nextMode = desiredMode ?? repeatMode
+        guard ["off", "one", "all"].contains(nextMode) else { throw XASSErr.invalidCommand }
+        let original = baseQueue.isEmpty ? (queue.isEmpty ? tracks : queue) : baseQueue
+        let ordered = shuffled == nil ? (queue.isEmpty ? original : queue) : nextShuffle ? original.shuffled() : original
+        if !offlinePlayback, !canonicalSessionKey.isEmpty {
+            _ = try await writeSession(["session_key": canonicalSessionKey, "queue": Array(ordered.prefix(2000)).map(\.id), "repeat_mode": nextMode, "takeover": false], explicit: true)
+        }
+        baseQueue = original; queue = ordered; shuffle = nextShuffle; repeatMode = nextMode; applyNativeQueue()
     }
     private func snapshot(state: String? = nil, position: Double? = nil) -> [String: Any] {
         var result: [String: Any] = ["session_key": sessionKey, "client_id": clientID, "device": selectedDevice,

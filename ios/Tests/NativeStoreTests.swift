@@ -82,4 +82,44 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertEqual(api.requests.filter { $0.0.contains("library") }.count, 2)
         store.disconnect()
     }
+    @MainActor func testShuffleTransferUsesOneCanonicalOrderAndQueuePatchIsPartial() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        await store.refresh()
+        let tracks = (1...8).compactMap { LibraryTrack(["id": $0, "title": "Track \($0)"]) }
+        store.tracks = tracks; store.selectedDevice = "agent:Студия"
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/transfers", method == "POST" {
+                return ["ok": true, "transfer_id": "shuffle-transfer", "status": "ready", "session": ["track_id": body!["track_id"]!, "device": "agent:Студия", "session_key": store.sessionKey, "client_id": store.clientID, "queue": body!["queue"]!, "repeat_mode": "off"]]
+            }
+            return nil
+        }
+        try await store.playAll(tracks, shuffled: true)
+        let transfer = api.requests.first { $0.0 == "/api/mini/music/transfers" }!.2!
+        XCTAssertEqual(store.queue.map(\.id), transfer["queue"] as? [Int])
+        XCTAssertEqual(Set(store.queue.map(\.id)), Set(1...8))
+        try await store.setQueueMode(repeatMode: "all")
+        let patch = api.requests.last!.2!
+        XCTAssertEqual(Set(patch.keys), Set(["session_key", "queue", "repeat_mode", "takeover"]))
+        XCTAssertEqual(patch["repeat_mode"] as? String, "all")
+        api.handler = { _, method, _ in if method == "POST" { throw OwnerAPIError(status: 503, message: "Unavailable") }; return nil }
+        do { try await store.setQueueMode(repeatMode: "one"); XCTFail("Failed patch must throw") } catch {}
+        XCTAssertEqual(store.repeatMode, "all")
+        store.disconnect()
+    }
+    @MainActor func testCanonicalPendingQueueCannotBeOverwrittenByOldPCHeartbeat() async {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        api.handler = { path, _, _ in
+            if path.contains("players") { return ["ok": true, "players": [["source_name": "Студия", "online": true, "available": true, "music_player": ["track_id": 1, "state": "ended", "position_sec": 100, "volume": 99]]]] }
+            return nil
+        }
+        for state in ["loading", "error", "unavailable"] {
+            api.session = ["track_id": 2, "device": "agent:Студия", "state": state, "position": 0, "volume": 45, "session_key": store.sessionKey, "queue": [1, 2], "repeat_mode": "all", "detail": "Ожидаем подтверждение ПК"]
+            await store.refresh()
+            XCTAssertEqual(store.currentID, 2); XCTAssertEqual(store.playbackState, state)
+            XCTAssertEqual(store.position, 0); XCTAssertEqual(store.volume, 45)
+            XCTAssertEqual(store.error, "Ожидаем подтверждение ПК")
+        }
+        XCTAssertFalse(api.requests.contains { $0.1 != "GET" }, "Native controller must not auto-advance a server-owned PC queue")
+        store.disconnect()
+    }
 }

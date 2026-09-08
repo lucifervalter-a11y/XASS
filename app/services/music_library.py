@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import time
+from weakref import WeakValueDictionary
 
 import mutagen
 
@@ -17,6 +19,22 @@ from app.services.pwa_auth import _session_generation, _session_secret
 
 FORMATS = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
 CHUNK_BYTES = 512 * 1024
+_content_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
+
+
+def content_lock(root: Path, sha256: str) -> asyncio.Lock:
+    """Serialize SHA check + commit across imports in this single-worker server."""
+    key = (str(root.resolve()), sha256)
+    lock = _content_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _content_locks[key] = lock
+    return lock
+
+
+def display_title(original_name: str) -> str:
+    """Humanize only the fallback label; never rename the source file or its tags."""
+    return re.sub(r"\s+", " ", Path(original_name).stem.replace("_", " ")).strip()[:240]
 
 
 def filename(value: str) -> str:
@@ -56,13 +74,17 @@ def inspect_audio(path: Path, original_name: str) -> dict:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return {"title": tag("title") or Path(original_name).stem[:240], "artist": tag("artist"),
+    return {"title": tag("title") or display_title(original_name), "artist": tag("artist"),
             "album": tag("album"), "duration": round(duration, 3), "mime": FORMATS[extension],
             "size": path.stat().st_size, "sha256": digest.hexdigest()}
 
 
 def track_json(track) -> dict:
-    return {key: getattr(track, key) for key in ("id", "title", "artist", "album", "duration", "favorite", "size", "mime", "filename")}
+    payload = {key: getattr(track, key) for key in ("id", "title", "artist", "album", "duration", "favorite", "size", "mime", "filename")}
+    if payload["title"] == Path(payload["filename"]).stem:
+        payload["title"] = display_title(payload["filename"])
+    payload["artwork_path"] = f"/api/mini/music/tracks/{track.id}/artwork"
+    return payload
 
 
 def issue_ticket(settings, track_id: int, *, purpose="listen", binding="", ttl=3600) -> str:

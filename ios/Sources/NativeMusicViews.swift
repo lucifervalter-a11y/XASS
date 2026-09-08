@@ -12,12 +12,13 @@ enum XASSStyle {
     @ObservedObject var store: NativeStore
     let trackID: Int
     var radius: Double = 8
+    var large = false
     @State private var image: UIImage?
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: radius).fill(XASSStyle.surface)
+            RoundedRectangle(cornerRadius: radius).fill(large ? Color(red: 0.13, green: 0.15, blue: 0.18) : XASSStyle.surface)
             if let image = image { Image(uiImage: image).resizable().scaledToFill() }
-            else { Image(systemName: "music.note").font(.system(size: 24, weight: .medium)).foregroundStyle(XASSStyle.secondary) }
+            else { Image(systemName: "music.note").font(.system(size: large ? 64 : 24, weight: .medium)).foregroundStyle(XASSStyle.secondary) }
         }.aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: radius))
             .accessibilityHidden(true)
             .task(id: trackID) { image = nil; image = await store.artwork(trackID) }
@@ -92,6 +93,13 @@ enum XASSStyle {
                     }
                 } else {
                     let rows = store.rows(filter: filter, query: query)
+                    if !rows.isEmpty {
+                        HStack(spacing: 10) {
+                            Button { store.run { try await store.playAll(rows, shuffled: false) } } label: { Label("Слушать всё", systemImage: "play.fill").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativePlayAll")
+                            Button { store.run { try await store.playAll(rows, shuffled: true) } } label: { Label("Перемешать", systemImage: "shuffle").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativeShuffleAll")
+                        }.buttonStyle(.bordered).font(.subheadline.weight(.medium)).disabled(store.busy)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 10, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                    }
                     ForEach(rows) { track in
                         NativeTrackRow(store: store, track: track, rows: rows) { selectedTrack = track }
                             .listRowInsets(EdgeInsets(top: 1, leading: 16, bottom: 1, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
@@ -153,7 +161,7 @@ enum XASSStyle {
                         Button { showQueue = true } label: { Image(systemName: "list.bullet").font(.title3).frame(width: 44, height: 36) }.accessibilityLabel("Очередь")
                     }.foregroundStyle(.white)
                     if let track = store.currentTrack {
-                        TrackArtwork(store: store, trackID: track.id, radius: 16)
+                        TrackArtwork(store: store, trackID: track.id, radius: 16, large: true)
                             .frame(width: min(geometry.size.width - 48, max(160, geometry.size.height * 0.33)), height: min(geometry.size.width - 48, max(160, geometry.size.height * 0.33)))
                             .padding(.bottom, 4)
                         HStack(spacing: 14) {
@@ -169,7 +177,7 @@ enum XASSStyle {
                         }
                         if store.busy || store.playbackState == "loading" { HStack { ProgressView(); Text(store.busy ? "Переключаю устройство…" : "Загрузка трека…").font(.caption) }.accessibilityIdentifier("nativePlayerLoading") }
                         HStack {
-                            Button { store.shuffle.toggle(); store.updateQueue() } label: { Image(systemName: "shuffle").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.shuffle ? XASSStyle.accent : XASSStyle.secondary).accessibilityLabel("Перемешивание").disabled(!store.canEditQueue)
+                            Button { store.run { try await store.setQueueMode(shuffled: !store.shuffle) } } label: { Image(systemName: "shuffle").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.shuffle ? XASSStyle.accent : XASSStyle.secondary).accessibilityLabel("Перемешивание").disabled(!store.canEditQueue)
                             Spacer()
                             Button { store.run { try await store.step(-1) } } label: { Image(systemName: "backward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Предыдущий трек")
                             Spacer()
@@ -177,7 +185,7 @@ enum XASSStyle {
                             Spacer()
                             Button { store.run { try await store.step(1) } } label: { Image(systemName: "forward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Следующий трек")
                             Spacer()
-                            Button { store.repeatMode = store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off"; store.updateQueue() } label: { Image(systemName: store.repeatMode == "one" ? "repeat.1" : "repeat").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.repeatMode == "off" ? XASSStyle.secondary : XASSStyle.accent).accessibilityLabel("Повтор: \(store.repeatMode)").disabled(!store.canEditQueue)
+                            Button { store.run { try await store.setQueueMode(repeatMode: store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off") } } label: { Image(systemName: store.repeatMode == "one" ? "repeat.1" : "repeat").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.repeatMode == "off" ? XASSStyle.secondary : XASSStyle.accent).accessibilityLabel("Повтор: \(store.repeatMode)").disabled(!store.canEditQueue)
                         }.foregroundStyle(.white).disabled(store.busy)
                         if store.otherLocal { Text("Команды выполняются после ответа другого устройства. Для переноса выберите «Этот iPhone» ниже.").font(.caption).foregroundStyle(.secondary) }
                         Button { showDevices = true } label: { HStack(spacing: 12) { Image(systemName: store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer").font(.title3); Text(store.deviceLabel).foregroundStyle(.white); Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary) }.padding(16).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.07))) }.accessibilityIdentifier("nativePlayerDevices")

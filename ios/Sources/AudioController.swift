@@ -141,6 +141,7 @@ struct NativePlaybackQueue {
     private var transition = UUID()
     private var automaticCache: AudioCache?
     private var cacheGeneration = UUID()
+    private var accountGeneration = UUID()
     private var cacheDownload: PrivateDownload?
     private var cacheDownloadID: Int?
     private var recordedPlay = false
@@ -377,13 +378,18 @@ struct NativePlaybackQueue {
         guard jobs[command.trackID] == nil, !downloadIDs.contains(command.trackID) else { return }
         if let cache = automaticCache, let entry = cachedTracks.first(where: { $0.id == command.trackID }) {
             downloadIDs.insert(command.trackID)
+            let account = accountGeneration
             Task { [weak self] in
                 do {
-                    let values = try await cache.promote(entry, to: library)
-                    guard let self = self, self.origin == origin else { return }
+                    let copied = try await cache.copyToPinned(entry, to: library)
+                    guard let self = self, self.origin == origin, self.accountGeneration == account else { return }
+                    var values = library.tracks().filter { $0.id != copied.id }; values.append(copied); try library.save(values)
                     self.downloadIDs.remove(command.trackID); self.downloads = values
                     self.emit?(["action": "download", "trackId": command.trackID, "downloaded": true])
-                } catch { self?.downloadIDs.remove(command.trackID); self?.error = "Не удалось сохранить трек из кэша." }
+                } catch {
+                    guard let self = self, self.accountGeneration == account else { return }
+                    self.downloadIDs.remove(command.trackID); self.error = "Не удалось сохранить трек из кэша."
+                }
             }
             return
         }
@@ -412,7 +418,7 @@ struct NativePlaybackQueue {
         catch { self.error = "Не удалось удалить локальную копию." }
     }
     private func resetCache() {
-        cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil
+        accountGeneration = UUID(); cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil
         automaticCache = nil; cachedTracks = []; cacheBytes = 0; recordedPlay = false
     }
     private func applyCache(_ value: AudioCacheSnapshot) {

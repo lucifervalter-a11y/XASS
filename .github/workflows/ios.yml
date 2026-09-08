@@ -108,4 +108,4 @@ jobs:
           else
             gh release create ios-latest --target "$GITHUB_SHA" --title "XASS iOS — unsigned, requires your signing" --notes-file ios/UNSIGNED.md --prerelease
           fi
-          gh release upload ios-latest release/XASS-unsigned.ipa release/XASS-unsigned.ipa.sha256 release/UNSIGNED.md --clobber
+          gh release upload ios-latest release/XASS-unsigned.ipa release/XASS-unsigned.ipa.sha256 release/UNSIGNED.md release/iOS-native-*.png --clobber

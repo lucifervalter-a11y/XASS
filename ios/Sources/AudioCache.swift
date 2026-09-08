@@ -83,12 +83,13 @@ actor AudioCache {
         }
         index.entries = []; index.plays = [:]; try save(); return snapshot()
     }
-    func promote(_ entry: CachedAudio, to library: OfflineLibrary) throws -> [DownloadedTrack] {
+    func copyToPinned(_ entry: CachedAudio, to library: OfflineLibrary) throws -> DownloadedTrack {
         let source = file(entry.id, suffix: entry.track.fileExtension ?? "audio"), target = library.file(for: entry.track)
         guard FileManager.default.fileExists(atPath: source.path) else { throw XASSErr.invalidMedia }
         if !FileManager.default.fileExists(atPath: target.path) { try FileManager.default.copyItem(at: source, to: target) }
-        var tracks = library.tracks().filter { $0.id != entry.id }; tracks.append(entry.track); try library.save(tracks)
-        return tracks
+        // Manual index read/modify/write has one owner: AudioController's main
+        // actor, shared with ordinary download completions and user removals.
+        return entry.track
     }
     private func trim(protectedID: Int? = nil) throws {
         let limit = Int64(index.limitMB) * 1024 * 1024

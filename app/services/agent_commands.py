@@ -31,7 +31,7 @@ ALLOWED_AGENT_COMMANDS = {
     "clipboard_set",
     "migration_download",
     "music_outputs", "music_play", "music_pause", "music_resume", "music_stop",
-    "music_seek", "music_volume", "music_status",
+    "music_seek", "music_volume", "music_status", "music_storage_sync",
 }
 DANGEROUS_AGENT_COMMANDS = {
     "lock", "sleep", "reboot", "shutdown", "restart", "update",

@@ -7,10 +7,24 @@ const {webcrypto} = require('node:crypto');
 const source = fs.readFileSync(path.join(__dirname,'../assets/miniapp-music.js'),'utf8');
 
 function runtime(api, options={}) {
-  const nodes=new Map(),events={},requests=[],toasts=[],intervals=[];
-  function node(id='') {return {id,innerHTML:'',textContent:'',value:0,hidden:false,dataset:{},style:{setProperty(){}},classList:{toggle(){},contains(){return false;}},handlers:{},addEventListener(name,fn){this.handlers[name]=fn;},setAttribute(){},removeAttribute(){},append(){},focus(){},click(){},close(){this.open=false;},showModal(){this.open=true;},querySelector(){return node();},querySelectorAll(){return[];},play(){return Promise.resolve();},pause(){},load(){}};}
+  const nodes=new Map(),events={},requests=[],toasts=[],intervals=[];let transferCount=0,serverSession={share_site:false};
+  function node(id='') {return {id,innerHTML:'',textContent:'',value:0,hidden:false,dataset:{},paused:true,currentTime:0,style:{setProperty(){}},classList:{toggle(){},contains(){return false;}},handlers:{},addEventListener(name,fn){this.handlers[name]=fn;},setAttribute(){},removeAttribute(name){delete this[name];},append(){},remove(){},focus(){},click(){},close(){this.open=false;},showModal(){this.open=true;},querySelector(){return node();},querySelectorAll(){return[];},play(){this.paused=false;return Promise.resolve();},pause(){this.paused=true;},load(){}};}
   const get=id=>{if(!nodes.has(id))nodes.set(id,node(id));return nodes.get(id);};
-  const X={state:{boot:{}},esc:value=>String(value??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x])),toast:value=>toasts.push(value),ask:(_message,done)=>done(false),api:async(p,o)=>{requests.push({path:p,...o});return api?api(p,o):{status:200,data:{ok:true}};}};
+  const X={state:{boot:{}},esc:value=>String(value??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x])),toast:value=>toasts.push(value),ask:(_message,done)=>done(false),api:async(p,o)=>{
+    requests.push({path:p,...o});let result=api?await api(p,o):undefined;
+    if(result===undefined){
+      if(p==='music/transfers'&&o.method==='POST'){
+        serverSession={...serverSession,...o.body,position:o.body.position??serverSession.position??0,state:o.body.autoplay?'loading':'paused'};
+        result={status:200,data:{ok:true,status:'ready',transfer_id:String(++transferCount).padStart(32,'0'),session:{...serverSession}}};
+      }else if(p==='music/session'&&o.method==='GET')result={status:200,data:{ok:true,session:{...serverSession}}};
+      else if(p.endsWith('/ticket'))result={status:200,data:{ok:true,path:`/api/music/tracks/${p.split('/')[2]}/stream?ticket=qa-ticket`}};
+      else if(p==='music/control'&&o.method==='POST')result={status:200,data:{ok:true,command_id:1}};
+      else if(p==='music/control/1')result={status:200,data:{ok:true,status:'completed',result:{ok:true,details:{outputs:[]}}}};
+      else result={status:200,data:{ok:true}};
+    }
+    if(p==='music/session'&&o.method==='POST'&&result.status>=200&&result.status<300&&result.data?.ok)serverSession={...serverSession,...o.body};
+    return result;
+  }};
   const window={XASS:X,addEventListener:(name,fn)=>{events[name]=fn;}};
   const document={getElementById:get,createElement:tag=>get(tag==='audio'?'audio':tag),body:node('body'),addEventListener(){},querySelectorAll(){return[];}};
   const context=vm.createContext({window,document,navigator:{userAgent:'QA'},location:{origin:'https://xass.example'},crypto:webcrypto,URL,URLSearchParams,FormData,Uint8Array,Promise,Number,Math,Date,setInterval(fn){intervals.push(fn);},setTimeout:options.fastTimers?(fn,ms)=>setTimeout(fn,Math.min(ms,10)):setTimeout,clearTimeout,btoa:raw=>Buffer.from(raw,'latin1').toString('base64')});
@@ -51,15 +65,17 @@ test('unsupported Windows formats are refused before any API or player action',a
   assert.equal(requests.length,0);
 });
 
-test('rapid track changes serialize session claims and cannot start an old ticket',async()=>{
-  let finishFirst;let sessionCount=0;
+test('rapid track changes serialize acknowledged transfers and cannot start an old ticket',async()=>{
+  let finishFirst;let transferCount=0,firstBody;
   const r=runtime(async(p,o)=>{
-    if(p==='music/session'&&o.method==='POST'){if(++sessionCount===1)await new Promise(resolve=>{finishFirst=resolve;});return{status:200,data:{ok:true}};}
-    const id=p.split('/')[2];return{status:200,data:{ok:true,path:`/api/music/tracks/${id}/stream?ticket=qa-ticket`}};
+    if(p==='music/transfers'&&o.method==='POST'&&++transferCount===1){firstBody=o.body;await new Promise(resolve=>{finishFirst=resolve;});return{status:200,data:{ok:true,status:'ready',transfer_id:'1'.repeat(32),session:{...firstBody,state:'loading',position:0,share_site:false}}};}
   });
   const one={id:1,title:'One',duration:10},two={id:2,title:'Two',duration:10};r.music.state.tracks=[one,two];
-  const first=r.music.play(one),second=r.music.play(two);finishFirst();await Promise.all([first,second]);
-  const tickets=r.requests.filter(q=>q.path.endsWith('/ticket'));assert.deepEqual(tickets.map(q=>q.path),['music/tracks/2/ticket']);assert.equal(sessionCount,2);assert.equal(r.music.state.current.id,2);
+  const first=r.music.play(one);await tick();const second=r.music.play(two);await tick();assert.equal(transferCount,1);
+  finishFirst();await Promise.all([first,second]);
+  const tickets=r.requests.filter(q=>q.path.endsWith('/ticket'));assert.deepEqual(tickets.map(q=>q.path),['music/tracks/2/ticket']);assert.equal(transferCount,2);assert.equal(r.music.state.current.id,2);
+  const between=r.requests.find(q=>q.path==='music/session');assert.equal(between.body.track_id,1);assert.equal(between.body.state,'paused');assert.equal(between.body.takeover,false);
+  assert(r.requests.every(q=>q.body?.takeover!==true));
 });
 
 test('native download and playback events reach the listener and update actual UI state',()=>{
@@ -77,13 +93,13 @@ test('native download and playback events reach the listener and update actual U
 });
 
 test('an unresolved media play promise times out and restores an actionable error state',async()=>{
-  const r=runtime(async(p)=>({status:200,data:{ok:true,...(p.endsWith('/ticket')?{path:'/api/music/tracks/1/stream?ticket=test-ticket'}:{})}}),{fastTimers:true});
+  const r=runtime(undefined,{fastTimers:true});
   r.nodes.get('audio').play=()=>new Promise(()=>{});const track={id:1,title:'Silent fixture',duration:10};r.music.state.tracks=[track];
   await assert.rejects(r.music.play(track),/Браузер не запустил/);assert.equal(r.music.state.state,'error');assert.match(r.nodes.get('xmPlayerStatus').textContent,/Повторите/);
 });
 
 test('native bridge sends session and a bounded queue containing tracks beyond the first 200',async()=>{
-  const r=runtime(async(p)=>({status:200,data:{ok:true,...(p.endsWith('/ticket')?{path:'/api/music/tracks/250/stream?ticket=test-ticket'}:{})}}));
+  const r=runtime();
   const commands=[];r.window.XASS_NATIVE_AUDIO=true;r.window.webkit={messageHandlers:{xassAudio:{postMessage:message=>commands.push(message)}}};
   r.music.state.tracks=Array.from({length:300},(_,i)=>({id:i+1,title:'Трек '+(i+1),artist:'Исполнитель',duration:100}));r.music.state.queue=r.music.state.tracks.map(t=>t.id);
   await r.music.play(r.music.state.tracks[249],{keepQueue:true});const sent=commands.find(c=>c.action==='play');
@@ -132,7 +148,6 @@ test('a sharing write survives a background snapshot, ignores double-toggle and 
       await new Promise(resolve=>pending.push(resolve));inFlight--;
       return{status:200,data:{ok:true}};
     }
-    return{status:200,data:{ok:true,path:'/api/music/tracks/2/stream?ticket=qa-ticket'}};
   });
   const one={id:1,title:'One',duration:10},two={id:2,title:'Two',duration:10};
   Object.assign(r.music.state,{current:one,tracks:[one,two],sessionOwned:true});
@@ -150,10 +165,13 @@ test('a sharing write survives a background snapshot, ignores double-toggle and 
   await Promise.all([r.intervals[0](),r.intervals[0](),r.intervals[0]()]);
   assert.equal(sessions().length,2);
   pending.shift()();await changed;await tick();
-  assert.equal(input.checked,true);assert.equal(input.disabled,false);assert.equal(sessions().length,3);
-  assert.equal(sessions()[2].body.share_site,true,'the next track must use the committed sharing value');
+  assert.equal(input.checked,true);assert.equal(sessions().length,3);
+  assert.equal(sessions()[2].body.share_site,true,'the old local player pause must preserve the committed sharing value');
+  assert.equal(sessions()[2].body.track_id,1);
   pending.shift()();await nextTrack;
   assert.equal(maxInFlight,1);assert.equal(sessions().length,3);assert.equal(r.music.state.current.id,2);
+  assert.equal(r.music.state.shareSite,true,'transfer must retain the acknowledged sharing setting');
+  assert.equal(r.requests.filter(q=>q.path==='music/transfers').length,1);assert.equal(input.disabled,false);
 });
 
 test('losing session ownership while waiting prevents the queued sharing write',async()=>{
@@ -168,7 +186,99 @@ test('losing session ownership while waiting prevents the queued sharing write',
 
 test('fullscreen player escapes retained view transforms and keeps its background and notices',()=>{
   const css=fs.readFileSync(path.join(__dirname,'../assets/miniapp-music.css'),'utf8');
-  assert.match(css,/\.xm-player-open #view-music\{animation:none;transform:none\}/);
+  assert.match(css,/#view-music\{animation:none;transform:none\}/);
   assert.match(css,/\.xm-player\{height:max-content\}/);
   assert.match(css,/\.xm-player-open #toast\{z-index:140\}/);
+});
+
+test('a ready transfer for another session cannot fetch a ticket or play',async()=>{
+  const r=runtime(async(p,o)=>p==='music/transfers'?{status:200,data:{ok:true,status:'ready',transfer_id:'1'.repeat(32),session:{...o.body,session_key:'another-player-key'}}}:undefined);
+  await assert.rejects(r.music.play({id:1,title:'One',duration:10}),/Управление изменилось/);
+  assert.equal(r.requests.filter(q=>q.path.endsWith('/ticket')).length,0);assert.equal(r.nodes.get('audio').paused,true);
+  assert(r.requests.every(q=>q.body?.takeover!==true));
+});
+
+test('server transfer conflict stays actionable without legacy takeover fallback',async()=>{
+  const r=runtime(async(p)=>p==='music/transfers'?{status:409,data:{detail:'Дождитесь завершения текущего переключения'}}:undefined);
+  await assert.rejects(r.music.play({id:1,title:'One',duration:10}),/Дождитесь/);
+  assert.equal(r.music.state.state,'error');assert.equal(r.music.state.sessionOwned,false);
+  assert.equal(r.requests.length,1);assert.equal(r.nodes.get('audio').paused,true);
+});
+
+test('switching a paused device preserves position and needs a real start before resume',async()=>{
+  const r=runtime(),track={id:1,title:'One',duration:90,mime:'audio/mpeg'};
+  Object.assign(r.music.state,{tracks:[track],current:track,device:'local',sessionOwned:true,state:'paused',position:33});r.nodes.get('audio').currentTime=33;
+  await r.music.chooseDevice('agent:PC');
+  assert.equal(r.music.state.device,'agent:PC');assert.equal(r.music.state.state,'paused');assert.equal(r.music.state.needsStart,true);
+  const transfer=r.requests.find(q=>q.path==='music/transfers');assert.equal(transfer.body.autoplay,false);assert(!('position' in transfer.body));
+  const pause=r.requests.find(q=>q.path==='music/session');assert.equal(pause.body.device,'local');assert.equal(pause.body.position,33);
+  await r.music.toggle();assert.equal(r.music.state.needsStart,false);
+  const transfers=r.requests.filter(q=>q.path==='music/transfers');assert.equal(transfers.length,2);assert.equal(transfers[1].body.autoplay,true);
+  assert(!r.requests.some(q=>q.path==='music/control'&&q.body.action==='resume'));
+});
+
+test('waiting transfers are polled to ready before playback tickets',async()=>{
+  let body;const r=runtime(async(p,o)=>{
+    if(p==='music/transfers'){body=o.body;return{status:200,data:{ok:true,status:'waiting',transfer_id:'a'.repeat(32)}};}
+    if(p==='music/transfers/'+'a'.repeat(32))return{status:200,data:{ok:true,status:'ready',transfer_id:'a'.repeat(32),session:{...body,state:'loading',position:17}}};
+  },{fastTimers:true});
+  await r.music.play({id:1,title:'One',duration:90});
+  assert.equal(r.requests[1].path,'music/transfers/'+'a'.repeat(32));assert.equal(r.requests[2].path,'music/tracks/1/ticket');assert.equal(r.nodes.get('audio').currentTime,17);
+});
+
+test('logout invalidates a late transfer and prevents starting old audio',async()=>{
+  let finish,body;const r=runtime(async(p,o)=>{
+    if(p==='music/transfers'){body=o.body;await new Promise(resolve=>{finish=resolve;});return{status:200,data:{ok:true,status:'ready',session:{...body,state:'loading',position:0}}};}
+  });
+  const playing=r.music.play({id:1,title:'One',duration:90});await tick();
+  r.nodes.get('logoutBtn').handlers.click();finish();await playing;
+  assert.equal(r.music.state.sessionOwned,false);assert.equal(r.requests.filter(q=>q.path.endsWith('/ticket')).length,0);assert.equal(r.nodes.get('audio').paused,true);
+});
+
+test('large libraries send a bounded handoff queue containing the selected track in order',async()=>{
+  const r=runtime();r.music.state.tracks=Array.from({length:3000},(_,i)=>({id:i+1,title:'Track '+(i+1),duration:10}));
+  await r.music.play(r.music.state.tracks[2499]);
+  const queue=r.requests.find(q=>q.path==='music/transfers').body.queue;
+  assert.equal(queue.length,2000);assert(queue.includes(2500));assert(queue.includes(2499));assert.equal(queue.at(-1),3000);
+  assert(queue.every((id,i)=>i===0||id===queue[i-1]+1));assert.equal(r.music.state.queue.length,3000);
+});
+
+test('PC ended snapshots are observational and server advancement does not trigger another transfer',async()=>{
+  let player={track_id:1,state:'ended',position_sec:10,duration_sec:10};
+  const r=runtime(async p=>p==='music/players'?{status:200,data:{ok:true,players:[{source_name:'PC',online:true,available:true,music_player:player}]}}:undefined);
+  const one={id:1,title:'One',duration:10},two={id:2,title:'Two',duration:10};
+  Object.assign(r.music.state,{tracks:[one,two],current:one,queue:[1,2],device:'agent:PC',state:'playing',sessionOwned:true,lastPublish:0});
+  await r.intervals[0]();await tick();
+  assert.equal(r.music.state.state,'ended');assert.equal(r.music.state.current.id,1);
+  r.events.pagehide();assert.equal(r.music.state.state,'ended','pagehide must not use the idle browser audio for PC state');
+  player={track_id:2,state:'playing',position_sec:1,duration_sec:10};await r.intervals[0]();await tick();
+  assert.equal(r.music.state.current.id,2);assert.equal(r.music.state.state,'playing');
+  assert.equal(r.nodes.get('xmPlayerTitle').textContent,'Two');
+  assert(r.requests.every(q=>q.path==='music/players'&&q.method==='GET'),'no transfer, command or stale session write');
+});
+
+test('manual PC next and previous still acquire the selected track through a transfer',async()=>{
+  const r=runtime(),one={id:1,title:'One',duration:10},two={id:2,title:'Two',duration:10};
+  Object.assign(r.music.state,{tracks:[one,two],current:one,queue:[1,2],device:'agent:PC',state:'playing',sessionOwned:true});
+  const press=name=>r.nodes.get('xassMusic').handlers.click({target:{closest:()=>({dataset:{xm:name}})}});
+  press('next');await tick();await tick();assert.equal(r.music.state.current.id,2);
+  press('prev');await tick();await tick();assert.equal(r.music.state.current.id,1);
+  assert.deepEqual(r.requests.filter(q=>q.path==='music/transfers').map(q=>q.body.track_id),[2,1]);
+  assert(!r.requests.some(q=>q.path==='music/session'));
+});
+
+test('browser ended still autoplays the next local track',async()=>{
+  const r=runtime(),one={id:1,title:'One',duration:10},two={id:2,title:'Two',duration:10};
+  Object.assign(r.music.state,{tracks:[one,two],current:one,queue:[1,2],device:'local',state:'playing',sessionOwned:true});
+  r.nodes.get('audio').handlers.ended();await tick();await tick();
+  assert.equal(r.music.state.current.id,2);assert.equal(r.requests.filter(q=>q.path==='music/transfers').length,1);
+  assert(r.requests.some(q=>q.path==='music/tracks/2/ticket'));assert.equal(r.nodes.get('audio').paused,false);
+});
+
+test('explicit PC sharing updates only the setting without stale playback fields',async()=>{
+  const r=runtime();Object.assign(r.music.state,{current:{id:1,title:'Old PC track'},device:'agent:PC',state:'ended',position:90,sessionOwned:true});
+  const input=r.nodes.get('xmShareSite');input.checked=true;await input.handlers.change();
+  assert.equal(r.music.state.shareSite,true);assert.equal(r.requests.length,1);
+  const body=r.requests[0].body;assert.equal(body.share_site,true);assert.equal(body.takeover,false);
+  for(const field of ['track_id','device','state','position'])assert(!(field in body),field+' must remain server-owned');
 });

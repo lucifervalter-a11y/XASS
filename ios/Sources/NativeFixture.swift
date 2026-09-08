@@ -1,5 +1,6 @@
 #if DEBUG && targetEnvironment(simulator)
 import Foundation
+import UIKit
 
 /// Explicit simulator-only data. No transport, media, authentication or device commands.
 @MainActor final class NativeFixture: OwnerService {
@@ -11,6 +12,21 @@ import Foundation
     }
     let origin: ServerOrigin
     init(origin: ServerOrigin) { self.origin = origin }
+    func artwork(trackID: Int) async throws -> Data? {
+        guard trackID == 1 else { return nil }
+        // A labelled generated test JPEG proves the exact production image view.
+        // This graphic exists only in Debug Simulator, never a production album.
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
+        return renderer.image { context in
+            UIColor(red: 0.06, green: 0.13, blue: 0.23, alpha: 1).setFill(); context.fill(CGRect(x: 0, y: 0, width: 320, height: 320))
+            for index in 0..<9 {
+                let path = UIBezierPath(); path.lineWidth = 3
+                path.move(to: CGPoint(x: -10, y: CGFloat(100 + index * 13))); path.addCurve(to: CGPoint(x: 330, y: CGFloat(160 + index * 10)), controlPoint1: CGPoint(x: 90, y: CGFloat(-40 + index * 18)), controlPoint2: CGPoint(x: 180, y: CGFloat(370 - index * 10)))
+                UIColor(red: 0.23, green: 0.51 + CGFloat(index) * 0.025, blue: 0.92, alpha: 0.65).setStroke(); path.stroke()
+            }
+            ("XASS · TEST ART" as NSString).draw(at: CGPoint(x: 20, y: 285), withAttributes: [.font: UIFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: UIColor.white])
+        }.jpegData(compressionQuality: 0.88)
+    }
     static let trackData: [[String: Any]] = [
         ["id": 1, "title": "Тихий город", "artist": "Тестовая библиотека", "duration": 224, "favorite": true],
         ["id": 2, "title": "Северный свет", "artist": "Тестовая библиотека", "duration": 196],

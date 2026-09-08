@@ -28,6 +28,7 @@ AUDIO = bytes(range(256)) * 1024
 TICKET = "fixture_ticket-Abc123.signed987"
 ETAG = '"fixture-audio-v1"'
 MODIFIED = "Mon, 07 Sep 2026 12:00:00 GMT"
+OWNER_COOKIE = "xass_pwa=fixture-owner-session; Path=/; Max-Age=86400; Secure; HttpOnly; SameSite=Lax"
 
 
 class AudioBackend(BaseHTTPRequestHandler):
@@ -42,10 +43,30 @@ class AudioBackend(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.respond()
 
+    def do_POST(self):
+        self.respond()
+
     def respond(self):
+        request_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.server.requests.put({"method": self.command, "path": self.path,
-                                  "headers": {name.lower(): value for name, value in self.headers.items()}})
+                                  "headers": {name.lower(): value for name, value in self.headers.items()},
+                                  "body": request_body})
         parsed = urlsplit(self.path)
+        if parsed.path in {"/api/native/enrollment/verify", "/api/pwa/logout"}:
+            body = json.dumps({"ok": True, "native": parsed.path.endswith("verify")}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "backend_admin=fixture-never-forward; Path=/; HttpOnly")
+            self.send_header("Set-Cookie", "xass_pwa_debug=fixture-never-forward-prefix; Path=/")
+            cookie = OWNER_COOKIE if parsed.path.endswith("verify") else 'xass_pwa=""; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax'
+            self.send_header("set-cookie", cookie)
+            if parse_qs(parsed.query).get("case_variant") == ["1"]:
+                self.send_header("Set-Cookie", "XASS_PWA=fixture-different-case-cookie; Path=/; HttpOnly")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
         if parsed.path == "/agent/installer/download":
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -274,6 +295,39 @@ class PhpMusicProxyTests(unittest.TestCase):
         self.assertEqual(error.status_code, 200)
         self.assertEqual(error.json()["_s"], 401)
         self.assertEqual(json.loads(error.json()["_b"]), {"detail": "ticket rejected"})
+
+    def test_native_enrollment_cookie_is_forwarded_as_header_not_json(self):
+        payload = {"challenge_id": "fixture-enrollment", "proof": "fixture-signed-proof"}
+        response = self.client.post("/proxy.php", params={"_p": "/api/native/enrollment/verify"}, json=payload,
+                                    headers={"X-Telegram-Init-Data": "fixture-owner-init-data",
+                                             "Cookie": "xass_pwa=fixture-old-session"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get_list("set-cookie"), [OWNER_COOKIE])
+        self.assertEqual(response.headers["cache-control"], "private, no-store")
+        self.assertEqual(response.json()["_s"], 200)
+        self.assertEqual(json.loads(response.json()["_b"]), {"ok": True, "native": True})
+        self.assertNotIn("fixture-owner-session", response.text)
+        self.assertNotIn("fixture-never-forward", response.text)
+        self.assertNotIn("backend_admin", str(response.headers))
+        self.assertNotIn("xass_pwa_debug", str(response.headers))
+        request = self.backend.requests.get_nowait()
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(json.loads(request["body"]), payload)
+        self.assertEqual(request["headers"]["x-telegram-init-data"], "fixture-owner-init-data")
+        self.assertEqual(request["headers"]["cookie"], "xass_pwa=fixture-old-session")
+
+    def test_native_envelope_forwards_exact_cookie_name_not_case_variant(self):
+        response = self.client.post("/proxy.php", params={"_p": "/api/native/enrollment/verify?case_variant=1"}, json={})
+        self.assertEqual(response.headers.get_list("set-cookie"), [OWNER_COOKIE])
+        self.assertNotIn("fixture-different-case-cookie", response.text)
+
+    def test_logout_cookie_expiry_survives_json_envelope(self):
+        response = self.client.post("/proxy.php", params={"_p": "/api/pwa/logout"}, json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get_list("set-cookie"),
+                         ['xass_pwa=""; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax'])
+        self.assertEqual(response.json()["_s"], 200)
+        self.assertNotIn("xass_pwa", response.json()["_b"])
 
 
 if __name__ == "__main__":

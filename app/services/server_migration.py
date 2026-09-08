@@ -51,6 +51,20 @@ EXCLUDED_PARTS = {".git", ".venv", "__pycache__", ".build-venv", "node_modules"}
 SOURCE_DIRS = {"app", "agent", "pc_client", "assets", "projects", "deploy", "docs", "tests", ".github"}
 SOURCE_FILES = {".env.example", ".gitignore", "requirements.txt", "README.md"}
 CANCELLED_COMMAND_RESULT = {"ok": False, "message": "Команда отменена при переносе сервера. Отправьте её повторно.", "details": {"reason": "server_migration"}}
+# Backups preserve identities and music, but must never resurrect one-time
+# authorizations or play delayed audio after a restore. SQL is static, not input.
+RESTORE_EPHEMERAL_UPDATES = {
+    "native_challenges": "UPDATE native_challenges SET used=true",
+    "native_action_proofs": "UPDATE native_action_proofs SET used=true",
+    "pwa_pair_tokens": "UPDATE pwa_pair_tokens SET is_active=false",
+    "agent_pair_codes": "UPDATE agent_pair_codes SET is_active=false",
+    "music_transfers": "UPDATE music_transfers SET status='failed', detail='server_migration' WHERE status NOT IN ('ready','failed')",
+    "music_remote_commands": "UPDATE music_remote_commands SET status='cancelled', error='server_migration' WHERE status='pending'",
+    "music_playback_state": "UPDATE music_playback_state SET transfer_id='', queue_command_id=NULL, revision=revision+1",
+    "music_sessions": "UPDATE music_sessions SET state='stopped', session_key='', share_site=false, share_discord=false",
+    "music_storage_jobs": "UPDATE music_storage_jobs SET status='failed', error_code='server_migration' WHERE status IN ('pending','running')",
+    "music_import_runs": "UPDATE music_import_runs SET status='cancelled' WHERE status IN ('pending','running')",
+}
 
 
 class MigrationError(ValueError):
@@ -391,9 +405,12 @@ def _prepare_sqlite(path: Path, mapping: dict[str, str]) -> None:
         if "agent_commands" in tables:
             columns = {row[1] for row in database.execute("PRAGMA table_info(agent_commands)")}
             completed_at = ", completed_at=CURRENT_TIMESTAMP" if "completed_at" in columns else ""
-            database.execute(f"UPDATE agent_commands SET status='failed', result=?{completed_at} WHERE status IN ('pending', 'delivered')", (json.dumps(CANCELLED_COMMAND_RESULT),))
+            database.execute(f"UPDATE agent_commands SET status='failed', result=?{completed_at} WHERE status IN ('pending', 'delivered', 'awaiting_media')", (json.dumps(CANCELLED_COMMAND_RESULT),))
         if "heartbeat_sources" in tables:
             database.execute("UPDATE heartbeat_sources SET is_online=0")
+        for table, statement in RESTORE_EPHEMERAL_UPDATES.items():
+            if table in tables:
+                database.execute(statement)
 
 
 def _restore_postgres(path: Path, url: str, mapping: dict[str, str]) -> None:
@@ -419,13 +436,16 @@ def _restore_postgres(path: Path, url: str, mapping: dict[str, str]) -> None:
     body = f"""BEGIN
         IF to_regclass('agent_commands') IS NOT NULL THEN
             IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agent_commands' AND column_name='completed_at') THEN
-                UPDATE agent_commands SET completed_at=CURRENT_TIMESTAMP WHERE status IN ('pending','delivered');
+                UPDATE agent_commands SET completed_at=CURRENT_TIMESTAMP WHERE status IN ('pending','delivered','awaiting_media');
             END IF;
-            UPDATE agent_commands SET status='failed', result={result_literal} WHERE status IN ('pending','delivered');
+            UPDATE agent_commands SET status='failed', result={result_literal} WHERE status IN ('pending','delivered','awaiting_media');
         END IF;
         IF to_regclass('heartbeat_sources') IS NOT NULL THEN UPDATE heartbeat_sources SET is_online=false; END IF;
     END"""
     edits.append(f"DO {literal(body)};")
+    for table, statement in RESTORE_EPHEMERAL_UPDATES.items():
+        body = f"BEGIN IF to_regclass({literal(table)}) IS NOT NULL THEN EXECUTE {literal(statement)}; END IF; END"
+        edits.append(f"DO {literal(body)};")
     adjustments_path.write_text("\n".join(edits), encoding="utf-8")
     try:
         _pg_run(["psql", "-X", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-f", str(sql_path), "-f", str(adjustments_path)], env)

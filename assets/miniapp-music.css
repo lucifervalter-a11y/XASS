@@ -1,7 +1,13 @@
 /* Music uses the accepted black/blue XASS library/player design. */
 .xm-player-open #toast{z-index:140}
 /* A retained view-animation transform would trap the fixed player inside it. */
-.xm-player-open #view-music{animation:none;transform:none}
+#view-music{animation:none;transform:none}
+#xassMusic.xm-has-track{padding-bottom:110px}
+#xassMusic input:not([type=range]):not([type=checkbox]),#xassMusic select{font-size:16px!important}
+#xassMusic .xm-art{max-width:min(305px,34dvh)}
+#xassMusic .xm-track-heading h2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:break-word;font-size:23px;line-height:1.25}
+#xassMusic .xm-dialog{width:min(480px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:calc(100dvh - 32px);margin:auto;overflow:auto}
+#xassMusic .xm-menu button span{min-width:0;overflow-wrap:anywhere}
 .xm-player{height:max-content}
 .xm-instructions{padding-left:22px;font-size:14px;line-height:1.65}.xm-instructions li{padding:0 0 10px 3px}
 @media(max-width:759px) and (min-height:760px){#xassMusic .xm-art{max-width:305px;margin-bottom:17px}#xassMusic .xm-volume{margin-block:21px}}

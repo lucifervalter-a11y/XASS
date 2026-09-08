@@ -56,8 +56,10 @@ final class AudioCacheTests: XCTestCase {
         _ = try await cache.insert(track)
         let library = try OfflineLibrary(origin: origin); defer { try? FileManager.default.removeItem(at: library.directory) }
         let cached = await cache.snapshot()
-        let saved = try await cache.promote(cached.entries[0], to: library)
-        XCTAssertEqual(saved.map(\.id), [3])
+        let copied = try await cache.copyToPinned(cached.entries[0], to: library)
+        XCTAssertTrue(library.tracks().isEmpty, "Cache actor must not mutate the manual index")
+        try library.save([copied])
+        XCTAssertEqual(library.tracks().map(\.id), [3])
         try Data([0]).write(to: cache.file(999, suffix: "wav"))
         let reopened = try AudioCache(origin: origin, root: root)
         _ = try await reopened.load()

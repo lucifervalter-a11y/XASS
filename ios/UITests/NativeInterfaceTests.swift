@@ -7,6 +7,8 @@ final class NativeInterfaceTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.buttons["track-1"].waitForExistence(timeout: 12))
         XCTAssertEqual(app.webViews.count, 0, "The music library must not be a website wrapper")
+        XCTAssertTrue(app.buttons["nativePlayAll"].exists)
+        XCTAssertTrue(app.buttons["nativeShuffleAll"].exists)
         XCTAssertTrue(app.tabBars.buttons["Музыка"].exists)
         XCTAssertTrue(app.tabBars.buttons["Устройства"].exists)
         XCTAssertTrue(app.tabBars.buttons["Загрузки"].exists)
@@ -37,6 +39,26 @@ final class NativeInterfaceTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Где слушать"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Переключить"].exists)
         capture(app, "Native-Routes")
+    }
+
+    @MainActor func testNativeSearchAndLargeTextPlayerCanReachBottomControls() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--native-ui-fixture"]
+        app.launch()
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 10)); search.tap(); search.typeText("север")
+        XCTAssertTrue(app.buttons["track-2"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["track-1"].exists)
+        capture(app, "Native-Search")
+        app.terminate()
+        app.launchArguments = ["--native-ui-fixture", "--native-ui-screen", "player", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        app.launch()
+        XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 10))
+        let download = app.buttons["nativeDownload"]
+        for _ in 0..<8 { if download.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(download.isHittable, "Large Dynamic Type must scroll to sharing/download controls")
+        XCTAssertEqual(app.webViews.count, 0)
+        capture(app, "Native-Player-LargeText")
     }
 
     @MainActor private func capture(_ app: XCUIApplication, _ name: String) {

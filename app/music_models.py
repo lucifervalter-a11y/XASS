@@ -44,6 +44,14 @@ class MusicPlaylist(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class MusicUploadReceipt(Base):
+    """Stable response for a completed multi-track upload; safe finish retries."""
+    __tablename__ = "music_upload_receipts"
+    upload_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    result: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class MusicSession(Base):
     __tablename__ = "music_sessions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)

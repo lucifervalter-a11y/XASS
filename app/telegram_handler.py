@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot_api import TelegramApiError, TelegramBotClient
 from app.config import Settings
@@ -53,6 +53,7 @@ from app.services.message_logging import handle_update_logging
 from app.services.message_logging import mark_single_deleted_message
 from app.services.monitoring import collect_server_metrics, collect_systemd_statuses
 from app.services.music_card import build_music_card, build_search_links, normalize_track_input
+from app.services.music_ingest import IngestError, TelegramMusicIngest, music_attachment
 from app.services.panel import (
     format_pc_text,
     dot_commands_help_text,
@@ -126,6 +127,7 @@ class TelegramUpdateHandler:
         self.background_tasks: set[asyncio.Task[Any]] = set()
         self.update_jobs: dict[int, asyncio.Task[Any]] = {}
         self.start_shortcut_hint_sent: set[int] = set()
+        self.music_ingest: TelegramMusicIngest | None = None
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -169,6 +171,8 @@ class TelegramUpdateHandler:
             return
         if await self._maybe_handle_projects_dialog_input(message):
             return
+        if "message" in update and await self._maybe_handle_music_upload(session, message):
+            return
 
         text = (message.get("text") or "").strip()
         if text.startswith("."):
@@ -177,6 +181,34 @@ class TelegramUpdateHandler:
                 return
         if text.startswith("/"):
             await self._handle_command(session, message, text)
+
+    async def _maybe_handle_music_upload(self, session: AsyncSession, message: dict[str, Any]) -> bool:
+        if not self.bot_client or music_attachment(message, self.settings.owner_user_id) is None:
+            return False
+        if self.music_ingest is None:
+            self.music_ingest = TelegramMusicIngest(
+                self.settings, self.bot_client,
+                async_sessionmaker(session.bind, expire_on_commit=False), self._safe_send,
+            )
+            await self.music_ingest.start()
+        try:
+            return self.music_ingest.enqueue(message)
+        except (IngestError, OSError) as exc:
+            logger.warning("Could not queue Telegram music (%s)", type(exc).__name__)
+            await self._safe_send(self.settings.owner_user_id,
+                                  "Не удалось сохранить очередь музыки. Проверьте свободное место на сервере и отправьте файл повторно.")
+            return True
+
+    async def start(self) -> None:
+        if self.bot_client and self.music_ingest is None:
+            from app.db import SessionLocal
+            self.music_ingest = TelegramMusicIngest(self.settings, self.bot_client, SessionLocal, self._safe_send)
+        if self.music_ingest is not None:
+            await self.music_ingest.start()
+
+    async def close(self) -> None:
+        if self.music_ingest is not None:
+            await self.music_ingest.close()
 
     async def _handle_dot_command(
         self,

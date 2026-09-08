@@ -23,6 +23,8 @@ from app.db import SessionLocal, get_session, init_db
 from app.poller import telegram_polling_loop
 from app.server_migration_api import build_router as build_server_migration_router
 from app.music_api import build_router as build_music_router
+from app.native_api import build_router as build_native_router, consume_native_proof
+from app.music_storage_api import build_router as build_music_storage_router
 from app.schemas import (
     AgentPairClaimPayload,
     AgentPairClaimResponse,
@@ -184,7 +186,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.16.0"
+APP_VERSION = "0.17.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -400,9 +402,14 @@ async def _require_pwa_action_proof(
     telegram_init_data: str,
     action_proof: str,
     purpose: str,
+    binding: dict | None = None,
 ) -> None:
     if miniapp_authenticate(telegram_init_data, settings) is not None:
         return
+    if action_proof.startswith("xna_"):
+        if await consume_native_proof(session, action_proof, user.user_id, purpose, binding, settings):
+            return
+        raise HTTPException(428, "Подтверждение iPhone истекло или не соответствует действию. Повторите")
     if not await passkey_count_credentials(session, user.user_id):
         raise HTTPException(
             status_code=status.HTTP_428_PRECONDITION_REQUIRED,
@@ -636,6 +643,7 @@ async def lifespan(_: FastAPI):
     ensure_site_config_exists(Path(settings.site_config_json_path))
     ensure_quotes_exists(Path(settings.quotes_json_path))
     await init_db()
+    await update_handler.start()
     async with SessionLocal() as session:
         await get_or_create_app_config(session, settings)
 
@@ -670,6 +678,7 @@ async def lifespan(_: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
+        await update_handler.close()
         if bot_client:
             await bot_client.close()
 
@@ -805,6 +814,18 @@ async def agent_heartbeat(
 
     config = await get_or_create_app_config(session, settings)
     source, recovered, is_new = await process_heartbeat(session, payload)
+    if auth.credential_id and source.source_type == "PC_AGENT":
+        from app.services.music_agent_queue import advance_agent_queue
+        queue_url = canonical_web_app_url(config.service_base_url or "", settings.profile_public_url)
+        queue_parts = urlsplit(queue_url)
+        try:
+            await advance_agent_queue(session, settings, source, f"{queue_parts.scheme}://{queue_parts.netloc}")
+        except Exception as exc:
+            # Music queue failures must not disconnect monitoring or updates.
+            await session.rollback()
+            await session.refresh(config)
+            await session.refresh(source)
+            logger.warning("Music queue update failed (%s)", type(exc).__name__)
     await sync_profile_now_playing_from_heartbeat(session, settings, config.heartbeat_timeout_minutes)
     if isinstance(payload.discord, dict) and payload.discord:
         update_profile_discord(settings, payload.discord)
@@ -1321,6 +1342,8 @@ def _public_origin(request: Request) -> tuple[str, str]:
 
 app.include_router(build_server_migration_router(settings, require_mini_owner, _require_pwa_action_proof, _public_origin))
 app.include_router(build_music_router(settings, require_mini_owner, _public_origin))
+app.include_router(build_native_router(settings, require_mini_owner))
+app.include_router(build_music_storage_router(settings, require_mini_owner, _require_pwa_action_proof))
 
 
 @app.get("/api/pwa/config")
@@ -2931,6 +2954,7 @@ async def mini_agent_detach(
     await _require_pwa_action_proof(
         session=session, user=user, telegram_init_data=x_telegram_init_data or "",
         action_proof=payload.action_proof, purpose=f"agent:detach:{payload.source_id}:{source_name}",
+        binding={"source_id": payload.source_id, "confirm_name": payload.confirm_name},
     )
     try:
         result = await detach_agent(
@@ -2985,6 +3009,7 @@ async def mini_agent_command(
             telegram_init_data=x_telegram_init_data or "",
             action_proof=payload.action_proof,
             purpose=f"agent:{command_name}:{source.source_name}",
+            binding={"source_id": source.id, "command": command_name, "payload": command_payload},
         )
     try:
         item = await enqueue_agent_command(

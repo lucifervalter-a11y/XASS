@@ -13,3 +13,4 @@ segno==1.6.6
 cryptography==50.0.0
 pywebpush==2.3.0
 mutagen==1.47.0
+Pillow==11.3.0

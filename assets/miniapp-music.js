@@ -4,7 +4,7 @@
   const X = window.XASS, root = document.getElementById('xassMusic');
   if (!X || !root) return;
   const esc = X.esc, $ = id => document.getElementById(id);
-  const ART = '/assets/xass-app-icon-512.png';
+  const ART = '/assets/music-note.svg';
   const PATHS = {
     plus:'M12 5v14M5 12h14', search:'m21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
     heart:'M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z',
@@ -28,7 +28,8 @@
   const s = {tracks:[],playlists:[],filter:'all',playlist:null,query:'',limit:50,loaded:false,loading:false,error:'',
     current:null,queue:[],shuffle:false,repeat:'off',state:'stopped',position:0,duration:0,volume:70,
     device:'local',output:'default',outputs:[],shareSite:false,shareSaving:false,shareDiscord:false,playerOpen:false,playGeneration:0,
-    pcPolling:false,sessionOwned:false,publishing:false,lastPublish:0,upload:null,downloads:new Set(),busy:false};
+    pcPolling:false,sessionOwned:false,publishing:false,lastPublish:0,upload:null,downloads:new Set(),busy:false,
+    transitioning:false,requestedDevice:null,needsStart:false,enabled:true};
   const audio = document.createElement('audio');
   audio.preload='metadata'; audio.setAttribute('playsinline',''); audio.id='xmAudio';
   root.innerHTML = `<div class="xm-library">
@@ -39,11 +40,11 @@
     <div id="xmUpload" role="status" hidden></div><div id="xmLibraryMessage" role="status"></div><div id="xmPlaylistHeading"></div><div id="xmTracks" class="xm-tracks"></div>
     <button id="xmMore" class="xm-secondary" data-xm="more" hidden>Показать ещё</button>
   </div>
-  <input id="xmFile" type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" multiple hidden>
+  <input id="xmFile" type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,.zip,audio/*,application/zip" multiple hidden>
   <div id="xmMini" class="xm-mini" hidden><button data-xm="expand" class="xm-mini-track"><img src="${ART}" alt=""><span><strong id="xmMiniTitle"></strong><small id="xmMiniDevice"></small></span></button>${button('toggle','Воспроизвести','play','id="xmMiniPlay"')}</div>
   <div id="xmPlayer" class="xm-player-backdrop" hidden><section class="xm-player" role="dialog" aria-modal="true" aria-labelledby="xmPlayerCaption" tabindex="-1">
     <header class="xm-player-head">${button('collapse','Свернуть плеер','down')}<span id="xmPlayerCaption">Сейчас играет</span>${button('queue','Очередь воспроизведения','queue')}</header>
-    <img class="xm-art" src="${ART}" alt="Обложка XASS">
+    <img class="xm-art" src="${ART}" alt="Обложка трека">
     <div class="xm-track-heading"><div><h2 id="xmPlayerTitle"></h2><p id="xmPlayerArtist"></p></div>${button('favorite-current','Добавить в избранное','heart','id="xmPlayerFavorite"')}</div>
     <div class="xm-progress"><input id="xmSeek" type="range" min="0" max="1" step="0.1" value="0" aria-label="Позиция трека"><div><span id="xmPosition">0:00</span><span id="xmDuration">0:00</span></div></div>
     <div id="xmPlayerStatus" class="xm-player-status" role="status"></div>
@@ -58,7 +59,7 @@
 
   async function request(path,method='GET',body){
     const result = await X.api('music/'+path,{method,...(body===undefined?{}:{body})});
-    if(result.status<200||result.status>=300||!result.data?.ok){const error=new Error(result.data?.detail||'Музыкальный сервис недоступен. Повторите позже');error.status=result.status;throw error;}
+    if(result.status<200||result.status>=300||!result.data?.ok){const detail=result.data?.detail;const error=new Error(typeof detail==='string'?detail:detail?.message||'Музыкальный сервис недоступен. Повторите позже');error.status=result.status;error.detail=detail;throw error;}
     return result.data;
   }
   function mediaUrl(path){
@@ -90,18 +91,19 @@
   }
   async function load(){
     if(s.loading)return;s.loading=true;s.error='';renderLibrary();
-    try{const data=await request('library');s.tracks=data.tracks||[];s.playlists=data.playlists||[];s.maxUpload=data.max_upload_bytes||256*1024*1024;s.loaded=true;
+    try{const data=await request('library');s.tracks=data.tracks||[];s.playlists=data.playlists||[];s.maxUpload=data.max_upload_bytes||256*1024*1024;
+      let next=data.next_offset;while(data.has_more&&Number.isInteger(next)){const page=await request('library?offset='+next);s.tracks.push(...(page.tracks||[]));if(!page.has_more||!Number.isInteger(page.next_offset)||page.next_offset<=next)break;next=page.next_offset;}s.loaded=true;
       const session=await request('session');if(!s.sessionOwned)s.shareSite=!!session.session?.share_site;
     }catch(error){s.error=error.message;}finally{s.loading=false;renderLibrary();renderPlayer();}
   }
   function deviceName(){return s.device==='local'?localLabel():s.device.slice(6);}
   function renderSharing(){
-    const input=$('xmShareSite');input.checked=s.shareSite;input.disabled=s.shareSaving;input.setAttribute('aria-busy',String(s.shareSaving));
+    const input=$('xmShareSite');input.checked=s.shareSite;input.disabled=s.shareSaving||s.transitioning;input.setAttribute('aria-busy',String(s.shareSaving));
     $('xmShareSiteText').textContent=s.shareSaving?'Сохраняю…':'На сайте';
   }
   function renderPlayer(){
     renderSharing();
-    const t=s.current;if(!t){$('xmMini').hidden=true;return;}
+    const t=s.current;root.classList.toggle('xm-has-track',!!t);if(!t){$('xmMini').hidden=true;return;}
     const playing=s.state==='playing';
     $('xmMini').hidden=false;$('xmMiniTitle').textContent=t.title;$('xmMiniDevice').textContent=deviceName();
     $('xmPlayerTitle').textContent=t.title;$('xmPlayerArtist').textContent=t.artist||'Неизвестный исполнитель';
@@ -137,19 +139,26 @@
     if(s.shuffle){const current=list.find(t=>t.id===s.current?.id),rest=list.filter(t=>t!==current);for(let i=rest.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[rest[i],rest[j]]=[rest[j],rest[i]];}list=current?[current,...rest]:rest;}
     return list.map(t=>({trackId:t.id,title:t.title,artist:t.artist||''}));
   }
-  let publication = null;
+  let publication = null, sharingWrite = null, transition = Promise.resolve(), cancelBrowserStart = null;
   async function publish(takeover=false,options={}){
     const explicitShare=typeof options.shareSite==='boolean',mustWrite=takeover||explicitShare;
+    // PC playback and queue progress belong to authenticated agent heartbeats.
+    // A delayed browser snapshot must not restore the previous track/state.
+    if(s.device!=='local'&&!explicitShare)return;
+    if(s.transitioning&&!options.allowTransition&&!explicitShare)return;
     if(!s.current||(!takeover&&!s.sessionOwned)){if(explicitShare)throw new Error('Сначала запустите трек на этом устройстве');return;}
     // Background snapshots coalesce; explicit settings must get their own
     // acknowledged write after an in-flight snapshot, never inherit its result.
     while(publication){if(!mustWrite){await publication.catch(()=>{});return;}await publication.catch(()=>{});}
     if(!s.current||(!takeover&&!s.sessionOwned)){if(explicitShare)throw new Error('Управление изменилось. Запустите трек на этом устройстве и повторите');return;}
     s.publishing=true;
-    publication=request('session','POST',{session_key:key,takeover,track_id:s.current.id,device:s.device,state:s.state,position:Math.max(0,finite(s.position)),share_site:explicitShare?options.shareSite:s.shareSite,share_discord:s.shareDiscord});
+    const snapshot=s.device==='local'?{track_id:s.current.id,device:s.device,state:s.state,position:Math.max(0,finite(s.position)),share_discord:s.shareDiscord}:{};
+    publication=request('session','POST',{session_key:key,takeover,...snapshot,share_site:explicitShare?options.shareSite:s.shareSite});
     try{await publication;s.sessionOwned=true;s.lastPublish=Date.now();if(explicitShare)s.shareSite=options.shareSite;}
     catch(error){
-      if(error.status===409){s.sessionOwned=false;audio.pause();if(native())nativeSend('pause');s.state='paused';s.error='Управление перешло на другое устройство. Нажмите воспроизведение, чтобы продолжить здесь.';renderPlayer();}
+      if(error.status===409){s.sessionOwned=false;audio.pause();if(native())nativeSend('pause');s.state='paused';
+        if(error.detail?.code==='transfer_requested'&&!native())await request('transfers/'+error.detail.transfer_id+'/ack','POST',{session_key:key,position:Math.max(0,finite(audio.currentTime))});
+        s.error='Управление перешло на другое устройство. Нажмите воспроизведение, чтобы продолжить здесь.';renderPlayer();}
       if(mustWrite)throw error;
     }finally{s.publishing=false;publication=null;}
   }
@@ -157,12 +166,16 @@
     const desired=$('xmShareSite').checked;
     // The switch and native reporter always reflect the last confirmed value.
     if(s.shareSaving){renderSharing();return;}
+    if(s.transitioning){renderSharing();X.toast('Дождитесь переключения устройства');return;}
     if(!s.sessionOwned){renderSharing();X.toast('Сначала запустите трек на этом устройстве');return;}
     if(desired===s.shareSite){renderSharing();return;}
     s.shareSaving=true;renderSharing();
-    try{await publish(false,{shareSite:desired});if(native()&&s.device==='local')nativeSend('session',{session:nativeSession()});}
-    catch(error){notice(new Error('Не удалось изменить публикацию на сайте. '+error.message));}
-    finally{s.shareSaving=false;renderSharing();}
+    sharingWrite=(async()=>{
+      try{await publish(false,{shareSite:desired});if(native()&&s.device==='local')nativeSend('session',{session:nativeSession()});}
+      catch(error){notice(new Error('Не удалось изменить публикацию на сайте. '+error.message));}
+      finally{s.shareSaving=false;renderSharing();}
+    })();
+    try{await sharingWrite;}finally{sharingWrite=null;}
   }
   async function control(action,extra={},device=s.device){
     if(!device.startsWith('agent:'))throw new Error('Выберите компьютер');
@@ -183,26 +196,71 @@
     renderPlayer();
   }
   function startBrowserAudio(){
-    const generation=s.playGeneration;let timer;
+    const generation=s.playGeneration;let timer,cancel;
     // Call play inside the original gesture; a stalled platform decoder must
     // not leave the interface in Loading forever (including desktop WebKit).
     const started=audio.play();
-    return Promise.race([started,new Promise((_,reject)=>{timer=setTimeout(()=>{
+    return Promise.race([started,new Promise(resolve=>{cancel=()=>{audio.pause();resolve();};cancelBrowserStart=cancel;}),new Promise((_,reject)=>{timer=setTimeout(()=>{
       if(generation===s.playGeneration){audio.pause();s.state='error';s.error='Браузер не запустил аудио. Повторите воспроизведение или выберите MP3/WAV';renderPlayer();}
       reject(new Error('Браузер не запустил аудио. Повторите воспроизведение или выберите MP3/WAV'));
-    },12000);})]).finally(()=>clearTimeout(timer));
+    },12000);})]).finally(()=>{clearTimeout(timer);if(cancelBrowserStart===cancel)cancelBrowserStart=null;});
+  }
+  async function handoff(t,options={}){
+    const start=Math.max(0,Math.min(s.queue.indexOf(t.id)-1000,s.queue.length-2000));
+    const body={session_key:key,client_id:key,device:s.device,output_id:s.output,track_id:t.id,
+      volume:Math.round(s.volume),autoplay:options.autoplay!==false,queue:s.queue.slice(start,start+2000),repeat_mode:s.repeat};
+    if(!options.preservePosition)body.position=options.position||0;
+    let result=await request('transfers','POST',body);const started=Date.now();
+    while(result.status!=='ready'){
+      if(result.status==='failed')throw new Error(result.detail||'Переключение не завершено');
+      if(result.status!=='waiting'||!(/^[a-f0-9]{32}$/).test(result.transfer_id||''))throw new Error('Сервер не подтвердил переключение');
+      if(Date.now()-started>31000)throw new Error('Устройство не подтвердило переключение. Повторите попытку');
+      await new Promise(resolve=>setTimeout(resolve,600));result=await request('transfers/'+result.transfer_id);
+    }
+    if(result.session?.session_key!==key||result.session?.device!==body.device||result.session?.track_id!==t.id)throw new Error('Управление изменилось во время переключения. Повторите воспроизведение');
+    return result;
   }
   async function play(t,options={}){
     if(!t)return;
-    if(s.device!=='local'&&(t.pc_supported===false||t.mime==='audio/mp4'))throw new Error('Для этого трека выберите iPhone или загрузите версию MP3/WAV для ПК');
+    if(!s.enabled)throw new Error('Войдите в XASS, чтобы продолжить');
+    const device=options.device||s.requestedDevice||s.device;
+    if(device!=='local'&&(t.pc_supported===false||t.mime==='audio/mp4'))throw new Error('Для этого трека выберите iPhone или загрузите версию MP3/WAV для ПК');
     const generation=++s.playGeneration;
-    audio.pause();if(native())nativeSend('stop');
-    s.current=t;s.queue=options.keepQueue&&s.queue.length?s.queue:tracks().map(t=>t.id);if(!s.queue.includes(t.id))s.queue.unshift(t.id);
-    s.position=options.position||0;s.duration=finite(t.duration);s.state='loading';s.error='';s.lastPlayAt=Date.now();renderLibrary();renderPlayer();
+    s.requestedDevice=device;cancelBrowserStart?.();
+    // Never overlap server handoffs. A superseded request must settle its lease
+    // before the newest request can pause/report it and acquire the next one.
+    const run=transition.catch(()=>{}).then(async()=>{
+      if(generation!==s.playGeneration||!s.enabled)return;
+      if(sharingWrite)await sharingWrite;
+      if(generation!==s.playGeneration||!s.enabled)return;
+      s.transitioning=true;renderSharing();
+      try{await performPlay(t,{...options,device},generation);}
+      finally{s.transitioning=false;if(generation===s.playGeneration)s.requestedDevice=null;renderSharing();}
+    });
+    transition=run;return run;
+  }
+  async function performPlay(t,options,generation){
     try{
-      try{await publish(options.takeover!==false);}catch(error){if(!(native()&&s.downloads.has(t.id)&&!navigator.onLine))throw error;}
+      audio.pause();if(native())nativeSend('stop');
+      if(s.current&&s.sessionOwned&&s.device==='local'){
+        s.position=native()?s.position:finite(audio.currentTime);s.state='paused';
+        await publish(false,{allowTransition:true});
+      }
       if(generation!==s.playGeneration)return;
-      if(s.device!=='local'){const result=await control('play',{track_id:t.id,position_sec:s.position});if(generation===s.playGeneration)applyPc(result);}
+      if(s.device!==options.device){s.output='default';s.outputs=[];}
+      s.device=options.device;s.current=t;s.sessionOwned=false;
+      s.queue=options.keepQueue&&s.queue.length?s.queue:tracks().map(track=>track.id);if(!s.queue.includes(t.id))s.queue.unshift(t.id);
+      s.position=finite(options.position);s.duration=finite(t.duration);s.state='loading';s.error='';s.lastPlayAt=Date.now();renderLibrary();renderPlayer();
+      try{
+        const result=await handoff(t,options);
+        if(!s.enabled)return;
+        s.sessionOwned=true;s.lastPublish=Date.now();s.position=finite(result.session.position);
+        s.state=result.session.state||'loading';s.shareSite=!!result.session.share_site;
+      }catch(error){if(!(native()&&s.downloads.has(t.id)&&navigator.onLine===false))throw error;}
+      if(generation!==s.playGeneration)return;
+      s.needsStart=options.autoplay===false;
+      if(s.needsStart){s.state='paused';renderPlayer();return;}
+      if(s.device!=='local'){renderPlayer();}
       else {
         const cached=native()&&s.downloads.has(t.id);
         const ticket=cached?null:await request(`tracks/${t.id}/ticket`,'POST',{purpose:'listen'});
@@ -211,21 +269,21 @@
         if(native())nativeSend('play',{url,title:t.title,artist:t.artist||'',trackId:t.id,position:s.position,volume:s.volume,artwork:new URL(ART,location.origin).href,session:nativeSession(),queue:nativeQueue(),repeat:s.repeat});
         else {audio.src=url;audio.volume=s.volume/100;audio.currentTime=s.position;await startBrowserAudio();}
       }
-      setMediaSession();
-    }catch(error){if(generation!==s.playGeneration)return;s.state='error';s.error=error.name==='NotAllowedError'?'Браузер ждёт нажатия. Нажмите «Воспроизвести» ещё раз.':error.name==='NotSupportedError'?'Этот браузер не поддерживает аудиоформат. Попробуйте MP3 или WAV':error.message;renderPlayer();await publish();throw new Error(s.error);}
+      if(generation===s.playGeneration)setMediaSession();
+    }catch(error){if(generation!==s.playGeneration)return;s.state='error';s.error=error.name==='NotAllowedError'?'Браузер ждёт нажатия. Нажмите «Воспроизвести» ещё раз.':error.name==='NotSupportedError'?'Этот браузер не поддерживает аудиоформат. Попробуйте MP3 или WAV':error.message;renderPlayer();await publish(false,{allowTransition:true});throw new Error(s.error);}
     renderPlayer();
   }
   async function toggle(){
     if(!s.current)return play(tracks()[0]);
-    if(s.device==='local'&&!native()&&s.state==='error'&&audio.src&&!audio.error){
+    if(s.device==='local'&&!native()&&s.sessionOwned&&!s.needsStart&&s.state==='error'&&audio.src&&!audio.error){
       // Safari may require a second explicit tap after the ticket request.
       // Invoke play synchronously in that gesture, without fetching again.
-      const resumed=startBrowserAudio();await resumed;s.error='';s.state='playing';await publish(!s.sessionOwned);renderPlayer();return;
+      const resumed=startBrowserAudio();await resumed;s.error='';s.state='playing';await publish();renderPlayer();return;
     }
     if(s.state==='playing'){
       if(s.device!=='local')applyPc(await control('pause'));else if(native())nativeSend('pause');else audio.pause();
       s.state='paused';
-    }else if(['loading','error','stopped','ended'].includes(s.state)||!s.sessionOwned){
+    }else if(['loading','error','stopped','ended'].includes(s.state)||!s.sessionOwned||s.needsStart){
       return play(s.current,{keepQueue:true,position:s.state==='ended'?0:s.position});
     }else{
       if(s.device!=='local')applyPc(await control('resume'));else if(native())nativeSend('resume');else await startBrowserAudio();
@@ -233,6 +291,7 @@
     renderPlayer();await publish();
   }
   async function step(direction,automatic=false){
+    if(automatic&&s.device!=='local')return;
     if(native()&&s.device==='local'){if(!automatic)nativeSend(direction>0?'next':'previous');return;}
     const ids=s.queue.filter(id=>s.tracks.some(t=>t.id===id));if(!ids.length)return;
     if(automatic&&!s.sessionOwned)return;
@@ -278,10 +337,10 @@
   }
   async function chooseDevice(value){
     if(value===s.device){if(value!=='local')await outputs();return;}
-    const previous=s.device,wasPlaying=s.state==='playing',position=s.position;
-    if(previous!=='local')await control('stop',{},previous);else{audio.pause();if(native())nativeSend('stop');}
-    s.device=value;s.output='default';s.outputs=[];s.state='paused';renderPlayer();await devices();
-    if(wasPlaying&&s.current)await play(s.current,{keepQueue:true,position});
+    const wasPlaying=['playing','loading'].includes(s.state);
+    if(s.current)await play(s.current,{device:value,keepQueue:true,preservePosition:true,autoplay:wasPlaying});
+    else{s.device=value;s.output='default';s.outputs=[];s.sessionOwned=false;renderPlayer();}
+    await devices();
   }
   async function download(id){
     const t=s.tracks.find(t=>t.id===id);if(!t)return;
@@ -297,13 +356,15 @@
     $('xmUpload').innerHTML=`<div class="xm-upload"><strong>${esc(u.file.name)}</strong><span>${u.error?esc(u.error):u.offset>=u.file.size?'Проверяю аудиофайл…':pct+'%'}</span><progress max="${u.file.size}" value="${u.offset}"></progress>${u.error?'<button class="xm-text" data-xm="resume-upload">Повторить загрузку</button>':''}<button class="xm-text" data-xm="cancel-upload">${u.error?'Закрыть':'Отмена'}</button></div>`;
   }
   async function upload(file,resume=false){
-    if(!resume){if(file.size>(s.maxUpload||256*1024*1024))throw new Error('Файл больше допустимого размера');if(!/\.(mp3|wav|flac|ogg|m4a)$/i.test(file.name))throw new Error('Выберите MP3, WAV, FLAC, OGG или M4A');s.upload={file,offset:0,id:null,error:'',cancelled:false};}
+    if(!resume){if(file.size>(s.maxUpload||256*1024*1024))throw new Error('Файл больше допустимого размера');if(!/\.(mp3|wav|flac|ogg|m4a|zip)$/i.test(file.name))throw new Error('Выберите MP3, WAV, FLAC, OGG, M4A или ZIP');s.upload={file,offset:0,id:null,error:'',cancelled:false};}
     const u=s.upload;if(!u)return;u.error='';uploadStatus();
     try{
       if(!u.id){const started=await request('uploads','POST',{filename:u.file.name,size:u.file.size});u.id=started.upload_id;u.offset=started.offset||0;u.chunk=Math.min(512*1024,started.chunk_bytes||512*1024);if(u.cancelled){await request('uploads/'+u.id,'DELETE');return;}}
       while(u.offset<u.file.size&&!u.cancelled){const bytes=await u.file.slice(u.offset,u.offset+u.chunk).arrayBuffer();const result=await request('uploads/'+u.id,'PUT',{offset:u.offset,data:base64(bytes)});if(result.offset<=u.offset)throw new Error('Сервер не подтвердил блок файла');u.offset=result.offset;uploadStatus();}
       if(u.cancelled)return;
-      const result=await request('uploads/'+u.id+'/finish','POST');if(u.cancelled||s.upload!==u)return;s.tracks=s.tracks.filter(t=>t.id!==result.track.id);s.tracks.unshift(result.track);s.upload=null;uploadStatus();renderLibrary();X.toast(result.duplicate?'Этот трек уже есть в библиотеке':'Трек добавлен');
+      const result=await request('uploads/'+u.id+'/finish','POST');if(u.cancelled||s.upload!==u)return;
+      const imported=result.tracks||(result.track?[result.track]:[]),ids=new Set(imported.map(t=>t.id));s.tracks=[...imported,...s.tracks.filter(t=>!ids.has(t.id))];s.upload=null;uploadStatus();renderLibrary();
+      X.toast(result.archive?`Добавлено: ${result.added}. Уже в библиотеке: ${result.duplicates}.${result.errors?.length?' '+result.errors[0]:''}`:result.duplicate?'Этот трек уже есть в библиотеке':'Трек добавлен');
     }catch(error){if(u.cancelled)return;u.error=error.message;uploadStatus();}
   }
   async function action(name,el){
@@ -362,14 +423,14 @@
   $('xmShareSite').addEventListener('change',changeSiteSharing);
   audio.addEventListener('loadedmetadata',()=>{if(s.device!=='local'||native())return;s.duration=finite(audio.duration);renderProgress();});
   audio.addEventListener('timeupdate',()=>{if(s.device!=='local'||native())return;s.position=finite(audio.currentTime);renderProgress();});
-  audio.addEventListener('playing',()=>{if(s.device!=='local'||native())return;s.state='playing';s.error='';renderPlayer();publish();});
-  audio.addEventListener('pause',()=>{if(s.device!=='local'||native()||s.state==='loading')return;if(!audio.ended)s.state='paused';renderPlayer();publish();});
+  audio.addEventListener('playing',()=>{if(s.device!=='local'||native()||!s.sessionOwned)return;s.state='playing';s.error='';renderPlayer();publish();});
+  audio.addEventListener('pause',()=>{if(s.device!=='local'||native()||s.transitioning||s.state==='loading')return;if(!audio.ended)s.state='paused';renderPlayer();publish();});
   audio.addEventListener('ended',()=>{if(s.device==='local'&&!native())step(1,true).catch(notice);});
   audio.addEventListener('error',()=>{if(!audio.src||s.device!=='local'||native())return;s.state='error';s.error='Не удалось воспроизвести аудио. Для этого браузера попробуйте MP3 или WAV';renderPlayer();publish();});
   window.addEventListener('xass:native-audio',event=>{const d=event.detail||{};
     if(d.action==='download'){if(d.downloaded){s.downloads.add(Number(d.trackId));X.toast('Трек сохранён в приложении');}else if(d.error)notice(d.error);renderPlayer();return;}
     if(Array.isArray(d.downloads)){s.downloads=new Set(d.downloads.map(t=>Number(t.trackId)));return;}
-    if(s.device!=='local')return;
+    if(s.device!=='local'||s.transitioning||!s.enabled)return;
     if(d.trackId&&Number(d.trackId)!==s.current?.id){const track=s.tracks.find(t=>t.id===Number(d.trackId));if(!track)return;s.current=track;renderLibrary();}
     const ended=d.state==='ended'&&s.state!=='ended';if(['playing','paused','loading','stopped','ended','error'].includes(d.state))s.state=d.state;
     s.position=finite(d.position);s.duration=finite(d.duration)||s.duration;s.error=d.error||'';renderPlayer();if(ended)step(1,true).catch(notice);
@@ -382,14 +443,14 @@
   document.addEventListener('xass:view',event=>{const visible=event.detail?.name==='music';$('xmMini').classList.toggle('xm-outside',!visible);if(visible&&!s.loaded)load();});
   document.addEventListener('xass:boot',()=>{if(document.getElementById('view-music').classList.contains('on')&&!s.loaded)load();});
   setInterval(async()=>{
-    if(s.current&&s.sessionOwned&&Date.now()-s.lastPublish>20000&&!(native()&&s.device==='local'))publish();
-    if(s.device==='local'||!s.current||s.pcPolling||document.hidden)return;
+    if(s.current&&s.sessionOwned&&!s.transitioning&&Date.now()-s.lastPublish>4000&&!(native()&&s.device==='local'))publish();
+    if(s.device==='local'||!s.current||s.pcPolling||document.hidden||s.transitioning)return;
     s.pcPolling=true;const generation=s.playGeneration,device=s.device;
-    try{const result=await request('players'),player=(result.players||[]).find(p=>p.source_name===device.slice(6));if(!player?.online)throw new Error('Компьютер не в сети');if(!player.available)throw new Error('Обновите Windows-агент для управления музыкой');const data=player.music_player||{};if(generation===s.playGeneration&&device===s.device){if(data.track_id!==s.current?.id&&Date.now()-s.lastPlayAt<15000)return;const ended=data.state==='ended'&&s.state!=='ended';applyPc(data);if(ended)await step(1,true);}}
+    try{const result=await request('players'),player=(result.players||[]).find(p=>p.source_name===device.slice(6));if(!player?.online)throw new Error('Компьютер не в сети');if(!player.available)throw new Error('Обновите Windows-агент для управления музыкой');const data=player.music_player||{};if(generation===s.playGeneration&&device===s.device){if(data.track_id!==s.current?.id&&Date.now()-s.lastPlayAt<15000)return;applyPc(data);}}
     catch(error){if(device===s.device){s.error=error.message;renderPlayer();}}finally{s.pcPolling=false;}
   },5000);
-  window.addEventListener('pagehide',()=>{if(s.sessionOwned&&s.current&&!native()){s.state=audio.paused?'paused':'playing';publish();}});
-  for(const id of ['logoutBtn','logoutAllBtn'])$(id)?.addEventListener('click',()=>{audio.pause();audio.removeAttribute('src');audio.load();if(native())nativeSend('stop');s.sessionOwned=false;});
-  X.music={state:s,load,play,toggle,seek,mediaUrl,seconds,base64,renderLibrary};
+  window.addEventListener('pagehide',()=>{if(s.device==='local'&&s.sessionOwned&&s.current&&!native()){s.state=audio.paused?'paused':'playing';publish();}});
+  for(const id of ['logoutBtn','logoutAllBtn'])$(id)?.addEventListener('click',()=>{s.enabled=false;s.playGeneration++;s.sessionOwned=false;cancelBrowserStart?.();audio.pause();audio.removeAttribute('src');audio.load();if(native())nativeSend('stop');});
+  X.music={state:s,load,play,toggle,seek,chooseDevice,mediaUrl,seconds,base64,renderLibrary};
   renderLibrary();if(native())nativeSend('downloads');
 })();

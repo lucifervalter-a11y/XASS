@@ -27,6 +27,9 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 async def init_db() -> None:
     import app.models  # noqa: F401
     import app.music_models  # noqa: F401
+    import app.native_models  # noqa: F401
+    import app.music_playback_models  # noqa: F401
+    import app.music_storage_models  # noqa: F401
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

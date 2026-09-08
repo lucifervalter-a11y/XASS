@@ -26,7 +26,7 @@ import UniformTypeIdentifiers
                     NavigationLink { NativeTrackStorageView(store: store, track: track, initialSource: source) } label: { HStack { Text(track.title).lineLimit(1); Spacer(); Image(systemName: "music.note").foregroundStyle(.secondary) } }
                 }
                 if store.tracks.isEmpty { Text("Добавьте треки в библиотеку, чтобы выбрать место хранения.").foregroundStyle(.secondary) }
-            } header: { Text(source.map { "На компьютере · " + $0 } ?? "Копии на компьютере") } footer: { Text("Оригинал удаляется с сервера только после проверки копии и вашего подтверждения.") }
+            } header: { Text(source.map { "Управление копиями · " + $0 } ?? "Управление копиями") } footer: { Text("Выберите трек, чтобы проверить копии или сохранить его на ПК. Оригинал удаляется с сервера только после проверки и вашего подтверждения.") }
             Section("Импорт") {
                 Button { importFiles = true } label: { Label("Из файлов или ZIP", systemImage: "doc") }.disabled(store.uploadName != nil)
                 if source != nil { Button { folderImport = true } label: { Label("Импортировать папку ПК", systemImage: "folder") } }

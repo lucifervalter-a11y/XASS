@@ -47,6 +47,7 @@ from remote_tools import (
 )
 from network_client import create_http_client
 from music_player import MUSIC_COMMANDS, handle_music_command, music_snapshot
+from music_storage import storage_tick, storage_snapshot
 try:
     from e2e_crypto import can_seal, ensure_agent_keys, is_public_jwk, seal_text, unseal_text
     from secret_store import seal_config, unseal_config
@@ -790,6 +791,7 @@ def run_agent(config: dict[str, Any]) -> str:
                 "last_error_at": _last_heartbeat_error_at,
                 "server_version_seen": _last_server_version,
                 "music_player": music_snapshot(),
+                "music_storage": storage_snapshot(),
             }
             sent_result_ids = [
                 int(item.get("id"))
@@ -845,6 +847,7 @@ def run_agent(config: dict[str, Any]) -> str:
                 manifest = body.get("update") if isinstance(body.get("update"), dict) else None
                 installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
                 config["archive_enabled"] = bool(body.get("archive_enabled"))
+                storage_tick(config, DATA_ROOT)
                 update_command_id: int | None = None
                 for command in commands:
                     if not isinstance(command, dict):
@@ -860,6 +863,10 @@ def run_agent(config: dict[str, Any]) -> str:
                     # Persist before execution. If the process dies after a power or
                     # lock command, the same server delivery cannot execute it twice.
                     mark_command_processed(command_id, command_name)
+                    if command_name == "music_storage_sync":
+                        storage_tick(config, DATA_ROOT, force=True)
+                        store_command_result(command_id, True, "Синхронизация хранилища запрошена", storage_snapshot())
+                        continue
                     if command_name in MUSIC_COMMANDS:
                         try:
                             music_details = handle_music_command(command_name, command_payload, config)

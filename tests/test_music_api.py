@@ -18,6 +18,7 @@ from app.db import Base, get_session
 from app.models import AgentCommand, AgentCredential, HeartbeatSource
 from app.music_api import build_router
 from app.music_models import MusicSession, MusicTrack, MusicUpload
+from app.music_playback_models import MusicPlaybackState
 from app.services.music_library import CHUNK_BYTES, issue_ticket
 from app.services.music_broadcast import current_broadcast
 from test_music_library import silent_wav
@@ -336,6 +337,62 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request("POST", "/api/mini/music/session", json={
             "session_key": key, "share_discord": True
         })).status_code, 409, "unconfigured Discord must not claim success")
+
+    async def test_stale_pc_publish_cannot_overwrite_server_queue_but_metadata_is_allowed(self):
+        first, second = await self.upload(), await self.upload(silent_wav(6), "next.wav")
+        key = "fixture-agent-queue-key"
+        timestamp = datetime.now(timezone.utc) - timedelta(seconds=5)
+        async with self.sessions() as session:
+            item = MusicSession(id=1, session_key=key, device="agent:PC", track_id=second["id"],
+                state="loading", position=0, updated_at=timestamp)
+            command = AgentCommand(source_name="PC", command="music_play", status="pending", payload={
+                "queue_managed": True, "queue_session_key": key, "track_id": second["id"]})
+            session.add_all([item, command]); await session.flush()
+            session.add(MusicPlaybackState(id=1, queue_command_id=command.id,
+                queue=[first["id"], second["id"]], repeat_mode="off"))
+            await session.commit(); command_id = command.id
+        for status in ("awaiting_media", "pending", "delivered", "completed", "failed"):
+            with self.subTest(status=status):
+                expected_state = "error" if status == "failed" else "loading"
+                async with self.sessions() as session:
+                    (await session.get(AgentCommand, command_id)).status = status
+                    item = await session.get(MusicSession, 1)
+                    item.state = expected_state; item.updated_at = timestamp
+                    await session.commit()
+                response = await self.request("POST", "/api/mini/music/session", json={
+                    "session_key": key, "track_id": first["id"], "device": "agent:PC",
+                    "state": "ended", "position": 5, "queue": [first["id"]]})
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(response.json()["detail"]["code"], "agent_playback_authoritative")
+                # Failed response cannot apply even its bundled metadata changes.
+                async with self.sessions() as session:
+                    item = await session.get(MusicSession, 1)
+                    self.assertEqual((item.track_id, item.state, item.position), (second["id"], expected_state, 0))
+                    self.assertEqual((await session.get(MusicPlaybackState, 1)).queue_command_id, command_id)
+                metadata = await self.request("POST", "/api/mini/music/session", json={
+                    "session_key": key, "queue": [second["id"], first["id"]], "repeat_mode": "all", "share_site": True})
+                self.assertEqual(metadata.status_code, 200, metadata.text)
+                async with self.sessions() as session:
+                    item = await session.get(MusicSession, 1); meta = await session.get(MusicPlaybackState, 1)
+                    self.assertEqual((item.track_id, item.state, item.position), (second["id"], expected_state, 0))
+                    self.assertTrue(item.share_site)
+                    self.assertEqual(item.updated_at.replace(tzinfo=timezone.utc), timestamp)
+                    self.assertEqual(meta.queue, [second["id"], first["id"]])
+                    self.assertEqual(meta.repeat_mode, "all")
+        for field in ({"state": "playing"}, {"position": 1}, {"device": "agent:PC"}, {"track_id": second["id"]}):
+            response = await self.request("POST", "/api/mini/music/session", json={"session_key": key, **field})
+            self.assertEqual(response.status_code, 409, response.text)
+
+    async def test_local_playback_reports_remain_writable(self):
+        track = await self.upload()
+        key = "fixture-local-session-key"
+        for state, position in (("playing", 1), ("paused", 2), ("playing", 3), ("ended", 5)):
+            response = await self.request("POST", "/api/mini/music/session", json={
+                "session_key": key, "device": "local", "track_id": track["id"], "state": state, "position": position})
+            self.assertEqual(response.status_code, 200, response.text)
+            async with self.sessions() as session:
+                item = await session.get(MusicSession, 1)
+                self.assertEqual((item.state, item.position), (state, position))
 
 
 if __name__ == "__main__":
