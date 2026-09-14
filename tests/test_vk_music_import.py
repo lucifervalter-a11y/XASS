@@ -18,6 +18,10 @@ class VkMusicImportHelpersTests(unittest.TestCase):
         self.assertNotIn("/", name)
         self.assertNotIn("?", name)
 
+    def test_rejects_blank_and_non_audio_hosts(self):
+        self.assertEqual(_direct_url({"url": ""}), "")
+        self.assertEqual(_direct_url({"url": "https://vk.com/audio"}), "https://vk.com/audio")
+
 
 if __name__ == "__main__":
     unittest.main()
