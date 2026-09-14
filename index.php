@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require __DIR__ . '/security-headers.php';
 
 // nginx serves the public PHP site and falls back to this front controller.
 // Keep the agent API on the same HTTPS origin without exposing FastAPI's port
