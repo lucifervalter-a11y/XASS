@@ -37,6 +37,9 @@ def resolve_https_ipv4(host: str, *, timeout: float = 4.0) -> str:
     if not normalized or normalized in {"localhost", "localhost.localdomain"}:
         return ""
     if _is_ip_address(normalized):
+        address = ipaddress.ip_address(normalized)
+        if address.is_private or address.is_loopback or address.is_reserved or address.is_link_local or address.is_multicast:
+            return ""
         return normalized
 
     now = time.monotonic()
@@ -70,6 +73,8 @@ def resolve_https_ipv4(host: str, *, timeout: float = 4.0) -> str:
             except ValueError:
                 continue
             if address.version != 4:
+                continue
+            if address.is_private or address.is_loopback or address.is_reserved or address.is_link_local or address.is_multicast:
                 continue
             with _cache_lock:
                 _cache[normalized] = (now, value)
@@ -114,10 +119,6 @@ class _HostOverrideBackend(httpcore.NetworkBackend):
 class _ResolvedHTTPTransport(httpx.HTTPTransport):
     def __init__(self, overrides: dict[str, str], *, retries: int = 1) -> None:
         super().__init__(retries=retries, trust_env=False)
-        # httpx does not expose httpcore's network backend in its public
-        # constructor. Replacing only this pool dependency keeps normal HTTP,
-        # redirect and TLS verification behaviour; TLS still receives the
-        # original hostname for SNI and certificate validation.
         self._pool._network_backend = _HostOverrideBackend(overrides)  # type: ignore[attr-defined]
 
 
