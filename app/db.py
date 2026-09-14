@@ -11,7 +11,18 @@ from sqlalchemy.orm import DeclarativeBase
 from app.config import get_settings
 
 settings = get_settings()
-engine = create_async_engine(settings.database_url, echo=False)
+
+
+def _engine_kwargs(database_url: str) -> dict:
+    kwargs: dict = {"echo": False}
+    if database_url.startswith("sqlite"):
+        # aiosqlite has no ?wal=true query flag. Enable WAL + busy timeout on connect.
+        kwargs["connect_args"] = {"timeout": 30}
+        return kwargs
+    return kwargs
+
+
+engine = create_async_engine(settings.database_url, **_engine_kwargs(settings.database_url))
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -32,6 +43,10 @@ async def init_db() -> None:
     import app.music_storage_models  # noqa: F401
 
     async with engine.begin() as connection:
+        if settings.database_url.startswith("sqlite"):
+            await connection.execute(text("PRAGMA journal_mode=WAL"))
+            await connection.execute(text("PRAGMA busy_timeout=30000"))
+            await connection.execute(text("PRAGMA foreign_keys=ON"))
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_apply_runtime_migrations)
 
