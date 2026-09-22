@@ -78,6 +78,9 @@ final class NativeStoreTests: XCTestCase {
             return nil
         }
         await store.refresh()
+        XCTAssertEqual(store.tracks.map(\.id), [1], "First paint stays lazy")
+        XCTAssertTrue(store.libraryHasMore)
+        await store.loadMoreTracks()
         XCTAssertEqual(store.tracks.map(\.id), [1, 2])
         XCTAssertEqual(api.requests.filter { $0.0.contains("library") }.count, 2)
         store.disconnect()

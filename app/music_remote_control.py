@@ -81,6 +81,19 @@ def install_remote_control_routes(router, require_owner):
         await session.commit()
         return {"ok": True, "command_id": value.id, "status": value.status, "error": value.error}
 
+
+    @router.post("/api/mini/music/session/commands/{command_id}/cancel")
+    async def cancel_command(command_id: str, user=Depends(require_owner), session=Depends(get_session)):
+        await expire(session)
+        value = await session.get(MusicRemoteCommand, command_id)
+        if not value:
+            raise HTTPException(404, "Команда не найдена")
+        if value.status == "pending":
+            value.status = "cancelled"
+            value.error = "Команда отменена"
+        await session.commit()
+        return {"ok": True, "command_id": value.id, "status": value.status, "error": value.error}
+
     @router.post("/api/mini/music/session/commands/{command_id}/ack")
     async def acknowledge(command_id: str, payload: RemoteAck, user=Depends(require_owner), session=Depends(get_session)):
         meta = await playback_meta(session)

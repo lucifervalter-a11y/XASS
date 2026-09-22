@@ -48,6 +48,9 @@ import UIKit
     private let libraryPageSize = 50
     private var transferCancelled = false
     private var activeTransferID: String?
+    /// User explicitly chose a route via AirPlay-like picker. Until then, play on this iPhone.
+    private var userPickedRoute = false
+    @Published var showRoutePicker = false
     var confirmationActivity: ((Bool) -> Void)?
     var canSendActions: () -> Bool = { UIApplication.shared.applicationState == .active }
     private(set) var queue: [LibraryTrack] = []
@@ -172,15 +175,66 @@ import UIKit
             error = nil
         } catch { handle(error) }
     }
-    func cancelTransfer() {
+    
+    func openRoutePicker() {
+        // Mutually exclusive: close player sheet while choosing route.
+        showPlayer = false
+        showLogin = false
+        showEnrollment = false
+        showRoutePicker = true
+    }
+
+    func pickRoute(device: String, output: String? = nil) async throws {
+        userPickedRoute = true
+        selectedDevice = device
+        if let output = output { outputID = output }
+        if currentID != nil {
+            // Keep the same AirPlay sheet open and show progress inside it.
+            showRoutePicker = true
+            showPlayer = false
+            do {
+                try await transfer(to: device, trackID: currentID, startPosition: position, output: output)
+                showRoutePicker = false
+            } catch is CancellationError {
+                showRoutePicker = true
+                throw CancellationError()
+            } catch {
+                showRoutePicker = true
+                throw error
+            }
+        } else {
+            showRoutePicker = false
+            notice = device == "local" ? "Будет играть на этом iPhone" : "Устройство выбрано"
+        }
+    }
+
+
+    /// Background/locked iPhone still owns the audible source: ACK stop from session poll.
+    private func acknowledgePendingHandoff(from session: [String: Any]) async {
+        guard let transferID = session["active_transfer_id"] as? String,
+              (session["active_transfer_status"] as? String) == "waiting",
+              let sourceKey = session["active_transfer_source_key"] as? String,
+              sourceKey == sessionKey else { return }
+        suppressReports = true; audio.pause(); suppressReports = false
+        let position = audio.exactPosition()
+        ownsSession = false
+        _ = try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/ack", method: "POST", body: ["session_key": sessionKey, "position": position])
+    }
+
+func cancelTransfer() {
+        // Only signal cancel. Clearing busy/transferPending here races a second POST / inbox.
+        // transfer()/remoteControl() clear locks in defer after server cancel.
+        let transferID = activeTransferID
+        let wasRemote = transferStatus?.contains("Команда") == true || transferStatus?.contains("подтвержден") == true || transferStatus?.contains("жду ответ") == true
         transferCancelled = true
         generation = UUID()
-        activeTransferID = nil
-        transferPending = false
-        busy = false
-        transferStatus = nil
-        transferProgress = 0
+        transferStatus = "Отменяю на сервере…"
         notice = "Переключение отменено"
+        guard let transferID, !transferID.isEmpty else { return }
+        let path = wasRemote
+            ? "/api/mini/music/session/commands/" + OwnerAPI.pathComponent(transferID) + "/cancel"
+            : "/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel"
+        Task { try? await api.request(path, method: "POST", body: nil) }
     }
 
     func foreground(_ active: Bool) {
@@ -209,6 +263,7 @@ import UIKit
             generation = UUID(); ownsSession = false; suppressReports = true; audio.pause(); suppressReports = false; pendingReport = nil
         }
         if !offlinePlayback && (!ownsSession || selectedDevice != "local") { applySession(session) }
+        await acknowledgePendingHandoff(from: session)
         else if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
             let mode = session["repeat_mode"] as? String ?? repeatMode
             if ids != queue.map(\.id) || mode != repeatMode {
@@ -226,7 +281,7 @@ import UIKit
     private func applySession(_ value: [String: Any]) {
         currentID = value["track_id"] as? Int
         canonicalClientID = value["client_id"] as? String ?? ""; canonicalSessionKey = value["session_key"] as? String ?? ""
-        selectedDevice = value["device"] as? String ?? "local"
+        if userPickedRoute || transferPending { selectedDevice = value["device"] as? String ?? selectedDevice } else { selectedDevice = "local" }
         playbackState = value["state"] as? String ?? "stopped"
         let detail = value["detail"] as? String
         if let detail = detail { error = detail }
@@ -271,7 +326,43 @@ import UIKit
         if let rows = rows { baseQueue = rows; queue = shuffle ? rows.shuffled() : rows }
         if queue.isEmpty { baseQueue = tracks; queue = shuffle ? tracks.shuffled() : tracks }
         if !queue.contains(where: { $0.id == track.id }) { queue.insert(track, at: 0) }
-        try await transfer(to: selectedDevice, trackID: track.id, startPosition: 0)
+        // Local play must go straight into AVPlayer — never through /transfers.
+        if selectedDevice == "local" || selectedDevice.isEmpty {
+            try await playLocal(track, startPosition: 0)
+        } else {
+            try await transfer(to: selectedDevice, trackID: track.id, startPosition: 0)
+        }
+    }
+
+    /// Start or resume on this iPhone without a handoff lease.
+    private func playLocal(_ track: LibraryTrack, startPosition: Double) async throws {
+        guard !busy else { return }; busy = true
+        defer { busy = false }
+        let nextGeneration = UUID(); generation = nextGeneration
+        transferCancelled = false
+        offlinePlayback = false
+        selectedDevice = "local"
+        currentID = track.id
+        error = nil
+        let url: String
+        do {
+            if audio.downloads.contains(where: { $0.id == track.id }) || audio.cachedTracks.contains(where: { $0.id == track.id }) {
+                url = ""
+            } else {
+                url = try await ticket(track.id)
+            }
+        } catch let failure {
+            playbackState = "error"
+            self.error = (failure as? LocalizedError)?.errorDescription ?? "Не удалось получить поток. Проверьте сеть и войдите снова."
+            throw failure
+        }
+        guard generation == nextGeneration, !transferCancelled else { throw CancellationError() }
+        ownsSession = true
+        position = startPosition
+        audio.handle(try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist,
+            "url": url, "position": startPosition, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: track.id), "repeat": repeatMode]))
+        _ = try? await writeSession(snapshot(state: "playing", position: startPosition), explicit: true)
+        showPlayer = true
     }
     func playAll(_ rows: [LibraryTrack], shuffled: Bool) async throws {
         guard !rows.isEmpty, !busy else { return }
@@ -310,7 +401,11 @@ import UIKit
         var response = started
         while response["status"] as? String != "ready" {
             if transferCancelled || generation != nextGeneration {
-                transferStatus = nil; transferProgress = 0; activeTransferID = nil
+                let id = activeTransferID ?? transferID
+                if !id.isEmpty {
+                    try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                }
+                activeTransferID = nil
                 throw CancellationError()
             }
             if response["status"] as? String == "failed" {
@@ -318,7 +413,9 @@ import UIKit
                 throw OwnerAPIError(status: 409, message: response["detail"] as? String ?? "Источник не подтвердил остановку. Переключение отменено.")
             }
             guard Date() < deadline else {
-                transferStatus = nil; transferProgress = 0; activeTransferID = nil
+                let id = activeTransferID ?? transferID
+                try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                activeTransferID = nil
                 throw OwnerAPIError(status: 408, message: "Устройство не подтвердило переключение. Второй плеер не запущен.")
             }
             let elapsed = Date().timeIntervalSince(startedAt)
@@ -327,23 +424,54 @@ import UIKit
             try await Task.sleep(for: .milliseconds(650)); try Task.checkCancellation()
             response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID), method: "GET", body: nil)
         }
-        transferProgress = 1; transferStatus = "Готово"; activeTransferID = nil
-        guard generation == nextGeneration, let session = response["session"] as? [String: Any] else { return }
+        transferProgress = 1; transferStatus = "Готово"
+        guard generation == nextGeneration, !transferCancelled else {
+            activeTransferID = nil
+            throw CancellationError()
+        }
+        guard let session = response["session"] as? [String: Any] else {
+            activeTransferID = nil
+            playbackState = "error"
+            error = "Сервер подтвердил переключение без сессии. Повторите воспроизведение."
+            // Roll back optimistic UI that looked like success.
+            try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel", method: "POST", body: nil)
+            throw OwnerAPIError(status: 409, message: error ?? "Нет сессии после переключения")
+        }
         offlinePlayback = false; applySession(session); currentID = chosenID; error = nil
         if selectedDevice == "local" {
-            guard let track = currentTrack else { throw OwnerAPIError.invalidResponse }
+            guard let track = currentTrack else {
+                activeTransferID = nil
+                playbackState = "error"
+                throw OwnerAPIError.invalidResponse
+            }
             let url: String
-            do { if audio.downloads.contains(where: { $0.id == chosenID }) || audio.cachedTracks.contains(where: { $0.id == chosenID }) { url = "" } else { url = try await ticket(chosenID) } }
-            catch {
+            do {
+                if audio.downloads.contains(where: { $0.id == chosenID }) || audio.cachedTracks.contains(where: { $0.id == chosenID }) { url = "" }
+                else { url = try await ticket(chosenID) }
+            } catch {
                 playbackState = "error"
                 _ = try? await writeSession(snapshot(state: "error"), explicit: true)
+                activeTransferID = nil
                 throw error
             }
-            guard generation == nextGeneration else { return }
+            guard generation == nextGeneration, !transferCancelled else {
+                // Cancel between ready → ticket → play: do not leave UI "playing" without AVPlayer.
+                activeTransferID = nil
+                ownsSession = false
+                playbackState = "paused"
+                suppressReports = true; audio.pause(); suppressReports = false
+                throw CancellationError()
+            }
             ownsSession = true
             audio.handle(try NativeAudioCommand(["action": "play", "trackId": chosenID, "title": track.title, "artist": track.artist,
                 "url": url, "position": position, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: chosenID), "repeat": repeatMode]))
-        } else { ownsSession = false }
+            activeTransferID = nil
+        } else {
+            ownsSession = false
+            activeTransferID = nil
+        }
+        // Close route picker only after handoff actually finished.
+        showRoutePicker = false
     }
     func toggle() async throws {
         guard currentID != nil, !busy else { return }
@@ -455,6 +583,7 @@ import UIKit
         let startedAt = Date()
         while Date() < deadline {
             if transferCancelled || generation != nextGeneration {
+                try? await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
                 activeTransferID = nil; throw CancellationError()
             }
             let elapsed = Date().timeIntervalSince(startedAt)
@@ -496,9 +625,14 @@ import UIKit
                             let value = try NativeAudioCommand(body)
                             if action == "seek" { await audio.seekConfirmed(value.position) }
                             else { audio.handle(value) }
-                            guard inboxGeneration == generation, !transferPending, ownsSession else { return }
                             if action == "volume" { volume = value.volume }
                             ack = ["session_key": sessionKey, "ok": audio.state != "error", "state": audio.state, "position": audio.exactPosition()]
+                            // Always ACK before aborting on generation/transfer change — else seek/pause/next repeats.
+                            if inboxGeneration != generation || transferPending || !ownsSession {
+                                acknowledgedCommands[id] = ack
+                                _ = try? await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id) + "/ack", method: "POST", body: ack)
+                                return
+                            }
                         } catch { ack = ["session_key": sessionKey, "ok": false, "state": audio.state, "position": audio.exactPosition(), "error": "Некорректная команда отклонена"] }
                     }
                     acknowledgedCommands[id] = ack
