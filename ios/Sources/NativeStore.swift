@@ -38,6 +38,16 @@ import UIKit
     @Published var repeatMode = "off"
     @Published var uploadName: String?
     @Published var uploadProgress: Double = 0
+    @Published private(set) var libraryHasMore = false
+    @Published private(set) var libraryLoadingMore = false
+    @Published private(set) var transferStatus: String?
+    @Published private(set) var transferProgress: Double = 0
+    private var libraryNextOffset: Int?
+    private var libraryQuery = ""
+    private var libraryFavorite = false
+    private let libraryPageSize = 50
+    private var transferCancelled = false
+    private var activeTransferID: String?
     var confirmationActivity: ((Bool) -> Void)?
     var canSendActions: () -> Bool = { UIApplication.shared.applicationState == .active }
     private(set) var queue: [LibraryTrack] = []
@@ -115,23 +125,64 @@ import UIKit
         do {
             let bootstrap = try await api.request("/api/mini/bootstrap", method: "GET", body: nil)
             devices = (bootstrap["sources"] as? [[String: Any]] ?? []).compactMap(NativeDevice.init)
-            let library = try await api.request("/api/mini/music/library?limit=2000&offset=0", method: "GET", body: nil)
-            var loaded = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
-            var page = library, offset = 0
-            while page["has_more"] as? Bool == true {
-                try Task.checkCancellation()
-                guard let next = page["next_offset"] as? Int, next > offset, next <= 100000 else { throw OwnerAPIError.invalidResponse }
-                offset = next
-                page = try await api.request("/api/mini/music/library?limit=2000&offset=\(offset)", method: "GET", body: nil)
-                loaded.append(contentsOf: (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init))
-            }
-            var seen = Set<Int>(); tracks = loaded.filter { seen.insert($0.id).inserted }
+            libraryQuery = ""; libraryFavorite = false
+            let library = try await api.request("/api/mini/music/library?limit=\(libraryPageSize)&offset=0", method: "GET", body: nil)
+            var seen = Set<Int>()
+            tracks = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init).filter { seen.insert($0.id).inserted }
             playlists = (library["playlists"] as? [[String: Any]] ?? []).compactMap(LibraryPlaylist.init)
             maxUpload = library["max_upload_bytes"] as? Int ?? maxUpload
+            libraryHasMore = library["has_more"] as? Bool == true
+            libraryNextOffset = library["next_offset"] as? Int
             authorized = true; showLogin = false; error = nil
             try await refreshSession()
         } catch { handle(error) }
     }
+
+    func loadMoreTracks() async {
+        guard libraryHasMore, !libraryLoadingMore, !loading, let offset = libraryNextOffset else { return }
+        libraryLoadingMore = true; defer { libraryLoadingMore = false }
+        do {
+            var path = "/api/mini/music/library?limit=\(libraryPageSize)&offset=\(offset)"
+            let q = libraryQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !q.isEmpty { path += "&q=\(q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q)" }
+            if libraryFavorite { path += "&favorite=true" }
+            let page = try await api.request(path, method: "GET", body: nil)
+            let incoming = (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+            var seen = Set(tracks.map(\.id))
+            tracks.append(contentsOf: incoming.filter { seen.insert($0.id).inserted })
+            libraryHasMore = page["has_more"] as? Bool == true
+            libraryNextOffset = page["next_offset"] as? Int
+            if let lists = page["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
+        } catch { handle(error) }
+    }
+    func searchLibrary(query: String, favorite: Bool = false) async {
+        libraryQuery = query; libraryFavorite = favorite
+        guard !loading else { return }; loading = true; defer { loading = false }
+        do {
+            var path = "/api/mini/music/library?limit=\(libraryPageSize)&offset=0"
+            let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !q.isEmpty { path += "&q=\(q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q)" }
+            if favorite { path += "&favorite=true" }
+            let library = try await api.request(path, method: "GET", body: nil)
+            var seen = Set<Int>()
+            tracks = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init).filter { seen.insert($0.id).inserted }
+            if let lists = library["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
+            libraryHasMore = library["has_more"] as? Bool == true
+            libraryNextOffset = library["next_offset"] as? Int
+            error = nil
+        } catch { handle(error) }
+    }
+    func cancelTransfer() {
+        transferCancelled = true
+        generation = UUID()
+        activeTransferID = nil
+        transferPending = false
+        busy = false
+        transferStatus = nil
+        transferProgress = 0
+        notice = "Переключение отменено"
+    }
+
     func foreground(_ active: Bool) {
         pollTask?.cancel(); pollTask = nil
         guard active else { return }
@@ -228,7 +279,8 @@ import UIKit
         if let track = queue.first { try await play(track) }
     }
     func transfer(to device: String, trackID: Int? = nil, startPosition: Double? = nil, output: String? = nil) async throws {
-        guard !busy else { return }; busy = true; defer { busy = false }
+        guard !busy else { return }; busy = true
+        defer { busy = false; transferStatus = nil; transferProgress = 0; activeTransferID = nil }
         let nextGeneration = UUID(); generation = nextGeneration; transferPending = true
         defer { transferPending = false }
         if offlinePlayback { suppressReports = true; audio.pause(); suppressReports = false }
@@ -251,14 +303,31 @@ import UIKit
         else if ownedSource { body["position"] = actualPosition }
         let started = try await api.request("/api/mini/music/transfers", method: "POST", body: body)
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
+        activeTransferID = transferID; transferCancelled = false
+        transferStatus = "Подключаю устройство…"; transferProgress = 0.08
         let deadline = Date().addingTimeInterval(30)
+        let startedAt = Date()
         var response = started
         while response["status"] as? String != "ready" {
-            if response["status"] as? String == "failed" { throw OwnerAPIError(status: 409, message: response["detail"] as? String ?? "Источник не подтвердил остановку. Переключение отменено.") }
-            guard Date() < deadline else { throw OwnerAPIError(status: 408, message: "Устройство не подтвердило переключение. Второй плеер не запущен.") }
+            if transferCancelled || generation != nextGeneration {
+                transferStatus = nil; transferProgress = 0; activeTransferID = nil
+                throw CancellationError()
+            }
+            if response["status"] as? String == "failed" {
+                transferStatus = nil; transferProgress = 0; activeTransferID = nil
+                throw OwnerAPIError(status: 409, message: response["detail"] as? String ?? "Источник не подтвердил остановку. Переключение отменено.")
+            }
+            guard Date() < deadline else {
+                transferStatus = nil; transferProgress = 0; activeTransferID = nil
+                throw OwnerAPIError(status: 408, message: "Устройство не подтвердило переключение. Второй плеер не запущен.")
+            }
+            let elapsed = Date().timeIntervalSince(startedAt)
+            transferProgress = min(0.92, 0.08 + elapsed / 30)
+            transferStatus = elapsed < 8 ? "Жду остановку на текущем устройстве…" : (elapsed < 18 ? "Передаю воспроизведение…" : "Почти готово…")
             try await Task.sleep(for: .milliseconds(650)); try Task.checkCancellation()
             response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID), method: "GET", body: nil)
         }
+        transferProgress = 1; transferStatus = "Готово"; activeTransferID = nil
         guard generation == nextGeneration, let session = response["session"] as? [String: Any] else { return }
         offlinePlayback = false; applySession(session); currentID = chosenID; error = nil
         if selectedDevice == "local" {
@@ -373,20 +442,37 @@ import UIKit
         }
     }
     private func remoteControl(_ action: String, extra: [String: Any] = [:]) async throws {
-        guard !busy, !canonicalSessionKey.isEmpty else { return }; busy = true; defer { busy = false; notice = nil }
+        guard !busy, !canonicalSessionKey.isEmpty else { return }; busy = true
+        defer { busy = false; notice = nil; transferStatus = nil; transferProgress = 0 }
+        let nextGeneration = UUID(); generation = nextGeneration; transferCancelled = false
         var body: [String: Any] = ["target_key": canonicalSessionKey, "action": action]; body.merge(extra) { _, new in new }
         let response = try await api.request("/api/mini/music/session/control", method: "POST", body: body)
         guard let id = NativeValue.identifier(response["command_id"]) else { throw OwnerAPIError.invalidResponse }
-        notice = "Команда отправлена. Ожидаю подтверждение устройства…"
+        activeTransferID = id
+        transferStatus = "Команда отправлена…"; transferProgress = 0.1
+        notice = nil
         let deadline = Date().addingTimeInterval(30)
+        let startedAt = Date()
         while Date() < deadline {
+            if transferCancelled || generation != nextGeneration {
+                activeTransferID = nil; throw CancellationError()
+            }
+            let elapsed = Date().timeIntervalSince(startedAt)
+            transferProgress = min(0.92, 0.1 + elapsed / 30)
+            transferStatus = elapsed < 10 ? "Ожидаю подтверждение устройства…" : "Ещё жду ответ устройства…"
             try await Task.sleep(for: .seconds(1)); try Task.checkCancellation()
             let result = try await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id), method: "GET", body: nil)
             let status = result["status"] as? String ?? "pending"
-            if ["completed", "complete"].contains(status) { notice = nil; try await refreshSession(); return }
-            if ["failed", "cancelled", "expired"].contains(status) { throw OwnerAPIError(status: 409, message: result["error"] as? String ?? "Устройство не выполнило команду. Откройте XASS на нём и повторите.") }
+            if ["completed", "complete"].contains(status) {
+                transferProgress = 1; transferStatus = "Готово"; activeTransferID = nil
+                try await refreshSession(); return
+            }
+            if ["failed", "cancelled", "expired"].contains(status) {
+                activeTransferID = nil
+                throw OwnerAPIError(status: 409, message: result["error"] as? String ?? "Устройство не выполнило команду. Откройте XASS на нём и повторите.")
+            }
         }
-        notice = nil
+        activeTransferID = nil
         throw OwnerAPIError(status: 408, message: "Устройство не ответило. iOS не позволяет удалённо запустить приостановленное приложение: откройте XASS на нужном iPhone.")
     }
     private func processInbox() async {

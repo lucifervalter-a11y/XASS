@@ -71,6 +71,7 @@ enum XASSStyle {
     @State private var selectedTrack: LibraryTrack?
     @State private var editingPlaylist = false
     @State private var playlistToEdit: LibraryPlaylist?
+    @State private var searchTask: Task<Void, Never>?
     var body: some View {
         NavigationStack {
             List {
@@ -92,7 +93,8 @@ enum XASSStyle {
                         }.listRowBackground(XASSStyle.surface)
                     }
                 } else {
-                    let rows = store.rows(filter: filter, query: query)
+                    // Server already filtered by q / favorite; keep local filter only as a light safety net.
+                    let rows = store.rows(filter: filter == "favorites" ? "all" : filter, query: "")
                     if !rows.isEmpty {
                         HStack(spacing: 10) {
                             Button { store.run { try await store.playAll(rows, shuffled: false) } } label: { Label("Слушать всё", systemImage: "play.fill").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativePlayAll")
@@ -103,6 +105,15 @@ enum XASSStyle {
                     ForEach(rows) { track in
                         NativeTrackRow(store: store, track: track, rows: rows) { selectedTrack = track }
                             .listRowInsets(EdgeInsets(top: 1, leading: 16, bottom: 1, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                            .onAppear { if track.id == rows.last?.id { store.run { await store.loadMoreTracks() } } }
+                    }
+                    if store.libraryLoadingMore {
+                        HStack { Spacer(); ProgressView(); Spacer() }
+                            .listRowBackground(Color.clear).listRowSeparator(.hidden)
+                    }
+                    if store.libraryHasMore && !store.libraryLoadingMore && !rows.isEmpty {
+                        Button("Показать ещё") { store.run { await store.loadMoreTracks() } }
+                            .listRowBackground(Color.clear).accessibilityIdentifier("nativeLibraryMore")
                     }
                     if rows.isEmpty && store.authorized && !store.loading {
                         ContentUnavailableView(query.isEmpty ? "Ваша музыка — здесь" : "Ничего не найдено", systemImage: "music.note", description: Text(query.isEmpty ? "Добавьте свои аудиофайлы кнопкой «+»." : "Попробуйте другое название или исполнителя.")).listRowBackground(Color.clear)
@@ -112,8 +123,15 @@ enum XASSStyle {
                 .navigationTitle("Музыка").searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск")
                 .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { importFiles = true } label: { Image(systemName: "plus").font(.title2) }.disabled(!store.authorized || store.uploadName != nil).accessibilityLabel("Добавить музыку") } }
                 .refreshable { await store.refresh() }
+                .onChange(of: query) { _, value in
+                    searchTask?.cancel()
+                    searchTask = Task { try? await Task.sleep(for: .milliseconds(350)); guard !Task.isCancelled else { return }; await store.searchLibrary(query: value, favorite: filter == "favorites") }
+                }
+                .onChange(of: filter) { _, value in
+                    if value == "playlists" { return }
+                    store.run { await store.searchLibrary(query: query, favorite: value == "favorites") }
+                }
                 .overlay { if store.loading && store.tracks.isEmpty { ProgressView() } }
-                .safeAreaInset(edge: .bottom, spacing: 0) { NativeMiniPlayer(store: store) }
                 .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }
                 .sheet(isPresented: $editingPlaylist) { NativePlaylistEditor(store: store, playlist: playlistToEdit) }
                 .fileImporter(isPresented: $importFiles, allowedContentTypes: [.audio, .zip], allowsMultipleSelection: true) { result in
