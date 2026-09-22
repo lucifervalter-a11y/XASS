@@ -94,7 +94,7 @@ enum XASSStyle {
                     }
                 } else {
                     // Server already filtered by q / favorite; keep local filter only as a light safety net.
-                    let rows = store.rows(filter: filter == "favorites" ? "all" : filter, query: "")
+                    let rows = store.rows(filter: filter, query: "")
                     if !rows.isEmpty {
                         HStack(spacing: 10) {
                             Button { store.run { try await store.playAll(rows, shuffled: false) } } label: { Label("Слушать всё", systemImage: "play.fill").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativePlayAll")
@@ -165,8 +165,7 @@ enum XASSStyle {
     @ObservedObject var store: NativeStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var typeSize
-    @State private var showDevices = false
-    @State private var showQueue = false
+        @State private var showQueue = false
     @State private var scrubbing: Double?
     @State private var volume: Double?
     var body: some View {
@@ -206,7 +205,7 @@ enum XASSStyle {
                             Button { store.run { try await store.setQueueMode(repeatMode: store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off") } } label: { Image(systemName: store.repeatMode == "one" ? "repeat.1" : "repeat").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.repeatMode == "off" ? XASSStyle.secondary : XASSStyle.accent).accessibilityLabel("Повтор: \(store.repeatMode)").disabled(!store.canEditQueue)
                         }.foregroundStyle(.white).disabled(store.busy)
                         if store.otherLocal { Text("Команды выполняются после ответа другого устройства. Для переноса выберите «Этот iPhone» ниже.").font(.caption).foregroundStyle(.secondary) }
-                        Button { showDevices = true } label: { HStack(spacing: 12) { Image(systemName: store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer").font(.title3); Text(store.deviceLabel).foregroundStyle(.white); Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary) }.padding(16).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.07))) }.accessibilityIdentifier("nativePlayerDevices")
+                        Button { store.openRoutePicker() } label: { HStack(spacing: 12) { Image(systemName: store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer").font(.title3); Text(store.deviceLabel).foregroundStyle(.white); Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary) }.padding(16).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.07))) }.accessibilityIdentifier("nativePlayerDevices")
                         HStack(spacing: 14) {
                             Image(systemName: "speaker.fill").foregroundStyle(.secondary)
                             Slider(value: Binding(get: { volume ?? store.volume }, set: { volume = $0 }), in: 0...100, onEditingChanged: { editing in if !editing, let value = volume { volume = nil; store.run { try await store.setVolume(value) } } }).accessibilityLabel("Громкость XASS")
@@ -221,7 +220,6 @@ enum XASSStyle {
                 }.padding(.horizontal, 24).padding(.top, 10).padding(.bottom, 24).frame(maxWidth: 560).frame(maxWidth: .infinity)
             }.background(XASSStyle.surface).scrollBounceBehavior(.basedOnSize)
         }.presentationDragIndicator(.visible).presentationDetents([.large])
-            .sheet(isPresented: $showDevices) { NativePlayerDevices(store: store) }
             .sheet(isPresented: $showQueue) { NativeQueueView(store: store) }
     }
     private var sharing: some View {

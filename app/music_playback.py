@@ -77,6 +77,13 @@ async def current_session(session):
         result["duration"] = track.duration
     result["updated_at"] = timestamp.isoformat()
     result["server_time"] = now.isoformat()
+    if meta and meta.transfer_id:
+        transfer = await session.get(MusicTransfer, meta.transfer_id)
+        if transfer and transfer.status not in {"ready", "failed"}:
+            result["active_transfer_id"] = transfer.id
+            result["active_transfer_status"] = transfer.status
+            result["active_transfer_source_key"] = transfer.source_key
+            result["active_transfer_source_device"] = transfer.source_device
     return result
 
 
@@ -266,6 +273,32 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
             if transfer is None:
                 raise HTTPException(404, "Переключение не найдено")
             await advance(transfer, request, user, session)
+            return await result(transfer, session)
+
+    
+    @router.post("/api/mini/music/transfers/{transfer_id}/cancel")
+    async def cancel_transfer(transfer_id: str, request: Request, user=Depends(require_owner), session=Depends(get_session)):
+        """Owner abort: clear transfer lock and stop a half-started target if needed."""
+        async with lock():
+            transfer = await session.get(MusicTransfer, transfer_id)
+            if transfer is None:
+                raise HTTPException(404, "Переключение не найдено")
+            if transfer.status in {"ready", "failed"}:
+                return await result(transfer, session)
+            target = transfer.target or {}
+            stop_target = (
+                transfer.status in {"starting", "stopped"}
+                and isinstance(target.get("device"), str)
+                and target["device"].startswith("agent:")
+                and target.get("autoplay", True)
+            )
+            await fail(session, transfer, "Переключение отменено")
+            if stop_target:
+                try:
+                    await control(control_body(source_name=target["device"][6:], action="pause",
+                        expires_at=int(datetime.now(timezone.utc).timestamp()) + 30), request, user, session)
+                except HTTPException:
+                    pass
             return await result(transfer, session)
 
     @router.post("/api/mini/music/transfers/{transfer_id}/ack")

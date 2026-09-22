@@ -15,12 +15,29 @@ import SwiftUI
             NativeSettingsView(app: app, store: store).tabItem { Label("Настройки", systemImage: "gearshape") }.tag(3)
         }.tint(XASSStyle.accent)
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                VStack(spacing: 0) {
-                    if store.transferStatus != nil { NativeTransferWait(store: store) }
+                // One chrome lane. Progress lives in the route picker during handoff —
+                // never stack TransferWait + MiniPlayer, and never under an open route sheet.
+                if store.transferStatus != nil && !store.showRoutePicker {
+                    NativeTransferWait(store: store)
+                } else if store.transferStatus == nil {
                     NativeMiniPlayer(store: store)
                 }
             }
-            .sheet(isPresented: $store.showPlayer) { NativePlayerView(store: store) }
+            .sheet(isPresented: $store.showRoutePicker) {
+                NativeRoutePicker(store: store)
+            }
+            .sheet(isPresented: $store.showPlayer) {
+                NativePlayerView(store: store)
+            }
+            .onChange(of: store.showRoutePicker) { _, open in
+                if open { store.showPlayer = false; store.showLogin = false; store.showEnrollment = false }
+            }
+            .onChange(of: store.showPlayer) { _, open in
+                if open { store.showRoutePicker = false }
+            }
+            .onChange(of: store.showLogin) { _, open in
+                if open { store.showRoutePicker = false; store.showPlayer = false; store.showEnrollment = false }
+            }
             .sheet(isPresented: $store.showLogin) {
                 NavigationStack {
                     WebContainer(app: app, origin: store.api.origin).navigationTitle("Вход через Telegram").navigationBarTitleDisplayMode(.inline)
@@ -126,7 +143,6 @@ import SwiftUI
                     }
                 }
                 Section("AirPlay и Bluetooth") {
-                    HStack { Text("Выбрать выход iPhone"); Spacer(); RoutePicker().frame(width: 44, height: 44) }
                 }
                 NativeMessage(store: store)
             }.navigationTitle("Где слушать").navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() } }
@@ -151,9 +167,12 @@ import SwiftUI
                     NavigationLink { NativeDeviceDetail(store: store, deviceID: device.id) } label: {
                         HStack(spacing: 14) {
                             Image(systemName: "desktopcomputer").font(.title2).frame(width: 40)
-                            VStack(alignment: .leading, spacing: 4) { Text(device.name).font(.headline); HStack(spacing: 5) { Circle().fill(device.online ? Color.green : Color.gray).frame(width: 6, height: 6); Text(device.online ? "В сети" : "Не в сети").font(.caption).foregroundStyle(.secondary) } }
+                            VStack(alignment: .leading, spacing: 4) { Text(device.name).font(.headline).accessibilityLabel(device.name); HStack(spacing: 5) { Circle().fill(device.online ? Color.green : Color.gray).frame(width: 6, height: 6); Text(device.online ? "В сети" : "Не в сети").font(.caption).foregroundStyle(.secondary) } }
                         }.padding(.vertical, 6)
                     }.accessibilityIdentifier("native-device-\(device.id)")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel(device.name)
                 }
                 if store.authorized && store.devices.isEmpty { ContentUnavailableView("Нет подключённых ПК", systemImage: "desktopcomputer", description: Text("Добавьте Windows-агент в Telegram Mini App и импортируйте его конфигурацию на ПК.")) }
                 NativeMessage(store: store)
@@ -272,7 +291,7 @@ import SwiftUI
     }
 }
 
-@MainActor struct NativeTransferWait: View {
+struct NativeTransferWait: View {
     @ObservedObject var store: NativeStore
     var body: some View {
         VStack(spacing: 10) {
@@ -297,5 +316,123 @@ import SwiftUI
         .padding(.horizontal, 16).padding(.vertical, 12)
         .background(Color.black.opacity(0.92))
         .overlay(alignment: .top) { Divider().overlay(Color.white.opacity(0.12)) }
+    }
+}
+
+/// AirPlay-like single sheet: pick iPhone/PC and watch handoff progress here (not a nested sheet).
+@MainActor struct NativeRoutePicker: View {
+    @ObservedObject var store: NativeStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedPC: NativeDevice?
+    @State private var loadingOutputs = false
+    @State private var targetOutput = "default"
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let status = store.transferStatus {
+                    Section {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text(status).font(.subheadline.weight(.semibold))
+                                Spacer(minLength: 0)
+                            }
+                            ProgressView(value: min(max(store.transferProgress, 0), 1))
+                                .tint(XASSStyle.accent)
+                                .accessibilityIdentifier("nativeTransferProgress")
+                            Button("Отмена") { store.cancelTransfer() }
+                                .accessibilityIdentifier("nativeTransferCancel")
+                        }
+                        .padding(.vertical, 4)
+                    } header: { Text("Переключение") }
+                } else {
+                    Section("Куда играть") {
+                        Button {
+                            store.run { try await store.pickRoute(device: "local") }
+                        } label: {
+                            HStack {
+                                Label("Этот iPhone", systemImage: "iphone")
+                                Spacer()
+                                if store.selectedDevice == "local" { Image(systemName: "checkmark") }
+                            }
+                        }
+                        .disabled(store.busy)
+                        .accessibilityIdentifier("route-local")
+
+                        ForEach(store.devices) { device in
+                            Button {
+                                selectedPC = device
+                                targetOutput = "default"
+                                loadingOutputs = true
+                                store.run {
+                                    defer { loadingOutputs = false }
+                                    try await store.loadOutputs(source: device.name)
+                                }
+                            } label: {
+                                HStack {
+                                    Image(systemName: "desktopcomputer")
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(device.name)
+                                        Text(device.online ? "В сети" : "Не в сети")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if store.selectedDevice == "agent:" + device.name {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                            .disabled(!device.online || store.busy)
+                            .accessibilityIdentifier("route-device-\(device.id)")
+                            .accessibilityLabel(Text(device.name))
+                        }
+                    }
+
+                    if let device = selectedPC {
+                        Section {
+                            if loadingOutputs { ProgressView("Получаю выходы Windows…") }
+                            ForEach(store.outputs) { output in
+                                Button { targetOutput = output.id } label: {
+                                    HStack {
+                                        Label(output.name, systemImage: "speaker.wave.2")
+                                        Spacer()
+                                        if targetOutput == output.id { Image(systemName: "checkmark") }
+                                    }
+                                }
+                            }
+                            Button("Слушать здесь") {
+                                store.run {
+                                    try await store.pickRoute(device: "agent:" + device.name, output: targetOutput)
+                                }
+                            }
+                            .disabled(store.busy || !device.online)
+                            .accessibilityIdentifier("route-confirm")
+                        } header: {
+                            Text("Аудиовыход · \(device.name)")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Куда играть")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Закрыть") {
+                        if store.transferStatus != nil { store.cancelTransfer() }
+                        store.showRoutePicker = false
+                        dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                selectedPC = store.devices.first(where: { "agent:" + $0.name == store.selectedDevice })
+            }
+            .onChange(of: store.showRoutePicker) { _, open in
+                if !open { dismiss() }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .interactiveDismissDisabled(store.transferStatus != nil)
     }
 }

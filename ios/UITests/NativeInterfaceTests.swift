@@ -19,7 +19,9 @@ final class NativeInterfaceTests: XCTestCase {
         XCTAssertFalse(app.buttons["track-2"].exists)
         app.buttons["Все"].tap()
         app.tabBars.buttons["Устройства"].tap()
-        app.staticTexts["Студия"].firstMatch.tap()
+        let studio = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Студия")).firstMatch
+        XCTAssertTrue(studio.waitForExistence(timeout: 6), "Device Студия must appear")
+        studio.tap()
         XCTAssertTrue(app.buttons["Заблокировать экран"].waitForExistence(timeout: 5))
         capture(app, "Native-Device")
         app.buttons["Заблокировать экран"].tap()
