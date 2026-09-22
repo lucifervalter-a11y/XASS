@@ -264,7 +264,7 @@ func cancelTransfer() {
         }
         if !offlinePlayback && (!ownsSession || selectedDevice != "local") { applySession(session) }
         await acknowledgePendingHandoff(from: session)
-        else if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
+        if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
             let mode = session["repeat_mode"] as? String ?? repeatMode
             if ids != queue.map(\.id) || mode != repeatMode {
                 queue = ids.compactMap { id in tracks.first { $0.id == id } }; baseQueue = queue; repeatMode = mode
