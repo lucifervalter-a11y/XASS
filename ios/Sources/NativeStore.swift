@@ -263,7 +263,6 @@ func cancelTransfer() {
             generation = UUID(); ownsSession = false; suppressReports = true; audio.pause(); suppressReports = false; pendingReport = nil
         }
         if !offlinePlayback && (!ownsSession || selectedDevice != "local") { applySession(session) }
-        await acknowledgePendingHandoff(from: session)
         else if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
             let mode = session["repeat_mode"] as? String ?? repeatMode
             if ids != queue.map(\.id) || mode != repeatMode {
@@ -271,6 +270,7 @@ func cancelTransfer() {
                 applyNativeQueue()
             }
         }
+        await acknowledgePendingHandoff(from: session)
         let result = try await api.request("/api/mini/music/players", method: "GET", body: nil)
         players = (result["players"] as? [[String: Any]] ?? []).compactMap(RemotePlayer.init)
         for index in devices.indices { if let player = players.first(where: { $0.id == devices[index].name }) { devices[index].online = player.online } }
