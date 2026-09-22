@@ -14,6 +14,12 @@ import SwiftUI
             NativeDownloadsView(store: store, audio: store.audio).tabItem { Label("Загрузки", systemImage: "arrow.down.to.line") }.tag(2)
             NativeSettingsView(app: app, store: store).tabItem { Label("Настройки", systemImage: "gearshape") }.tag(3)
         }.tint(XASSStyle.accent)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    if store.transferStatus != nil { NativeTransferWait(store: store) }
+                    NativeMiniPlayer(store: store)
+                }
+            }
             .sheet(isPresented: $store.showPlayer) { NativePlayerView(store: store) }
             .sheet(isPresented: $store.showLogin) {
                 NavigationStack {
@@ -39,7 +45,9 @@ import SwiftUI
                 #endif
             }
             .onChange(of: app.locked) { _, locked in
-                if locked { store.showPlayer = false; store.showLogin = false; if !app.nativeConfirmation { store.showEnrollment = false } }
+                // Keep Now Playing / player sheet across Control Center and lock:
+                // scenePhase .inactive sets app.locked, but must not dismiss playback UI.
+                if locked { store.showLogin = false; if !app.nativeConfirmation { store.showEnrollment = false } }
             }
     }
 }
@@ -149,7 +157,7 @@ import SwiftUI
                 }
                 if store.authorized && store.devices.isEmpty { ContentUnavailableView("Нет подключённых ПК", systemImage: "desktopcomputer", description: Text("Добавьте Windows-агент в Telegram Mini App и импортируйте его конфигурацию на ПК.")) }
                 NativeMessage(store: store)
-            }.navigationTitle("Устройства").refreshable { await store.refresh() }.safeAreaInset(edge: .bottom, spacing: 0) { NativeMiniPlayer(store: store) }
+            }.navigationTitle("Устройства").refreshable { await store.refresh() }
         }
     }
 }
@@ -213,7 +221,7 @@ import SwiftUI
                 }
                 Section { Button("Выйти и сменить сервер", role: .destructive) { forget = true }; Text("XASS \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")").foregroundStyle(.secondary) }
                 NativeMessage(store: store)
-            }.navigationTitle("Настройки").safeAreaInset(edge: .bottom, spacing: 0) { NativeMiniPlayer(store: store) }
+            }.navigationTitle("Настройки")
                 .sheet(isPresented: $webAdmin) { NavigationStack { WebContainer(app: app, origin: store.api.origin).navigationTitle("Сайт · веб-панель").navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { webAdmin = false } } } }
                 .confirmationDialog("Выйти из XASS на этом iPhone?", isPresented: $forget, titleVisibility: .visible) { Button("Выйти и сменить сервер", role: .destructive) { app.forgetServer() } } message: { Text("Данные сервера и сохранённые треки не удаляются.") }
         }
@@ -252,7 +260,7 @@ import SwiftUI
                     }
                 }
                 NativeMessage(store: store)
-            }.navigationTitle("Загрузки").safeAreaInset(edge: .bottom, spacing: 0) { NativeMiniPlayer(store: store) }
+            }.navigationTitle("Загрузки")
                 .confirmationDialog("Удалить только копию с iPhone? На сервере трек останется.", isPresented: Binding(get: { remove != nil }, set: { if !$0 { remove = nil } }), titleVisibility: .visible) {
                     Button("Удалить локальную копию", role: .destructive) { if let track = remove { audio.removeDownload(track) }; remove = nil }
                 }
@@ -261,5 +269,33 @@ import SwiftUI
                     Button("Отмена", role: .cancel) { offline = nil }
                 } message: { Text("Сервер не подтвердил переключение. В офлайн-режиме XASS не может остановить музыку на другом устройстве. Продолжайте только если там ничего не играет.") }
         }
+    }
+}
+
+@MainActor struct NativeTransferWait: View {
+    @ObservedObject var store: NativeStore
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                ProgressView().tint(.white)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(store.transferStatus ?? "Переключаю…").font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                    Text("Можно отменить и остаться на текущем устройстве").font(.caption2).foregroundStyle(.white.opacity(0.7))
+                }
+                Spacer(minLength: 0)
+                Button("Отмена") { store.cancelTransfer() }
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color.white.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.white)
+                    .accessibilityIdentifier("nativeTransferCancel")
+            }
+            ProgressView(value: min(max(store.transferProgress, 0), 1))
+                .tint(XASSStyle.accent)
+                .accessibilityIdentifier("nativeTransferProgress")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Color.black.opacity(0.92))
+        .overlay(alignment: .top) { Divider().overlay(Color.white.opacity(0.12)) }
     }
 }
