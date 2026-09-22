@@ -301,7 +301,7 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                     pass
             return await result(transfer, session)
 
-@router.post("/api/mini/music/transfers/{transfer_id}/ack")
+    @router.post("/api/mini/music/transfers/{transfer_id}/ack")
     async def acknowledge(transfer_id: str, payload: TransferAck, user=Depends(require_owner), session=Depends(get_session)):
         async with lock():
             transfer = await session.get(MusicTransfer, transfer_id)
