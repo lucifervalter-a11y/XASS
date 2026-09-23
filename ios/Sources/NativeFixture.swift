@@ -14,8 +14,6 @@ import UIKit
     init(origin: ServerOrigin) { self.origin = origin }
     func artwork(trackID: Int) async throws -> Data? {
         guard trackID == 1 else { return nil }
-        // A labelled generated test JPEG proves the exact production image view.
-        // This graphic exists only in Debug Simulator, never a production album.
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
         return renderer.image { context in
             UIColor(red: 0.06, green: 0.13, blue: 0.23, alpha: 1).setFill(); context.fill(CGRect(x: 0, y: 0, width: 320, height: 320))
@@ -39,11 +37,38 @@ import UIKit
         ["id": 1, "source_type": "PC_AGENT", "source_name": "Студия", "is_online": true, "agent_version": "0.17.0"],
         ["id": 2, "source_type": "PC_AGENT", "source_name": "Ноутбук", "is_online": false, "agent_version": "0.17.0"]
     ]
+    private static func queryItems(_ path: String) -> [String: String] {
+        guard let mark = path.firstIndex(of: "?") else { return [:] }
+        var out: [String: String] = [:]
+        let query = String(path[path.index(after: mark)...])
+        for part in query.split(separator: "&") {
+            let pair = part.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { continue }
+            let key = String(pair[0])
+            let raw = String(pair[1]).replacingOccurrences(of: "+", with: " ")
+            out[key] = raw.removingPercentEncoding ?? raw
+        }
+        return out
+    }
     func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
-        // Fail closed: fixture gestures never reach a network or execute an action.
         if method != "GET" { throw OwnerAPIError(status: 403, message: "Предпросмотр: действия с сервером и устройствами отключены.") }
         if path.contains("bootstrap") { return ["ok": true, "sources": Self.deviceData] }
-        if path.contains("library") { return ["ok": true, "tracks": Self.trackData, "playlists": [], "has_more": false] }
+        if path.contains("library") {
+            var tracks = Self.trackData
+            let items = Self.queryItems(path)
+            let q = (items["q"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !q.isEmpty {
+                tracks = tracks.filter { row in
+                    let title = row["title"] as? String ?? ""
+                    let artist = row["artist"] as? String ?? ""
+                    return title.localizedCaseInsensitiveContains(q) || artist.localizedCaseInsensitiveContains(q)
+                }
+            }
+            if items["favorite"] == "true" {
+                tracks = tracks.filter { ($0["favorite"] as? Bool) == true }
+            }
+            return ["ok": true, "tracks": tracks, "playlists": [], "has_more": false]
+        }
         if path.contains("storage") { return ["ok": true, "targets": [], "copies": [], "jobs": [], "server_available": true] }
         if path.contains("players") { return ["ok": true, "players": []] }
         return ["ok": true, "session": [:], "commands": []]

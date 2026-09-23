@@ -6,15 +6,16 @@
 
 <p align="center">
   <strong>Личный центр управления для Telegram, Windows, сервера, сайта и iPhone.</strong><br>
-  Один backend, несколько интерфейсов и никакой россыпи отдельных панелей.
+  Один backend. Telegram, Windows, сайт и iPhone — без россыпи отдельных панелей.
 </p>
 
 <p align="center">
   <a href="https://redvps.site">Сайт</a> ·
   <a href="https://redvps.site/miniapp.php">Mini App</a> ·
-  <a href="https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe">Скачать для Windows</a> ·
-  <a href="https://github.com/lucifervalter-a11y/XASS/releases/download/ios-latest/XASS-unsigned.ipa">Скачать IPA (нужна подпись)</a> ·
-  <a href="./docs/OPERATIONS.md">Документация</a>
+  <a href="https://github.com/lucifervalter-a11y/XASS/releases/download/agent-latest/XASS-Setup.exe">Windows</a> ·
+  <a href="https://github.com/lucifervalter-a11y/XASS/releases/download/ios-latest/XASS-unsigned.ipa">iOS IPA</a> ·
+  <a href="./docs/OPERATIONS.md">Документация</a> ·
+  <a href="./ios/UNSIGNED.md">Как подписать IPA</a>
 </p>
 
 <p align="center">
@@ -23,6 +24,7 @@
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-111827?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-059669?style=flat-square&logo=fastapi&logoColor=white">
   <img alt="Telegram Mini App" src="https://img.shields.io/badge/Telegram-Mini_App-229ED9?style=flat-square&logo=telegram&logoColor=white">
+  <img alt="iOS 0.17" src="https://img.shields.io/badge/iOS-0.17_SwiftUI-000000?style=flat-square&logo=apple&logoColor=white">
 </p>
 
 ## Что такое XASS
@@ -37,7 +39,7 @@ XASS объединяет персонального Telegram Business‑бот�
   <tr>
     <td colspan="2" align="center">
       <img src="./docs/assets/xass-desktop-overview.png" alt="XASS Desktop Agent для Windows" width="100%">
-      <br><sub><b>XASS для Windows 0.15</b> — реальный экран приложения в безопасном режиме предпросмотра. Подключение, локальные метрики, команды, файлы и обновления.</sub>
+      <br><sub><b>XASS для Windows 0.17</b> — реальный экран приложения в безопасном режиме предпросмотра. Подключение, локальные метрики, команды, файлы и обновления.</sub>
     </td>
   </tr>
   <tr>
@@ -55,7 +57,7 @@ XASS объединяет персонального Telegram Business‑бот�
 <p align="center">
   <img src="./docs/assets/xass-music-library.png" alt="XASS Music — библиотека с поиском и избранным" width="310">
   <img src="./docs/assets/xass-music-player.png" alt="XASS Music — плеер и выбор устройства" width="310">
-  <br><sub>Реальный интерфейс 0.16 в браузере; на скриншотах демонстрационные записи с беззвучными тестовыми файлами. <a href="./docs/MUSIC_PLAYER.md">Как пользоваться музыкой</a></sub>
+  <br><sub>Реальный интерфейс 0.17 в браузере; на скриншотах демонстрационные записи с беззвучными тестовыми файлами. <a href="./docs/MUSIC_PLAYER.md">Как пользоваться музыкой</a></sub>
 </p>
 
 ### Нативный iPhone · 0.17
@@ -106,7 +108,7 @@ XASS объединяет персонального Telegram Business‑бот�
 
 - Личная библиотека: загрузка MP3/WAV/FLAC/OGG Vorbis/M4A, поиск, избранное, редактирование метаданных и плейлисты. Это хранилище ваших файлов, не сторонний музыкальный каталог.
 - Плеер с очередью, перемоткой, повтором, случайным порядком и скачиванием. Первое воспроизведение требует нажатия пользователя.
-- Выбор «этот телефон» или Windows‑агент 0.16+: конкретные WASAPI‑выходы, отдельная громкость XASS. M4A на ПК не декодируется; используйте MP3/WAV. Поддержка форматов браузером/iOS зависит от его декодеров.
+- Выбор «этот телефон» или Windows‑агент 0.17+: конкретные WASAPI‑выходы, отдельная громкость XASS. M4A на ПК не декодируется; используйте MP3/WAV. Поддержка форматов браузером/iOS зависит от его декодеров.
 - На сайте можно слушать текущую **явно опубликованную** композицию. Личная библиотека закрыта, отключение трансляции отзывает публичный доступ. Уже переданные посетителю байты отозвать невозможно.
 - Звук в голосовой Discord передаётся через **установленное пользователем виртуальное аудиоустройство**: выход выбирается в XASS, соответствующий вход — в Discord. XASS не подключается сам к каналу и не изменяет настройки Discord.
 - Нативное [iOS-приложение 0.17](./ios/README.md): SwiftUI-библиотека, плеер, выбор устройства и управление ПК. Фоновый AVPlayer, локальные загрузки, AirPlay, Face ID или системный код. WebView остался только для первоначального веб-входа и отдельного редактора сайта. [IPA требует собственной подписи](./ios/UNSIGNED.md).
@@ -120,7 +122,7 @@ XASS объединяет персонального Telegram Business‑бот�
 - Фильтрация браузерных вкладок и приложений, которые не являются музыкой.
 - Передача текущей активности в профиль и автоответы только при включённой функции.
 
-### Отзывчивость Windows 0.16
+### Отзывчивость Windows
 
 Отрисовка скруглений и иллюстрации кешируется; сбор процессов вынесен из GUI в ограниченный по времени read-only процесс. В изолированном тесте на Windows открытие раздела ПК сократилось с 4,82 до 0,49 с, максимальная задержка интерфейса — с 2,11 до 0,13 с. Это результаты конкретного тестового ПК, а не обещание одинаковой частоты кадров на любом устройстве.
 
@@ -255,6 +257,7 @@ app/                    FastAPI backend и Telegram‑логика
 app/services/           heartbeat, агенты, контент, музыка, погода, обновления
 pc_client/              Windows‑приложение, агент, установщик и updater
 agent/                  кроссплатформенный server/PC agent
+ios/                    нативное SwiftUI-приложение и UITests
 miniapp.php             Telegram Mini App и iPhone PWA
 profile.php             публичный профиль
 projects.php            страница проектов
@@ -278,8 +281,8 @@ XASS_PROXY_TEST_CASE=fallback php tests/test_pwa_proxy.php
 GitHub Actions автоматически:
 
 - разворачивает `main` на production‑сервер;
-- собирает Windows‑установщик;
-- публикует стабильный `XASS‑Setup.exe` в GitHub Releases;
+- собирает Windows‑установщик и публикует `XASS‑Setup.exe`;
+- прогоняет Simulator UITests, собирает unsigned IPA и при зелёном `main` публикует `ios-latest`;
 - доставляет installer и metadata на сервер обновлений.
 
 ## Документация
