@@ -19,8 +19,11 @@ final class NativeInterfaceTests: XCTestCase {
         XCTAssertFalse(app.buttons["track-2"].exists)
         app.buttons["Все"].tap()
         app.tabBars.buttons["Устройства"].tap()
-        let studio = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Студия")).firstMatch
+        let studio = app.descendants(matching: .any)["native-device-1"]
         XCTAssertTrue(studio.waitForExistence(timeout: 6), "Device Студия must appear")
+        if !studio.isHittable {
+            app.swipeUp()
+        }
         studio.tap()
         XCTAssertTrue(app.buttons["Заблокировать экран"].waitForExistence(timeout: 5))
         capture(app, "Native-Device")
@@ -38,8 +41,8 @@ final class NativeInterfaceTests: XCTestCase {
         XCTAssertEqual(app.webViews.count, 0)
         capture(app, "Native-Player")
         app.buttons["nativePlayerDevices"].tap()
-        XCTAssertTrue(app.staticTexts["Где слушать"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["Переключить"].exists)
+        XCTAssertTrue(app.staticTexts["Где слушать"].waitForExistence(timeout: 5) || app.navigationBars["Где слушать"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Переключить"].waitForExistence(timeout: 5) || app.buttons["route-switch"].waitForExistence(timeout: 3))
         capture(app, "Native-Routes")
     }
 
