@@ -22,7 +22,7 @@ import AVKit
         ZStack {
             Color.black.ignoresSafeArea()
             if let store = app.native {
-                if app.hasUnlocked { NativeShell(app: app, store: store).id(store.api.origin.namespace) }
+                if app.hasUnlocked { NativeAppShell(app: app, store: store).id(store.api.origin.namespace) }
                 if app.locked || app.privacyCovered { LockView(app: app).zIndex(10) }
             } else { ConnectView(app: app) }
         }
@@ -53,14 +53,14 @@ struct BrandMark: View {
                 BrandMark().padding(.top, 36)
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Ваш сервер.\nВ кармане.").font(.system(size: 36, weight: .semibold, design: .rounded))
-                    Text("Устройства, музыка и ваш сайт — в XASS.").foregroundStyle(.secondary)
+                    Text("Музыка и управление устройствами — в одном приложении.").foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Адрес XASS").font(.subheadline.weight(.semibold))
                     TextField("https://ваш-домен.ru", text: $address).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
                         .padding(15).background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14)).accessibilityIdentifier("serverAddress")
-                    Text("Одноразовая ссылка или ключ · необязательно").font(.caption).foregroundStyle(.secondary)
-                    SecureField("Вставить из Telegram Mini App", text: $pair).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Text("Одноразовая ссылка или ключ · можно добавить позже").font(.caption).foregroundStyle(.secondary)
+                    SecureField("Вставить одноразовую ссылку XASS", text: $pair).textInputAutocapitalization(.never).autocorrectionDisabled()
                         .padding(15).background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14)).accessibilityIdentifier("pairLink")
                 }
                 if let error = app.error { Text(error).font(.callout).foregroundStyle(.orange).accessibilityIdentifier("connectionError") }
@@ -70,7 +70,7 @@ struct BrandMark: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Как войти", systemImage: "key.horizontal").font(.subheadline.weight(.semibold))
                     Text("Откройте XASS в Telegram → Инструменты → iPhone и веб-приложение → создайте защищённую ссылку. Вставьте её здесь. Ключ одноразовый и не сохраняется.")
-                    Text("Без ссылки откроется обычный вход через Telegram. Для защиты приложения на iPhone должен быть включён код-пароль.")
+                    Text("Вход выполняется внутри приложения по одноразовой ссылке. Без неё можно подключить адрес сервера и войти позже. Для защиты приложения на iPhone должен быть включён код-пароль.")
                 }.font(.caption).foregroundStyle(.secondary).lineSpacing(4).padding(18).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 18))
                 Text("Только ваш HTTPS-сервер. Без общего облачного аккаунта XASS.").font(.caption2).foregroundStyle(.secondary)
             }.padding(24).frame(maxWidth: 500)
