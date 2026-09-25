@@ -170,7 +170,12 @@ struct NativeRemoteFileTarget: Identifiable {
     private var peerKey: [String: Any]?
     private var messageRequest: String?
     private var temporaryFiles: [URL] = []
-    init(owner: NativeStore) { self.owner = owner }
+    private let workspacePrivateKey: () -> Data?
+    init(owner: NativeStore, workspacePrivateKey: (() -> Data?)? = nil) {
+        self.owner = owner
+        let keyName = NativeWorkspaceCrypto.keyName(owner.api.origin)
+        self.workspacePrivateKey = workspacePrivateKey ?? { SecureStore.load(keyName) }
+    }
 
     func perform(_ action: () async throws -> Void) async {
         guard !busy else { return }; busy = true; error = nil; status = nil
@@ -363,7 +368,7 @@ struct NativeRemoteFileTarget: Identifiable {
         let mime = values.contentType?.preferredMIMEType ?? "application/octet-stream"
         var headers = ["Content-Type": mime]
         if let key = try await optionalPeer(device) {
-            guard let secret = SecureStore.load(NativeWorkspaceCrypto.keyName(owner.api.origin)) else { throw NativeWorkspaceCrypto.missingKey }
+            guard let secret = workspacePrivateKey() else { throw NativeWorkspaceCrypto.missingKey }
             bytes = try NativeWorkspaceCrypto.seal(bytes, privateKey: secret, peer: key, purpose: "file_upload")
             headers = ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": mime]
         }
@@ -391,7 +396,7 @@ struct NativeRemoteFileTarget: Identifiable {
         guard text.unicodeScalars.count <= 64 * 1024 else { throw OwnerAPIError(status: 413, message: "Текст превышает 64 КБ.") }
         var payload: [String: Any] = ["text": text]
         if let key = try await optionalPeer(device) {
-            guard let secret = SecureStore.load(NativeWorkspaceCrypto.keyName(owner.api.origin)) else { throw NativeWorkspaceCrypto.missingKey }
+            guard let secret = workspacePrivateKey() else { throw NativeWorkspaceCrypto.missingKey }
             let blob = try NativeWorkspaceCrypto.seal(Data(text.utf8), privateKey: secret, peer: key, purpose: "clipboard")
             payload = ["sealed": true, "blob": NativeWorkspaceCrypto.encoded(blob)]
         }

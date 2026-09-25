@@ -109,20 +109,19 @@ final class NativeAdvancedStoreTests: XCTestCase {
     }
     @MainActor func testFileUploadEncryptsBytesAndPreservesLiteralFilenameAndDestination() async throws {
         let api = AdvancedOwnerFixture(), owner = NativeStore(api: api, audio: AudioController())
-        let data = NativeAdvancedStore(owner: owner)
         let device = try XCTUnwrap(NativeDevice(["id": 7, "source_type": "PC_AGENT", "source_name": "PC +1"]))
         let ownerKey = P256.KeyAgreement.PrivateKey(), agentKey = P256.KeyAgreement.PrivateKey()
+        var availableKey: Data? = ownerKey.rawRepresentation
+        let data = NativeAdvancedStore(owner: owner, workspacePrivateKey: { availableKey })
         func jwk(_ key: P256.KeyAgreement.PublicKey) -> [String: Any] {
             let point = key.x963Representation
             return ["kty": "EC", "crv": "P-256", "x": NativeWorkspaceCrypto.encoded(point[1..<33]), "y": NativeWorkspaceCrypto.encoded(point[33..<65])]
         }
-        let keyName = NativeWorkspaceCrypto.keyName(api.origin)
-        try SecureStore.save(ownerKey.rawRepresentation, name: keyName)
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let url = folder.appendingPathComponent("Отчёт + #1.txt"), plain = Data("Файл с iPhone 🎵".utf8)
         try plain.write(to: url)
-        defer { SecureStore.remove(keyName); try? FileManager.default.removeItem(at: folder); owner.disconnect() }
+        defer { try? FileManager.default.removeItem(at: folder); owner.disconnect() }
         var uploadCount = 0, listing = false
         api.uploadHandler = { path, bytes, headers in
             uploadCount += 1
@@ -149,7 +148,7 @@ final class NativeAdvancedStoreTests: XCTestCase {
         }
         try await data.uploadFile(device, url: url, root: "documents", path: "Папка + #A")
         XCTAssertEqual(uploadCount, 1); XCTAssertEqual(data.currentPath, "Папка + #A")
-        SecureStore.remove(keyName)
+        availableKey = nil
         do { try await data.uploadFile(device, url: url, root: "documents", path: "Папка + #A"); XCTFail("A missing owner key must not cause plaintext fallback") }
         catch {}
         XCTAssertEqual(uploadCount, 1)
