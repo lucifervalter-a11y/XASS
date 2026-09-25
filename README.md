@@ -18,8 +18,8 @@
 </p>
 
 <p align="center">
-  <img alt="Server 0.17.0" src="https://img.shields.io/badge/server-0.17.0-3b82f6?style=flat-square">
-  <img alt="Windows agent 0.17.0" src="https://img.shields.io/badge/Windows_agent-0.17.0-2563eb?style=flat-square&logo=windows11&logoColor=white">
+  <img alt="Server 0.18.0" src="https://img.shields.io/badge/server-0.18.0-3b82f6?style=flat-square">
+  <img alt="Windows agent 0.18.0" src="https://img.shields.io/badge/Windows_agent-0.18.0-2563eb?style=flat-square&logo=windows11&logoColor=white">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-111827?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-059669?style=flat-square&logo=fastapi&logoColor=white">
   <img alt="Telegram Mini App" src="https://img.shields.io/badge/Telegram-Mini_App-229ED9?style=flat-square&logo=telegram&logoColor=white">
@@ -58,7 +58,7 @@ XASS объединяет персонального Telegram Business‑бот�
   <br><sub>Реальный интерфейс 0.16 в браузере; на скриншотах демонстрационные записи с беззвучными тестовыми файлами. <a href="./docs/MUSIC_PLAYER.md">Как пользоваться музыкой</a></sub>
 </p>
 
-### Нативный iPhone · 0.17
+### Нативный iPhone · 0.18
 
 <p align="center">
   <img src="https://github.com/lucifervalter-a11y/XASS/releases/download/ios-latest/iOS-native-library.png" alt="Нативная SwiftUI-библиотека XASS" width="280">
@@ -75,7 +75,7 @@ XASS объединяет персонального Telegram Business‑бот�
 | Mini App | Единый центр состояния, агенты, Screenshot, безопасные файлы, Clipboard, Timeline, Rules, уведомления, аудит, переписки и управление сайтом |
 | Windows | Нативное приложение, автозапуск, CPU/RAM/Disk, снимок экрана по запросу, ограниченный файловый доступ, Clipboard, локальный архив и автообновления |
 | iPhone / PWA | Вход и подтверждение опасных действий через Face ID / Passkey, установка на экран «Домой» |
-| iPhone / native 0.17 | SwiftUI-библиотека, плеер AVPlayer, устройства и хранилище без WebView; подтверждение команд аппаратным ключом и системной биометрией/кодом |
+| iPhone / native 0.18 | Пять SwiftUI-вкладок: Главная, Музыка, Сайт, Инструменты, Погода; AVPlayer, нативный вход, управление ПК, сценарии, переписки и файловые инструменты без WebView |
 | Публичный сайт | Профиль, проекты, цитаты, аватары, контакты, погода и музыка с раздельными зонами интерфейса |
 | Backend | FastAPI, heartbeat, PostgreSQL/SQLite, очередь команд, экспорт, резервные копии и контроль состояния сервисов |
 
@@ -109,7 +109,7 @@ XASS объединяет персонального Telegram Business‑бот�
 - Выбор «этот телефон» или Windows‑агент 0.16+: конкретные WASAPI‑выходы, отдельная громкость XASS. M4A на ПК не декодируется; используйте MP3/WAV. Поддержка форматов браузером/iOS зависит от его декодеров.
 - На сайте можно слушать текущую **явно опубликованную** композицию. Личная библиотека закрыта, отключение трансляции отзывает публичный доступ. Уже переданные посетителю байты отозвать невозможно.
 - Звук в голосовой Discord передаётся через **установленное пользователем виртуальное аудиоустройство**: выход выбирается в XASS, соответствующий вход — в Discord. XASS не подключается сам к каналу и не изменяет настройки Discord.
-- Нативное [iOS-приложение 0.17](./ios/README.md): SwiftUI-библиотека, плеер, выбор устройства и управление ПК. Фоновый AVPlayer, локальные загрузки, AirPlay, Face ID или системный код. WebView остался только для первоначального веб-входа и отдельного редактора сайта. [IPA требует собственной подписи](./ios/UNSIGNED.md).
+- Нативное [iOS-приложение 0.18](./ios/README.md): SwiftUI-экраны, нативная привязка, редактор сайта, инструменты и погода. Фоновый AVPlayer, локальные загрузки, AirPlay, Face ID или системный код. Встроенные веб-страницы удалены. [IPA требует собственной подписи](./ios/UNSIGNED.md).
 - Музыку можно отправить владельцем в личный чат бота: аудио, несколько файлов или ZIP. Повторы проверяются по содержимому, очередность файлов сохраняется, очередь импорта переживает рестарт. ZIP также принимается через Mini App/iPhone; крупные файлы отправляйте там, поскольку Telegram Bot API ограничивает скачивание 20 МиБ.
 - Переключение между iPhone и ПК передаёт позицию только после подтверждения остановки прежнего плеера. Команды другому iPhone имеют срок 30 секунд; спящий iPhone нужно открыть, фальшивое подтверждение не показывается.
 - Копирование музыки на выбранный Windows-агент, возврат на сервер и импорт выбранной папки ПК. Освободить серверную копию можно отдельно, только после проверки копии по SHA-256 и явного подтверждения владельца. Исходные файлы на ПК не удаляются.

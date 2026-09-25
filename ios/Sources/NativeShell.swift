@@ -1,33 +1,36 @@
 import SwiftUI
+import AVKit
+
+private enum NativeMainSheet: String, Identifiable {
+    case player, route, enrollment
+    var id: String { rawValue }
+}
 
 @MainActor struct NativeShell: View {
     @ObservedObject var app: AppState
     @ObservedObject var store: NativeStore
+    @StateObject private var workspace: NativeWorkspaceStore
     @State private var selectedTab = 0
-    @State private var fixtureRoutes = false
     @State private var fixtureDevice = false
     @State private var fixtureStorage = false
+    init(app: AppState, store: NativeStore) {
+        self.app = app; self.store = store
+        _workspace = StateObject(wrappedValue: NativeWorkspaceStore(api: store.api))
+    }
     var body: some View {
         TabView(selection: $selectedTab) {
-            NativeLibraryView(store: store).tabItem { Label("Музыка", systemImage: "music.note") }.tag(0)
-            NativeDevicesView(store: store).tabItem { Label("Устройства", systemImage: "desktopcomputer") }.tag(1)
-            NativeDownloadsView(store: store, audio: store.audio).tabItem { Label("Загрузки", systemImage: "arrow.down.to.line") }.tag(2)
-            NativeSettingsView(app: app, store: store).tabItem { Label("Настройки", systemImage: "gearshape") }.tag(3)
+            content(NativeHomeView(store: store, workspace: workspace)).tabItem { Label("Главная", systemImage: "house") }.tag(0).accessibilityIdentifier("tab-home")
+            content(NativeLibraryView(store: store)).tabItem { Label("Музыка", systemImage: "music.note") }.tag(1).accessibilityIdentifier("tab-music")
+            content(NativeSiteView(store: store, workspace: workspace)).tabItem { Label("Сайт", systemImage: "person.crop.square") }.tag(2).accessibilityIdentifier("tab-site")
+            content(NativeToolsView(app: app, store: store, workspace: workspace)).tabItem { Label("Инструменты", systemImage: "square.grid.2x2") }.tag(3).accessibilityIdentifier("tab-tools")
+            content(NativeWeatherView(store: store, workspace: workspace)).tabItem { Label("Погода", systemImage: "cloud.sun") }.tag(4).accessibilityIdentifier("tab-weather")
         }.tint(XASSStyle.accent)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                // One chrome lane. Progress lives in the route picker during handoff —
-                // never stack TransferWait + MiniPlayer, and never under an open route sheet.
-                if store.transferStatus != nil && !store.showRoutePicker {
-                    NativeTransferWait(store: store)
-                } else if store.transferStatus == nil {
-                    NativeMiniPlayer(store: store)
+            .sheet(item: presentedSheet) { sheet in
+                switch sheet {
+                case .player: NativePlayerView(store: store)
+                case .route: NativeRoutePicker(store: store)
+                case .enrollment: NativeEnrollmentView(store: store)
                 }
-            }
-            .sheet(isPresented: $store.showRoutePicker) {
-                NativeRoutePicker(store: store)
-            }
-            .sheet(isPresented: $store.showPlayer) {
-                NativePlayerView(store: store)
             }
             .onChange(of: store.showRoutePicker) { _, open in
                 if open { store.showPlayer = false; store.showLogin = false; store.showEnrollment = false }
@@ -36,26 +39,22 @@ import SwiftUI
                 if open { store.showRoutePicker = false }
             }
             .onChange(of: store.showLogin) { _, open in
-                if open { store.showRoutePicker = false; store.showPlayer = false; store.showEnrollment = false }
+                if open { store.showRoutePicker = false; store.showPlayer = false; store.showLogin = false; store.showEnrollment = true }
             }
-            .sheet(isPresented: $store.showLogin) {
-                NavigationStack {
-                    WebContainer(app: app, origin: store.api.origin).navigationTitle("Вход через Telegram").navigationBarTitleDisplayMode(.inline)
-                        .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Закрыть") { store.showLogin = false } } }
-                }
-            }
-            .sheet(isPresented: $store.showEnrollment) { NativeEnrollmentView(store: store) }
-            .sheet(isPresented: $fixtureRoutes) { NativePlayerDevices(store: store) }
             .sheet(isPresented: $fixtureDevice) { NavigationStack { if let device = store.devices.first { NativeDeviceDetail(store: store, deviceID: device.id) } } }
             .sheet(isPresented: $fixtureStorage) { NavigationStack { NativeStorageView(store: store) } }
             .onAppear {
                 #if DEBUG && targetEnvironment(simulator)
                 if NativeFixture.enabled {
                     switch NativeFixture.screen {
-                    case "player": store.showPlayer = true
-                    case "devices": selectedTab = 1; fixtureDevice = true
-                    case "routes": fixtureRoutes = true
+                    case "library": selectedTab = 1
+                    case "player": selectedTab = 1; store.showPlayer = true
+                    case "devices": selectedTab = 3; fixtureDevice = true
+                    case "routes": selectedTab = 1; store.showRoutePicker = true
                     case "storage": selectedTab = 3; fixtureStorage = true
+                    case "site": selectedTab = 2
+                    case "tools": selectedTab = 3
+                    case "weather": selectedTab = 4
                     default: break
                     }
                 }
@@ -67,6 +66,24 @@ import SwiftUI
                 if locked { store.showLogin = false; if !app.nativeConfirmation { store.showEnrollment = false } }
             }
     }
+    private var presentedSheet: Binding<NativeMainSheet?> {
+        Binding(get: {
+            if store.showRoutePicker { return .route }
+            if store.showPlayer { return .player }
+            if store.showEnrollment { return .enrollment }
+            return nil
+        }, set: { value in
+            if value == nil { store.showRoutePicker = false; store.showPlayer = false; store.showEnrollment = false }
+        })
+    }
+    private func content<Content: View>(_ view: Content) -> some View {
+        // Reserve space inside each tab's content area. An inset on TabView itself
+        // overlaps the native tab bar on iPhone and intercepts navigation taps.
+        view.safeAreaInset(edge: .bottom, spacing: 0) {
+            if store.transferStatus != nil && !store.showRoutePicker { NativeTransferWait(store: store) }
+            else if store.transferStatus == nil { NativeMiniPlayer(store: store) }
+        }
+    }
 }
 
 @MainActor struct NativeLoginPrompt: View {
@@ -74,9 +91,8 @@ import SwiftUI
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Label("Войдите на свой сервер", systemImage: "person.crop.circle.badge.checkmark").font(.headline)
-            Text("Вход через Telegram открывает библиотеку. Одноразовая ссылка также привяжет защищённый ключ iPhone для команд ПК.").font(.callout).foregroundStyle(.secondary)
+            Text("Создайте одноразовую ссылку в боте XASS в Telegram и вставьте её здесь. Она откроет библиотеку и привяжет этот iPhone.").font(.callout).foregroundStyle(.secondary)
             Button("Вставить одноразовую ссылку") { store.showEnrollment = true }.buttonStyle(.borderedProminent)
-            Button("Войти через Telegram") { store.showLogin = true }
         }.padding(.vertical, 14).accessibilityIdentifier("nativeLoginPrompt")
     }
 }
@@ -109,58 +125,9 @@ import SwiftUI
     }
 }
 
-@MainActor struct NativePlayerDevices: View {
-    @ObservedObject var store: NativeStore
-    @State private var selectedPC: NativeDevice?
-    @State private var loadingOutputs = false
-    @State private var targetDevice = "local"
-    @State private var targetOutput = "default"
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        NavigationStack {
-            List {
-                Section("Устройство воспроизведения") {
-                    Button { targetDevice = "local"; targetOutput = "default"; selectedPC = nil } label: {
-                        HStack { Label("Этот iPhone", systemImage: "iphone"); Spacer(); if targetDevice == "local" { Image(systemName: "checkmark") } }
-                    }.disabled(store.busy)
-                    ForEach(store.devices) { device in
-                        Button {
-                            selectedPC = device; targetDevice = "agent:" + device.name; targetOutput = "default"; loadingOutputs = true
-                            store.run { defer { loadingOutputs = false }; try await store.loadOutputs(source: device.name) }
-                        } label: {
-                            HStack { Image(systemName: "desktopcomputer"); VStack(alignment: .leading) { Text(device.name); Text(device.online ? "В сети" : "Не в сети").font(.caption).foregroundStyle(.secondary) }; Spacer(); if targetDevice == "agent:" + device.name { Image(systemName: "checkmark") } }
-                        }.disabled(!device.online || store.busy).accessibilityIdentifier("output-device-\(device.id)")
-                    }
-                }
-                if let device = selectedPC {
-                    Section("Аудиовыход · \(device.name)") {
-                        if loadingOutputs { ProgressView("Получаю устройства Windows…") }
-                        ForEach(store.outputs) { output in
-                            Button { targetOutput = output.id } label: {
-                                HStack { Label(output.name, systemImage: "speaker.wave.2"); Spacer(); if targetOutput == output.id { Image(systemName: "checkmark") } }
-                            }.disabled(store.busy)
-                        }
-                    }
-                }
-                Section("AirPlay и Bluetooth") {
-                }
-                NativeMessage(store: store)
-            }.navigationTitle("Где слушать").navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() } }
-                .safeAreaInset(edge: .bottom) {
-                    VStack(spacing: 14) {
-                        Text("Продолжим с текущего места.").font(.footnote).foregroundStyle(.secondary)
-                        Button { store.run { try await store.transfer(to: targetDevice, output: targetOutput); dismiss() } } label: { HStack { Spacer(); if store.busy { ProgressView() }; Text(store.busy ? "Переключаю…" : "Переключить"); Spacer() }.padding(.vertical, 12) }.buttonStyle(.borderedProminent).disabled(store.busy || loadingOutputs)
-                    }.padding(20).background(XASSStyle.surface)
-                }
-                .onAppear { targetDevice = store.selectedDevice; targetOutput = store.outputID }
-        }.presentationDetents([.fraction(0.7), .large]).presentationDragIndicator(.visible)
-    }
-}
-
 @MainActor struct NativeDevicesView: View {
     @ObservedObject var store: NativeStore
     var body: some View {
-        NavigationStack {
             List {
                 if !store.authorized { NativeLoginPrompt(store: store) }
                 ForEach(store.devices) { device in
@@ -169,15 +136,14 @@ import SwiftUI
                             Image(systemName: "desktopcomputer").font(.title2).frame(width: 40)
                             VStack(alignment: .leading, spacing: 4) { Text(device.name).font(.headline).accessibilityLabel(device.name); HStack(spacing: 5) { Circle().fill(device.online ? Color.green : Color.gray).frame(width: 6, height: 6); Text(device.online ? "В сети" : "Не в сети").font(.caption).foregroundStyle(.secondary) } }
                         }.padding(.vertical, 6)
-                    }.accessibilityIdentifier("native-device-\(device.id)")
-                    .accessibilityElement(children: .combine)
+                    }.accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isButton)
                     .accessibilityLabel(device.name)
+                    .accessibilityIdentifier("native-device-\(device.id)")
                 }
                 if store.authorized && store.devices.isEmpty { ContentUnavailableView("Нет подключённых ПК", systemImage: "desktopcomputer", description: Text("Добавьте Windows-агент в Telegram Mini App и импортируйте его конфигурацию на ПК.")) }
                 NativeMessage(store: store)
             }.navigationTitle("Устройства").refreshable { await store.refresh() }
-        }
     }
 }
 
@@ -201,6 +167,9 @@ import SwiftUI
                 Section("Музыкальное хранилище") {
                     NavigationLink { NativeStorageView(store: store, source: device.name) } label: { Label("Сохранённые треки", systemImage: "music.note") }
                 }
+                Section("Рабочая область") {
+                    NavigationLink { NativePCWorkspace(store: store, device: device) } label: { Label("Экран, файлы и буфер обмена", systemImage: "rectangle.connected.to.line.below") }
+                }
                 Section { Button(role: .destructive) { detach = true } label: { Label("Отвязать агент", systemImage: "trash") }.disabled(store.busy).accessibilityIdentifier("nativeDetachAgent") } header: { Text("Опасная зона") } footer: { Text("Файлы и архивы сохранятся.") }
                 NativeMessage(store: store)
             } else { ContentUnavailableView("ПК отвязан", systemImage: "desktopcomputer") }
@@ -223,10 +192,8 @@ import SwiftUI
 @MainActor struct NativeSettingsView: View {
     @ObservedObject var app: AppState
     @ObservedObject var store: NativeStore
-    @State private var webAdmin = false
     @State private var forget = false
     var body: some View {
-        NavigationStack {
             List {
                 Section("Сервер") { Text(store.api.origin.url.absoluteString).textSelection(.enabled); Button("Обновить данные") { store.run { await store.refresh() } } }
                 Section("Приложение") {
@@ -234,16 +201,10 @@ import SwiftUI
                     Button { store.showEnrollment = true } label: { Label(store.enrolled ? "Защищённый ключ iPhone привязан" : "Привязать ключ iPhone", systemImage: "lock.shield") }
                     Label("Face ID или код-пароль при возвращении", systemImage: "faceid").font(.callout)
                 }
-                Section("Дополнительно") {
-                    Button { webAdmin = true } label: { Label("Администрирование сайта · веб", systemImage: "safari") }
-                    Text("Музыка, устройства и загрузки работают нативно. Только дополнительные настройки сайта открываются отдельной веб-страницей.").font(.caption).foregroundStyle(.secondary)
-                }
                 Section { Button("Выйти и сменить сервер", role: .destructive) { forget = true }; Text("XASS \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")").foregroundStyle(.secondary) }
                 NativeMessage(store: store)
             }.navigationTitle("Настройки")
-                .sheet(isPresented: $webAdmin) { NavigationStack { WebContainer(app: app, origin: store.api.origin).navigationTitle("Сайт · веб-панель").navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { webAdmin = false } } } }
                 .confirmationDialog("Выйти из XASS на этом iPhone?", isPresented: $forget, titleVisibility: .visible) { Button("Выйти и сменить сервер", role: .destructive) { app.forgetServer() } } message: { Text("Данные сервера и сохранённые треки не удаляются.") }
-        }
     }
 }
 
@@ -253,7 +214,6 @@ import SwiftUI
     @State private var remove: DownloadedTrack?
     @State private var offline: DownloadedTrack?
     var body: some View {
-        NavigationStack {
             List {
                 if audio.downloads.isEmpty && audio.cachedTracks.isEmpty { ContentUnavailableView("Музыка без интернета", systemImage: "arrow.down.circle", description: Text("Сохраните треки из плеера. Они доступны в этом приложении без сети.")) }
                 if !audio.downloadIDs.isEmpty { ProgressView("Сохраняю треки: \(audio.downloadIDs.count)") }
@@ -287,7 +247,6 @@ import SwiftUI
                     Button("Слушать локальную копию") { if let track = offline { store.playOffline(track) }; offline = nil }
                     Button("Отмена", role: .cancel) { offline = nil }
                 } message: { Text("Сервер не подтвердил переключение. В офлайн-режиме XASS не может остановить музыку на другом устройстве. Продолжайте только если там ничего не играет.") }
-        }
     }
 }
 
@@ -406,12 +365,13 @@ struct NativeTransferWait: View {
                                     try await store.pickRoute(device: "agent:" + device.name, output: targetOutput)
                                 }
                             }
-                            .disabled(store.busy || !device.online)
+                            .disabled(store.busy || loadingOutputs || !device.online)
                             .accessibilityIdentifier("route-confirm")
                         } header: {
                             Text("Аудиовыход · \(device.name)")
                         }
                     }
+                    Section("AirPlay и Bluetooth") { NativeSystemAudioRoute() }
                 }
             }
             .navigationTitle("Куда играть")
@@ -427,6 +387,11 @@ struct NativeTransferWait: View {
             }
             .onAppear {
                 selectedPC = store.devices.first(where: { "agent:" + $0.name == store.selectedDevice })
+                targetOutput = store.outputID
+                if let device = selectedPC {
+                    loadingOutputs = true
+                    store.run { defer { loadingOutputs = false }; try await store.loadOutputs(source: device.name) }
+                }
             }
             .onChange(of: store.showRoutePicker) { _, open in
                 if !open { dismiss() }
@@ -435,4 +400,26 @@ struct NativeTransferWait: View {
         .presentationDetents([.medium, .large])
         .interactiveDismissDisabled(store.transferStatus != nil)
     }
+}
+
+struct NativeSystemAudioRoute: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Выход звука iPhone")
+                Text("Наушники, колонки и AirPlay").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            NativeAudioRouteButton().frame(width: 48, height: 48).accessibilityLabel("Выбрать AirPlay или наушники")
+        }
+    }
+}
+
+private struct NativeAudioRouteButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let view = AVRoutePickerView()
+        view.tintColor = .white; view.activeTintColor = .systemBlue; view.prioritizesVideoDevices = false
+        return view
+    }
+    func updateUIView(_ view: AVRoutePickerView, context: Context) { }
 }

@@ -25,6 +25,7 @@ import UIKit
     @Published var selectedDevice = "local"
     @Published private(set) var canonicalClientID = ""
     private var canonicalSessionKey = ""
+    private var canonicalDevice = "local"
     private var canonicalDetail: String?
     @Published var outputID = "default"
     @Published var playbackState = "stopped"
@@ -42,12 +43,17 @@ import UIKit
     @Published private(set) var libraryLoadingMore = false
     @Published private(set) var transferStatus: String?
     @Published private(set) var transferProgress: Double = 0
+    private var libraryRequest = UUID()
+    private var libraryPageRequest = UUID()
+    private var knownTracks: [Int: LibraryTrack] = [:]
     private var libraryNextOffset: Int?
     private var libraryQuery = ""
     private var libraryFavorite = false
     private let libraryPageSize = 50
     private var transferCancelled = false
     private var activeTransferID: String?
+    private enum TransferKind { case handoff, remoteCommand }
+    private var activeTransferKind: TransferKind?
     /// User explicitly chose a route via AirPlay-like picker. Until then, play on this iPhone.
     private var userPickedRoute = false
     @Published var showRoutePicker = false
@@ -99,15 +105,18 @@ import UIKit
         try? SecureStore.save(Data(value.utf8), name: name); return value
     }
     var currentTrack: LibraryTrack? {
-        tracks.first(where: { $0.id == currentID }) ?? audio.downloads.first(where: { $0.id == currentID }).map(LibraryTrack.init) ?? audio.cachedTracks.first(where: { $0.id == currentID }).map { LibraryTrack($0.track) }
+        guard let id = currentID else { return nil }
+        if let track = tracks.first(where: { $0.id == id }) ?? queue.first(where: { $0.id == id }) ?? knownTracks[id] { return track }
+        if let saved = audio.downloads.first(where: { $0.id == id }) { return LibraryTrack(saved) }
+        return audio.cachedTracks.first(where: { $0.id == id }).map { LibraryTrack($0.track) }
     }
-    var otherLocal: Bool { selectedDevice == "local" && !canonicalSessionKey.isEmpty && (canonicalSessionKey != sessionKey || (!canonicalClientID.isEmpty && canonicalClientID != clientID)) }
+    var otherLocal: Bool { selectedDevice == "local" && canonicalDevice == "local" && !canonicalSessionKey.isEmpty && (canonicalSessionKey != sessionKey || (!canonicalClientID.isEmpty && canonicalClientID != clientID)) }
     var deviceLabel: String { selectedDevice == "local" ? (otherLocal ? "Другое устройство" : "Этот iPhone") : String(selectedDevice.dropFirst(6)) }
     var playing: Bool { playbackState == "playing" }
     var canEditQueue: Bool { !queueSaving && !busy && (authorized || offlinePlayback) }
     var enrolled: Bool { authorization.identity.enrolled }
     func rows(filter: String, query: String, playlist: LibraryPlaylist? = nil) -> [LibraryTrack] {
-        var rows = playlist.map { p in p.trackIDs.compactMap { id in tracks.first { $0.id == id } } } ?? tracks
+        var rows = playlist.map { p in p.trackIDs.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] } } ?? tracks
         if filter == "favorites" { rows = rows.filter(\.favorite) }
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !search.isEmpty { rows = rows.filter { ($0.title + " " + $0.artist + " " + $0.album).localizedCaseInsensitiveContains(search) } }
@@ -123,59 +132,88 @@ import UIKit
         }
         error = failure.localizedDescription
     }
+    private func libraryPath(offset: Int, query: String = "", favorite: Bool = false, playlist: Int? = nil) -> String {
+        var parts = URLComponents()
+        parts.path = "/api/mini/music/library"
+        parts.queryItems = [URLQueryItem(name: "limit", value: String(libraryPageSize)), URLQueryItem(name: "offset", value: String(offset))]
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !search.isEmpty { parts.queryItems?.append(URLQueryItem(name: "q", value: search)) }
+        if favorite { parts.queryItems?.append(URLQueryItem(name: "favorite", value: "true")) }
+        if let playlist { parts.queryItems?.append(URLQueryItem(name: "playlist", value: String(playlist))) }
+        // Form-style query parsers interpret an unescaped plus sign as a space.
+        return parts.string!.replacingOccurrences(of: "+", with: "%2B")
+    }
+    private func remember(_ values: [LibraryTrack]) {
+        for track in values { knownTracks[track.id] = track }
+    }
+    private func applyLibraryPage(_ page: [String: Any], append: Bool) {
+        let incoming = (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+        remember(incoming)
+        var seen = Set(append ? tracks.map(\.id) : [])
+        let unique = incoming.filter { seen.insert($0.id).inserted }
+        tracks = append ? tracks + unique : unique
+        if let lists = page["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
+        maxUpload = page["max_upload_bytes"] as? Int ?? maxUpload
+        libraryHasMore = page["has_more"] as? Bool == true
+        libraryNextOffset = page["next_offset"] as? Int
+    }
     func refresh() async {
-        guard !loading else { return }; loading = true; defer { loading = false }
+        guard !loading else { return }
+        let request = UUID(); libraryRequest = request; loading = true
+        defer { if libraryRequest == request { loading = false } }
         do {
             let bootstrap = try await api.request("/api/mini/bootstrap", method: "GET", body: nil)
+            try Task.checkCancellation()
+            guard libraryRequest == request else { return }
             devices = (bootstrap["sources"] as? [[String: Any]] ?? []).compactMap(NativeDevice.init)
-            libraryQuery = ""; libraryFavorite = false
-            let library = try await api.request("/api/mini/music/library?limit=\(libraryPageSize)&offset=0", method: "GET", body: nil)
-            var seen = Set<Int>()
-            tracks = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init).filter { seen.insert($0.id).inserted }
-            playlists = (library["playlists"] as? [[String: Any]] ?? []).compactMap(LibraryPlaylist.init)
-            maxUpload = library["max_upload_bytes"] as? Int ?? maxUpload
-            libraryHasMore = library["has_more"] as? Bool == true
-            libraryNextOffset = library["next_offset"] as? Int
+            let library = try await api.request(libraryPath(offset: 0, query: libraryQuery, favorite: libraryFavorite), method: "GET", body: nil)
+            try Task.checkCancellation()
+            guard libraryRequest == request else { return }
+            applyLibraryPage(library, append: false)
             authorized = true; showLogin = false; error = nil
             try await refreshSession()
-        } catch { handle(error) }
+        } catch is CancellationError {} catch { if libraryRequest == request { handle(error) } }
     }
-
     func loadMoreTracks() async {
         guard libraryHasMore, !libraryLoadingMore, !loading, let offset = libraryNextOffset else { return }
-        libraryLoadingMore = true; defer { libraryLoadingMore = false }
+        let request = libraryRequest, pageRequest = UUID(); libraryPageRequest = pageRequest
+        libraryLoadingMore = true
+        defer { if libraryPageRequest == pageRequest { libraryLoadingMore = false } }
         do {
-            var path = "/api/mini/music/library?limit=\(libraryPageSize)&offset=\(offset)"
-            let q = libraryQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !q.isEmpty { path += "&q=\(q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q)" }
-            if libraryFavorite { path += "&favorite=true" }
-            let page = try await api.request(path, method: "GET", body: nil)
-            let incoming = (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
-            var seen = Set(tracks.map(\.id))
-            tracks.append(contentsOf: incoming.filter { seen.insert($0.id).inserted })
-            libraryHasMore = page["has_more"] as? Bool == true
-            libraryNextOffset = page["next_offset"] as? Int
-            if let lists = page["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
-        } catch { handle(error) }
+            let page = try await api.request(libraryPath(offset: offset, query: libraryQuery, favorite: libraryFavorite), method: "GET", body: nil)
+            try Task.checkCancellation()
+            guard libraryRequest == request else { return }
+            applyLibraryPage(page, append: true)
+        } catch is CancellationError {} catch { if libraryRequest == request { handle(error) } }
     }
     func searchLibrary(query: String, favorite: Bool = false) async {
-        libraryQuery = query; libraryFavorite = favorite
-        guard !loading else { return }; loading = true; defer { loading = false }
+        let request = UUID(); libraryRequest = request
+        libraryPageRequest = UUID(); libraryLoadingMore = false
+        libraryQuery = query; libraryFavorite = favorite; loading = true
+        defer { if libraryRequest == request { loading = false } }
         do {
-            var path = "/api/mini/music/library?limit=\(libraryPageSize)&offset=0"
-            let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !q.isEmpty { path += "&q=\(q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q)" }
-            if favorite { path += "&favorite=true" }
-            let library = try await api.request(path, method: "GET", body: nil)
-            var seen = Set<Int>()
-            tracks = (library["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init).filter { seen.insert($0.id).inserted }
-            if let lists = library["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
-            libraryHasMore = library["has_more"] as? Bool == true
-            libraryNextOffset = library["next_offset"] as? Int
-            error = nil
-        } catch { handle(error) }
+            let library = try await api.request(libraryPath(offset: 0, query: query, favorite: favorite), method: "GET", body: nil)
+            try Task.checkCancellation()
+            guard libraryRequest == request else { return }
+            applyLibraryPage(library, append: false)
+            authorized = true; error = nil
+        } catch is CancellationError {} catch { if libraryRequest == request { handle(error) } }
     }
-    
+    func playlistTracks(_ playlist: LibraryPlaylist) async throws -> [LibraryTrack] {
+        var result: [LibraryTrack] = [], seen = Set<Int>(), offset = 0
+        repeat {
+            try Task.checkCancellation()
+            let page = try await api.request(libraryPath(offset: offset, playlist: playlist.id), method: "GET", body: nil)
+            try Task.checkCancellation()
+            let values = (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+            remember(values)
+            result.append(contentsOf: values.filter { seen.insert($0.id).inserted })
+            guard page["has_more"] as? Bool == true else { return result }
+            guard let next = page["next_offset"] as? Int, next > offset else { throw OwnerAPIError.invalidResponse }
+            offset = next
+        } while true
+    }
+
     func openRoutePicker() {
         // Mutually exclusive: close player sheet while choosing route.
         showPlayer = false
@@ -185,29 +223,23 @@ import UIKit
     }
 
     func pickRoute(device: String, output: String? = nil) async throws {
-        userPickedRoute = true
-        selectedDevice = device
-        if let output = output { outputID = output }
+        guard !busy else { return }
         if currentID != nil {
-            // Keep the same AirPlay sheet open and show progress inside it.
-            showRoutePicker = true
-            showPlayer = false
+            showRoutePicker = true; showPlayer = false
             do {
+                // Keep the source route until its player has been paused and acknowledged.
                 try await transfer(to: device, trackID: currentID, startPosition: position, output: output)
-                showRoutePicker = false
-            } catch is CancellationError {
-                showRoutePicker = true
-                throw CancellationError()
+                userPickedRoute = true; showRoutePicker = false
             } catch {
                 showRoutePicker = true
                 throw error
             }
         } else {
+            userPickedRoute = true; selectedDevice = device; outputID = output ?? "default"
             showRoutePicker = false
             notice = device == "local" ? "Будет играть на этом iPhone" : "Устройство выбрано"
         }
     }
-
 
     /// Background/locked iPhone still owns the audible source: ACK stop from session poll.
     private func acknowledgePendingHandoff(from session: [String: Any]) async {
@@ -221,20 +253,23 @@ import UIKit
         _ = try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/ack", method: "POST", body: ["session_key": sessionKey, "position": position])
     }
 
-func cancelTransfer() {
-        // Only signal cancel. Clearing busy/transferPending here races a second POST / inbox.
-        // transfer()/remoteControl() clear locks in defer after server cancel.
-        let transferID = activeTransferID
-        let wasRemote = transferStatus?.contains("Команда") == true || transferStatus?.contains("подтвержден") == true || transferStatus?.contains("жду ответ") == true
-        transferCancelled = true
-        generation = UUID()
-        transferStatus = "Отменяю на сервере…"
-        notice = "Переключение отменено"
-        guard let transferID, !transferID.isEmpty else { return }
-        let path = wasRemote
-            ? "/api/mini/music/session/commands/" + OwnerAPI.pathComponent(transferID) + "/cancel"
-            : "/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel"
-        Task { try? await api.request(path, method: "POST", body: nil) }
+    func cancelTransfer() {
+        guard busy else { return }
+        transferCancelled = true; generation = UUID()
+        transferStatus = "Отменяю на сервере…"; notice = "Переключение отменено"
+        guard let id = activeTransferID, let kind = activeTransferKind else { return }
+        let path = cancellationPath(id, kind: kind)
+        Task { _ = try? await api.request(path, method: "POST", body: nil) }
+    }
+    private func cancellationPath(_ id: String, kind: TransferKind) -> String {
+        let prefix = kind == .remoteCommand ? "/api/mini/music/session/commands/" : "/api/mini/music/transfers/"
+        return prefix + OwnerAPI.pathComponent(id) + "/cancel"
+    }
+    private func cancelServerOperation(_ path: String, method: String = "POST") async {
+        // Cleanup must outlive cancellation of the view/task that started it.
+        // OwnerAPI rejects new requests from already cancelled tasks.
+        let cleanup = Task { try await api.request(path, method: method, body: nil) }
+        _ = try? await cleanup.value
     }
 
     func foreground(_ active: Bool) {
@@ -251,7 +286,7 @@ func cancelTransfer() {
         }
     }
     func disconnect() {
-        generation = UUID(); foreground(false); ownsSession = false; pendingReport = nil; suppressReports = true
+        generation = UUID(); libraryRequest = UUID(); loading = false; foreground(false); ownsSession = false; pendingReport = nil; suppressReports = true
         reportTask?.cancel(); reportTask = nil; audio.disconnect(); imageCache.removeAllObjects()
         (api as? OwnerAPI)?.invalidate()
     }
@@ -267,7 +302,7 @@ func cancelTransfer() {
         if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
             let mode = session["repeat_mode"] as? String ?? repeatMode
             if ids != queue.map(\.id) || mode != repeatMode {
-                queue = ids.compactMap { id in tracks.first { $0.id == id } }; baseQueue = queue; repeatMode = mode
+                queue = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }; baseQueue = queue; repeatMode = mode
                 applyNativeQueue()
             }
         }
@@ -281,6 +316,7 @@ func cancelTransfer() {
     private func applySession(_ value: [String: Any]) {
         currentID = value["track_id"] as? Int
         canonicalClientID = value["client_id"] as? String ?? ""; canonicalSessionKey = value["session_key"] as? String ?? ""
+        canonicalDevice = value["device"] as? String ?? "local"
         if userPickedRoute || transferPending { selectedDevice = value["device"] as? String ?? selectedDevice } else { selectedDevice = "local" }
         playbackState = value["state"] as? String ?? "stopped"
         let detail = value["detail"] as? String
@@ -290,13 +326,17 @@ func cancelTransfer() {
         position = NativeValue.number(value["position"]); duration = currentTrack?.duration ?? 0
         outputID = value["output_id"] as? String ?? "default"; volume = NativeValue.number(value["volume"], fallback: volume)
         if !shareSaving { shareSite = value["share_site"] as? Bool ?? shareSite }
-        if !queueSaving, let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } }; if baseQueue.isEmpty { baseQueue = queue } }
+        if !queueSaving, let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }; if baseQueue.isEmpty { baseQueue = queue } }
         if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { repeatMode = mode }
     }
     private func audioEvent(_ value: [String: Any]) {
         if value["action"] != nil { objectWillChange.send(); return }
         guard selectedDevice == "local", ownsSession || offlinePlayback || transferPending else { return }
-        if let id = value["trackId"] as? Int, id > 0 { currentID = id }
+        if let id = value["trackId"] as? Int, id > 0, id != currentID {
+            currentID = id
+            // Slide the bounded AVPlayer queue window as long libraries advance.
+            applyNativeQueue()
+        }
         playbackState = value["state"] as? String ?? playbackState
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
         if let message = value["error"] as? String { error = message }
@@ -319,14 +359,20 @@ func cancelTransfer() {
     }
     func clearArtworkCache() { imageCache.removeAllObjects(); missingArtwork.removeAll(); artworkBytes = 0; notice = "Кэш обложек очищен. Скачанная музыка не затронута." }
     func playOffline(_ track: DownloadedTrack) {
+        var seen = Set<Int>()
+        baseQueue = (audio.downloads + audio.cachedTracks.map(\.track)).filter { seen.insert($0.id).inserted }.map(LibraryTrack.init)
+        queue = shuffle ? baseQueue.shuffled() : baseQueue
+        remember(queue)
         ownsSession = false; offlinePlayback = true; suppressReports = true; selectedDevice = "local"; currentID = track.id; canonicalSessionKey = ""; canonicalClientID = clientID
-        audio.playOffline(track); suppressReports = false; showPlayer = true
+        audio.playOffline(track); applyNativeQueue(); suppressReports = false; showPlayer = true
     }
     func play(_ track: LibraryTrack, rows: [LibraryTrack]? = nil) async throws {
+        guard !busy else { return }
+        remember(rows ?? [track])
         if let rows = rows { baseQueue = rows; queue = shuffle ? rows.shuffled() : rows }
         if queue.isEmpty { baseQueue = tracks; queue = shuffle ? tracks.shuffled() : tracks }
         if !queue.contains(where: { $0.id == track.id }) { queue.insert(track, at: 0) }
-        // Local play must go straight into AVPlayer — never through /transfers.
+        // An already idle source starts locally; active foreign sources use a handoff.
         if selectedDevice == "local" || selectedDevice.isEmpty {
             try await playLocal(track, startPosition: 0)
         } else {
@@ -334,34 +380,41 @@ func cancelTransfer() {
         }
     }
 
-    /// Start or resume on this iPhone without a handoff lease.
+    /// Reserve the canonical session before starting AVPlayer, so a rejected
+    /// ownership claim never leaves two audible players or false "playing" UI.
     private func playLocal(_ track: LibraryTrack, startPosition: Double) async throws {
         guard !busy else { return }; busy = true
         defer { busy = false }
         let nextGeneration = UUID(); generation = nextGeneration
         transferCancelled = false
-        offlinePlayback = false
-        selectedDevice = "local"
-        currentID = track.id
         error = nil
         let url: String
-        do {
-            if audio.downloads.contains(where: { $0.id == track.id }) || audio.cachedTracks.contains(where: { $0.id == track.id }) {
-                url = ""
-            } else {
-                url = try await ticket(track.id)
-            }
-        } catch let failure {
-            playbackState = "error"
-            self.error = (failure as? LocalizedError)?.errorDescription ?? "Не удалось получить поток. Проверьте сеть и войдите снова."
-            throw failure
-        }
+        if audio.downloads.contains(where: { $0.id == track.id }) || audio.cachedTracks.contains(where: { $0.id == track.id }) { url = "" }
+        else { url = try await ticket(track.id) }
+        try Task.checkCancellation()
         guard generation == nextGeneration, !transferCancelled else { throw CancellationError() }
-        ownsSession = true
-        position = startPosition
+        var claim = snapshot(state: "loading", position: startPosition)
+        claim["track_id"] = track.id; claim["device"] = "local"; claim["takeover"] = true
+        claim["queue"] = Array(queue.prefix(2000)).map(\.id); claim["repeat_mode"] = repeatMode
+        let response: [String: Any]
+        suppressReports = true; pendingReport = nil
+        do { response = try await writeSession(claim, explicit: true) }
+        catch let failure as OwnerAPIError where failure.status == 409 && failure.detail?["code"] as? String == "transfer_required" {
+            suppressReports = false; busy = false
+            try await transfer(to: "local", trackID: track.id, startPosition: startPosition)
+            return
+        } catch { suppressReports = false; throw error }
+        suppressReports = false
+        if Task.isCancelled || generation != nextGeneration || transferCancelled {
+            claim["state"] = "paused"; claim["takeover"] = false
+            _ = try? await writeSession(claim, explicit: true)
+            throw CancellationError()
+        }
+        if let session = response["session"] as? [String: Any] { applySession(session) }
+        offlinePlayback = false; selectedDevice = "local"; currentID = track.id
+        canonicalSessionKey = sessionKey; canonicalClientID = clientID; canonicalDevice = "local"; ownsSession = true; position = startPosition
         audio.handle(try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist,
             "url": url, "position": startPosition, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: track.id), "repeat": repeatMode]))
-        _ = try? await writeSession(snapshot(state: "playing", position: startPosition), explicit: true)
         showPlayer = true
     }
     func playAll(_ rows: [LibraryTrack], shuffled: Bool) async throws {
@@ -371,8 +424,8 @@ func cancelTransfer() {
     }
     func transfer(to device: String, trackID: Int? = nil, startPosition: Double? = nil, output: String? = nil) async throws {
         guard !busy else { return }; busy = true
-        defer { busy = false; transferStatus = nil; transferProgress = 0; activeTransferID = nil }
-        let nextGeneration = UUID(); generation = nextGeneration; transferPending = true
+        defer { busy = false; transferStatus = nil; transferProgress = 0; activeTransferID = nil; activeTransferKind = nil }
+        let nextGeneration = UUID(); generation = nextGeneration; transferPending = true; transferCancelled = false; activeTransferKind = .handoff
         defer { transferPending = false }
         if offlinePlayback { suppressReports = true; audio.pause(); suppressReports = false }
         let chosenID = trackID ?? currentID
@@ -380,7 +433,7 @@ func cancelTransfer() {
         if device != "local", tracks.first(where: { $0.id == chosenID })?.pcSupported == false {
             throw OwnerAPIError(status: 415, message: "Этот формат доступен на iPhone. Для ПК загрузите MP3 или WAV.")
         }
-        let ownedSource = selectedDevice == "local" && (ownsSession || canonicalSessionKey == sessionKey)
+        let ownedSource = selectedDevice == "local" && (ownsSession || (canonicalDevice == "local" && canonicalSessionKey == sessionKey))
         let actualPosition = ownedSource && audio.hasPlayableItem ? audio.exactPosition() : position
         if ownedSource {
             suppressReports = true; audio.pause(); suppressReports = false
@@ -392,9 +445,15 @@ func cancelTransfer() {
             "queue": Array(queue.prefix(2000)).map(\.id), "repeat_mode": repeatMode]
         if let start = startPosition { body["position"] = start }
         else if ownedSource { body["position"] = actualPosition }
+        try Task.checkCancellation()
+        guard generation == nextGeneration, !transferCancelled else { throw CancellationError() }
         let started = try await api.request("/api/mini/music/transfers", method: "POST", body: body)
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
-        activeTransferID = transferID; transferCancelled = false
+        activeTransferID = transferID
+        if Task.isCancelled || transferCancelled || generation != nextGeneration {
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
+            throw CancellationError()
+        }
         transferStatus = "Подключаю устройство…"; transferProgress = 0.08
         let deadline = Date().addingTimeInterval(30)
         let startedAt = Date()
@@ -403,7 +462,7 @@ func cancelTransfer() {
             if transferCancelled || generation != nextGeneration {
                 let id = activeTransferID ?? transferID
                 if !id.isEmpty {
-                    try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                    await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel")
                 }
                 activeTransferID = nil
                 throw CancellationError()
@@ -414,18 +473,24 @@ func cancelTransfer() {
             }
             guard Date() < deadline else {
                 let id = activeTransferID ?? transferID
-                try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel")
                 activeTransferID = nil
                 throw OwnerAPIError(status: 408, message: "Устройство не подтвердило переключение. Второй плеер не запущен.")
             }
             let elapsed = Date().timeIntervalSince(startedAt)
             transferProgress = min(0.92, 0.08 + elapsed / 30)
             transferStatus = elapsed < 8 ? "Жду остановку на текущем устройстве…" : (elapsed < 18 ? "Передаю воспроизведение…" : "Почти готово…")
-            try await Task.sleep(for: .milliseconds(650)); try Task.checkCancellation()
-            response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID), method: "GET", body: nil)
+            do {
+                try await Task.sleep(for: .milliseconds(650)); try Task.checkCancellation()
+                response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID), method: "GET", body: nil)
+            } catch {
+                await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
+                throw error
+            }
         }
         transferProgress = 1; transferStatus = "Готово"
         guard generation == nextGeneration, !transferCancelled else {
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
             activeTransferID = nil
             throw CancellationError()
         }
@@ -434,7 +499,7 @@ func cancelTransfer() {
             playbackState = "error"
             error = "Сервер подтвердил переключение без сессии. Повторите воспроизведение."
             // Roll back optimistic UI that looked like success.
-            try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel", method: "POST", body: nil)
+            await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel")
             throw OwnerAPIError(status: 409, message: error ?? "Нет сессии после переключения")
         }
         offlinePlayback = false; applySession(session); currentID = chosenID; error = nil
@@ -571,8 +636,8 @@ func cancelTransfer() {
     }
     private func remoteControl(_ action: String, extra: [String: Any] = [:]) async throws {
         guard !busy, !canonicalSessionKey.isEmpty else { return }; busy = true
-        defer { busy = false; notice = nil; transferStatus = nil; transferProgress = 0 }
-        let nextGeneration = UUID(); generation = nextGeneration; transferCancelled = false
+        defer { busy = false; notice = nil; transferStatus = nil; transferProgress = 0; activeTransferID = nil; activeTransferKind = nil }
+        let nextGeneration = UUID(); generation = nextGeneration; transferCancelled = false; activeTransferKind = .remoteCommand
         var body: [String: Any] = ["target_key": canonicalSessionKey, "action": action]; body.merge(extra) { _, new in new }
         let response = try await api.request("/api/mini/music/session/control", method: "POST", body: body)
         guard let id = NativeValue.identifier(response["command_id"]) else { throw OwnerAPIError.invalidResponse }
@@ -583,14 +648,24 @@ func cancelTransfer() {
         let startedAt = Date()
         while Date() < deadline {
             if transferCancelled || generation != nextGeneration {
-                try? await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                await cancelServerOperation("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id) + "/cancel")
                 activeTransferID = nil; throw CancellationError()
             }
             let elapsed = Date().timeIntervalSince(startedAt)
             transferProgress = min(0.92, 0.1 + elapsed / 30)
             transferStatus = elapsed < 10 ? "Ожидаю подтверждение устройства…" : "Ещё жду ответ устройства…"
-            try await Task.sleep(for: .seconds(1)); try Task.checkCancellation()
-            let result = try await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id), method: "GET", body: nil)
+            let result: [String: Any]
+            do {
+                try await Task.sleep(for: .seconds(1)); try Task.checkCancellation()
+                result = try await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id), method: "GET", body: nil)
+            } catch {
+                await cancelServerOperation(cancellationPath(id, kind: .remoteCommand))
+                throw error
+            }
+            guard generation == nextGeneration, !transferCancelled else {
+                await cancelServerOperation(cancellationPath(id, kind: .remoteCommand))
+                throw CancellationError()
+            }
             let status = result["status"] as? String ?? "pending"
             if ["completed", "complete"].contains(status) {
                 transferProgress = 1; transferStatus = "Готово"; activeTransferID = nil
@@ -601,6 +676,7 @@ func cancelTransfer() {
                 throw OwnerAPIError(status: 409, message: result["error"] as? String ?? "Устройство не выполнило команду. Откройте XASS на нём и повторите.")
             }
         }
+        await cancelServerOperation(cancellationPath(id, kind: .remoteCommand))
         activeTransferID = nil
         throw OwnerAPIError(status: 408, message: "Устройство не ответило. iOS не позволяет удалённо запустить приостановленное приложение: откройте XASS на нужном iPhone.")
     }
@@ -683,7 +759,12 @@ func cancelTransfer() {
     }
     func favorite(_ track: LibraryTrack) async throws {
         let result = try await api.request("/api/mini/music/tracks/\(track.id)", method: "PATCH", body: ["favorite": !track.favorite])
-        if let value = result["track"] as? [String: Any], let updated = LibraryTrack(value), let index = tracks.firstIndex(where: { $0.id == track.id }) { tracks[index] = updated }
+        if let value = result["track"] as? [String: Any], let updated = LibraryTrack(value) {
+            knownTracks[updated.id] = updated
+            if let index = tracks.firstIndex(where: { $0.id == updated.id }) { tracks[index] = updated }
+            if let index = queue.firstIndex(where: { $0.id == updated.id }) { queue[index] = updated }
+            if let index = baseQueue.firstIndex(where: { $0.id == updated.id }) { baseQueue[index] = updated }
+        }
     }
     func savePlaylist(id: Int?, name: String, trackIDs: [Int]) async throws {
         let result = try await api.request("/api/mini/music/playlists" + (id.map { "/\($0)" } ?? ""), method: id == nil ? "POST" : "PUT", body: ["name": name.trimmingCharacters(in: .whitespacesAndNewlines), "track_ids": trackIDs])
@@ -694,7 +775,9 @@ func cancelTransfer() {
     }
     func deleteTrack(_ track: LibraryTrack) async throws {
         _ = try await api.request("/api/mini/music/tracks/\(track.id)", method: "DELETE", body: nil)
-        tracks.removeAll { $0.id == track.id }; queue.removeAll { $0.id == track.id }
+        tracks.removeAll { $0.id == track.id }; queue.removeAll { $0.id == track.id }; baseQueue.removeAll { $0.id == track.id }; knownTracks.removeValue(forKey: track.id)
+        for index in playlists.indices { playlists[index].trackIDs.removeAll { $0 == track.id } }
+        applyNativeQueue()
         if currentID == track.id && ownsSession { audio.stop(); ownsSession = false; currentID = nil }
     }
     func download(_ track: LibraryTrack) async throws {
@@ -725,7 +808,7 @@ func cancelTransfer() {
             if let values = result["tracks"] as? [[String: Any]] { let imported = values.compactMap(LibraryTrack.init); let ids = Set(imported.map(\.id)); tracks.removeAll { ids.contains($0.id) }; tracks.insert(contentsOf: imported, at: 0) }
             notice = result["archive"] as? Bool == true ? "Архив обработан. Добавлено: \(result["added"] as? Int ?? 0), дубликатов: \(result["duplicates"] as? Int ?? 0), пропущено: \(result["skipped"] as? Int ?? 0)." : "Трек добавлен в библиотеку"
         } catch {
-            _ = try? await api.request("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id), method: "DELETE", body: nil)
+            await cancelServerOperation("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id), method: "DELETE")
             throw error
         }
     }

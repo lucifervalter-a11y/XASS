@@ -13,7 +13,7 @@ from sqlalchemy import select, update, func
 
 from app.db import get_session
 from app.music_models import MusicSession, MusicTrack
-from app.music_playback import aware, playback_meta
+from app.music_playback import aware, expire_active_transfer, playback_meta
 from app.music_playback_models import MusicRemoteCommand
 
 
@@ -41,6 +41,7 @@ def install_remote_control_routes(router, require_owner):
 
     @router.post("/api/mini/music/session/control")
     async def command(payload: RemoteControl, user=Depends(require_owner), session=Depends(get_session)):
+        await expire_active_transfer(session)
         meta = await playback_meta(session)
         item = await session.get(MusicSession, 1)
         if not item or item.device != "local" or not secrets.compare_digest(item.session_key, payload.target_key):
@@ -60,6 +61,7 @@ def install_remote_control_routes(router, require_owner):
     @router.get("/api/mini/music/session/commands")
     async def inbox(session_key: str = Query(min_length=16, max_length=64),
                     user=Depends(require_owner), session=Depends(get_session)):
+        await expire_active_transfer(session)
         meta = await playback_meta(session)
         await expire(session)
         item = await session.get(MusicSession, 1)
@@ -96,6 +98,7 @@ def install_remote_control_routes(router, require_owner):
 
     @router.post("/api/mini/music/session/commands/{command_id}/ack")
     async def acknowledge(command_id: str, payload: RemoteAck, user=Depends(require_owner), session=Depends(get_session)):
+        await expire_active_transfer(session)
         meta = await playback_meta(session)
         await expire(session)
         value = await session.get(MusicRemoteCommand, command_id)

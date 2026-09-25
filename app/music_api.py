@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.db import get_session
 from app.models import AgentCommand, AgentCredential, AppConfig, HeartbeatSource
 from app.music_models import MusicPlaylist, MusicSession, MusicTrack, MusicUpload, MusicUploadReceipt
-from app.music_playback import current_session, install_transfer_routes, pending_handoff, playback_meta
+from app.music_playback import current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta
 from app.music_playback_models import MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
 from app.services.agent_lifecycle import ensure_agent_attached
@@ -493,10 +493,12 @@ def build_router(settings, require_owner, public_origin):
 
     @router.get("/api/mini/music/session")
     async def session_state(user=Depends(require_owner), session=Depends(get_session)):
+        await expire_active_transfer(session)
         return {"ok": True, "session": await current_session(session)}
 
     @router.post("/api/mini/music/session")
     async def publish(payload: SessionBody, user=Depends(require_owner), session=Depends(get_session)):
+        await expire_active_transfer(session)
         meta = await playback_meta(session)
         transfer = await pending_handoff(session, payload.session_key)
         if transfer:

@@ -126,6 +126,16 @@ class NativeAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.consume(proof))
         self.assertFalse(await self.consume(proof))
 
+    async def test_scenario_proof_is_bound_to_reviewed_actions_devices_and_delay(self):
+        device = (await self.enrollment())[0].json()["device_id"]
+        self.purpose = "scenario:night"
+        self.binding = {"scenario_id": "night", "actions": ["quiet_on", "lock_all"], "devices": ["fixture-PC"], "delay_sec": 2}
+        proof, _ = await self.proof(device)
+        for key, value in [("actions", ["update_all"]), ("devices", []), ("delay_sec", 0)]:
+            self.assertFalse(await self.consume(proof, binding={**self.binding, key: value}))
+        self.assertTrue(await self.consume(proof))
+        self.assertFalse(await self.consume(proof))
+
     async def test_revoked_device_proof_cannot_authorize(self):
         device = (await self.enrollment())[0].json()["device_id"]
         proof, _ = await self.proof(device)

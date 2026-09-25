@@ -66,11 +66,11 @@ struct BrandMark: View {
                 if let error = app.error { Text(error).font(.callout).foregroundStyle(.orange).accessibilityIdentifier("connectionError") }
                 Button { app.connect(address: address, pair: pair); if app.origin != nil { pair = "" } } label: {
                     HStack { Text("Подключить XASS").fontWeight(.semibold); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 10)
-                }.buttonStyle(.borderedProminent).disabled(address.trimmingCharacters(in: .whitespaces).isEmpty || app.clearingSession).accessibilityIdentifier("connectServer")
+                }.buttonStyle(.borderedProminent).disabled((address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !pair.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("https://")) || app.clearingSession).accessibilityIdentifier("connectServer")
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Как войти", systemImage: "key.horizontal").font(.subheadline.weight(.semibold))
                     Text("Откройте XASS в Telegram → Инструменты → iPhone и веб-приложение → создайте защищённую ссылку. Вставьте её здесь. Ключ одноразовый и не сохраняется.")
-                    Text("Без ссылки откроется обычный вход через Telegram. Для защиты приложения на iPhone должен быть включён код-пароль.")
+                    Text("Если вставлена полная ссылка, адрес заполнится из неё. Уже подключались? Укажите адрес сервера: сохранённый вход и музыка загрузятся автоматически. Для первого входа нужна одноразовая ссылка и код-пароль iPhone.")
                 }.font(.caption).foregroundStyle(.secondary).lineSpacing(4).padding(18).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 18))
                 Text("Только ваш HTTPS-сервер. Без общего облачного аккаунта XASS.").font(.caption2).foregroundStyle(.secondary)
             }.padding(24).frame(maxWidth: 500)

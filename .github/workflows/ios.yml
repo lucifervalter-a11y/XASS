@@ -29,8 +29,9 @@ jobs:
           set -euo pipefail
           simulator_id=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for devices in d["devices"].values() for x in devices if x["name"].startswith("iPhone")))')
           echo "XASS_SIMULATOR_ID=$simulator_id" >> "$GITHUB_ENV"
+          mkdir -p build
           # One short test bundle exercises the system audio session; extra simulator clones add no value.
-          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO
+          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/simulator-tests.log
       - name: Capture real native screens (isolated simulator data, no account or audio)
         working-directory: ios
         run: |
@@ -46,7 +47,7 @@ jobs:
           sleep 2
           mkdir -p build/package
           xcrun simctl io "$XASS_SIMULATOR_ID" screenshot build/package/iOS-first-connection.png
-          for screen in library player devices routes storage; do
+          for screen in home library site tools weather player devices routes storage; do
             xcrun simctl launch --terminate-running-process "$XASS_SIMULATOR_ID" app.xass.mobile --native-ui-fixture --native-ui-screen "$screen"
             sleep 3
             xcrun simctl io "$XASS_SIMULATOR_ID" screenshot "build/package/iOS-native-$screen.png"
@@ -55,7 +56,7 @@ jobs:
         working-directory: ios
         run: |
           set -euo pipefail
-          xcodebuild build -project XASS.xcodeproj -scheme XASS -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          xcodebuild build -project XASS.xcodeproj -scheme XASS -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build/device-build.log
           expected_version=$(python3 -c 'import pathlib,re; print(re.search(r"MARKETING_VERSION: \"([^\"]+)\"", pathlib.Path("project.yml").read_text()).group(1))')
           actual_version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' build/device/Build/Products/Release-iphoneos/XASS.app/Info.plist)
           test "$actual_version" = "$expected_version" || { echo "Packaged version does not match project.yml"; exit 1; }
@@ -81,7 +82,10 @@ jobs:
         if: always()
         with:
           name: XASS-iOS-simulator-test-results
-          path: ios/build/Tests.xcresult
+          path: |
+            ios/build/Tests.xcresult
+            ios/build/simulator-tests.log
+            ios/build/device-build.log
           if-no-files-found: ignore
           retention-days: 14
 

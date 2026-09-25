@@ -4,7 +4,6 @@ import WebKit
 
 @MainActor final class AppState: ObservableObject {
     @Published var origin: ServerOrigin?
-    @Published var entryURL: URL?
     @Published private(set) var locked = true
     @Published private(set) var privacyCovered = true
     @Published private(set) var authenticating = false
@@ -24,26 +23,28 @@ import WebKit
     init() {
         #if DEBUG && targetEnvironment(simulator)
         if NativeFixture.enabled, let server = try? ServerOrigin("https://native-fixture.invalid") {
-            origin = server; entryURL = server.entryURL
+            origin = server
             native = NativeStore(api: NativeFixture(origin: server), audio: audio)
             native?.installFixture(); locked = false; privacyCovered = false; hasUnlocked = true
             return
         }
         #endif
         if let data = SecureStore.load("origin"), let text = String(data: data, encoding: .utf8), let server = try? ServerOrigin(text) {
-            origin = server; entryURL = server.entryURL; audio.configure(server)
+            origin = server; audio.configure(server)
             configureNative(server)
         }
     }
     func connect(address: String, pair: String) {
         guard !clearingSession else { error = "Завершаю выход из предыдущего сервера…"; return }
         do {
-            let server = try ServerOrigin(address)
+            let rawAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawPair = pair.trimmingCharacters(in: .whitespacesAndNewlines)
+            let server = try ServerOrigin(rawAddress.isEmpty ? rawPair : rawAddress)
             // A pasted complete pair link can be used directly as the address.
-            let input = pair.isEmpty && address.contains("#pair=") ? address : pair
+            let input = rawPair.isEmpty && rawAddress.contains("#pair=") ? rawAddress : rawPair
             _ = try server.loginURL(pairInput: input)
             try SecureStore.save(Data(server.url.absoluteString.utf8), name: "origin")
-            origin = server; entryURL = server.entryURL; audio.configure(server); configureNative(server)
+            origin = server; audio.configure(server); configureNative(server)
             pendingNativePair = input.isEmpty ? nil : input
             error = nil; locked = true; authenticate()
         } catch { self.error = error.localizedDescription }
@@ -113,8 +114,12 @@ import WebKit
         guard !clearingSession else { return }
         clearingSession = true
         if let origin = origin { SecureStore.remove("session-" + origin.namespace) }
-        SecureStore.remove("origin"); native?.disconnect(); native = nil; audio.disconnect(); origin = nil; entryURL = nil; pendingNativePair = nil
+        authGeneration = UUID(); authContext?.invalidate(); authContext = nil
+        authenticating = false; pendingUnlock = false
+        SecureStore.remove("origin"); native?.disconnect(); native = nil; audio.disconnect(); origin = nil; pendingNativePair = nil
         hasUnlocked = false; locked = true; showSettings = false; error = nil
+        // Remove website credentials left by versions before 0.18. No web view
+        // is constructed; all new sessions use the native enrollment API.
         WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             Task { @MainActor in self?.clearingSession = false }
         }

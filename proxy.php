@@ -32,14 +32,23 @@ function proxy_error(int $status, string $detail): void {
     exit;
 }
 
-$rawPath = isset($_GET['_p']) ? (string)$_GET['_p'] : '';
-$rawPath = '/' . ltrim(rawurldecode($rawPath), '/');
-// Reject path traversal and NUL before prefix checks. Otherwise `/api/../docs`
-// would pass the `/api/` allow-list and reach FastAPI's OpenAPI UI.
+$rawTarget = $_GET['_p'] ?? '';
+if (!is_string($rawTarget)) {
+    proxy_error(400, 'invalid proxy path');
+}
+// PHP has already decoded the outer _p query parameter. Decode a separate
+// copy for validation only: another decode of the forwarded target changes
+// q=AC%2BDC%26x%3D1 into q=AC+DC&x=1 and turns encoded '#' into a fragment.
+$targetParts = explode('?', $rawTarget, 2);
+$rawPath = '/' . ltrim($targetParts[0], '/');
+$decodedPath = rawurldecode($rawPath);
+// Check traversal on the decoded route, not on search terms or filenames in
+// the query. Reject control bytes before constructing the HTTP request.
 if (
-    strpos($rawPath, '..') !== false
-    || strpos($rawPath, chr(0)) !== false
-    || strpos($rawPath, chr(92)) !== false
+    strpos($decodedPath, '..') !== false
+    || strpos($decodedPath, chr(92)) !== false
+    || preg_match('/[\x00-\x20\x7f#]/', $rawTarget) === 1
+    || preg_match('/[\x00-\x1f\x7f]/', rawurldecode($rawTarget)) === 1
 ) {
     proxy_error(400, 'invalid proxy path');
 }
@@ -55,7 +64,7 @@ if ($mediaMode && preg_match('#^/(?:api|agent)/music/tracks/[1-9][0-9]*/stream(?
 }
 
 $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string)$_SERVER['REQUEST_METHOD']) : 'GET';
-$url    = $BACKEND . $rawPath;
+$url    = $BACKEND . $rawPath . (isset($targetParts[1]) ? '?' . $targetParts[1] : '');
 
 $body = '';
 if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
@@ -82,7 +91,8 @@ if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
 $forwardHeaders[] = 'X-Forwarded-Proto: ' . $publicProto;
 
 if (function_exists('getallheaders')) {
-    $allowed = ['content-type', 'x-telegram-init-data', 'x-xass-action-proof', 'x-api-key', 'authorization', 'cookie'];
+    $allowed = ['content-type', 'x-telegram-init-data', 'x-xass-action-proof', 'x-xass-cipher',
+                'x-xass-inner-type', 'x-api-key', 'authorization', 'cookie'];
     if ($mediaMode) {
         $allowed = array_merge($allowed, ['range', 'if-range']);
     }
@@ -97,6 +107,8 @@ if (function_exists('getallheaders')) {
 $serverMap = [
     'HTTP_X_TELEGRAM_INIT_DATA' => 'X-Telegram-Init-Data',
     'HTTP_X_XASS_ACTION_PROOF'  => 'X-XASS-Action-Proof',
+    'HTTP_X_XASS_CIPHER'        => 'X-XASS-Cipher',
+    'HTTP_X_XASS_INNER_TYPE'    => 'X-XASS-Inner-Type',
     'HTTP_X_API_KEY'            => 'X-Api-Key',
     'HTTP_AUTHORIZATION'        => 'Authorization',
     'HTTP_COOKIE'               => 'Cookie',

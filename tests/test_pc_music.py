@@ -178,6 +178,23 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertFalse(saved.exists())
         self.assertFalse(self.audio.devices[-1].running)
 
+    def test_pause_during_download_cancels_worker_and_preserves_handoff_position(self):
+        downloading = threading.Event()
+        def slow_response(request):
+            downloading.set()
+            self.release.wait(timeout=2)
+            return httpx.Response(200, content=silent_wav())
+        self.handler = slow_response
+        self.assertEqual(self.play(position_sec=27)["state"], "loading")
+        self.assertTrue(downloading.wait(timeout=1))
+        paused = self.command("music_pause")
+        self.assertEqual(paused["state"], "stopped")
+        self.assertEqual(paused["position_sec"], 27)
+        self.release.set()
+        self.player.close()
+        self.player._worker.join(timeout=2)
+        self.assertEqual(self.audio.devices, [], "cancelled download must not start audio")
+
     def test_play_invalid_output_does_not_download_or_interrupt_existing(self):
         self.play()
         self.wait_state("playing")

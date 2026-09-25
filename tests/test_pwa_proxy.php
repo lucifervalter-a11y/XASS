@@ -12,6 +12,8 @@ if ($testCase === 'headers') {
             'x-xass-action-proof' => 'signed-test-proof',
             'Cookie' => 'xass_pwa=test-session',
             'Content-Type' => 'application/json',
+            'X-XASS-Cipher' => 'xass-sealed-v1',
+            'X-XASS-Inner-Type' => 'text/plain',
             'X-Unrelated-Header' => 'must-not-be-forwarded',
         ];
     }
@@ -21,6 +23,8 @@ if ($testCase === 'headers') {
     $_SERVER['HTTP_X_XASS_ACTION_PROOF'] = 'signed-test-proof';
     $_SERVER['HTTP_COOKIE'] = 'xass_pwa=test-session';
     $_SERVER['CONTENT_TYPE'] = 'application/json';
+    $_SERVER['HTTP_X_XASS_CIPHER'] = 'xass-sealed-v1';
+    $_SERVER['HTTP_X_XASS_INNER_TYPE'] = 'text/plain';
 } else {
     throw new RuntimeException('Unknown test case');
 }
@@ -62,6 +66,8 @@ if (
     || strpos($headers, 'x-forwarded-host: xass.example') === false
     || strpos($headers, 'x-forwarded-proto: https') === false
     || strpos($headers, 'x-unrelated-header') !== false
+    || substr_count($headers, 'x-xass-cipher: xass-sealed-v1') !== 1
+    || substr_count($headers, 'x-xass-inner-type: text/plain') !== 1
 ) {
     throw new RuntimeException('Proxy did not preserve the authenticated action request');
 }

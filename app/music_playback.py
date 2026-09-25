@@ -40,6 +40,46 @@ async def playback_meta(session):
     return await session.scalar(select(MusicPlaybackState).where(MusicPlaybackState.id == 1).with_for_update())
 
 
+async def fail_transfer(session, transfer, detail):
+    """Release a failed handoff without claiming an audible target is silent."""
+    previous_status = transfer.status
+    transfer.status = "failed"
+    transfer.detail = detail
+    start_command = await session.get(AgentCommand, transfer.start_command_id) if transfer.start_command_id else None
+    target_may_play = bool(start_command and (
+        start_command.delivered_at is not None or start_command.status in {"delivered", "completed"}))
+    for command_id in (transfer.stop_command_id, transfer.start_command_id):
+        if command_id:
+            await session.execute(update(AgentCommand).where(AgentCommand.id == command_id,
+                AgentCommand.status == "pending").values(status="cancelled"))
+    meta = await playback_meta(session)
+    target = transfer.target or {}
+    owns_lease = meta.transfer_id == transfer.id or (
+        previous_status == "ready" and not meta.transfer_id and meta.revision == target.get("lease_revision"))
+    if meta.transfer_id == transfer.id:
+        meta.transfer_id = ""
+    item = await session.get(MusicSession, 1)
+    # A controller commonly reuses its session key when moving from iPhone to
+    # PC. Failing before the source ACK must not overwrite that source's state.
+    if (owns_lease and previous_status in {"starting", "stopped", "ready"} and item
+            and item.session_key == target.get("session_key") and item.device == target.get("device")
+            and item.track_id == target.get("track_id")):
+        item.state = "loading" if target_may_play else "error"
+        item.updated_at = datetime.now(timezone.utc)
+    if owns_lease:
+        meta.revision += 1
+    await session.commit()
+
+
+async def expire_active_transfer(session):
+    """Recover abandoned handoffs even when their initiating client disappears."""
+    meta = await session.get(MusicPlaybackState, 1)
+    transfer = await session.get(MusicTransfer, meta.transfer_id) if meta and meta.transfer_id else None
+    if (transfer and transfer.status not in {"ready", "failed"}
+            and (datetime.now(timezone.utc) - aware(transfer.created_at)).total_seconds() > 30):
+        await fail_transfer(session, transfer, "Время переключения истекло. Повторите действие")
+
+
 async def current_session(session):
     item = await session.get(MusicSession, 1)
     if item is None:
@@ -60,7 +100,10 @@ async def current_session(session):
         source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == item.device[6:]))
         if source and source_is_online(source, 2):
             player = (source.last_payload or {}).get("music_player") or {}
-            if player.get("track_id") == item.track_id and not queue_pending:
+            # A paused heartbeat from before a new play command cannot prove
+            # silence if the command was delivered and its ACK was lost.
+            fresh_for_start = item.state != "loading" or aware(source.last_seen_at) >= timestamp
+            if player.get("track_id") == item.track_id and not queue_pending and fresh_for_start:
                 result.update(state=player.get("state", "paused"), position=number(player.get("position_sec")),
                     volume=max(0, min(100, number(player.get("volume"), result["volume"]))),
                     output_id=player.get("output_id") or result["output_id"])
@@ -119,19 +162,7 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
     def lock():
         return locks.setdefault("handoff", asyncio.Lock())
 
-    async def fail(session, transfer, detail):
-        transfer.status = "failed"; transfer.detail = detail
-        for command_id in (transfer.stop_command_id, transfer.start_command_id):
-            if command_id:
-                await session.execute(update(AgentCommand).where(AgentCommand.id == command_id,
-                    AgentCommand.status == "pending").values(status="cancelled"))
-        meta = await playback_meta(session)
-        if meta.transfer_id == transfer.id:
-            meta.transfer_id = ""
-        item = await session.get(MusicSession, 1)
-        if item and item.session_key == transfer.target.get("session_key") and transfer.status == "failed":
-            item.state = "error"; item.updated_at = datetime.now(timezone.utc)
-        await session.commit()
+    fail = fail_transfer
 
     async def advance(transfer, request, user, session):
         if transfer.status in {"ready", "failed"}:
@@ -169,6 +200,7 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
             if target.get("queue") is not None:
                 meta.queue = list(dict.fromkeys(target["queue"]))
             meta.repeat_mode = target["repeat_mode"]; meta.revision += 1
+            transfer.target = {**target, "lease_revision": meta.revision}
             if target["device"] == "local" or not target["autoplay"]:
                 transfer.status = "ready"; meta.transfer_id = ""
                 await session.commit()
@@ -192,8 +224,11 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                 return
             command = await session.get(AgentCommand, transfer.start_command_id)
             if command and command.status == "completed" and (command.result or {}).get("ok") is not False:
-                transfer.status = "ready"; meta.transfer_id = ""
                 details = (command.result or {}).get("details") or {}
+                if details.get("state") not in {"loading", "playing", "ended"}:
+                    await fail(session, transfer, "ПК не подтвердил запуск музыки")
+                    return
+                transfer.status = "ready"; meta.transfer_id = ""
                 item = await session.get(MusicSession, 1)
                 item.state = details.get("state", "loading"); item.updated_at = datetime.now(timezone.utc)
                 await session.commit()
@@ -283,11 +318,19 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
             transfer = await session.get(MusicTransfer, transfer_id)
             if transfer is None:
                 raise HTTPException(404, "Переключение не найдено")
-            if transfer.status in {"ready", "failed"}:
+            if transfer.status == "failed":
                 return await result(transfer, session)
             target = transfer.target or {}
+            if transfer.status == "ready":
+                meta = await playback_meta(session)
+                item = await session.get(MusicSession, 1)
+                if (not item or item.session_key != target.get("session_key")
+                        or item.device != target.get("device") or item.track_id != target.get("track_id")
+                        or meta.transfer_id or meta.revision != target.get("lease_revision")):
+                    # A late cancel must never stop a later playback selection.
+                    return await result(transfer, session)
             stop_target = (
-                transfer.status in {"starting", "stopped"}
+                transfer.status in {"starting", "ready"}
                 and isinstance(target.get("device"), str)
                 and target["device"].startswith("agent:")
                 and target.get("autoplay", True)
@@ -295,7 +338,9 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
             await fail(session, transfer, "Переключение отменено")
             if stop_target:
                 try:
-                    await control(control_body(source_name=target["device"][6:], action="pause",
+                    # Stop also invalidates a pending download; pause cannot
+                    # prevent its worker from starting audio after cancellation.
+                    await control(control_body(source_name=target["device"][6:], action="stop",
                         expires_at=int(datetime.now(timezone.utc).timestamp()) + 30), request, user, session)
                 except HTTPException:
                     pass
@@ -307,9 +352,13 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
             transfer = await session.get(MusicTransfer, transfer_id)
             if transfer is None or transfer.source_device != "local" or not secrets.compare_digest(transfer.source_key, payload.session_key):
                 raise HTTPException(403, "Подтверждение другого плеера")
+            if transfer.status == "waiting" and (datetime.now(timezone.utc) - aware(transfer.created_at)).total_seconds() > 30:
+                await fail(session, transfer, "Время переключения истекло. Повторите действие")
+                raise HTTPException(409, "Подтверждение переключения истекло")
             if transfer.status == "waiting":
                 if transfer.target.get("preserve_position"):
-                    transfer.position = payload.position
+                    track = await session.get(MusicTrack, transfer.target.get("track_id"))
+                    transfer.position = min(track.duration, payload.position) if track else payload.position
                 transfer.status = "stopped"
                 item = await session.get(MusicSession, 1)
                 if item and item.session_key == payload.session_key:

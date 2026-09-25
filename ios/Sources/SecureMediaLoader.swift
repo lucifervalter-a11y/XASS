@@ -23,6 +23,7 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
         let request: AVAssetResourceLoadingRequest
         let task: URLSessionDataTask
         var responseOffset: Int64 = 0
+        var contentLength: Int64?
         init(_ request: AVAssetResourceLoadingRequest, _ task: URLSessionDataTask) {
             self.request = request; self.task = task
         }
@@ -86,8 +87,14 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
                   let pieces = Self.parseRange(range) else {
                 completionHandler(.cancel); finish(dataTask.taskIdentifier, error: XASSErr.invalidMedia); return
             }
+            let requestedStart = max(transfer.request.dataRequest?.currentOffset ?? 0, transfer.request.dataRequest?.requestedOffset ?? 0)
+            guard pieces.start <= requestedStart, pieces.end >= requestedStart,
+                  response.expectedContentLength < 0 || response.expectedContentLength == pieces.end - pieces.start + 1 else {
+                completionHandler(.cancel); finish(dataTask.taskIdentifier, error: XASSErr.invalidMedia); return
+            }
             transfer.responseOffset = pieces.start; length = pieces.total
         }
+        if length > 0 { transfer.contentLength = length }
         if let info = transfer.request.contentInformationRequest {
             info.contentType = UTType(mimeType: mime)?.identifier ?? UTType.audio.identifier
             info.contentLength = max(0, length)
@@ -98,13 +105,14 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
         }
         completionHandler(.allow)
     }
-    static func parseRange(_ header: String) -> (start: Int64, total: Int64)? {
+    static func parseRange(_ header: String) -> (start: Int64, end: Int64, total: Int64)? {
         guard header.hasPrefix("bytes ") else { return nil }
-        let components = header.replacingOccurrences(of: "bytes ", with: "").split(separator: "/")
-        guard components.count == 2, let total = Int64(components[1]), total > 0,
-              let first = components[0].split(separator: "-").first,
-              let start = Int64(first), start >= 0, start < total else { return nil }
-        return (start, total)
+        let components = header.dropFirst(6).split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 2, let total = Int64(components[1]), total > 0 else { return nil }
+        let bounds = components[0].split(separator: "-", omittingEmptySubsequences: false)
+        guard bounds.count == 2, let start = Int64(bounds[0]), let end = Int64(bounds[1]),
+              start >= 0, end >= start, end < total else { return nil }
+        return (start, end, total)
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let transfer = requests[dataTask.taskIdentifier], let target = transfer.request.dataRequest else { return }
@@ -124,7 +132,16 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
             finish(dataTask.taskIdentifier, error: nil)
         }
     }
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { finish(task.taskIdentifier, error: error) }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if error == nil, let transfer = requests[task.taskIdentifier], let target = transfer.request.dataRequest {
+            let requestedEnd = target.requestedOffset + Int64(target.requestedLength)
+            let expectedEnd = target.requestsAllDataToEndOfResource ? transfer.contentLength : min(requestedEnd, transfer.contentLength ?? requestedEnd)
+            if let expectedEnd, target.currentOffset < expectedEnd {
+                finish(task.taskIdentifier, error: URLError(.networkConnectionLost)); return
+            }
+        }
+        finish(task.taskIdentifier, error: error)
+    }
     private func finish(_ id: Int, error: Error?) {
         guard let transfer = requests.removeValue(forKey: id) else { return }
         if let error = error { transfer.request.finishLoading(with: error) } else { transfer.request.finishLoading() }
@@ -161,6 +178,8 @@ final class PrivateDownload: NSObject, URLSessionDownloadDelegate {
         if totalBytesWritten > Self.maxBytes || totalBytesExpectedToWrite > Self.maxBytes { complete(.failure(URLError(.dataLengthExceedsMaximum))) }
     }
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        // URLSession can deliver an already queued completion after cancellation.
+        guard completion != nil else { return }
         guard let response = downloadTask.response as? HTTPURLResponse, response.statusCode == 200,
               let url = response.url, (try? origin.mediaURL(url.absoluteString, trackID: trackID)) != nil,
               let size = try? location.resourceValues(forKeys: [.fileSizeKey]).fileSize,

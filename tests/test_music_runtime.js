@@ -78,16 +78,13 @@ test('rapid track changes serialize acknowledged transfers and cannot start an o
   assert(r.requests.every(q=>q.body?.takeover!==true));
 });
 
-test('native download and playback events reach the listener and update actual UI state',()=>{
+test('legacy native download and playback events update the web compatibility listener',()=>{
   const r=runtime();r.music.state.tracks=[{id:1,title:'One',duration:10},{id:2,title:'Two',duration:20}];r.music.state.current=r.music.state.tracks[0];
   const event=r.events['xass:native-audio'];assert.equal(typeof event,'function');
-  // Exercise the exact JavaScript emitted by production Swift. A direct test
-  // event could hide a document/window mismatch (these events do not bubble).
-  const swift=fs.readFileSync(path.join(__dirname,'../ios/Sources/WebContainer.swift'),'utf8');
-  const bridge=swift.match(/evaluateJavaScript\("([^"]+)" \+ json \+ "([^"]+)"/);
-  assert(bridge,'Expected production native event emitter');assert.match(bridge[1],/^window\.dispatchEvent/);
+  // Old installed shells can still use the web compatibility listener.
+  // Current iOS uses SwiftUI/OwnerAPI and contains no JavaScript emitter.
   r.window.dispatchEvent=e=>r.events[e.type]?.(e);
-  const send=detail=>vm.runInNewContext(bridge[1]+JSON.stringify(detail)+bridge[2],{window:r.window,CustomEvent:class{constructor(type,options){this.type=type;this.detail=options.detail;}}});
+  const send=detail=>r.window.dispatchEvent({type:'xass:native-audio',detail});
   send({action:'download',trackId:1,downloaded:true});assert(r.music.state.downloads.has(1));
   send({trackId:2,state:'playing',position:4,duration:20});assert.equal(r.music.state.current.id,2);assert.equal(r.music.state.position,4);assert.equal(r.nodes.get('xmPlayerTitle').textContent,'Two');
 });

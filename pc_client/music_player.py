@@ -182,7 +182,8 @@ class MusicPlayer:
                     self._state, self._error = "error", "Аудиовыход отключён. Выберите доступное устройство"
                     self._release_device()
             return {"state": self._state, "track_id": self._track_id, "output_id": self._output_id,
-                    "position_sec": round(min(self._duration, self._progress["position"]), 2),
+                    "position_sec": round(min(self._duration, self._progress["position"])
+                        if self._duration else self._progress["position"], 2),
                     "duration_sec": round(self._duration, 2), "volume": round(self._volume),
                     "title": self._title, "artist": self._artist, "error": self._error,
                     "downloaded_bytes": self._downloaded_bytes, "total_bytes": self._total_bytes,
@@ -285,7 +286,7 @@ class MusicPlayer:
                 self._title, self._artist = str(payload.get("title") or "")[:256], str(payload.get("artist") or "")[:256]
                 self._state, self._error, self._duration = "loading", "", 0.0
                 self._downloaded_bytes, self._total_bytes = 0, 0
-                self._progress = {"position": 0.0, "ended": False, "error": ""}
+                self._progress = {"position": position, "ended": False, "error": ""}
                 self._pending = (self._generation, url, dict(config), position)
                 if self._worker is None:
                     self._worker = threading.Thread(target=self._download_loop, name="xass-music", daemon=True)
@@ -300,6 +301,14 @@ class MusicPlayer:
             elif command == "music_volume":
                 self._volume = _number(payload.get("volume"), "Громкость", 0, 100)
             elif command in {"music_pause", "music_resume", "music_seek"}:
+                if command == "music_pause" and self._state == "loading":
+                    # A handoff must be able to silence a download too. Merely
+                    # returning an error leaves the worker free to start later.
+                    self._generation += 1
+                    self._pending = None
+                    self._discard_track()
+                    self._state, self._error = "stopped", ""
+                    return self.snapshot()
                 if self._path is None or self._state in {"idle", "loading", "stopped", "error"}:
                     raise MusicError("Сначала запустите трек и дождитесь загрузки")
                 if command == "music_pause":

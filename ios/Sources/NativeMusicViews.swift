@@ -121,16 +121,23 @@ enum XASSStyle {
                 }
             }.listStyle(.plain).scrollContentBackground(.hidden).background(XASSStyle.background)
                 .navigationTitle("Музыка").searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск")
-                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { importFiles = true } label: { Image(systemName: "plus").font(.title2) }.disabled(!store.authorized || store.uploadName != nil).accessibilityLabel("Добавить музыку") } }
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { NavigationLink { NativeDownloadsView(store: store, audio: store.audio) } label: { Image(systemName: "arrow.down.circle") }.accessibilityLabel("Загрузки") }
+                    ToolbarItem(placement: .topBarTrailing) { Button { importFiles = true } label: { Image(systemName: "plus").font(.title2) }.disabled(!store.authorized || store.uploadName != nil).accessibilityLabel("Добавить музыку") }
+                }
                 .refreshable { await store.refresh() }
                 .onChange(of: query) { _, value in
                     searchTask?.cancel()
-                    searchTask = Task { try? await Task.sleep(for: .milliseconds(350)); guard !Task.isCancelled else { return }; await store.searchLibrary(query: value, favorite: filter == "favorites") }
+                    guard filter != "playlists" else { return }
+                    let favorite = filter == "favorites"
+                    searchTask = Task { try? await Task.sleep(for: .milliseconds(350)); guard !Task.isCancelled else { return }; await store.searchLibrary(query: value, favorite: favorite) }
                 }
                 .onChange(of: filter) { _, value in
+                    searchTask?.cancel()
                     if value == "playlists" { return }
                     store.run { await store.searchLibrary(query: query, favorite: value == "favorites") }
                 }
+                .onDisappear { searchTask?.cancel() }
                 .overlay { if store.loading && store.tracks.isEmpty { ProgressView() } }
                 .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }
                 .sheet(isPresented: $editingPlaylist) { NativePlaylistEditor(store: store, playlist: playlistToEdit) }
@@ -165,7 +172,7 @@ enum XASSStyle {
     @ObservedObject var store: NativeStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var typeSize
-        @State private var showQueue = false
+    @State private var showQueue = false
     @State private var scrubbing: Double?
     @State private var volume: Double?
     var body: some View {
@@ -192,7 +199,7 @@ enum XASSStyle {
                             Slider(value: Binding(get: { scrubbing ?? min(store.position, max(1, store.duration)) }, set: { scrubbing = $0 }), in: 0...max(1, store.duration), onEditingChanged: { editing in if !editing, let value = scrubbing { scrubbing = nil; store.run { try await store.seek(value) } } }).accessibilityLabel("Позиция трека")
                             HStack { Text(NativeValue.time(scrubbing ?? store.position)); Spacer(); Text(NativeValue.time(store.duration)) }.font(.caption).monospacedDigit().foregroundStyle(XASSStyle.secondary)
                         }
-                        if store.busy || store.playbackState == "loading" { HStack { ProgressView(); Text(store.busy ? "Переключаю устройство…" : "Загрузка трека…").font(.caption) }.accessibilityIdentifier("nativePlayerLoading") }
+                        if store.busy || store.playbackState == "loading" { HStack { ProgressView(); Text(store.transferStatus ?? (store.busy ? "Выполняю действие…" : "Загрузка трека…")).font(.caption) }.accessibilityIdentifier("nativePlayerLoading") }
                         HStack {
                             Button { store.run { try await store.setQueueMode(shuffled: !store.shuffle) } } label: { Image(systemName: "shuffle").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.shuffle ? XASSStyle.accent : XASSStyle.secondary).accessibilityLabel("Перемешивание").disabled(!store.canEditQueue)
                             Spacer()
@@ -240,7 +247,7 @@ enum XASSStyle {
     var body: some View {
         NavigationStack {
             List(store.queue.isEmpty ? store.tracks : store.queue) { track in
-                Button { store.run { try await store.play(track) }; dismiss() } label: { HStack { Text(track.title); Spacer(); if track.id == store.currentID { Image(systemName: "waveform") } } }
+                Button { store.run { try await store.play(track); dismiss() } } label: { HStack { Text(track.title); Spacer(); if track.id == store.currentID { Image(systemName: "waveform") } } }.disabled(store.busy)
             }.navigationTitle("Очередь").toolbar { Button("Готово") { dismiss() } }
         }
     }
@@ -251,19 +258,26 @@ enum XASSStyle {
     let track: LibraryTrack
     @Environment(\.dismiss) private var dismiss
     @State private var confirmDelete = false
+    @State private var acting = false
     var body: some View {
         NavigationStack {
             List {
-                Button { store.run { try await store.favorite(track) }; dismiss() } label: { Label(track.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
-                Button { store.run { try await store.download(track) }; dismiss() } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }
+                Button { perform { try await store.favorite(track) } } label: { Label(track.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
+                Button { perform { try await store.download(track) } } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }
                 Section("Добавить в плейлист") {
                     if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
-                    ForEach(store.playlists) { playlist in Button(playlist.name) { store.run { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) }; dismiss() } }
+                    ForEach(store.playlists) { playlist in Button(playlist.name) { perform { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) } } }
                 }
                 Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
-            }.navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() } }
-                .confirmationDialog("Убрать трек из библиотеки? Файл останется на сервере для восстановления.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Убрать трек", role: .destructive) { store.run { try await store.deleteTrack(track) }; dismiss() } }
-        }.presentationDetents([.medium, .large])
+                NativeMessage(store: store)
+            }.disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }
+                .confirmationDialog("Убрать трек из библиотеки? Файл останется на сервере для восстановления.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Убрать трек", role: .destructive) { perform { try await store.deleteTrack(track) } } }
+        }.presentationDetents([.medium, .large]).interactiveDismissDisabled(acting)
+    }
+    private func perform(_ action: @escaping () async throws -> Void) {
+        guard !acting else { return }
+        acting = true
+        store.run { defer { acting = false }; try await action(); dismiss() }
     }
 }
 
@@ -272,18 +286,42 @@ enum XASSStyle {
     let playlistID: Int
     @State private var editing = false
     @State private var confirmDelete = false
+    @State private var tracks: [LibraryTrack] = []
+    @State private var loading = false
+    @State private var selectedTrack: LibraryTrack?
     @Environment(\.dismiss) private var dismiss
     private var playlist: LibraryPlaylist? { store.playlists.first { $0.id == playlistID } }
     var body: some View {
         List {
             if let playlist = playlist {
-                ForEach(store.rows(filter: "all", query: "", playlist: playlist)) { track in
-                    Button { store.run { try await store.play(track, rows: store.rows(filter: "all", query: "", playlist: playlist)) } } label: { HStack { Text(track.title); Spacer(); Text(NativeValue.time(track.duration)).foregroundStyle(.secondary) } }
+                if !tracks.isEmpty {
+                    HStack {
+                        Button { store.run { try await store.playAll(tracks, shuffled: false) } } label: { Label("Слушать", systemImage: "play.fill") }
+                        Spacer()
+                        Button { store.run { try await store.playAll(tracks, shuffled: true) } } label: { Label("Перемешать", systemImage: "shuffle") }
+                    }.buttonStyle(.bordered).disabled(store.busy)
                 }
+                ForEach(tracks) { track in
+                    NativeTrackRow(store: store, track: track, rows: tracks) { selectedTrack = track }.listRowBackground(Color.clear).listRowSeparator(.hidden)
+                }
+                if tracks.isEmpty && !loading { ContentUnavailableView("В плейлисте пока нет треков", systemImage: "music.note.list", description: Text("Добавьте музыку через меню «Изменить».")) }
+                NativeMessage(store: store)
+                Text("Треков в плейлисте: \(playlist.trackIDs.count)").font(.caption).foregroundStyle(.secondary)
             }
         }.navigationTitle(playlist?.name ?? "Плейлист").toolbar { Menu { Button("Изменить") { editing = true }; Button("Удалить плейлист", role: .destructive) { confirmDelete = true } } label: { Image(systemName: "ellipsis") } }
-            .sheet(isPresented: $editing) { NativePlaylistEditor(store: store, playlist: playlist) }
+            .task(id: playlist?.trackIDs) { await loadTracks() }
+            .refreshable { await loadTracks() }
+            .overlay { if loading && tracks.isEmpty { ProgressView() } }
+            .sheet(isPresented: $editing, onDismiss: { Task { await loadTracks() } }) { NativePlaylistEditor(store: store, playlist: playlist) }
+            .sheet(item: $selectedTrack, onDismiss: { Task { await loadTracks() } }) { track in NativeTrackActions(store: store, track: track) }
             .confirmationDialog("Удалить плейлист? Треки останутся в библиотеке.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Удалить", role: .destructive) { if let playlist = playlist { store.run { try await store.deletePlaylist(playlist) }; dismiss() } } }
+    }
+    private func loadTracks() async {
+        guard let playlist = playlist, !loading else { return }
+        loading = true; defer { loading = false }
+        do { tracks = try await store.playlistTracks(playlist) }
+        catch is CancellationError { }
+        catch { store.handle(error) }
     }
 }
 
@@ -293,16 +331,36 @@ enum XASSStyle {
     @State private var name = ""
     @State private var selected = Set<Int>()
     @State private var saving = false
+    @State private var tracks: [LibraryTrack] = []
+    @State private var loading = false
+    @State private var nextOffset: Int? = 0
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationStack {
             Form {
                 TextField("Название плейлиста", text: $name).accessibilityIdentifier("playlistName")
-                Section("Треки") { ForEach(store.tracks) { track in Toggle(track.title, isOn: Binding(get: { selected.contains(track.id) }, set: { if $0 { selected.insert(track.id) } else { selected.remove(track.id) } })) } }
+                Section("Треки") {
+                    ForEach(tracks) { track in Toggle(track.title, isOn: Binding(get: { selected.contains(track.id) }, set: { if $0 { selected.insert(track.id) } else { selected.remove(track.id) } })) }
+                    if loading { ProgressView("Загрузка библиотеки…") }
+                    else if nextOffset != nil { Button("Показать ещё треки") { Task { await loadMore() } } }
+                }
                 NativeMessage(store: store)
             }.navigationTitle(playlist == nil ? "Новый плейлист" : "Изменить плейлист")
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { saving = true; store.run { defer { saving = false }; let preserved = (playlist?.trackIDs ?? []).filter { selected.contains($0) }; let ids = preserved + store.tracks.filter { selected.contains($0.id) && !preserved.contains($0.id) }.map(\.id); try await store.savePlaylist(id: playlist?.id, name: String(name.prefix(160)), trackIDs: ids); dismiss() } }.disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() }.disabled(saving) }; ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { saving = true; store.run { defer { saving = false }; let preserved = (playlist?.trackIDs ?? []).filter { selected.contains($0) }; let ids = preserved + tracks.filter { selected.contains($0.id) && !preserved.contains($0.id) }.map(\.id); try await store.savePlaylist(id: playlist?.id, name: String(name.prefix(160)), trackIDs: ids); dismiss() } }.disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
                 .onAppear { name = playlist?.name ?? ""; selected = Set(playlist?.trackIDs ?? []) }
-        }
+                .task { await loadMore() }
+        }.interactiveDismissDisabled(saving)
+    }
+    private func loadMore() async {
+        guard !loading, let offset = nextOffset else { return }
+        loading = true; defer { loading = false }
+        do {
+            let response = try await store.api.request("/api/mini/music/library?offset=\(offset)&limit=200", method: "GET", body: nil)
+            let page = (response["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+            let seen = Set(tracks.map(\.id)); tracks += page.filter { !seen.contains($0.id) }
+            nextOffset = response["has_more"] as? Bool == true ? response["next_offset"] as? Int : nil
+            if let next = nextOffset, next <= offset { nextOffset = nil }
+        } catch is CancellationError { }
+        catch { store.handle(error) }
     }
 }
