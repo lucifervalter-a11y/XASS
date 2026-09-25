@@ -265,6 +265,12 @@ import UIKit
         let prefix = kind == .remoteCommand ? "/api/mini/music/session/commands/" : "/api/mini/music/transfers/"
         return prefix + OwnerAPI.pathComponent(id) + "/cancel"
     }
+    private func cancelServerOperation(_ path: String, method: String = "POST") async {
+        // Cleanup must outlive cancellation of the view/task that started it.
+        // OwnerAPI rejects new requests from already cancelled tasks.
+        let cleanup = Task { try await api.request(path, method: method, body: nil) }
+        _ = try? await cleanup.value
+    }
 
     func foreground(_ active: Bool) {
         pollTask?.cancel(); pollTask = nil
@@ -445,7 +451,7 @@ import UIKit
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
         activeTransferID = transferID
         if Task.isCancelled || transferCancelled || generation != nextGeneration {
-            _ = try? await api.request(cancellationPath(transferID, kind: .handoff), method: "POST", body: nil)
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
             throw CancellationError()
         }
         transferStatus = "Подключаю устройство…"; transferProgress = 0.08
@@ -456,7 +462,7 @@ import UIKit
             if transferCancelled || generation != nextGeneration {
                 let id = activeTransferID ?? transferID
                 if !id.isEmpty {
-                    try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                    await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel")
                 }
                 activeTransferID = nil
                 throw CancellationError()
@@ -467,7 +473,7 @@ import UIKit
             }
             guard Date() < deadline else {
                 let id = activeTransferID ?? transferID
-                try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel")
                 activeTransferID = nil
                 throw OwnerAPIError(status: 408, message: "Устройство не подтвердило переключение. Второй плеер не запущен.")
             }
@@ -478,13 +484,13 @@ import UIKit
                 try await Task.sleep(for: .milliseconds(650)); try Task.checkCancellation()
                 response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID), method: "GET", body: nil)
             } catch {
-                _ = try? await api.request(cancellationPath(transferID, kind: .handoff), method: "POST", body: nil)
+                await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
                 throw error
             }
         }
         transferProgress = 1; transferStatus = "Готово"
         guard generation == nextGeneration, !transferCancelled else {
-            _ = try? await api.request(cancellationPath(transferID, kind: .handoff), method: "POST", body: nil)
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
             activeTransferID = nil
             throw CancellationError()
         }
@@ -493,7 +499,7 @@ import UIKit
             playbackState = "error"
             error = "Сервер подтвердил переключение без сессии. Повторите воспроизведение."
             // Roll back optimistic UI that looked like success.
-            try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel", method: "POST", body: nil)
+            await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel")
             throw OwnerAPIError(status: 409, message: error ?? "Нет сессии после переключения")
         }
         offlinePlayback = false; applySession(session); currentID = chosenID; error = nil
@@ -642,7 +648,7 @@ import UIKit
         let startedAt = Date()
         while Date() < deadline {
             if transferCancelled || generation != nextGeneration {
-                try? await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id) + "/cancel", method: "POST", body: nil)
+                await cancelServerOperation("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id) + "/cancel")
                 activeTransferID = nil; throw CancellationError()
             }
             let elapsed = Date().timeIntervalSince(startedAt)
@@ -653,11 +659,11 @@ import UIKit
                 try await Task.sleep(for: .seconds(1)); try Task.checkCancellation()
                 result = try await api.request("/api/mini/music/session/commands/" + OwnerAPI.pathComponent(id), method: "GET", body: nil)
             } catch {
-                _ = try? await api.request(cancellationPath(id, kind: .remoteCommand), method: "POST", body: nil)
+                await cancelServerOperation(cancellationPath(id, kind: .remoteCommand))
                 throw error
             }
             guard generation == nextGeneration, !transferCancelled else {
-                _ = try? await api.request(cancellationPath(id, kind: .remoteCommand), method: "POST", body: nil)
+                await cancelServerOperation(cancellationPath(id, kind: .remoteCommand))
                 throw CancellationError()
             }
             let status = result["status"] as? String ?? "pending"
@@ -670,7 +676,7 @@ import UIKit
                 throw OwnerAPIError(status: 409, message: result["error"] as? String ?? "Устройство не выполнило команду. Откройте XASS на нём и повторите.")
             }
         }
-        _ = try? await api.request(cancellationPath(id, kind: .remoteCommand), method: "POST", body: nil)
+        await cancelServerOperation(cancellationPath(id, kind: .remoteCommand))
         activeTransferID = nil
         throw OwnerAPIError(status: 408, message: "Устройство не ответило. iOS не позволяет удалённо запустить приостановленное приложение: откройте XASS на нужном iPhone.")
     }
@@ -753,7 +759,12 @@ import UIKit
     }
     func favorite(_ track: LibraryTrack) async throws {
         let result = try await api.request("/api/mini/music/tracks/\(track.id)", method: "PATCH", body: ["favorite": !track.favorite])
-        if let value = result["track"] as? [String: Any], let updated = LibraryTrack(value), let index = tracks.firstIndex(where: { $0.id == track.id }) { tracks[index] = updated }
+        if let value = result["track"] as? [String: Any], let updated = LibraryTrack(value) {
+            knownTracks[updated.id] = updated
+            if let index = tracks.firstIndex(where: { $0.id == updated.id }) { tracks[index] = updated }
+            if let index = queue.firstIndex(where: { $0.id == updated.id }) { queue[index] = updated }
+            if let index = baseQueue.firstIndex(where: { $0.id == updated.id }) { baseQueue[index] = updated }
+        }
     }
     func savePlaylist(id: Int?, name: String, trackIDs: [Int]) async throws {
         let result = try await api.request("/api/mini/music/playlists" + (id.map { "/\($0)" } ?? ""), method: id == nil ? "POST" : "PUT", body: ["name": name.trimmingCharacters(in: .whitespacesAndNewlines), "track_ids": trackIDs])
@@ -765,6 +776,7 @@ import UIKit
     func deleteTrack(_ track: LibraryTrack) async throws {
         _ = try await api.request("/api/mini/music/tracks/\(track.id)", method: "DELETE", body: nil)
         tracks.removeAll { $0.id == track.id }; queue.removeAll { $0.id == track.id }; baseQueue.removeAll { $0.id == track.id }; knownTracks.removeValue(forKey: track.id)
+        for index in playlists.indices { playlists[index].trackIDs.removeAll { $0 == track.id } }
         applyNativeQueue()
         if currentID == track.id && ownsSession { audio.stop(); ownsSession = false; currentID = nil }
     }
@@ -796,7 +808,7 @@ import UIKit
             if let values = result["tracks"] as? [[String: Any]] { let imported = values.compactMap(LibraryTrack.init); let ids = Set(imported.map(\.id)); tracks.removeAll { ids.contains($0.id) }; tracks.insert(contentsOf: imported, at: 0) }
             notice = result["archive"] as? Bool == true ? "Архив обработан. Добавлено: \(result["added"] as? Int ?? 0), дубликатов: \(result["duplicates"] as? Int ?? 0), пропущено: \(result["skipped"] as? Int ?? 0)." : "Трек добавлен в библиотеку"
         } catch {
-            _ = try? await api.request("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id), method: "DELETE", body: nil)
+            await cancelServerOperation("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id), method: "DELETE")
             throw error
         }
     }

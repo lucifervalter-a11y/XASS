@@ -285,4 +285,50 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertFalse(audio.hasPlayableItem)
     }
 
+    @MainActor func testFavoriteUpdatesHiddenCurrentTrackAndDeletePrunesPlaylists() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        await store.refresh()
+        let original = store.tracks[0]
+        store.playlists = [LibraryPlaylist(["id": 1, "name": "Saved", "track_ids": [1, 2]])!]
+        api.handler = { path, method, _ in
+            if path.contains("library") { return ["ok": true, "tracks": [["id": 2, "title": "Other"]]] }
+            if method == "PATCH" { return ["ok": true, "track": ["id": 1, "title": "Silent fixture", "favorite": true]] }
+            if method == "DELETE" { return ["ok": true] }
+            return nil
+        }
+        await store.searchLibrary(query: "Other")
+        try await store.favorite(original)
+        XCTAssertEqual(store.currentTrack?.favorite, true)
+        try await store.deleteTrack(original)
+        XCTAssertEqual(store.playlists.first?.trackIDs, [2])
+        XCTAssertNil(store.currentTrack)
+    }
+    @MainActor func testCancelledTaskStillSendsTransferCleanup() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        await store.refresh()
+        let posted = expectation(description: "Transfer POST started")
+        var returnReceipt: CheckedContinuation<Void, Never>?
+        var cleanupCompleted = false
+        api.handler = { path, _, _ in
+            if path == "/api/mini/music/transfers" {
+                await withCheckedContinuation { done in returnReceipt = done; posted.fulfill() }
+                return ["ok": true, "transfer_id": "task-cancelled", "status": "ready"]
+            }
+            if path.hasSuffix("/cancel") {
+                try Task.checkCancellation()
+                cleanupCompleted = true
+                return ["ok": true]
+            }
+            return nil
+        }
+        let transfer = Task { try await store.transfer(to: "agent:Studio") }
+        await fulfillment(of: [posted], timeout: 2)
+        transfer.cancel(); returnReceipt?.resume()
+        do { try await transfer.value; XCTFail("Cancelled task must not play") } catch is CancellationError {}
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers/task-cancelled/cancel" })
+        XCTAssertTrue(cleanupCompleted, "Cancellation cleanup must execute in a fresh, uncancelled task")
+    }
+
 }

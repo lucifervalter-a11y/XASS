@@ -18,7 +18,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
 
@@ -283,6 +283,43 @@ class PhpMusicProxyTests(unittest.TestCase):
             with self.subTest(path=path):
                 response = self.client.get("/proxy.php", params={"_binary": "1", "_media": "1", "_p": path})
                 self.assertEqual(response.status_code, 400, response.text)
+        self.assertTrue(self.backend.requests.empty())
+
+    def test_nested_music_search_query_reaches_backend_without_second_decode(self):
+        for query in ("AC+DC&x=1", "100% #live", "https://example.test//mix", "Песня .. ремикс"):
+            with self.subTest(query=query):
+                path = "/api/mini/music/library?" + urlencode({"q": query, "offset": 0})
+                response = self.client.get("/proxy.php", params={"_p": path})
+                self.assertEqual(response.json()["_s"], 401)  # Fixture auth response, not a path rejection.
+                request = self.backend.requests.get_nowait()
+                self.assertEqual(request["path"], path)
+                self.assertEqual(parse_qs(urlsplit(request["path"]).query), {"q": [query], "offset": ["0"]})
+
+    def test_encoded_source_and_encrypted_upload_preserve_route_query_headers_and_body(self):
+        source = "ПК #1+100% & studio"
+        path = "/api/mini/agents/" + quote(source, safe="") + "/files/upload?" + urlencode({
+            "root": "documents", "path": "Мои файлы/100% +", "filename": "отчёт #1 & план.txt"})
+        sealed = b"XASS\x01" + bytes(range(12)) + bytes(range(256))
+        response = self.client.post("/proxy.php", params={"_p": path}, content=sealed, headers={
+            "Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1",
+            "X-XASS-Inner-Type": "text/plain", "Cookie": "xass_pwa=fixture-session"})
+        self.assertEqual(response.json()["_s"], 401)
+        request = self.backend.requests.get_nowait()
+        self.assertEqual(request["path"], path)
+        self.assertEqual(request["body"], sealed)
+        self.assertEqual(request["headers"]["content-type"], "application/x-xass-sealed")
+        self.assertEqual(request["headers"]["x-xass-cipher"], "xass-sealed-v1")
+        self.assertEqual(request["headers"]["x-xass-inner-type"], "text/plain")
+        self.assertEqual(request["headers"]["cookie"], "xass_pwa=fixture-session")
+
+    def test_encoded_traversal_and_control_bytes_never_reach_backend(self):
+        for path in ("/api/%2e%2e/docs", "/api/.%2E/docs", "/api/%2e%2e%2fdocs",
+                     "/api/%00/private", "/api/%0d%0aInjected/private", "/api/%5c../docs",
+                     "/api/mini/music/library?q=%00", "/api/mini/music/library?q=raw\r\nheader",
+                     "/api/mini/agents/PC#fragment/commands"):
+            with self.subTest(path=path):
+                response = self.client.get("/proxy.php", params={"_p": path})
+                self.assertEqual(response.json()["_s"], 400, response.text)
         self.assertTrue(self.backend.requests.empty())
 
     def test_existing_installer_and_json_envelope_contracts_do_not_change(self):

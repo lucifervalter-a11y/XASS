@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hmac
 import ipaddress
 import logging
@@ -271,6 +273,30 @@ class MiniAgentCommandPayload(BaseModel):
     command: str = Field(min_length=1, max_length=32)
     payload: dict[str, Any] | None = None
     action_proof: str = Field(default="", max_length=2048)
+
+
+def _normalize_clipboard_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if "blob" in payload or payload.get("sealed"):
+        blob = payload.get("blob")
+        max_bytes = 64 * 1024 * 4 + 33  # UTF-8 text + magic/version, nonce and GCM tag.
+        if (payload.get("sealed") is not True or not isinstance(blob, str)
+                or not 44 <= len(blob) <= 4 * ((max_bytes + 2) // 3)
+                or not re.fullmatch(r"[A-Za-z0-9_-]+", blob)):
+            raise HTTPException(400, "Некорректный зашифрованный буфер обмена")
+        try:
+            decoded = base64.b64decode(blob + "=" * (-len(blob) % 4), altchars=b"-_", validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(400, "Некорректный зашифрованный буфер обмена") from exc
+        if (not 33 <= len(decoded) <= max_bytes or decoded[:5] != b"XASS\x01"
+                or base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != blob):
+            raise HTTPException(400, "Некорректный зашифрованный буфер обмена")
+        # Validate only the envelope; the server has no key to read its content.
+        # Drop any accompanying plaintext so it cannot enter the command queue.
+        return {"sealed": True, "blob": blob}
+    text_value = str(payload.get("text") or "")
+    if len(text_value) > 64 * 1024:
+        raise HTTPException(400, "Текст превышает 64 КБ")
+    return {"text": text_value}
 
 
 class MiniAgentDetachPayload(BaseModel):
@@ -2999,10 +3025,7 @@ async def mini_agent_command(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите файл")
         command_payload = {"root": root_name, "path": relative_path}
     if command_name == "clipboard_set":
-        text_value = str(command_payload.get("text") or "")
-        if len(text_value) > 64 * 1024:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Текст превышает 64 КБ")
-        command_payload = {"text": text_value}
+        command_payload = _normalize_clipboard_payload(command_payload)
     if command_name in {"reboot", "shutdown"}:
         try:
             delay_sec = int(command_payload.get("delay_sec") or 0)

@@ -247,7 +247,7 @@ enum XASSStyle {
     var body: some View {
         NavigationStack {
             List(store.queue.isEmpty ? store.tracks : store.queue) { track in
-                Button { store.run { try await store.play(track, rows: store.queue.isEmpty ? store.tracks : store.queue); dismiss() } } label: { HStack { Text(track.title); Spacer(); if track.id == store.currentID { Image(systemName: "waveform") } } }.disabled(store.busy)
+                Button { store.run { try await store.play(track); dismiss() } } label: { HStack { Text(track.title); Spacer(); if track.id == store.currentID { Image(systemName: "waveform") } } }.disabled(store.busy)
             }.navigationTitle("Очередь").toolbar { Button("Готово") { dismiss() } }
         }
     }

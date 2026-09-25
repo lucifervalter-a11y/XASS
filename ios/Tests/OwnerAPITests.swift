@@ -87,11 +87,59 @@ final class OwnerAPITests: XCTestCase {
         api.invalidate()
     }
     func testBinaryTransportCannotBecomeAnArbitraryAuthenticatedDownloader() {
-        for path in ["https://evil.invalid/media/1", "/api/mini/config", "/api/mini/media/0", "/api/mini/media/1?other=1", "/api/mini/agents/../assets/token", "/api/mini/agents/%2e%2e/assets/token", "/api/mini/media/1#fragment"] {
+        for path in ["https://evil.invalid/media/1", "/api/mini/config", "/api/mini/media/0", "/api/mini/media/1?other=1", "/api/mini/agents/../assets/token", "/api/mini/agents/%2e%2e/assets/token", "/api/mini/agents/PC%2Fother/assets/token", "/api/mini/agents/PC%3Fquery/assets/token", "/api/mini/agents/PC%23fragment/assets/token", "/api/mini/agents/PC%0A/assets/token", "/api/mini/media/1#fragment"] {
             XCTAssertFalse(OwnerAPI.allowsBinaryPath(path), path)
         }
         XCTAssertTrue(OwnerAPI.allowsBinaryPath("/api/mini/media/12"))
         XCTAssertTrue(OwnerAPI.allowsBinaryPath("/api/mini/agents/" + OwnerAPI.pathComponent("Мой ПК") + "/assets/abc_123"))
+    }
+    @MainActor func testUploadPreservesRawEncryptedBodyAndDestinationThroughProxy() async throws {
+        OwnerHTTPFixture.requests = []
+        let payload = Data([88, 65, 83, 83, 1, 0, 255, 10])
+        var received = Data()
+        OwnerHTTPFixture.reply = { request in
+            if let body = request.httpBody { received = body }
+            else if let stream = request.httpBodyStream {
+                stream.open(); defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 1024)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count <= 0 { break }
+                    received.append(contentsOf: buffer.prefix(count))
+                }
+            }
+            return (200, ["Content-Type": "application/json"], Data(#"{"_s":200,"_b":"{\"ok\":true,\"command\":{\"id\":31}}"}"#.utf8))
+        }
+        let origin = try ServerOrigin("https://native-api-fixture.invalid"), config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [OwnerHTTPFixture.self]
+        let api = OwnerAPI(origin: origin, configuration: config, savedSession: { SavedSession(value: "fixture-session", expires: Date().addingTimeInterval(60)) })
+        defer { api.invalidate() }
+        let path = "/api/mini/agents/PC%2B1/files/upload?root=xass_files&path=Folder%20%2B%20%23A&filename=Report%2B1.txt"
+        let reply = try await api.upload(path, data: payload, headers: ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": "text/plain"])
+        XCTAssertEqual((reply["command"] as? [String: Any])?["id"] as? Int, 31)
+        XCTAssertEqual(received, payload)
+        let request = try XCTUnwrap(OwnerHTTPFixture.requests.last)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, path)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-XASS-Cipher"), "xass-sealed-v1")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-XASS-Inner-Type"), "text/plain")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "xass_pwa=fixture-session")
+        do { _ = try await api.upload(path, data: payload, headers: ["Cookie": "untrusted"]); XCTFail("Arbitrary authenticated header accepted") } catch {}
+        do { _ = try await api.upload(path, data: Data(repeating: 0, count: OwnerAPI.maxAssetBytes + 1), headers: [:]); XCTFail("Oversized upload accepted") } catch {}
+        XCTAssertEqual(OwnerHTTPFixture.requests.count, 1)
+    }
+    func testUploadCannotTargetAnotherEndpointOrEscapeFileRoots() {
+        let base = "/api/mini/agents/PC/files/upload"
+        XCTAssertTrue(OwnerAPI.allowsUploadPath(base + "?root=downloads&path=&filename=file.txt"))
+        for path in [
+            "https://evil.invalid" + base + "?root=downloads&path=&filename=file.txt",
+            "/api/mini/config?root=downloads&path=&filename=file.txt",
+            base + "?root=system&path=&filename=file.txt",
+            base + "?root=downloads&path=%2E%2E&filename=file.txt",
+            base + "?root=downloads&path=&filename=folder%2Ffile.txt",
+            base + "?root=downloads&path=&filename=file%0A.txt",
+            base + "?root=downloads&path=&filename=file.txt&root=desktop"
+        ] { XCTAssertFalse(OwnerAPI.allowsUploadPath(path), path) }
     }
     func testNativeModelsRejectMissingIdentityAndBoundQueueAroundCurrentTrack() throws {
         XCTAssertNil(LibraryTrack(["title": "Missing ID"]))

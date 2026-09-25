@@ -15,10 +15,12 @@ protocol OwnerService: AnyObject {
     @MainActor func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any]
     @MainActor func artwork(trackID: Int) async throws -> Data?
     @MainActor func binary(_ path: String) async throws -> Data
+    @MainActor func upload(_ path: String, data: Data, headers: [String: String]) async throws -> [String: Any]
 }
 extension OwnerService {
     @MainActor func artwork(trackID: Int) async throws -> Data? { nil }
     @MainActor func binary(_ path: String) async throws -> Data { throw OwnerAPIError.invalidResponse }
+    @MainActor func upload(_ path: String, data: Data, headers: [String: String]) async throws -> [String: Any] { throw OwnerAPIError.invalidResponse }
 }
 
 /// Native API transport. An HttpOnly owner cookie never passes through JavaScript;
@@ -116,8 +118,10 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     static func allowsBinaryPath(_ path: String) -> Bool {
         guard !path.contains("\\"), !path.contains(".."),
               !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
-              let decoded = path.removingPercentEncoding, !decoded.contains(".."), !decoded.contains("\\") else { return false }
-        return path.range(of: #"^/api/mini/(media/[1-9][0-9]*|agents/[^/?#]+/assets/[A-Za-z0-9_-]+)$"#, options: .regularExpression) != nil
+              let decoded = path.removingPercentEncoding, !decoded.contains(".."), !decoded.contains("\\"),
+              !decoded.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return false }
+        let allowed = #"^/api/mini/(media/[1-9][0-9]*|agents/[^/?#]+/assets/[A-Za-z0-9_-]+)$"#
+        return path.range(of: allowed, options: .regularExpression) != nil && decoded.range(of: allowed, options: .regularExpression) != nil
     }
 
     @MainActor func binary(_ path: String) async throws -> Data {
@@ -138,6 +142,48 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         }
         try Task.checkCancellation()
         return value
+    }
+
+    static func allowsUploadPath(_ path: String) -> Bool {
+        guard let parts = URLComponents(string: path), parts.scheme == nil, parts.host == nil, parts.fragment == nil,
+              !parts.path.contains(".."), !parts.path.contains("\\"),
+              !parts.path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              parts.path.range(of: #"^/api/mini/agents/[^/?#]+/files/upload$"#, options: .regularExpression) != nil,
+              let items = parts.queryItems, items.count == 3, Set(items.map(\.name)) == Set(["root", "path", "filename"]),
+              items.allSatisfy({ item in
+                  guard let value = item.value else { return false }
+                  return value.utf8.count <= 2048 && !value.contains("\\") && !value.contains("..") &&
+                      !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+              }),
+              let root = items.first(where: { $0.name == "root" })?.value,
+              ["desktop", "downloads", "documents", "xass_files"].contains(root),
+              let filename = items.first(where: { $0.name == "filename" })?.value,
+              !filename.isEmpty, !filename.contains("/") else { return false }
+        return true
+    }
+
+    @MainActor func upload(_ path: String, data: Data, headers: [String: String]) async throws -> [String: Any] {
+        guard Self.allowsUploadPath(path), !data.isEmpty, data.count <= Self.maxAssetBytes else { throw OwnerAPIError.invalidResponse }
+        let allowedHeaders: Set<String> = ["content-type", "x-xass-cipher", "x-xass-inner-type"]
+        guard Set(headers.keys.map { $0.lowercased() }).count == headers.count,
+              headers.allSatisfy({ key, value in allowedHeaders.contains(key.lowercased()) && !value.isEmpty && value.utf8.count <= 200 && value.unicodeScalars.allSatisfy { (32...126).contains(Int($0.value)) } }) else { throw OwnerAPIError.invalidResponse }
+        guard let saved = savedSession(), saved.expires > Date(), !saved.value.isEmpty,
+              saved.value.utf8.count < 8192, !saved.value.contains("\r"), !saved.value.contains("\n"), !saved.value.contains(";") else { throw OwnerAPIError.signedOut }
+        var parts = URLComponents(url: origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
+        parts.queryItems = [.init(name: "_p", value: path)]
+        var request = URLRequest(url: parts.url!)
+        request.httpMethod = "POST"; request.httpBody = data
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        request.setValue("xass_pwa=" + saved.value, forHTTPHeaderField: "Cookie")
+        request.setValue(origin.url.absoluteString, forHTTPHeaderField: "Origin")
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { done in
+            let task = session.dataTask(with: request)
+            transfers[task.taskIdentifier] = Transfer(completion: .json(done)); task.resume()
+        }
     }
 
     static func decode(_ data: Data, status: Int) throws -> [String: Any] {

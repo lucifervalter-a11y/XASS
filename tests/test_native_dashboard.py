@@ -51,6 +51,24 @@ class NativeWeatherTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NativeScenarioRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_pwa_bodyless_request_keeps_header_proof(self):
+        from app import main
+
+        app = FastAPI()
+        app.add_api_route("/api/mini/scenarios/{scenario_id}/run", main.mini_scenario_run, methods=["POST"])
+        app.dependency_overrides[main.require_mini_owner] = lambda: SimpleNamespace(user_id=42)
+        app.dependency_overrides[main.get_session] = lambda: object()
+        scenario = {"id": "night", "enabled": True, "actions": ["lock_all"], "devices": [], "delay_sec": 0}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://fixture.invalid") as client:
+            with (patch.object(main, "find_scenario", return_value=scenario),
+                  patch.object(main, "_require_pwa_action_proof", new_callable=AsyncMock) as verify,
+                  patch.object(main, "try_start_scenario", return_value=False)):
+                response = await client.post("/api/mini/scenarios/night/run",
+                    headers={"X-XASS-Action-Proof": "legacy-passkey-proof"})
+        self.assertEqual(response.status_code, 409)  # Existing run remains protected.
+        self.assertEqual(verify.await_args.kwargs["action_proof"], "legacy-passkey-proof")
+        self.assertEqual(verify.await_args.kwargs["purpose"], "scenario:night")
+
     async def test_native_json_proof_is_checked_against_current_scenario_snapshot(self):
         from app import main
 

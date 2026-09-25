@@ -72,6 +72,14 @@ enum NativeWorkspaceCrypto {
         let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: data[5..<17]), ciphertext: data[17..<(data.count - 16)], tag: data.suffix(16))
         return try AES.GCM.open(box, using: aes, authenticating: Data(purpose.utf8))
     }
+    static func seal(_ data: Data, privateKey: Data, peer: [String: Any], purpose: String, nonce: AES.GCM.Nonce = AES.GCM.Nonce()) throws -> Data {
+        let key = try P256.KeyAgreement.PrivateKey(rawRepresentation: privateKey)
+        let secret = try key.sharedSecretFromKeyAgreement(with: publicKey(peer))
+        let aes = secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: Data("xass-e2e-v1".utf8), sharedInfo: Data("xass-e2e-aes".utf8), outputByteCount: 32)
+        let box = try AES.GCM.seal(data, using: aes, nonce: nonce, authenticating: Data(purpose.utf8))
+        guard let combined = box.combined else { throw OwnerAPIError.invalidResponse }
+        return Data([88, 65, 83, 83, 1]) + combined
+    }
     static func open(_ data: Data, origin: ServerOrigin, peer: [String: Any], purpose: String) throws -> Data {
         guard let secret = SecureStore.load(keyName(origin)) else { throw missingKey }
         do { return try open(data, privateKey: secret, peer: peer, purpose: purpose) }

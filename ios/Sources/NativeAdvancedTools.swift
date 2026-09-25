@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import QuickLook
 
@@ -316,6 +317,10 @@ private struct NativeAdvancedNotice: View {
     @State private var root = "downloads"
     @State private var clipboardDraft = ""
     @State private var confirmClipboard = false
+    @State private var deleting: NativeRemoteFileTarget?
+    @State private var selectingUpload = false
+    @State private var uploadRoot = "downloads"
+    @State private var uploadPath = ""
     @State private var commandTask: Task<Void, Never>?
     init(store: NativeStore, device: NativeDevice) { self.store = store; self.device = device; _data = StateObject(wrappedValue: NativeAdvancedStore(owner: store)) }
     var body: some View {
@@ -335,6 +340,7 @@ private struct NativeAdvancedNotice: View {
                 Button("Открыть папку") { execute { try await data.listFiles(device, root: root) } }.disabled(data.busy)
                 if data.filesLoaded {
                     Text(data.currentRoot + "/" + data.currentPath).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    Button { uploadRoot = data.currentRoot; uploadPath = data.currentPath; selectingUpload = true } label: { Label("Загрузить файл в эту папку", systemImage: "square.and.arrow.up") }.disabled(data.busy)
                     if !data.currentPath.isEmpty {
                         Button { let parent = data.currentPath.split(separator: "/").dropLast().joined(separator: "/"); execute { try await data.listFiles(device, root: data.currentRoot, path: parent) } } label: { Label("На уровень выше", systemImage: "arrow.up") }.disabled(data.busy)
                     }
@@ -347,7 +353,11 @@ private struct NativeAdvancedNotice: View {
                             } else { execute { try await data.download(device, file: file) } }
                         } label: {
                             HStack { Label(file.name, systemImage: file.directory ? "folder" : "doc"); Spacer(); if !file.directory { Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)).font(.caption).foregroundStyle(.secondary) } }
-                        }.disabled(data.busy)
+                        }.disabled(data.busy).swipeActions {
+                            if !file.directory {
+                                Button("Удалить", role: .destructive) { deleting = NativeRemoteFileTarget(root: data.currentRoot, folder: data.currentPath, file: file) }.disabled(data.busy || store.busy)
+                            }
+                        }
                     }
                     if data.filesTruncated { Text("Список ограничен агентом. Часть файлов этой папки не показана.").font(.caption).foregroundStyle(.secondary) }
                 }
@@ -382,6 +392,17 @@ private struct NativeAdvancedNotice: View {
             .onDisappear { commandTask?.cancel(); commandTask = nil; data.clearPreviews() }
             .confirmationDialog("Заменить буфер обмена на ПК?", isPresented: $confirmClipboard, titleVisibility: .visible) {
                 Button("Отправить на \(device.name)") { let text = clipboardDraft; execute { try await data.setClipboard(device, text: text) } }
+            }
+            .confirmationDialog("Удалить файл с ПК?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
+                if let deleting { Button("Удалить «\(deleting.name)»", role: .destructive) { execute { try await data.deleteFile(device, target: deleting) }; self.deleting = nil } }
+            } message: { if let deleting { Text(device.name + " · " + deleting.root + "/" + deleting.path) } }
+            .fileImporter(isPresented: $selectingUpload, allowedContentTypes: [.data]) { result in
+                switch result {
+                case .success(let url):
+                    let root = uploadRoot, path = uploadPath
+                    execute { try await data.uploadFile(device, url: url, root: root, path: path) }
+                case .failure(let error): data.error = error.localizedDescription
+                }
             }
     }
     private func execute(_ action: @escaping () async throws -> Void) { commandTask = Task { await data.perform(action) } }

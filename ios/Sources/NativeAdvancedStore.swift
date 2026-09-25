@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UIKit
+import UniformTypeIdentifiers
 
 struct NativeTimelineEvent: Identifiable {
     let id: String
@@ -126,6 +127,25 @@ struct NativeRemoteFile: Identifiable {
     }
 }
 
+struct NativeRemoteFileTarget: Identifiable {
+    var id: String { root + "/" + path }
+    let root: String
+    let folder: String
+    let name: String
+    let path: String
+    init?(root: String, folder: String, file: NativeRemoteFile) {
+        guard !file.directory, Self.validFolder(root: root, path: folder) else { return nil }
+        self.root = root; self.folder = folder; name = file.name
+        path = folder.isEmpty ? file.name : folder + "/" + file.name
+    }
+    static func validFolder(root: String, path: String) -> Bool {
+        guard ["downloads", "desktop", "documents", "xass_files"].contains(root), !path.contains("\\"), !path.contains(":"), !path.contains("\0") else { return false }
+        return path.isEmpty || path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+    var payload: [String: Any] { ["root": root, "path": path] }
+    func binding(device: NativeDevice) -> [String: Any] { ["source_id": device.id, "command": "file_delete", "payload": payload] }
+}
+
 @MainActor final class NativeAdvancedStore: ObservableObject {
     let owner: NativeStore
     @Published var busy = false
@@ -164,11 +184,11 @@ struct NativeRemoteFile: Identifiable {
     }
     static func query(_ path: String, _ items: [URLQueryItem]) -> String {
         var parts = URLComponents(); parts.queryItems = items
-        return path + "?" + (parts.percentEncodedQuery ?? "")
+        return path + "?" + (parts.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
     }
     static func date(_ raw: String) -> String {
         let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let first = parser.date(from: raw); parser.formatOptions = [.withInternetDateTime]
+        let first = parser.date(from: raw) ?? parser.date(from: raw + "Z"); parser.formatOptions = [.withInternetDateTime]
         guard let date = first ?? parser.date(from: raw) ?? parser.date(from: raw + "Z") else { return raw }
         return date.formatted(date: .abbreviated, time: .shortened)
     }
@@ -257,6 +277,9 @@ struct NativeRemoteFile: Identifiable {
     func command(_ device: NativeDevice, name: String, payload: [String: Any] = [:]) async throws -> [String: Any] {
         guard ["screenshot", "files_list", "file_download", "clipboard_get", "clipboard_set"].contains(name) else { throw OwnerAPIError.invalidResponse }
         let result = try await request(devicePath(device) + "/commands", method: "POST", body: ["command": name, "payload": payload])
+        return try await waitForCommand(device, response: result)
+    }
+    private func waitForCommand(_ device: NativeDevice, response result: [String: Any]) async throws -> [String: Any] {
         guard let item = result["command"] as? [String: Any], let id = item["id"] as? Int, id > 0 else { throw OwnerAPIError.invalidResponse }
         pendingCommandID = id; status = "Команда №\(id) отправлена. Жду ответ ПК…"
         defer { pendingCommandID = nil }
@@ -277,12 +300,18 @@ struct NativeRemoteFile: Identifiable {
         }
         throw OwnerAPIError(status: 0, message: "ПК ещё не ответил на команду №\(id). Проверьте историю команд: она может выполниться позже.")
     }
-    private func peer(_ device: NativeDevice) async throws -> [String: Any] {
+    private func optionalPeer(_ device: NativeDevice) async throws -> [String: Any]? {
         if let peerKey { return peerKey }
         let result = try await request("/api/mini/bootstrap")
         let source = (result["sources"] as? [[String: Any]] ?? []).first { $0["id"] as? Int == device.id && $0["source_name"] as? String == device.name }
-        guard let payload = source?["last_payload"] as? [String: Any], let key = payload["e2e_public_jwk"] as? [String: Any] else { throw OwnerAPIError(status: 0, message: "ПК не опубликовал ключ шифрования. Обновите агент и повторите.") }
+        guard source != nil else { throw OwnerAPIError(status: 404, message: "ПК больше не привязан к серверу.") }
+        guard let payload = source?["last_payload"] as? [String: Any], let raw = payload["e2e_public_jwk"], !(raw is NSNull) else { return nil }
+        guard let key = raw as? [String: Any] else { throw OwnerAPIError.invalidResponse }
         _ = try NativeWorkspaceCrypto.publicKey(key); peerKey = key; return key
+    }
+    private func peer(_ device: NativeDevice) async throws -> [String: Any] {
+        guard let key = try await optionalPeer(device) else { throw OwnerAPIError(status: 0, message: "ПК не опубликовал ключ шифрования. Обновите агент и повторите.") }
+        return key
     }
     func capture(_ device: NativeDevice) async throws {
         screenshot = nil
@@ -307,6 +336,47 @@ struct NativeRemoteFile: Identifiable {
         if NativeWorkspaceCrypto.isSealed(bytes) { bytes = try NativeWorkspaceCrypto.open(bytes, origin: owner.api.origin, peer: try await peer(device), purpose: "file_download") }
         try preview(bytes, filename: file.name)
     }
+    func deleteFile(_ device: NativeDevice, target: NativeRemoteFileTarget) async throws {
+        guard !owner.busy else { throw OwnerAPIError(status: 409, message: "Дождитесь завершения текущего действия.") }
+        owner.busy = true; owner.confirmationActivity?(true)
+        defer { owner.busy = false; owner.confirmationActivity?(false) }
+        let proof = try await owner.authorization.proof(purpose: "agent:file_delete:" + device.name, binding: target.binding(device: device), reason: "Удалить «\(target.name)» с ПК \(device.name)")
+        for _ in 0..<20 {
+            if owner.canSendActions() { break }; try await Task.sleep(for: .milliseconds(100))
+        }
+        try Task.checkCancellation()
+        guard owner.canSendActions() else { throw OwnerAPIError(status: 0, message: "Вернитесь в XASS и повторите удаление.") }
+        let response = try await request(devicePath(device) + "/commands", method: "POST", body: ["command": "file_delete", "payload": target.payload, "action_proof": proof])
+        _ = try await waitForCommand(device, response: response)
+        if currentRoot == target.root && currentPath == target.folder { files.removeAll { $0.name == target.name } }
+        status = "Файл «\(target.name)» удалён с ПК"
+    }
+    func uploadFile(_ device: NativeDevice, url: URL, root: String, path: String) async throws {
+        guard NativeRemoteFileTarget.validFolder(root: root, path: path) else { throw OwnerAPIError.invalidResponse }
+        let scoped = url.startAccessingSecurityScopedResource(); defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .contentTypeKey])
+        guard values.isRegularFile == true, let size = values.fileSize, size > 0, size <= 16 * 1024 * 1024 - 33 else {
+            throw OwnerAPIError(status: 413, message: "Выберите непустой файл до 16 МБ.")
+        }
+        var bytes = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard bytes.count == size else { throw OwnerAPIError(status: 409, message: "Файл изменился во время чтения. Повторите выбор.") }
+        let mime = values.contentType?.preferredMIMEType ?? "application/octet-stream"
+        var headers = ["Content-Type": mime]
+        if let key = try await optionalPeer(device) {
+            guard let secret = SecureStore.load(NativeWorkspaceCrypto.keyName(owner.api.origin)) else { throw NativeWorkspaceCrypto.missingKey }
+            bytes = try NativeWorkspaceCrypto.seal(bytes, privateKey: secret, peer: key, purpose: "file_upload")
+            headers = ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": mime]
+        }
+        try Task.checkCancellation()
+        status = "Отправляю файл «\(url.lastPathComponent)»…"
+        let uploadPath = Self.query(devicePath(device) + "/files/upload", [.init(name: "root", value: root), .init(name: "path", value: path), .init(name: "filename", value: url.lastPathComponent)])
+        let response = try await owner.api.upload(uploadPath, data: bytes, headers: headers)
+        let result = try await waitForCommand(device, response: response)
+        let savedName = result["filename"] as? String ?? url.lastPathComponent
+        do { try await listFiles(device, root: root, path: path) }
+        catch { self.error = "Файл сохранён, но список папки не обновлён: " + error.localizedDescription }
+        status = "Файл «\(savedName)» сохранён на ПК"
+    }
     func getClipboard(_ device: NativeDevice) async throws {
         clipboard = ""
         let result = try await command(device, name: "clipboard_get")
@@ -319,6 +389,12 @@ struct NativeRemoteFile: Identifiable {
     }
     func setClipboard(_ device: NativeDevice, text: String) async throws {
         guard text.unicodeScalars.count <= 64 * 1024 else { throw OwnerAPIError(status: 413, message: "Текст превышает 64 КБ.") }
-        _ = try await command(device, name: "clipboard_set", payload: ["text": text])
+        var payload: [String: Any] = ["text": text]
+        if let key = try await optionalPeer(device) {
+            guard let secret = SecureStore.load(NativeWorkspaceCrypto.keyName(owner.api.origin)) else { throw NativeWorkspaceCrypto.missingKey }
+            let blob = try NativeWorkspaceCrypto.seal(Data(text.utf8), privateKey: secret, peer: key, purpose: "clipboard")
+            payload = ["sealed": true, "blob": NativeWorkspaceCrypto.encoded(blob)]
+        }
+        _ = try await command(device, name: "clipboard_set", payload: payload)
     }
 }
