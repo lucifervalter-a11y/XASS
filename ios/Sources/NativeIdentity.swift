@@ -93,7 +93,8 @@ final class NativeIdentity {
         guard let challenge = options["challenge_id"] as? String, let message = options["message"] as? String else { throw OwnerAPIError.invalidResponse }
         let signature = try await identity.sign(message, reason: "Разрешить этому iPhone управление вашим XASS")
         try Task.checkCancellation()
-        let verified = try await api.request("/api/native/enrollment/verify", method: "POST", body: ["challenge_id": challenge, "public_key": key.publicKey, "signature": signature, "pair_token": token, "device_name": String(deviceName.prefix(120))])
+        let name = String(deviceName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(100))
+        let verified = try await api.request("/api/native/enrollment/verify", method: "POST", body: ["challenge_id": challenge, "public_key": key.publicKey, "signature": signature, "pair_token": token, "device_name": name.isEmpty ? "iPhone" : name])
         guard let id = verified["device_id"] as? String else { throw OwnerAPIError.invalidResponse }
         try identity.saveDeviceID(id)
     }

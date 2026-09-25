@@ -68,6 +68,31 @@ final class OwnerAPITests: XCTestCase {
         XCTAssertEqual(try NativeEncoding.pairToken("https://xass.example/miniapp.php#pair=" + token, origin: origin), token)
         XCTAssertThrowsError(try NativeEncoding.pairToken("https://other.example/miniapp.php#pair=" + token, origin: origin))
     }
+    @MainActor func testAuthenticatedBinaryUsesBoundedProxyAndRejectsErrorPages() async throws {
+        OwnerHTTPFixture.requests = []
+        let bytes = Data([0x89, 0x50, 0x4e, 0x47])
+        OwnerHTTPFixture.reply = { _ in (200, ["Content-Type": "image/png"], bytes) }
+        let origin = try ServerOrigin("https://native-api-fixture.invalid"), config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [OwnerHTTPFixture.self]
+        let api = OwnerAPI(origin: origin, configuration: config, savedSession: { SavedSession(value: "fixture-session", expires: Date().addingTimeInterval(60)) })
+        let actual = try await api.binary("/api/mini/agents/PC/assets/fixture-token")
+        XCTAssertEqual(actual, bytes)
+        let request = try XCTUnwrap(OwnerHTTPFixture.requests.last)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "xass_pwa=fixture-session")
+        XCTAssertTrue(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.contains(.init(name: "_binary", value: "1")) == true)
+        OwnerHTTPFixture.reply = { _ in (200, ["Content-Type": "text/html"], Data("<html>Login</html>".utf8)) }
+        do { _ = try await api.binary("/api/mini/media/1"); XCTFail("Accepted an HTML login page as media") } catch {}
+        OwnerHTTPFixture.reply = { _ in (200, ["Content-Type": "image/png", "Content-Length": String(OwnerAPI.maxAssetBytes + 1)], bytes) }
+        do { _ = try await api.binary("/api/mini/media/1"); XCTFail("Accepted oversized media") } catch {}
+        api.invalidate()
+    }
+    func testBinaryTransportCannotBecomeAnArbitraryAuthenticatedDownloader() {
+        for path in ["https://evil.invalid/media/1", "/api/mini/config", "/api/mini/media/0", "/api/mini/media/1?other=1", "/api/mini/agents/../assets/token", "/api/mini/agents/%2e%2e/assets/token", "/api/mini/media/1#fragment"] {
+            XCTAssertFalse(OwnerAPI.allowsBinaryPath(path), path)
+        }
+        XCTAssertTrue(OwnerAPI.allowsBinaryPath("/api/mini/media/12"))
+        XCTAssertTrue(OwnerAPI.allowsBinaryPath("/api/mini/agents/" + OwnerAPI.pathComponent("Мой ПК") + "/assets/abc_123"))
+    }
     func testNativeModelsRejectMissingIdentityAndBoundQueueAroundCurrentTrack() throws {
         XCTAssertNil(LibraryTrack(["title": "Missing ID"]))
         XCTAssertNil(NativeDevice(["id": 1, "source_type": "SERVER", "source_name": "Server"]))

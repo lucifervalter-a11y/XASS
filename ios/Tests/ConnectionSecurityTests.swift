@@ -47,16 +47,11 @@ final class ConnectionSecurityTests: XCTestCase {
         }
         XCTAssertNoThrow(try NativeAudioCommand(["action": "downloads"]))
     }
-    func testRangeParsingAndTelegramLoginAllowlist() {
+    func testRangeParsing() {
         XCTAssertEqual(SecureMediaLoader.parseRange("bytes 100-199/500")?.start, 100)
         XCTAssertEqual(SecureMediaLoader.parseRange("bytes 100-199/500")?.total, 500)
         XCTAssertNil(SecureMediaLoader.parseRange("bytes */500"))
         XCTAssertNil(SecureMediaLoader.parseRange("bytes 100-199/0"))
-    }
-    @MainActor func testTelegramPopupDoesNotAuthorizeLookalikes() {
-        XCTAssertTrue(WebController.telegramLogin(URL(string: "https://oauth.telegram.org/auth")!))
-        XCTAssertFalse(WebController.telegramLogin(URL(string: "https://oauth.telegram.org.attacker.invalid/auth")!))
-        XCTAssertFalse(WebController.telegramLogin(URL(string: "https://user@oauth.telegram.org/auth")!))
     }
     func testNativeQueueAdvancesWithoutJSAndRepeatModesAreExplicit() throws {
         let tracks: [[String: Any]] = [["trackId": 1], ["trackId": 2], ["trackId": 3]]

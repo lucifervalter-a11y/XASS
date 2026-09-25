@@ -139,6 +139,7 @@ struct NativePlaybackQueue {
     private var resumeAfterInterruption = false
     private var queue: NativePlaybackQueue?
     private var transition = UUID()
+    private var awaitingTrack = false
     private var automaticCache: AudioCache?
     private var cacheGeneration = UUID()
     private var accountGeneration = UUID()
@@ -152,7 +153,7 @@ struct NativePlaybackQueue {
         }
         playerObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             Task { @MainActor in
-                guard let self = self, self.player.currentItem != nil, self.state != "ended", self.state != "error" else { return }
+                guard let self = self, self.player.currentItem != nil, !self.awaitingTrack, self.state != "ended", self.state != "error" else { return }
                 self.state = player.timeControlStatus == .playing ? "playing" : player.timeControlStatus == .waitingToPlayAtSpecifiedRate ? "loading" : "paused"
                 if self.state == "playing" { self.recordCachePlay() }
                 self.publish()
@@ -160,7 +161,7 @@ struct NativePlaybackQueue {
         }
         observers.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             Task { @MainActor in
-                guard let self = self, let item = note.object as? AVPlayerItem, item === self.player.currentItem else { return }
+                guard let self = self, !self.awaitingTrack, let item = note.object as? AVPlayerItem, item === self.player.currentItem else { return }
                 self.state = "ended"; self.publish(forceReport: true); self.advance(direction: 1, automatic: true)
             }
         })
@@ -252,7 +253,7 @@ struct NativePlaybackQueue {
             item = AVPlayerItem(asset: created.asset()); nextLoader = created
         }
         try activateAudio()
-        transition = UUID()
+        transition = UUID(); awaitingTrack = false
         player.pause(); player.replaceCurrentItem(with: nil); loader?.invalidate(); loader = nextLoader
         state = "loading"; title = command.title; artist = command.artist; trackID = command.trackID; recordedPlay = false
         position = command.position; duration = 0; error = nil
@@ -278,16 +279,16 @@ struct NativePlaybackQueue {
         guard let command = try? NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist, "queue": window.map(\.bridge)]) else { return }
         handle(command)
     }
-    func pause() { transition = UUID(); player.pause(); if trackID > 0 { state = "paused"; publish(forceReport: true) } }
+    func pause() { transition = UUID(); awaitingTrack = false; player.pause(); if trackID > 0 { state = "paused"; publish(forceReport: true) } }
     func resume() {
         guard canResumePlayback() else { return }
-        transition = UUID()
+        transition = UUID(); awaitingTrack = false
         guard player.currentItem != nil else { return }
         do { try activateAudio(); if state == "ended" { player.seek(to: .zero) }; state = "playing"; player.play(); publish(forceReport: true) }
         catch { self.error = "Не удалось включить аудио. Проверьте устройство вывода."; state = "error"; publish() }
     }
     func stop() {
-        transition = UUID()
+        transition = UUID(); awaitingTrack = false
         player.pause(); player.replaceCurrentItem(with: nil); itemObserver = nil; loader?.invalidate(); loader = nil
         state = "stopped"; position = 0; publish(forceReport: true)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -295,7 +296,7 @@ struct NativePlaybackQueue {
     }
     func seek(_ seconds: Double) {
         guard seconds.isFinite, seconds >= 0, player.currentItem != nil else { return }
-        transition = UUID()
+        transition = UUID(); awaitingTrack = false
         let value = duration > 0 ? min(seconds, duration) : min(seconds, 86400)
         player.seek(to: CMTime(seconds: value, preferredTimescale: 600)); position = value; publish(forceReport: true)
     }
@@ -306,7 +307,7 @@ struct NativePlaybackQueue {
     var hasPlayableItem: Bool { player.currentItem != nil }
     func seekConfirmed(_ seconds: Double) async {
         guard seconds.isFinite, seconds >= 0, player.currentItem != nil else { return }
-        let request = UUID(); transition = request
+        let request = UUID(); transition = request; awaitingTrack = false
         let value = duration > 0 ? min(seconds, duration) : min(seconds, 86400)
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             player.seek(to: CMTime(seconds: value, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { _ in done.resume() }
@@ -353,13 +354,13 @@ struct NativePlaybackQueue {
         if let library = library, let saved = downloads.first(where: { $0.id == track.id }), FileManager.default.fileExists(atPath: library.file(for: saved).path) { start(""); return }
         if cachedTracks.contains(where: { $0.id == track.id }) { start(""); return }
         guard let request = requestTicket else { state = "error"; error = "Для следующего трека нужен вход на сервер."; publish(forceReport: true); return }
-        state = "loading"; publish()
+        awaitingTrack = true; player.pause(); state = "loading"; publish()
         request(track.id) { [weak self] result in
             Task { @MainActor in
                 guard let self = self, self.transition == generation else { return }
                 switch result {
                 case .success(let url): start(url)
-                case .failure: self.state = "error"; self.error = "Следующий трек недоступен. Проверьте сеть или войдите заново."; self.publish(forceReport: true)
+                case .failure: self.awaitingTrack = false; self.state = "error"; self.error = "Следующий трек недоступен. Проверьте сеть или войдите заново."; self.publish(forceReport: true)
                 }
             }
         }
@@ -399,9 +400,10 @@ struct NativePlaybackQueue {
         if let free = free, free < PrivateDownload.maxBytes + 32 * 1024 * 1024 { throw URLError(.cannotWriteToFile) }
         let job = PrivateDownload(origin: origin, trackID: command.trackID, destination: library.file(command.trackID))
         jobs[command.trackID] = job; downloadIDs.insert(command.trackID)
+        let account = accountGeneration
         job.start(url: url) { [weak self] result in
             Task { @MainActor in
-                guard let self = self, self.origin == origin else { return }
+                guard let self = self, self.origin == origin, self.accountGeneration == account else { return }
                 self.jobs.removeValue(forKey: command.trackID); self.downloadIDs.remove(command.trackID)
                 do {
                     let file = try result.get()

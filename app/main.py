@@ -24,6 +24,7 @@ from app.poller import telegram_polling_loop
 from app.server_migration_api import build_router as build_server_migration_router
 from app.music_api import build_router as build_music_router
 from app.native_api import build_router as build_native_router, consume_native_proof
+from app.native_dashboard_api import build_router as build_native_dashboard_router
 from app.music_storage_api import build_router as build_music_storage_router
 from app.schemas import (
     AgentPairClaimPayload,
@@ -186,7 +187,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.17.0"
+APP_VERSION = "0.18.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -393,6 +394,10 @@ class MiniRulePayload(BaseModel):
     cooldown_minutes: int = Field(default=60, ge=1, le=10080)
     priority: str = Field(default="warning", max_length=16)
     enabled: bool = True
+
+
+class MiniScenarioRunPayload(BaseModel):
+    action_proof: str = Field(default="", max_length=4096)
 
 
 async def _require_pwa_action_proof(
@@ -1343,6 +1348,7 @@ def _public_origin(request: Request) -> tuple[str, str]:
 app.include_router(build_server_migration_router(settings, require_mini_owner, _require_pwa_action_proof, _public_origin))
 app.include_router(build_music_router(settings, require_mini_owner, _public_origin))
 app.include_router(build_native_router(settings, require_mini_owner))
+app.include_router(build_native_dashboard_router(settings, require_mini_owner))
 app.include_router(build_music_storage_router(settings, require_mini_owner, _require_pwa_action_proof))
 
 
@@ -2765,6 +2771,7 @@ async def mini_scenario_delete(
 @app.post("/api/mini/scenarios/{scenario_id}/run")
 async def mini_scenario_run(
     scenario_id: str,
+    payload: MiniScenarioRunPayload | None = None,
     x_xass_action_proof: str | None = Header(default=None),
     x_telegram_init_data: str | None = Header(default=None),
     user: MiniAppUser = Depends(require_mini_owner),
@@ -2780,8 +2787,10 @@ async def mini_scenario_run(
             session=session,
             user=user,
             telegram_init_data=x_telegram_init_data or "",
-            action_proof=x_xass_action_proof or "",
+            action_proof=(payload.action_proof if payload else "") or x_xass_action_proof or "",
             purpose=f"scenario:{scenario_id}",
+            binding={"scenario_id": scenario_id, "actions": scenario.get("actions") or [],
+                     "devices": scenario.get("devices") or [], "delay_sec": scenario.get("delay_sec") or 0},
         )
     if not try_start_scenario(scenario_id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Этот сценарий уже выполняется")

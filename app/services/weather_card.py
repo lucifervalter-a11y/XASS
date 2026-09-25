@@ -189,6 +189,7 @@ async def build_weather_card(query: str, profile: dict[str, Any]) -> WeatherCard
                     "latitude": latitude,
                     "longitude": longitude,
                     "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m",
+                    "wind_speed_unit": "ms",
                     "timezone": timezone_name,
                 },
             )
@@ -228,4 +229,3 @@ def build_weather_links(card: WeatherCard) -> dict[str, str]:
         "2GIS": f"https://2gis.ru/search/{encoded}",
         "Windy": f"https://www.windy.com/{lat}/{lon}?{lat},{lon},8",
     }
-

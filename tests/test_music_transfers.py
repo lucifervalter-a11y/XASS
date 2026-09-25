@@ -207,6 +207,125 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             self.assertEqual((await session.get(MusicPlaybackState, 1)).transfer_id, "")
 
+    async def expire_transfer(self, transfer_id):
+        async with self.sessions() as session:
+            transfer = await session.get(MusicTransfer, transfer_id)
+            transfer.created_at = datetime.now(timezone.utc) - timedelta(seconds=31)
+            await session.commit()
+
+    async def test_abandoned_transfer_expires_without_initiator_polling(self):
+        track = await self.music_track()
+        await self.playing(track)
+        response = await self.transfer()
+        transfer_id = response.json()["transfer_id"]
+        await self.expire_transfer(transfer_id)
+        # The source iPhone must recover even when the controller closed before
+        # polling the transfer resource again.
+        report = await self.request("POST", "/api/mini/music/session", json={
+            "session_key": self.old_key, "state": "playing", "position": 18})
+        self.assertEqual(report.status_code, 200, report.text)
+        self.assertNotIn("active_transfer_id", report.json()["session"])
+        self.assertEqual((await self.poll(transfer_id))["status"], "failed")
+
+    async def test_normal_session_poll_expires_abandoned_transfer(self):
+        track = await self.music_track()
+        await self.playing(track)
+        transfer_id = (await self.transfer()).json()["transfer_id"]
+        await self.expire_transfer(transfer_id)
+        response = await self.request("GET", "/api/mini/music/session")
+        self.assertNotIn("active_transfer_id", response.json()["session"])
+        self.assertEqual(response.json()["session"]["state"], "playing")
+
+    async def test_late_local_ack_cannot_advance_expired_transfer(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        await self.playing(track)
+        transfer_id = (await self.transfer(device="agent:PC")).json()["transfer_id"]
+        await self.expire_transfer(transfer_id)
+        ack = await self.request("POST", f"/api/mini/music/transfers/{transfer_id}/ack",
+            json={"session_key": self.old_key, "position": 19})
+        self.assertEqual(ack.status_code, 409, ack.text)
+        self.assertEqual((await self.poll(transfer_id))["status"], "failed")
+        self.assertEqual(await self.commands(), [])
+
+    async def test_cancel_same_key_waiting_transfer_preserves_source_playback(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        await self.playing(track)
+        response = await self.transfer(device="agent:PC", session_key=self.old_key)
+        cancelled = await self.request("POST", f"/api/mini/music/transfers/{response.json()['transfer_id']}/cancel")
+        self.assertEqual(cancelled.json()["status"], "failed")
+        self.assertEqual(cancelled.json()["session"]["state"], "playing")
+        self.assertEqual(cancelled.json()["session"]["device"], "local")
+        self.assertEqual(await self.commands(), [])
+
+    async def test_cancel_immediately_ready_local_lease_allows_retry(self):
+        track = await self.music_track()
+        ready = (await self.transfer(track)).json()
+        self.assertEqual(ready["status"], "ready")
+        cancelled = await self.request("POST", f"/api/mini/music/transfers/{ready['transfer_id']}/cancel")
+        self.assertEqual(cancelled.json()["status"], "failed")
+        self.assertNotEqual(cancelled.json()["session"]["state"], "loading")
+        self.assertEqual((await self.transfer(track)).json()["status"], "ready")
+
+    async def test_late_cancel_does_not_stop_a_newer_local_selection(self):
+        track = await self.music_track()
+        ready = (await self.transfer(track)).json()
+        report = await self.request("POST", "/api/mini/music/session", json={
+            "session_key": self.new_key, "state": "playing", "position": 22})
+        self.assertEqual(report.status_code, 200, report.text)
+        cancelled = await self.request("POST", f"/api/mini/music/transfers/{ready['transfer_id']}/cancel")
+        self.assertEqual(cancelled.json()["status"], "ready")
+        self.assertEqual(cancelled.json()["session"]["state"], "playing")
+
+    async def test_cancel_ready_pc_target_stops_pending_audio_download(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        response = await self.transfer(track, device="agent:PC")
+        command = (await self.commands())[0]
+        await self.complete(command.id, state="loading")
+        transfer_id = response.json()["transfer_id"]
+        self.assertEqual((await self.poll(transfer_id))["status"], "ready")
+        cancelled = await self.request("POST", f"/api/mini/music/transfers/{transfer_id}/cancel")
+        self.assertEqual(cancelled.json()["status"], "failed")
+        self.assertEqual([item.command for item in await self.commands()], ["music_play", "music_stop"])
+
+    async def test_completed_start_without_playback_confirmation_fails(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        response = await self.transfer(track, device="agent:PC")
+        await self.complete((await self.commands())[0].id, state="paused")
+        data = await self.poll(response.json()["transfer_id"])
+        self.assertEqual(data["status"], "failed")
+        self.assertFalse(data["ok"])
+
+    async def test_timeout_after_delivered_start_requires_actual_stop_before_new_player(self):
+        track = await self.music_track()
+        # The PC last reported this same track paused, before receiving play.
+        await self.agent("PC", track_id=track, state="paused")
+        transfer_id = (await self.transfer(track, device="agent:PC")).json()["transfer_id"]
+        command = (await self.commands())[0]
+        async with self.sessions() as session:
+            delivered = await session.get(AgentCommand, command.id)
+            delivered.status = "delivered"
+            delivered.delivered_at = datetime.now(timezone.utc)
+            await session.commit()
+        await self.expire_transfer(transfer_id)
+        state = (await self.request("GET", "/api/mini/music/session")).json()["session"]
+        self.assertEqual(state["state"], "loading", "an old paused heartbeat is not proof of current silence")
+        response = await self.transfer(track)
+        self.assertEqual(response.json()["status"], "waiting")
+        self.assertEqual([item.command for item in await self.commands()], ["music_play", "music_pause"])
+
+    async def test_source_ack_position_is_clamped_to_track_duration(self):
+        track = await self.music_track()
+        await self.playing(track)
+        transfer_id = (await self.transfer()).json()["transfer_id"]
+        ack = await self.request("POST", f"/api/mini/music/transfers/{transfer_id}/ack",
+            json={"session_key": self.old_key, "position": 601})
+        self.assertEqual(ack.status_code, 200, ack.text)
+        self.assertEqual((await self.poll(transfer_id))["session"]["position"], 600)
+
     async def test_offline_source_or_target_cannot_trigger_optimistic_play(self):
         track = await self.music_track()
         await self.agent("Offline", track_id=track, state="playing", online=False)

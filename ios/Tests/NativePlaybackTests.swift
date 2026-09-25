@@ -71,4 +71,12 @@ final class NativePlaybackTests: XCTestCase {
         XCTAssertEqual(audio.trackID, 102, "state=\(audio.state) position=\(audio.position) duration=\(audio.duration) error=\(audio.error ?? "none")")
         audio.stop(); observer.cancel()
     }
+    func testRangeParserRejectsMalformedOrInconsistentBounds() {
+        let valid = SecureMediaLoader.parseRange("bytes 10-19/100")
+        XCTAssertEqual(valid?.start, 10); XCTAssertEqual(valid?.end, 19); XCTAssertEqual(valid?.total, 100)
+        for header in ["bytes 10/100", "bytes 10-9/100", "bytes 10-100/100", "bytes 10-no/100", "bytes 10-19-20/100", "bytes -1-19/100", "bytes 10-19/0", "bytes 10-19/*"] {
+            XCTAssertNil(SecureMediaLoader.parseRange(header), header)
+        }
+    }
+
 }

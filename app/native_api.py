@@ -201,7 +201,7 @@ def build_router(settings, require_owner):
     @router.post("/api/native/actions/options")
     async def action_options(payload: ActionOptions, user=Depends(require_owner), session=Depends(get_session)):
         device = await device_for(session, payload.device_id, user.user_id)
-        if not payload.purpose.startswith(("agent:", "music:evict:")):
+        if not payload.purpose.startswith(("agent:", "music:evict:", "scenario:")):
             raise HTTPException(400, "Действие не поддерживается нативным подтверждением")
         return await challenge(session, owner_id=user.user_id, kind="action", key=device.public_key,
             device_id=device.id, purpose=payload.purpose, binding=payload.binding)

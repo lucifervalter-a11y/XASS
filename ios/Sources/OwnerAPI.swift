@@ -14,9 +14,11 @@ protocol OwnerService: AnyObject {
     var origin: ServerOrigin { get }
     @MainActor func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any]
     @MainActor func artwork(trackID: Int) async throws -> Data?
+    @MainActor func binary(_ path: String) async throws -> Data
 }
 extension OwnerService {
     @MainActor func artwork(trackID: Int) async throws -> Data? { nil }
+    @MainActor func binary(_ path: String) async throws -> Data { throw OwnerAPIError.invalidResponse }
 }
 
 /// Native API transport. An HttpOnly owner cookie never passes through JavaScript;
@@ -24,13 +26,16 @@ extension OwnerService {
 final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked Sendable {
     let origin: ServerOrigin
     static let maxResponseBytes = 4 * 1024 * 1024
+    static let maxAssetBytes = 16 * 1024 * 1024
     private let configuration: URLSessionConfiguration
     private let savedSession: () -> SavedSession?
     private let saveSession: (SavedSession) -> Void
     private enum Completion {
         case json(CheckedContinuation<[String: Any], Error>)
         case artwork(CheckedContinuation<Data?, Error>)
-        func fail(_ error: Error) { switch self { case .json(let done): done.resume(throwing: error); case .artwork(let done): done.resume(throwing: error) } }
+        case binary(CheckedContinuation<Data, Error>)
+        var limit: Int { switch self { case .json: return OwnerAPI.maxResponseBytes; case .artwork: return 1024 * 1024; case .binary: return OwnerAPI.maxAssetBytes } }
+        func fail(_ error: Error) { switch self { case .json(let done): done.resume(throwing: error); case .artwork(let done): done.resume(throwing: error); case .binary(let done): done.resume(throwing: error) } }
     }
     private struct Transfer {
         var data = Data()
@@ -80,13 +85,18 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
         try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { completion in
+        let value: [String: Any] = try await withCheckedThrowingContinuation { completion in
             let task = session.dataTask(with: request)
             transfers[task.taskIdentifier] = Transfer(completion: .json(completion))
             task.resume()
         }
+        // Mutations must return their receipt even when the calling view was
+        // cancelled, so callers can undo a handoff by its server-issued ID.
+        if method == "GET" { try Task.checkCancellation() }
+        return value
     }
     @MainActor func artwork(trackID: Int) async throws -> Data? {
+        try Task.checkCancellation()
         guard trackID > 0, let saved = savedSession(), saved.expires > Date(), !saved.value.isEmpty,
               saved.value.count < 8192, !saved.value.contains("\r"), !saved.value.contains("\n"), !saved.value.contains(";") else { throw OwnerAPIError.signedOut }
         var parts = URLComponents(url: origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
@@ -96,9 +106,38 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         request.setValue("image/jpeg", forHTTPHeaderField: "Accept")
         request.setValue("xass_pwa=" + saved.value, forHTTPHeaderField: "Cookie")
         request.setValue(origin.url.absoluteString, forHTTPHeaderField: "Origin")
-        return try await withCheckedThrowingContinuation { done in
+        let value: Data? = try await withCheckedThrowingContinuation { done in
             let task = session.dataTask(with: request); transfers[task.taskIdentifier] = Transfer(completion: .artwork(done)); task.resume()
         }
+        try Task.checkCancellation()
+        return value
+    }
+
+    static func allowsBinaryPath(_ path: String) -> Bool {
+        guard !path.contains("\\"), !path.contains(".."),
+              !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              let decoded = path.removingPercentEncoding, !decoded.contains(".."), !decoded.contains("\\") else { return false }
+        return path.range(of: #"^/api/mini/(media/[1-9][0-9]*|agents/[^/?#]+/assets/[A-Za-z0-9_-]+)$"#, options: .regularExpression) != nil
+    }
+
+    @MainActor func binary(_ path: String) async throws -> Data {
+        guard Self.allowsBinaryPath(path) else { throw OwnerAPIError.invalidResponse }
+        guard let saved = savedSession(), saved.expires > Date(), !saved.value.isEmpty,
+              saved.value.utf8.count < 8192, !saved.value.contains("\r"), !saved.value.contains("\n"), !saved.value.contains(";") else { throw OwnerAPIError.signedOut }
+        var parts = URLComponents(url: origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
+        parts.queryItems = [.init(name: "_binary", value: "1"), .init(name: "_p", value: path)]
+        var request = URLRequest(url: parts.url!)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue("xass_pwa=" + saved.value, forHTTPHeaderField: "Cookie")
+        request.setValue(origin.url.absoluteString, forHTTPHeaderField: "Origin")
+        try Task.checkCancellation()
+        let value: Data = try await withCheckedThrowingContinuation { done in
+            let task = session.dataTask(with: request)
+            transfers[task.taskIdentifier] = Transfer(completion: .binary(done)); task.resume()
+        }
+        try Task.checkCancellation()
+        return value
     }
 
     static func decode(_ data: Data, status: Int) throws -> [String: Any] {
@@ -128,13 +167,14 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard let http = response as? HTTPURLResponse, let url = http.url, origin.contains(url),
-              response.expectedContentLength <= Int64(Self.maxResponseBytes) else {
+              let transfer = transfers[dataTask.taskIdentifier],
+              response.expectedContentLength <= Int64(transfer.completion.limit) else {
             completionHandler(.cancel); finish(dataTask.taskIdentifier, error: OwnerAPIError.invalidResponse); return
         }
         transfers[dataTask.taskIdentifier]?.response = http; completionHandler(.allow)
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard let current = transfers[dataTask.taskIdentifier], current.data.count + data.count <= Self.maxResponseBytes else {
+        guard let current = transfers[dataTask.taskIdentifier], current.data.count + data.count <= current.completion.limit else {
             dataTask.cancel(); finish(dataTask.taskIdentifier, error: OwnerAPIError.invalidResponse); return
         }
         transfers[dataTask.taskIdentifier]?.data.append(data)
@@ -144,6 +184,14 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         guard let transfer = transfers.removeValue(forKey: id) else { return }
         if let error = error { transfer.completion.fail(error); return }
         guard let status = transfer.response?.statusCode else { transfer.completion.fail(OwnerAPIError.invalidResponse); return }
+        if case .binary(let done) = transfer.completion {
+            guard status == 200, !transfer.data.isEmpty else {
+                done.resume(throwing: status == 401 ? OwnerAPIError.signedOut : OwnerAPIError(status: status, message: "Файл недоступен. Запросите его заново.")); return
+            }
+            let mime = transfer.response?.mimeType?.lowercased() ?? ""
+            guard mime != "application/json", mime != "text/html" else { done.resume(throwing: OwnerAPIError.invalidResponse); return }
+            done.resume(returning: transfer.data); return
+        }
         if case .artwork(let done) = transfer.completion {
             if status == 404 { done.resume(returning: nil); return }
             guard status == 200, transfer.response?.mimeType == "image/jpeg", transfer.data.count <= 1024 * 1024 else { done.resume(throwing: OwnerAPIError.invalidResponse); return }
