@@ -82,6 +82,15 @@ async def expire_active_transfer(session):
         await fail_transfer(session, transfer, "Время переключения истекло. Повторите действие")
 
 
+def stale_local_recovery_available(item, meta, transfer, *, now=None):
+    """Staleness permits an explicit owner-confirmed pause, never automatic play."""
+    active_handoff = bool(meta and meta.transfer_id and (
+        transfer is None or transfer.status not in {"ready", "failed"}))
+    return bool(item and item.session_key and item.device == "local"
+        and item.state in {"playing", "loading"} and not active_handoff
+        and ((now or datetime.now(timezone.utc)) - aware(item.updated_at)).total_seconds() >= 300)
+
+
 async def current_session(session):
     item = await session.get(MusicSession, 1)
     if item is None:
@@ -122,8 +131,9 @@ async def current_session(session):
         result["duration"] = track.duration
     result["updated_at"] = timestamp.isoformat()
     result["server_time"] = now.isoformat()
+    transfer = await session.get(MusicTransfer, meta.transfer_id) if meta and meta.transfer_id else None
+    result["recovery_available"] = stale_local_recovery_available(item, meta, transfer, now=now)
     if meta and meta.transfer_id:
-        transfer = await session.get(MusicTransfer, meta.transfer_id)
         if transfer and transfer.status not in {"ready", "failed"}:
             result["active_transfer_id"] = transfer.id
             result["active_transfer_status"] = transfer.status
