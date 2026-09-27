@@ -93,12 +93,22 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
                   ("DELETE", "/tracks/1"), ("POST", "/playlists"), ("PUT", "/playlists/1"),
                   ("DELETE", "/playlists/1"), ("POST", "/tracks/1/ticket"), ("POST", "/control"),
                   ("GET", "/control/1"), ("GET", "/session"), ("POST", "/session"),
-                  ("DELETE", "/uploads/" + "a" * 32), ("GET", "/players")]
+                  ("DELETE", "/uploads/" + "a" * 32), ("GET", "/players"), ("GET", "/tracks/1/lyrics")]
         for method, path in routes:
             for headers, status in (({}, 401), ({"x-test-owner": "guest"}, 403)):
                 with self.subTest(method=method, path=path, status=status):
                     response = await self.request(method, "/api/mini/music" + path, headers=headers, json={})
                     self.assertEqual(response.status_code, status, response.text)
+
+    async def test_lyrics_empty_state_is_private_and_deleted_tracks_are_unavailable(self):
+        track = await self.upload()
+        path = f"/api/mini/music/tracks/{track['id']}/lyrics"
+        response = await self.request("GET", path)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "lyrics": {"text": "", "lines": [], "source": "none", "synced": False}})
+        self.assertEqual(response.headers["cache-control"], "private, no-store")
+        await self.request("DELETE", f"/api/mini/music/tracks/{track['id']}")
+        self.assertEqual((await self.request("GET", path)).status_code, 404)
 
     async def test_chunk_offsets_retries_owner_binding_finish_and_deduplication(self):
         upload_id = await self.start()

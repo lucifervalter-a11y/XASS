@@ -13,12 +13,13 @@ import UIKit
     let origin: ServerOrigin
     init(origin: ServerOrigin) { self.origin = origin }
     func artwork(trackID: Int) async throws -> Data? {
-        guard trackID == 1 else { return nil }
+        guard [1, 3, 5].contains(trackID) else { return nil }
         // A labelled generated test JPEG proves the exact production image view.
         // This graphic exists only in Debug Simulator, never a production album.
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
         return renderer.image { context in
-            UIColor(red: 0.06, green: 0.13, blue: 0.23, alpha: 1).setFill(); context.fill(CGRect(x: 0, y: 0, width: 320, height: 320))
+            let tint: UIColor = trackID == 3 ? UIColor(red: 0.25, green: 0.10, blue: 0.20, alpha: 1) : trackID == 5 ? UIColor(red: 0.18, green: 0.25, blue: 0.14, alpha: 1) : UIColor(red: 0.06, green: 0.13, blue: 0.23, alpha: 1)
+            tint.setFill(); context.fill(CGRect(x: 0, y: 0, width: 320, height: 320))
             for index in 0..<9 {
                 let path = UIBezierPath(); path.lineWidth = 3
                 path.move(to: CGPoint(x: -10, y: CGFloat(100 + index * 13))); path.addCurve(to: CGPoint(x: 330, y: CGFloat(160 + index * 10)), controlPoint1: CGPoint(x: 90, y: CGFloat(-40 + index * 18)), controlPoint2: CGPoint(x: 180, y: CGFloat(370 - index * 10)))
@@ -28,12 +29,12 @@ import UIKit
         }.jpegData(compressionQuality: 0.88)
     }
     static let trackData: [[String: Any]] = [
-        ["id": 1, "title": "Тихий город", "artist": "Тестовая библиотека", "duration": 224, "favorite": true],
-        ["id": 2, "title": "Северный свет", "artist": "Тестовая библиотека", "duration": 196],
-        ["id": 3, "title": "После дождя", "artist": "Тестовая библиотека", "duration": 243, "favorite": true],
-        ["id": 4, "title": "На другой стороне", "artist": "Тестовая библиотека", "duration": 218],
-        ["id": 5, "title": "Дорога домой", "artist": "Тестовая библиотека", "duration": 207],
-        ["id": 6, "title": "Последний поезд", "artist": "Тестовая библиотека", "duration": 256]
+        ["id": 1, "title": "Тихий город", "artist": "Тестовая библиотека", "album": "Ночной маршрут", "duration": 224, "favorite": true],
+        ["id": 2, "title": "Северный свет", "artist": "Тестовая библиотека", "album": "Ночной маршрут", "duration": 196],
+        ["id": 3, "title": "После дождя", "artist": "Тестовая библиотека", "album": "Тёплый свет", "duration": 243, "favorite": true],
+        ["id": 4, "title": "На другой стороне", "artist": "Тестовая библиотека", "album": "Тёплый свет", "duration": 218],
+        ["id": 5, "title": "Дорога домой", "artist": "Тестовая коллекция", "album": "Открытые окна", "duration": 207],
+        ["id": 6, "title": "Последний поезд", "artist": "Тестовая коллекция", "duration": 256]
     ]
     static let deviceData: [[String: Any]] = [
         ["id": 1, "source_type": "PC_AGENT", "source_name": "Студия", "is_online": true, "agent_version": "0.17.0"],
@@ -61,7 +62,7 @@ import UIKit
             func value(_ key: String) -> String? { queryItems.first { $0.name == key }?.value }
             let query = (value("q") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let filtered = Self.trackData.filter { row in
-                let matchesQuery = query.isEmpty || [row["title"], row["artist"]].compactMap { $0 as? String }.contains { $0.localizedCaseInsensitiveContains(query) }
+                let matchesQuery = query.isEmpty || [row["title"], row["artist"], row["album"]].compactMap { $0 as? String }.contains { $0.localizedCaseInsensitiveContains(query) }
                 return matchesQuery && (value("favorite") != "true" || row["favorite"] as? Bool == true)
             }
             let offset = max(0, Int(value("offset") ?? "0") ?? 0)
@@ -71,6 +72,15 @@ import UIKit
             var result: [String: Any] = ["ok": true, "tracks": tracks, "playlists": Self.playlistData, "has_more": nextOffset < filtered.count]
             if nextOffset < filtered.count { result["next_offset"] = nextOffset }
             return result
+        }
+        if endpoint.hasPrefix("/api/mini/music/tracks/"), endpoint.hasSuffix("/lyrics") {
+            if endpoint == "/api/mini/music/tracks/1/lyrics" {
+                // Labelled fixture text, not copied lyrics or a production response.
+                return ["ok": true, "lyrics": ["source": "owner", "synced": true,
+                    "text": "Проверка текста\nЭто тестовая строка\nСинхронизация с позицией\nКонец тестового фрагмента",
+                    "lines": [["time": 0, "text": "Проверка текста"], ["time": 60, "text": "Это тестовая строка"], ["time": 84, "text": "Синхронизация с позицией"], ["time": 120, "text": "Конец тестового фрагмента"]]]]
+            }
+            return ["ok": true, "lyrics": ["source": "none", "synced": false, "text": "", "lines": []]]
         }
         if endpoint == "/api/mini/site" {
             return ["ok": true, "profile": ["name": "Артём", "title": "Мой XASS", "bio": "Музыка, устройства и личный сайт в одном приложении."],

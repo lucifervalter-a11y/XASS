@@ -47,7 +47,7 @@ jobs:
           sleep 2
           mkdir -p build/package
           xcrun simctl io "$XASS_SIMULATOR_ID" screenshot build/package/iOS-first-connection.png
-          for screen in home library site tools weather player devices routes storage; do
+          for screen in home library site tools weather player devices routes storage albums lyrics queue; do
             xcrun simctl launch --terminate-running-process "$XASS_SIMULATOR_ID" app.xass.mobile --native-ui-fixture --native-ui-screen "$screen"
             sleep 3
             xcrun simctl io "$XASS_SIMULATOR_ID" screenshot "build/package/iOS-native-$screen.png"

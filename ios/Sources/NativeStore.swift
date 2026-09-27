@@ -104,6 +104,9 @@ import UIKit
         let value = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         try? SecureStore.save(Data(value.utf8), name: name); return value
     }
+    func resolvedTrack(_ track: LibraryTrack) -> LibraryTrack {
+        knownTracks[track.id] ?? tracks.first(where: { $0.id == track.id }) ?? queue.first(where: { $0.id == track.id }) ?? track
+    }
     var currentTrack: LibraryTrack? {
         guard let id = currentID else { return nil }
         if let track = tracks.first(where: { $0.id == id }) ?? queue.first(where: { $0.id == id }) ?? knownTracks[id] { return track }
@@ -758,8 +761,9 @@ import UIKit
         outputs = (result["outputs"] as? [[String: Any]] ?? []).compactMap(PlayerOutput.init)
     }
     func favorite(_ track: LibraryTrack) async throws {
-        let result = try await api.request("/api/mini/music/tracks/\(track.id)", method: "PATCH", body: ["favorite": !track.favorite])
+        let result = try await api.request("/api/mini/music/tracks/\(track.id)", method: "PATCH", body: ["favorite": !resolvedTrack(track).favorite])
         if let value = result["track"] as? [String: Any], let updated = LibraryTrack(value) {
+            objectWillChange.send()
             knownTracks[updated.id] = updated
             if let index = tracks.firstIndex(where: { $0.id == updated.id }) { tracks[index] = updated }
             if let index = queue.firstIndex(where: { $0.id == updated.id }) { queue[index] = updated }
