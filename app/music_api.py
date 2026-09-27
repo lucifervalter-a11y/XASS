@@ -419,7 +419,7 @@ def build_router(settings, require_owner, public_origin):
         from app.music_enrichment_api import enrich_saved_track
         result = await enrich_saved_track(session, track_id)
         value = dict(result["enrichment"].get("lyrics") or embedded)
-        value["status"] = result["enrichment"].get("status", "not_found")
+        value.setdefault("status", result["enrichment"].get("lookup_status") or result["enrichment"].get("status", "not_found"))
         return {"ok": True, "lyrics": value, "track": result["track"]}
 
     @router.get("/api/mini/music/tracks/{track_id}/artwork")

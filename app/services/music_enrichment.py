@@ -16,6 +16,7 @@ import json
 import math
 import re
 import time
+from types import SimpleNamespace
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -177,7 +178,7 @@ def _select(signature, rows):
 
 def _lyrics(raw, candidate):
     if raw.get("instrumental") is True:
-        return empty_lyrics()
+        return {**empty_lyrics(), "status": "instrumental"}
     for field in ("syncedLyrics", "plainLyrics"):
         value = raw.get(field)
         parsed = parse_lyrics(value) if isinstance(value, str) else empty_lyrics()
@@ -313,6 +314,63 @@ class MusicEnrichmentService:
             self._put(key, result)
             return deepcopy(result)
 
+    async def confirm(self, track, candidate):
+        """Resolve one owner-selected stored candidate, never an arbitrary URL.
+
+        Selection resolves ambiguity only. It does not waive metadata/length or
+        excerpt checks, and the caller must recheck its DB revision after I/O.
+        """
+        if not isinstance(candidate, dict) or getattr(track, "deleted", False):
+            return _empty("unavailable", "invalid_candidate")
+        source, identity = candidate.get("source"), candidate.get("source_id")
+        valid_id = (source == "lrclib" and type(identity) is int and 0 < identity < 2**63) or (
+            source == "musicbrainz" and isinstance(identity, str) and bool(re.fullmatch(_UUID, identity)))
+        title, artist, album = (_text(candidate.get(field)) for field in ("title", "artist", "album"))
+        if not valid_id or not _norm(title) or not _norm(artist) or max(len(title), len(artist), len(album)) > 240:
+            return _empty("unavailable", "invalid_candidate")
+        snapshot = SimpleNamespace(title=title, artist=artist, album=album,
+            duration=getattr(track, "duration", 0), is_excerpt=_signature(track)["cut"])
+        signature = _signature(snapshot)
+        if not signature["duration"]:
+            return _empty("insufficient_metadata")
+        selected = _candidate(title, artist, album, _duration(candidate.get("duration")), source, identity)
+        if signature["cut"]:
+            return _empty("candidate", "duration_mismatch", candidate=selected, candidates=[selected])
+        if source == "musicbrainz":
+            # A recording selection is not a lyrics selection. Ordinary exact
+            # matching still decides whether an independent LRCLIB record fits.
+            return await self.enrich(snapshot)
+        key = ("confirmed", source, identity, *signature.values())
+        async with self._lock:
+            cached = self._cache.get(key)
+            if cached and cached[0] > self._clock():
+                self._cache.move_to_end(key)
+                return deepcopy(cached[1])
+            if cached:
+                self._cache_bytes -= self._cache.pop(key)[2]
+            try:
+                raw = await self._json(f"https://lrclib.net/api/get/{identity}", None)
+                rows = _lrclib_rows([raw]) if isinstance(raw, dict) else []
+                if raw is None:
+                    result = _empty("not_found")
+                elif len(rows) != 1 or rows[0][0]["source_id"] != identity:
+                    result = _empty("unavailable", "candidate_changed")
+                else:
+                    fresh, raw = rows[0]
+                    match = _match(signature, fresh)
+                    if match == "matched":
+                        result = _empty("matched", candidate=fresh, lyrics=_lyrics(raw, fresh),
+                            provenance=[{"source": "lrclib", "id": identity, "url": fresh["source_url"]}])
+                    else:
+                        result = _empty("candidate", "duration_mismatch" if match == "duration_mismatch" else "candidate_changed",
+                            candidate=selected, candidates=[selected])
+            except _ProviderFailure as exc:
+                result = _empty(exc.status, **({"retry_after": exc.retry_after} if exc.retry_after else {}))
+            except (ValueError, TypeError):
+                result = _empty("unavailable")
+            self._put(key, result)
+            return deepcopy(result)
+
     async def _enrich(self, signature):
         result, lrc_choice = _empty("not_found"), None
         try:
@@ -418,3 +476,7 @@ async def enrich_track(track):
 
 async def fetch_artwork_thumbnail(artwork):
     return await _service.fetch_artwork(artwork)
+
+
+async def enrich_confirmed_candidate(track, candidate):
+    return await _service.confirm(track, candidate)

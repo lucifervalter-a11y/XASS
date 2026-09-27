@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -66,12 +67,21 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
         track = await find_track(session, track_id)
         record = await session.get(MusicEnrichment, track_id, populate_existing=True)
         now = datetime.now(timezone.utc)
+        confirmed_candidate, previous_result, previous_artwork = None, None, None
         if record:
             age = (now - record.checked_at.replace(tzinfo=timezone.utc)).total_seconds()
             ttl = 30 * 86400 if record.result.get("status") == "matched" else 6 * 3600
             if record.result.get("status") in {"unavailable", "rate_limited"}:
                 ttl = max(60, min(86400, record.result.get("retry_after", 60)))
             same = record.fingerprint == fingerprint(track)
+            if same and not record.dismissed and record.result.get("status") == "confirmed":
+                # Owner selection is durable, not a six-hour search suggestion.
+                # Only an explicit refresh may revalidate the chosen provider ID.
+                if not refresh:
+                    return {"ok": True, "track": track_json(track), "enrichment": result_json(record)}
+                confirmed_candidate = deepcopy(record.result.get("candidate") or {})
+                previous_result = deepcopy(record.result)
+                previous_artwork = record.artwork_data
             if record.dismissed and not refresh or same and record.result.get("status") and age < (60 if refresh else ttl):
                 return {"ok": True, "track": track_json(track), "enrichment": result_json(record)}
         before = identity(track)
@@ -84,15 +94,30 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
             (original.get("title", "") + " " + snapshot.filename).replace("_", " "), re.I))
         original["is_excerpt"] = snapshot.is_excerpt
         await session.rollback()
-        from app.services.music_enrichment import enrich_track, fetch_artwork_thumbnail
+        from app.services.music_enrichment import enrich_track, enrich_confirmed_candidate, fetch_artwork_thumbnail
         try:
             async with asyncio.timeout(18):
-                result = await enrich_track(snapshot)
+                result = (await enrich_confirmed_candidate(snapshot, confirmed_candidate)
+                    if confirmed_candidate is not None else await enrich_track(snapshot))
                 artwork = await fetch_artwork_thumbnail(result.get("artwork", {})) if result.get("status") == "matched" else None
         except (TimeoutError, OSError):
             result, artwork = {"status": "unavailable", "lyrics": empty_lyrics()}, None
         if len(json.dumps(result, ensure_ascii=False).encode()) > 192 * 1024:
             result, artwork = {"status": "unavailable", "lyrics": empty_lyrics()}, None
+        if confirmed_candidate is not None:
+            retryable = result.get("status") in {"unavailable", "rate_limited"}
+            if retryable:
+                # A temporary catalog outage cannot delete an explicit choice
+                # or its previously verified lyrics/artwork.
+                artwork = previous_artwork
+            elif result.get("status") == "matched" and artwork is None:
+                artwork = previous_artwork
+            result = {"status": "confirmed", "candidate": confirmed_candidate,
+                "lyrics": (previous_result.get("lyrics") if retryable else result.get("lyrics")) or empty_lyrics(),
+                "provenance": (previous_result.get("provenance", []) if retryable else result.get("provenance", [])),
+                "lookup_status": result.get("status", "not_found"), "lookup_reason": result.get("reason", ""),
+                **({"retry_after": result["retry_after"]} if result.get("retry_after") else {}),
+                **({"using_cached_result": True} if retryable else {})}
         track = await lock_track_row(session, track_id)
         record = await session.get(MusicEnrichment, track_id, populate_existing=True)
         if identity(track) != before or track.sha256 != snapshot.sha256 or (record.revision if record else None) != generation:
@@ -186,10 +211,28 @@ def build_router(require_owner):
         values = {key: str(candidate.get(key) or before[key])[:240] for key in before}
         if not values["title"].strip():
             raise HTTPException(400, "Не найдено название песни.")
+        snapshot = SimpleNamespace(**{key: getattr(track, key) for key in
+            ("id", "title", "artist", "album", "filename", "duration", "sha256")},
+            is_excerpt=bool(record.original.get("is_excerpt")))
+        expected_revision = record.revision
+        await session.rollback()
+        from app.services.music_enrichment import enrich_confirmed_candidate, fetch_artwork_thumbnail
+        try:
+            async with asyncio.timeout(18):
+                selected = await enrich_confirmed_candidate(snapshot, candidate)
+                artwork = await fetch_artwork_thumbnail(selected.get("artwork", {}))
+        except (TimeoutError, OSError):
+            selected, artwork = {"lyrics": empty_lyrics(), "status": "unavailable"}, None
+        track = await lock_track_row(session, track_id)
+        record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+        if not record or record.revision != expected_revision or record.fingerprint != fingerprint(track) or result_json(record).get("candidate_token") != payload.candidate_token:
+            raise HTTPException(409, "Песня или результаты поиска изменились. Повторите выбор.")
         for key, value in values.items():
             setattr(track, key, value)
-        record.result = {"status": "confirmed", "candidate": candidate, "lyrics": empty_lyrics(),
-            "provenance": record.result.get("provenance", [])}
+        record.result = {"status": "confirmed", "candidate": candidate, "lyrics": selected.get("lyrics") or empty_lyrics(),
+            "provenance": selected.get("provenance") or record.result.get("provenance", []),
+            "lookup_status": selected.get("status", "not_found")}
+        record.artwork_data = artwork if artwork and len(artwork) <= 384 * 1024 else None
         record.dismissed = False
         record.revision += 1
         record.fingerprint = fingerprint(track)

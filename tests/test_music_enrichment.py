@@ -165,6 +165,95 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_instrumental_does_not_attach_unrelated_lyrics(self):
         result = await self.service(lyrics=[{**self.lyric, "instrumental": True}]).enrich(self.track)
         self.assertEqual(result["lyrics"]["source"], "none")
+        self.assertEqual(result["lyrics"]["status"], "instrumental")
+
+    def selected(self):
+        return {"title": "Fixture Song", "artist": "Fixture Artist", "album": "Fixture Album", "duration": 180,
+            "source": "lrclib", "source_id": 123, "source_url": "https://untrusted.invalid/not-used"}
+
+    async def test_confirmed_lrclib_id_resolves_ambiguity_without_repeating_search(self):
+        service = self.service(handler=lambda req: httpx.Response(200, json=self.lyric))
+        result = await service.confirm(self.track, self.selected())
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["lyrics"]["source"], "lrclib")
+        self.assertIs(result["lyrics"]["synced"], True)
+        self.assertEqual(result["provenance"], [{"source": "lrclib", "id": 123, "url": "https://lrclib.net/lyrics/123"}])
+        self.assertEqual([str(req.url) for req in self.requests], ["https://lrclib.net/api/get/123"])
+
+    async def test_confirm_missing_invalid_id_and_unknown_source_never_fetch(self):
+        service = self.service()
+        for change in ({"source_id": None}, {"source_id": True}, {"source_id": "123"},
+                       {"source_id": "../../private"}, {"source_id": 2**63}, {"source_id": -1},
+                       {"source": "anything"}, {"source": "musicbrainz", "source_id": "bad"}):
+            result = await service.confirm(self.track, {**self.selected(), **change})
+            self.assertEqual(result["reason"], "invalid_candidate")
+            self.assertEqual(result["lyrics"]["text"], "")
+        self.assertEqual(self.requests, [])
+
+    async def test_confirm_rechecks_fetched_id_title_artist_album_and_duration(self):
+        for change in ({"id": 124}, {"trackName": "Different Song"}, {"artistName": "Another Artist"},
+                       {"albumName": "Wrong Album"}, {"trackName": "Fixture Sogn"}, {"duration": 220}):
+            with self.subTest(change=change):
+                service = self.service(handler=lambda req: httpx.Response(200, json={**self.lyric, **change}))
+                result = await service.confirm(self.track, self.selected())
+                self.assertNotEqual(result["status"], "matched")
+                self.assertEqual(result["lyrics"]["text"], "")
+                self.assertEqual(result["lyrics"]["lines"], [])
+
+    async def test_confirm_uses_owner_selected_metadata_but_original_audio_duration(self):
+        self.track.title = "Mistyped Fxituer title"
+        self.track.artist = ""
+        service = self.service(handler=lambda req: httpx.Response(200, json=self.lyric))
+        result = await service.confirm(self.track, self.selected())
+        self.assertEqual(result["status"], "matched")
+        self.track.duration = 99
+        result = await service.confirm(self.track, self.selected())
+        self.assertEqual(result["reason"], "duration_mismatch")
+        self.assertEqual(result["lyrics"]["text"], "")
+
+    async def test_confirm_known_cut_never_fetches_or_adds_full_recording_lyrics(self):
+        service = self.service()
+        self.track.is_excerpt = True
+        result = await service.confirm(self.track, self.selected())
+        self.assertEqual(result["reason"], "duration_mismatch")
+        self.assertEqual(result["lyrics"]["text"], "")
+        del self.track.is_excerpt
+        self.track.title = "Fixture Song cut99sec"
+        self.assertEqual((await service.confirm(self.track, self.selected()))["reason"], "duration_mismatch")
+        self.assertEqual(self.requests, [])
+
+    async def test_confirm_cache_is_bound_to_id_and_file_signature(self):
+        service = self.service(handler=lambda req: httpx.Response(200, json={**self.lyric, "id": int(req.url.path.rsplit("/", 1)[1])}))
+        first, second = await asyncio.gather(service.confirm(self.track, self.selected()), service.confirm(self.track, self.selected()))
+        self.assertEqual(len(self.requests), 1)
+        first["lyrics"]["lines"].clear()
+        self.assertEqual(len(second["lyrics"]["lines"]), 2)
+        await service.confirm(self.track, {**self.selected(), "source_id": 124})
+        self.track.duration = 99
+        await service.confirm(self.track, self.selected())
+        self.assertEqual(len(self.requests), 3)
+
+    async def test_confirm_not_found_rate_limit_and_oversized_response_are_bounded(self):
+        for bad, expected in ((httpx.Response(404), "not_found"),
+                              (httpx.Response(429, headers={"Retry-After": "120"}), "rate_limited"),
+                              (httpx.Response(200, content=b"x" * (MAX_JSON_BYTES + 1)), "unavailable")):
+            service = self.service(handler=lambda req: bad)
+            result = await service.confirm(self.track, self.selected())
+            self.assertEqual(result["status"], expected)
+            self.assertEqual(result["lyrics"]["text"], "")
+        service = self.service(handler=lambda req: httpx.Response(429, headers={"Retry-After": "120"}))
+        self.requests.clear()
+        await service.confirm(self.track, self.selected())
+        result = await service.confirm(self.track, {**self.selected(), "source_id": 124})
+        self.assertEqual((result["status"], result["retry_after"]), ("rate_limited", 120))
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_confirm_musicbrainz_does_not_force_an_ambiguous_lyrics_record(self):
+        service = self.service(lyrics=[self.lyric, {**self.lyric, "id": 124}])
+        result = await service.confirm(self.track, {**self.selected(), "source": "musicbrainz", "source_id": RECORDING})
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(result["lyrics"]["text"], "")
+        self.assertEqual(self.requests[0].url.path, "/api/search")
 
     async def test_musicbrainz_fallback_and_millisecond_duration(self):
         result = await self.service(lyrics=[]).enrich(self.track)

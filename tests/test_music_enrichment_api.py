@@ -205,6 +205,99 @@ class MusicEnrichmentApiTests(MusicApiTests):
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         self.assertEqual(confirmed.json()["track"]["title"], "Suggestion")
 
+    async def test_confirmed_lrclib_candidate_persists_selected_timed_lyrics_for_get(self):
+        track, route = await self.prepared()
+        candidate = {"title": "Selected Fixture", "artist": "Selected Artist", "album": "Selected Album",
+                     "duration": 180, "source": "lrclib", "source_id": 456,
+                     "source_url": "https://lrclib.net/lyrics/456"}
+        alternative = {**candidate, "title": "Other Fixture", "source_id": 123,
+                       "source_url": "https://lrclib.net/lyrics/123"}
+        ambiguous = {"status": "ambiguous", "candidates": [alternative, candidate], "lyrics": empty_lyrics()}
+        selected_lyrics = {"text": "Selected fixture line", "lines": [{"time": 12.5, "text": "Selected fixture line"}],
+                           "source": "lrclib", "source_url": candidate["source_url"], "synced": True}
+        selected = {"status": "matched", "lyrics": selected_lyrics, "artwork": {},
+                    "provenance": [{"source": "lrclib", "id": 456, "url": candidate["source_url"]}]}
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=ambiguous)):
+            found = await self.request("POST", route, json={})
+        self.assertEqual(found.status_code, 200, found.text)
+        self.assertEqual(found.json()["track"]["title"], "fixture song")
+        token = found.json()["enrichment"]["candidate_token"]
+        with patch("app.services.music_enrichment.enrich_confirmed_candidate", AsyncMock(return_value=selected)) as lookup, \
+             patch("app.services.music_enrichment.fetch_artwork_thumbnail", AsyncMock(return_value=None)):
+            confirmed = await self.request("POST", route + "/confirm", json={"index": 1, "candidate_token": token})
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        lookup.assert_awaited_once()
+        snapshot, actual_candidate = lookup.await_args.args
+        self.assertEqual(snapshot.id, track["id"])
+        self.assertEqual(snapshot.title, "fixture song")
+        self.assertEqual(actual_candidate, candidate)
+        self.assertEqual(confirmed.json()["track"]["title"], "Selected Fixture")
+        self.assertEqual(confirmed.json()["enrichment"]["lyrics"], selected_lyrics)
+        self.assertEqual(confirmed.json()["enrichment"]["lookup_status"], "matched")
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(side_effect=AssertionError("Use selected cache"))):
+            loaded = await self.request("GET", route.replace("/enrichment", "/lyrics"))
+        self.assertEqual(loaded.status_code, 200, loaded.text)
+        self.assertEqual(loaded.headers["cache-control"], "private, no-store")
+        self.assertEqual(loaded.json()["lyrics"], {**selected_lyrics, "status": "matched"})
+        async with self.sessions() as session:
+            record = await session.get(MusicEnrichment, track["id"])
+            self.assertEqual(record.result["status"], "confirmed")
+            self.assertEqual(record.result["lyrics"], selected_lyrics)
+            self.assertNotIn("candidates", record.result)
+
+    async def test_concurrent_restore_or_manual_edit_during_selected_fetch_rejects_confirmation(self):
+        track, route = await self.prepared()
+        candidate = {"title": "Selected Fixture", "artist": "Selected Artist", "album": "Selected Album",
+                     "duration": 180, "source": "lrclib", "source_id": 456,
+                     "source_url": "https://lrclib.net/lyrics/456"}
+        candidates = {"status": "candidate", "candidates": [candidate], "lyrics": empty_lyrics()}
+        for mutation in ("restore", "manual"):
+            with self.subTest(mutation=mutation):
+                if mutation == "manual":
+                    await self.expire_lookup_cache(track["id"])
+                with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=candidates)):
+                    found = await self.request("POST", route, json={"refresh": True})
+                self.assertEqual(found.status_code, 200, found.text)
+                token = found.json()["enrichment"]["candidate_token"]
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def selected_lookup(_, selected_candidate):
+                    self.assertEqual(selected_candidate, candidate)
+                    entered.set()
+                    await asyncio.wait_for(release.wait(), timeout=5)
+                    return self.matched()
+
+                with patch("app.services.music_enrichment.enrich_confirmed_candidate", side_effect=selected_lookup), \
+                     patch("app.services.music_enrichment.fetch_artwork_thumbnail", AsyncMock(return_value=b"late-cover")):
+                    task = asyncio.create_task(self.request("POST", route + "/confirm",
+                        json={"index": 0, "candidate_token": token}))
+                    try:
+                        await asyncio.wait_for(entered.wait(), timeout=5)
+                        if mutation == "restore":
+                            changed = await asyncio.wait_for(self.request("POST", route + "/restore", json={}), timeout=5)
+                            expected_title = "fixture song"
+                        else:
+                            changed = await asyncio.wait_for(self.request("PATCH", route.replace("/enrichment", ""),
+                                json={"title": "Manual wins"}), timeout=5)
+                            expected_title = "Manual wins"
+                        self.assertEqual(changed.status_code, 200, changed.text)
+                        release.set()
+                        stale = await asyncio.wait_for(task, timeout=5)
+                        self.assertEqual(stale.status_code, 409, stale.text)
+                    finally:
+                        release.set()
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                current = await self.request("GET", route)
+                self.assertEqual(current.json()["track"]["title"], expected_title)
+                self.assertEqual(current.json()["enrichment"]["status"], "disabled")
+                async with self.sessions() as session:
+                    record = await session.get(MusicEnrichment, track["id"])
+                    self.assertTrue(record.dismissed)
+                    self.assertIsNone(record.artwork_data)
+                    self.assertFalse(record.result["lyrics"]["synced"])
+
     async def test_manual_edit_refresh_then_restore_returns_manual_baseline_not_upload_tags(self):
         track, route = await self.prepared()
         with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=self.matched())), \
@@ -229,13 +322,23 @@ class MusicEnrichmentApiTests(MusicApiTests):
             row.title, row.duration = "fixture song cut99sec", 99
             await session.commit()
         seen_cuts = []
+        selected_cuts = []
+        candidate = {"title": "Clean catalog title", "artist": "Artist", "album": "", "duration": 180,
+                     "source": "lrclib", "source_id": 123, "source_url": "https://lrclib.net/lyrics/123"}
 
         async def lookup(snapshot):
             seen_cuts.append(snapshot.is_excerpt)
-            return {"status": "candidate", "candidates": [{"title": "Clean catalog title", "artist": "Artist", "album": ""}],
-                    "lyrics": empty_lyrics()}
+            return {"status": "candidate", "candidates": [candidate], "lyrics": empty_lyrics()}
 
-        with patch("app.services.music_enrichment.enrich_track", side_effect=lookup):
+        async def selected_lookup(snapshot, selected):
+            self.assertEqual(selected, candidate)
+            selected_cuts.append((snapshot.title, snapshot.is_excerpt))
+            return {"status": "candidate", "reason": "duration_mismatch", "candidate": selected,
+                    "candidates": [selected], "lyrics": empty_lyrics()}
+
+        with patch("app.services.music_enrichment.enrich_track", side_effect=lookup), \
+             patch("app.services.music_enrichment.enrich_confirmed_candidate", side_effect=selected_lookup), \
+             patch("app.services.music_enrichment.fetch_artwork_thumbnail", AsyncMock(return_value=None)):
             first = await self.request("POST", route, json={})
             self.assertEqual(first.status_code, 200, first.text)
             token = first.json()["enrichment"]["candidate_token"]
@@ -245,7 +348,9 @@ class MusicEnrichmentApiTests(MusicApiTests):
             await self.expire_lookup_cache(track["id"])
             refreshed = await self.request("POST", route, json={"refresh": True})
             self.assertEqual(refreshed.status_code, 200, refreshed.text)
-        self.assertEqual(seen_cuts, [True, True], "Confirmation must not erase evidence that this is an excerpt")
+        self.assertEqual(seen_cuts, [True], "A confirmed selection must not return to general discovery")
+        self.assertEqual(selected_cuts, [("fixture song cut99sec", True), ("Clean catalog title", True)],
+                         "Confirmation and selected-ID refresh must retain evidence that this is an excerpt")
         self.assertFalse(refreshed.json()["enrichment"]["lyrics"]["synced"])
         async with self.sessions() as session:
             record = await session.get(MusicEnrichment, track["id"])
