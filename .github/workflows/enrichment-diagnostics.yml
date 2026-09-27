@@ -51,10 +51,10 @@ jobs:
           [[ "$request_b64" =~ ^[A-Za-z0-9+/=]+$ ]]
           {
             printf '%s\n' 'set -euo pipefail' 'cd /home/red/serverredus' 'export PYTHONDONTWRITEBYTECODE=1'
-            printf '%s\n' "timeout --signal=TERM --kill-after=5s 85s .venv/bin/python - '$request_b64' <<'XASS_ENRICHMENT_DIAGNOSTICS'"
+            printf '%s\n' "timeout --signal=TERM --kill-after=5s 180s .venv/bin/python - '$request_b64' <<'XASS_ENRICHMENT_DIAGNOSTICS'"
             cat deploy/enrichment_diagnostics.py
             printf '\n%s\n' 'XASS_ENRICHMENT_DIAGNOSTICS'
-          } | timeout --signal=TERM --kill-after=5s 110s bash deploy/github_ssh.sh exec > delivery/enrichment.encrypted.json 2>/dev/null || {
+          } | timeout --signal=TERM --kill-after=5s 205s bash deploy/github_ssh.sh exec > delivery/enrichment.encrypted.json 2>/dev/null || {
             printf '%s\n' 'Read-only diagnostic transport failed; no report published.'
             exit 1
           }

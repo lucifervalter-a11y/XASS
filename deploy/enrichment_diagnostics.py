@@ -16,9 +16,12 @@ import logging
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import subprocess
 import sys
 import time
+import unicodedata
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -94,6 +97,51 @@ def failure_category(error):
     if any("timeout" in type(item).__name__.lower() for item in chain):
         return "timeout"
     return "provider_unavailable"
+
+
+def tls_environment():
+    """Public MusicBrainz endpoint only; both trust modes verify certificates."""
+    import certifi
+    defaults = ssl.get_default_verify_paths()
+    result = {"server_clock_utc": datetime.now(timezone.utc).isoformat(), "openssl": ssl.OPENSSL_VERSION,
+              "certifi_version": getattr(certifi, "__version__", "unknown"),
+              "certifi_bundle_present": Path(certifi.where()).is_file(),
+              "default_cafile_present": bool(defaults.cafile and Path(defaults.cafile).is_file()),
+              "default_capath_present": bool(defaults.capath and Path(defaults.capath).is_dir()),
+              "ssl_cert_file_env_present": bool(os.environ.get("SSL_CERT_FILE")),
+              "ssl_cert_dir_env_present": bool(os.environ.get("SSL_CERT_DIR")), "tls": [], "curl": []}
+    try:
+        result["musicbrainz_addresses"] = sorted({entry[4][0] for entry in socket.getaddrinfo("musicbrainz.org", 443, type=socket.SOCK_STREAM)})
+    except OSError:
+        result["dns_error"] = True
+    for source in ("system", "certifi"):
+        started = time.monotonic()
+        item = {"trust_source": source}
+        try:
+            context = ssl.create_default_context(cafile=certifi.where() if source == "certifi" else None)
+            with socket.create_connection(("musicbrainz.org", 443), timeout=4) as raw:
+                item["peer_address"] = raw.getpeername()[0]
+                with context.wrap_socket(raw, server_hostname="musicbrainz.org") as verified:
+                    cert = verified.getpeercert()
+                    item.update(verified=True, protocol=verified.version(), expires=cert.get("notAfter"))
+        except ssl.SSLCertVerificationError as error:
+            item.update(verified=False, verify_code=error.verify_code, verify_message=error.verify_message[:160])
+        except (OSError, TimeoutError) as error:
+            item.update(verified=False, error_category=failure_category(error))
+        item["elapsed_ms"] = round(1000 * (time.monotonic() - started))
+        result["tls"].append(item)
+        try:
+            command = ["curl", "--noproxy", "*", "--connect-timeout", "4", "--max-time", "7", "--silent", "--show-error",
+                       "--output", os.devnull, "--write-out", '{"http_status":"%{http_code}","ssl_verify_result":%{ssl_verify_result}}']
+            if source == "certifi":
+                command.extend(["--cacert", certifi.where()])
+            command.append("https://musicbrainz.org/")
+            output = subprocess.run(command, capture_output=True, text=True, timeout=9)
+            status = json.loads(output.stdout) if output.stdout else {}
+            result["curl"].append({"trust_source": source, "returncode": output.returncode, **status})
+        except Exception:
+            result["curl"].append({"trust_source": source, "error_category": "curl_probe_unavailable"})
+    return result
 
 
 async def read_tracks(database_url):
@@ -185,7 +233,7 @@ async def collect(database_url):
                 observation["http"] = self.network[network_start:]
 
     service = ObservedCatalog()
-    report = {"schema": 1, "created_at": datetime.now(timezone.utc).isoformat(),
+    report = {"schema": 2, "created_at": datetime.now(timezone.utc).isoformat(),
               "limits": {"tracks": TRACK_LIMIT, "live": LIVE_LIMIT}, "tracks": []}
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3, check=True).stdout.strip()
@@ -219,7 +267,32 @@ async def collect(database_url):
             except Exception:
                 row["live"] = {"status": "diagnostic_failed"}
             row["provider_observations"] = service.observations
+            signature = catalog._signature(track)
+            raw_title, raw_artist = signature["title"], signature["artist"]
+            # Comparison only: do not change the DB, stored tags, or catalog code.
+            raw_title_for_cleanup = track.title
+            if not track.artist and len(parts := re.split(r"\s+[-–—]\s+", raw_title_for_cleanup)) == 2:
+                raw_title_for_cleanup = parts[1]
+            nfc_title = unicodedata.normalize("NFC", raw_title)
+            nfc_artist = unicodedata.normalize("NFC", raw_artist)
+            variants = [("raw", raw_title, raw_artist), ("NFC", nfc_title, nfc_artist)]
+            if re.search(r"\s*\[facetext\]\s*$", raw_title_for_cleanup, flags=re.I):
+                clean = re.sub(r"\s*\[facetext\]\s*$", "", raw_title_for_cleanup, flags=re.I)
+                variants.append(("NFC_without_exact_facetext_suffix", unicodedata.normalize("NFC", clean), nfc_artist))
+            row["lrclib_query_comparison"] = []
+            for mode, title, artist in variants:
+                service.observations = []
+                service.signature = {**signature, "title": title, "artist": artist, "query": f"{artist} {title}".strip()}
+                comparison = {"mode": mode}
+                try:
+                    async with asyncio.timeout(13):
+                        await service._json("https://lrclib.net/api/search", {"track_name": title, "artist_name": artist})
+                except (catalog._ProviderFailure, TimeoutError, ValueError, TypeError) as error:
+                    comparison["error_category"] = failure_category(error)
+                comparison["observations"] = service.observations
+                row["lrclib_query_comparison"].append(comparison)
         report["tracks"].append(row)
+    report["public_tls_environment"] = await asyncio.to_thread(tls_environment)
     return report
 
 
@@ -232,7 +305,7 @@ def main():
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             from app.config import Settings
             async def bounded():
-                return await asyncio.wait_for(collect(Settings().database_url), timeout=75)
+                return await asyncio.wait_for(collect(Settings().database_url), timeout=170)
             report = asyncio.run(bounded())
             envelope = encrypt(report, request, recipient)
         print(json.dumps(envelope, separators=(",", ":")), flush=True)
