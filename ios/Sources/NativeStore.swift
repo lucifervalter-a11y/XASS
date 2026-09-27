@@ -82,6 +82,7 @@ import UIKit
     private var missingArtwork = Set<Int>()
     @Published private(set) var artworkBytes = 0
     @Published private(set) var artworkRevision = 0
+    @Published private(set) var lyricsRevision = 0
     private var maxUpload = 256 * 1024 * 1024
     private var lastAudioDiagnosticFailed = false
 
@@ -406,8 +407,12 @@ import UIKit
         let response = try await api.request("/api/mini/music/tracks/\(id)/enrichment", method: "POST", body: ["refresh": refresh])
         try Task.checkCancellation()
         applyEnrichedTrack(response)
+        invalidateLyrics()
         return response
     }
+    // Only successful owner mutations call this. Applying a GET response must
+    // not invalidate its own lyrics request and create a reload loop.
+    func invalidateLyrics() { lyricsRevision &+= 1 }
     func clearArtworkCache() { imageCache.removeAllObjects(); missingArtwork.removeAll(); artworkBytes = 0; notice = "Кэш обложек очищен. Скачанная музыка не затронута." }
     func playOffline(_ track: DownloadedTrack) {
         var seen = Set<Int>()

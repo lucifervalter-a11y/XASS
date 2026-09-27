@@ -109,23 +109,52 @@ final class NativeLyricsTests: XCTestCase {
         follow.resume(); XCTAssertTrue(follow.enabled)
         follow.pause(); XCTAssertFalse(follow.enabled)
     }
+    func testTranscriptEditorByteLimitReportsOverflowWithoutTruncatingUnicode() {
+        XCTAssertNil(NativeEnrichmentPresentation.transcriptProblem(String(repeating: "a", count: 64_000)))
+        XCTAssertNotNil(NativeEnrichmentPresentation.transcriptProblem(String(repeating: "a", count: 64_001)))
+        XCTAssertNil(NativeEnrichmentPresentation.transcriptProblem(String(repeating: "я", count: 32_000)))
+        XCTAssertNotNil(NativeEnrichmentPresentation.transcriptProblem(String(repeating: "я", count: 32_001)))
+    }
 }
 
 @MainActor private final class LyricsClockService: OwnerService {
     let origin = try! ServerOrigin("https://lyrics-clock-fixture.invalid")
     var state = "playing"
     var updatedAt = "2026-09-27T18:00:14Z"
+    var failEnrichment = false
     func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
         if path == "/api/mini/music/session" {
             return ["ok": true, "session": ["track_id": 7, "device": "agent:Fixture", "state": state, "position": 10,
                 "session_key": "fixture-remote-session", "server_time": "2026-09-27T18:00:15Z", "updated_at": updatedAt]]
         }
         if path == "/api/mini/music/players" { return ["ok": true, "players": []] }
+        if path == "/api/mini/music/tracks/7/enrichment", method == "POST" {
+            if failEnrichment { throw OwnerAPIError.invalidResponse }
+            return ["ok": true, "track": ["id": 7, "title": "Fixture"]]
+        }
         throw OwnerAPIError.invalidResponse
     }
 }
 
 @MainActor final class NativeLyricsClockStoreTests: XCTestCase {
+    func testOnlySuccessfulMutationsInvalidateLyricsNotReadResponseApplication() async throws {
+        let service = LyricsClockService()
+        let store = NativeStore(api: service, audio: AudioController())
+        defer { store.disconnect() }
+        XCTAssertEqual(store.lyricsRevision, 0)
+        store.applyEnrichedTrack(["track": ["id": 7, "title": "GET fixture"]])
+        XCTAssertEqual(store.lyricsRevision, 0, "GET lyrics applies track metadata without triggering itself again")
+        _ = try await store.enrichTrack(7)
+        XCTAssertEqual(store.lyricsRevision, 1)
+        service.failEnrichment = true
+        do { _ = try await store.enrichTrack(7); XCTFail("Expected failed request") }
+        catch { }
+        XCTAssertEqual(store.lyricsRevision, 1, "A failed mutation must not claim to have changed lyrics")
+        store.invalidateLyrics()
+        XCTAssertEqual(store.lyricsRevision, 2, "Confirmed restore/transcript mutations share the same explicit signal")
+        store.applyEnrichedTrack(["track": ["id": 7, "title": "Reloaded fixture"]])
+        XCTAssertEqual(store.lyricsRevision, 2)
+    }
     func testRemoteSamplesReanchorEvenWhenTheReportedPositionIsUnchanged() async throws {
         let service = LyricsClockService()
         let store = NativeStore(api: service, audio: AudioController())

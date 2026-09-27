@@ -1,6 +1,11 @@
 import SwiftUI
 
 enum NativeEnrichmentPresentation {
+    static func transcriptProblem(_ text: String) -> String? {
+        text.utf8.count > NativeTranscriptPolicy.maximumBytes
+            ? "Текст превышает лимит 64 000 байт. Сократите его перед сохранением; ничего не будет обрезано автоматически."
+            : nil
+    }
     static func message(_ status: String) -> String {
         switch status {
         case "matched": return "Найдены проверенные сведения о песне"
@@ -41,7 +46,11 @@ enum NativeEnrichmentPresentation {
                     Text(title).font(.headline)
                 }
                 Text(NativeEnrichmentPresentation.message(info["status"] as? String ?? "not_checked"))
-                if working { ProgressView("Ищу в каталогах…") }
+                if info["using_cached_result"] as? Bool == true {
+                    Text("Каталог временно недоступен. Сохранённые сведения и текст остаются доступны.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                if working { ProgressView("Обновляю информацию…") }
                 Button("Найти название, обложку и текст") { lookup(refresh: true) }.disabled(working || transcriber.running)
                 Text("При воспроизведении XASS ищет сведения по названию, исполнителю и длительности. Аудиофайл в каталоги не отправляется. Неоднозначные совпадения не применяются сами.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -110,7 +119,11 @@ enum NativeEnrichmentPresentation {
             if !transcript.isEmpty {
                 Text("Автоматическая расшифровка · проверьте слова").font(.caption).foregroundStyle(.orange)
                 TextEditor(text: $transcript).frame(minHeight: 200).font(.body).accessibilityIdentifier("transcriptPreview")
-                Button("Сохранить проверенный текст") { saveTranscript() }.disabled(working || transcriber.running)
+                if let problem = NativeEnrichmentPresentation.transcriptProblem(transcript) {
+                    Text(problem).font(.footnote).foregroundStyle(.orange).accessibilityIdentifier("transcriptLimit")
+                }
+                Button("Сохранить проверенный текст") { saveTranscript() }
+                    .disabled(working || transcriber.running || NativeEnrichmentPresentation.transcriptProblem(transcript) != nil)
             }
         }
     }
@@ -131,6 +144,7 @@ enum NativeEnrichmentPresentation {
             do {
                 let response = try await store.api.request("/api/mini/music/tracks/\(trackID)" + path, method: "POST", body: body)
                 try Task.checkCancellation(); store.applyEnrichedTrack(response)
+                store.invalidateLyrics()
                 info = response["enrichment"] as? [String: Any] ?? [:]
             } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
@@ -148,12 +162,15 @@ enum NativeEnrichmentPresentation {
         }
     }
     private func saveTranscript() {
-        guard !working, !transcriber.running, transcript.utf8.count <= 64_000 else { return }; working = true
+        guard !working, !transcriber.running else { return }
+        if let problem = NativeEnrichmentPresentation.transcriptProblem(transcript) { message = problem; return }
+        working = true; message = nil
         job = Task {
             defer { working = false }
             do {
                 _ = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "PUT", body: ["text": transcript, "source": "on_device_transcription"])
-                try Task.checkCancellation(); transcript = ""; message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
+                try Task.checkCancellation(); store.invalidateLyrics()
+                transcript = ""; message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
             } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
     }

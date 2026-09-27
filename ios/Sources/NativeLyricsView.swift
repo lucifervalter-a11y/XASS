@@ -155,7 +155,7 @@ struct NativeLyricsFollowing: Equatable {
             } else {
                 ProgressView("Ищем текст песни…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        }.task(id: "\(trackID)-\(retry)") {
+        }.task(id: "\(trackID)-\(retry)-\(store.lyricsRevision)") {
             lyrics = nil; error = nil; following.resume(); focusedLine = nil
             do {
                 let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "GET", body: nil)
