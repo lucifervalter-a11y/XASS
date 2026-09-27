@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.db import get_session
 from app.models import AgentCommand, AgentCredential, AppConfig, HeartbeatSource
-from app.music_models import MusicPlaylist, MusicSession, MusicTrack, MusicUpload, MusicUploadReceipt
+from app.music_models import MusicEnrichment, MusicPlaylist, MusicSession, MusicTrack, MusicUpload, MusicUploadReceipt
 from app.music_playback import current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta, stale_local_recovery_available
 from app.music_playback_models import MusicRemoteCommand, MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
@@ -341,12 +341,25 @@ def build_router(settings, require_owner, public_origin):
 
     @router.patch("/api/mini/music/tracks/{track_id}")
     async def edit(track_id: int, payload: EditTrack, user=Depends(require_owner), session=Depends(get_session)):
-        item = await find_track(session, track_id)
+        if {"title", "artist", "album"}.intersection(payload.model_fields_set):
+            from app.music_enrichment_api import lock_track_row
+            item = await lock_track_row(session, track_id)
+        else:
+            item = await find_track(session, track_id)
         for key, value in payload.model_dump(exclude_none=True).items():
             cleaned = value.strip() if isinstance(value, str) else value
             if key == "title" and not cleaned:
                 raise HTTPException(400, "Укажите название трека")
             setattr(item, key, cleaned)
+        if {"title", "artist", "album"}.intersection(payload.model_fields_set):
+            cached = await session.get(MusicEnrichment, track_id)
+            if not cached:
+                from app.music_enrichment_api import identity, fingerprint
+                cached = MusicEnrichment(track_id=track_id, original=identity(item), fingerprint=fingerprint(item), result={})
+                session.add(cached)
+            cached.dismissed = True
+            cached.revision = (cached.revision or 0) + 1
+            cached.artwork_data = None
         await session.commit()
         return {"ok": True, "track": track_json(item)}
 
@@ -397,7 +410,17 @@ def build_router(settings, require_owner, public_origin):
         from app.services.music_lyrics import embedded_lyrics
         track = await find_track(session, track_id)
         response.headers["Cache-Control"] = "private, no-store"
-        return {"ok": True, "lyrics": await asyncio.to_thread(embedded_lyrics, root, track)}
+        record = await session.get(MusicEnrichment, track_id)
+        if record and record.owner_lyrics:
+            return {"ok": True, "lyrics": record.owner_lyrics}
+        embedded = await asyncio.to_thread(embedded_lyrics, root, track)
+        if embedded["text"]:
+            return {"ok": True, "lyrics": embedded}
+        from app.music_enrichment_api import enrich_saved_track
+        result = await enrich_saved_track(session, track_id)
+        value = dict(result["enrichment"].get("lyrics") or embedded)
+        value.setdefault("status", result["enrichment"].get("lookup_status") or result["enrichment"].get("status", "not_found"))
+        return {"ok": True, "lyrics": value, "track": result["track"]}
 
     @router.get("/api/mini/music/tracks/{track_id}/artwork")
     async def artwork(track_id: int, user=Depends(require_owner), session=Depends(get_session)):
@@ -405,7 +428,11 @@ def build_router(settings, require_owner, public_origin):
         track = await find_track(session, track_id)
         path = await asyncio.to_thread(artwork_thumbnail, root, track)
         if path is None:
-            raise HTTPException(404, "В файле нет обложки")
+            cached = await session.get(MusicEnrichment, track_id)
+            if cached and not cached.dismissed and cached.artwork_data:
+                return Response(cached.artwork_data, media_type="image/jpeg", headers={"Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
+            raise HTTPException(404, "Обложка пока не найдена")
         return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
 
@@ -609,4 +636,6 @@ def build_router(settings, require_owner, public_origin):
     install_transfer_routes(router, settings, require_owner, control, ControlBody)
     from app.music_remote_control import install_remote_control_routes
     install_remote_control_routes(router, require_owner)
+    from app.music_enrichment_api import build_router as enrichment_router
+    router.include_router(enrichment_router(require_owner))
     return router

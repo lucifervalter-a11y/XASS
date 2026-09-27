@@ -106,6 +106,12 @@ extension NativeStore {
         devices = NativeFixture.deviceData.compactMap(NativeDevice.init)
         outputs = [["id": "default", "name": "По умолчанию"], ["id": "fixture-speakers", "name": "Динамики (Realtek Audio)"]].compactMap(PlayerOutput.init)
         authorized = true; currentID = 1; duration = 224; position = 84; playbackState = "paused"
+        if ProcessInfo.processInfo.arguments.contains("--native-ui-diagnostics-filled") {
+            NativeDiagnostics.shared.setEnabled(true)
+            for _ in 0..<200 {
+                NativeDiagnostics.shared.record(operation: .musicSession, step: .completed, target: .server, httpStatus: 200)
+            }
+        }
     }
 }
 #endif

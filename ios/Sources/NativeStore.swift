@@ -32,6 +32,8 @@ import UIKit
     @Published var outputID = "default"
     @Published var playbackState = "stopped"
     @Published var position: Double = 0
+    @Published private(set) var playbackSampleAt = Date.distantPast
+    @Published private(set) var playbackProjectionLimit: TimeInterval = 0
     @Published var duration: Double = 0
     @Published var volume: Double = 70
     @Published var shareSite = false
@@ -79,6 +81,8 @@ import UIKit
     private let imageCache = NSCache<NSNumber, UIImage>()
     private var missingArtwork = Set<Int>()
     @Published private(set) var artworkBytes = 0
+    @Published private(set) var artworkRevision = 0
+    @Published private(set) var lyricsRevision = 0
     private var maxUpload = 256 * 1024 * 1024
     private var lastAudioDiagnosticFailed = false
 
@@ -348,6 +352,8 @@ import UIKit
         if !shareSaving { shareSite = value["share_site"] as? Bool ?? shareSite }
         if !queueSaving, let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }; if baseQueue.isEmpty { baseQueue = queue } }
         if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { repeatMode = mode }
+        playbackSampleAt = Date()
+        playbackProjectionLimit = NativeLyricsClock.projectionLimit(serverTime: value["server_time"] as? String, updatedAt: value["updated_at"] as? String)
     }
     private func audioEvent(_ value: [String: Any]) {
         if value["action"] != nil { objectWillChange.send(); return }
@@ -367,6 +373,9 @@ import UIKit
         lastAudioDiagnosticFailed = audioFailed
         playbackState = nextState
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
+        playbackSampleAt = Date()
+        playbackProjectionLimit = NativeLyricsClock.maximumProjection
+        if let gain = value["playback_gain"] as? Double, gain.isFinite { volume = min(100, max(0, gain)) }
         if let message = value["error"] as? String { error = message }
     }
     func ticket(_ trackID: Int, purpose: String = "listen") async throws -> String {
@@ -385,6 +394,25 @@ import UIKit
             imageCache.setObject(image, forKey: NSNumber(value: id), cost: data.count); return image
         } catch { return nil }
     }
+    func applyEnrichedTrack(_ response: [String: Any]) {
+        guard let value = response["track"] as? [String: Any], let track = LibraryTrack(value) else { return }
+        knownTracks[track.id] = track
+        for index in tracks.indices where tracks[index].id == track.id { tracks[index] = track }
+        for index in queue.indices where queue[index].id == track.id { queue[index] = track }
+        for index in baseQueue.indices where baseQueue[index].id == track.id { baseQueue[index] = track }
+        imageCache.removeObject(forKey: NSNumber(value: track.id)); missingArtwork.remove(track.id)
+        artworkRevision += 1
+    }
+    func enrichTrack(_ id: Int, refresh: Bool = false) async throws -> [String: Any] {
+        let response = try await api.request("/api/mini/music/tracks/\(id)/enrichment", method: "POST", body: ["refresh": refresh])
+        try Task.checkCancellation()
+        applyEnrichedTrack(response)
+        invalidateLyrics()
+        return response
+    }
+    // Only successful owner mutations call this. Applying a GET response must
+    // not invalidate its own lyrics request and create a reload loop.
+    func invalidateLyrics() { lyricsRevision &+= 1 }
     func clearArtworkCache() { imageCache.removeAllObjects(); missingArtwork.removeAll(); artworkBytes = 0; notice = "Кэш обложек очищен. Скачанная музыка не затронута." }
     func playOffline(_ track: DownloadedTrack) {
         var seen = Set<Int>()
@@ -424,6 +452,7 @@ import UIKit
         guard generation == nextGeneration, !transferCancelled else { throw CancellationError() }
         var claim = snapshot(state: "loading", position: startPosition)
         claim["track_id"] = track.id; claim["device"] = "local"; claim["takeover"] = true
+        claim["volume"] = 100 // Local system volume stays entirely under iOS control.
         claim["queue"] = Array(queue.prefix(2000)).map(\.id); claim["repeat_mode"] = repeatMode
         let response: [String: Any]
         suppressReports = true; pendingReport = nil
@@ -443,7 +472,7 @@ import UIKit
         offlinePlayback = false; selectedDevice = "local"; currentID = track.id
         canonicalSessionKey = sessionKey; canonicalClientID = clientID; canonicalDevice = "local"; ownsSession = true; position = startPosition
         audio.handle(try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist,
-            "url": url, "position": startPosition, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: track.id), "repeat": repeatMode]))
+            "url": url, "position": startPosition, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: track.id), "repeat": repeatMode]))
         showPlayer = true
     }
     func playAll(_ rows: [LibraryTrack], shuffled: Bool) async throws {
@@ -472,7 +501,7 @@ import UIKit
             ownsSession = false; pendingReport = nil
         }
         var body: [String: Any] = ["session_key": sessionKey, "client_id": clientID, "device": device,
-            "output_id": output ?? (device == selectedDevice ? outputID : "default"), "track_id": chosenID, "volume": Int(volume), "autoplay": true,
+            "output_id": output ?? (device == selectedDevice ? outputID : "default"), "track_id": chosenID, "volume": device == "local" ? 100 : Int(volume), "autoplay": true,
             "queue": Array(queue.prefix(2000)).map(\.id), "repeat_mode": repeatMode]
         if let start = startPosition { body["position"] = start }
         else if ownedSource { body["position"] = actualPosition }
@@ -577,7 +606,7 @@ import UIKit
             }
             ownsSession = true
             audio.handle(try NativeAudioCommand(["action": "play", "trackId": chosenID, "title": track.title, "artist": track.artist,
-                "url": url, "position": position, "volume": volume, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: chosenID), "repeat": repeatMode]))
+                "url": url, "position": position, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: chosenID), "repeat": repeatMode]))
             activeTransferID = nil
         } else {
             ownsSession = false
@@ -632,14 +661,21 @@ import UIKit
         if selectedDevice == "local" {
             if !ownsSession && !offlinePlayback { try await transfer(to: "local", startPosition: value) }
             else { audio.seek(value) }
-        } else { _ = try await control("seek", extra: ["position_sec": value]); position = value }
+        } else { _ = try await control("seek", extra: ["position_sec": value]); position = value; playbackSampleAt = Date(); playbackProjectionLimit = NativeLyricsClock.maximumProjection }
     }
     func setVolume(_ value: Double) async throws {
-        if otherLocal { try await remoteControl("volume", extra: ["volume": Int(value)]); return }
+        guard value.isFinite else { throw XASSErr.invalidCommand }
         let bounded = min(100, max(0, value))
+        if otherLocal { try await remoteControl("volume", extra: ["volume": Int(bounded)]); return }
+        // For another iPhone this command changes XASS gain, never hardware
+        // volume. Local UI uses MPVolumeView, except the explicit gain reset.
         if selectedDevice == "local" { volume = bounded; audio.handle(try NativeAudioCommand(["action": "volume", "volume": bounded])) }
         else { _ = try await control("volume", extra: ["volume": Int(bounded)]) }
         volume = bounded
+    }
+    func resetLocalPlaybackGain() {
+        guard selectedDevice == "local", !otherLocal else { return }
+        audio.resetPlaybackGain(); volume = audio.playbackGain
     }
     func step(_ direction: Int) async throws {
         if otherLocal { try await remoteControl(direction < 0 ? "previous" : "next"); return }

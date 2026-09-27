@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,9 +106,13 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_lyrics_empty_state_is_private_and_deleted_tracks_are_unavailable(self):
         track = await self.upload()
         path = f"/api/mini/music/tracks/{track['id']}/lyrics"
-        response = await self.request("GET", path)
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value={"status": "not_found"})):
+            response = await self.request("GET", path)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"ok": True, "lyrics": {"text": "", "lines": [], "source": "none", "synced": False}})
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(response.json()["lyrics"]["text"], "")
+        self.assertEqual(response.json()["lyrics"]["lines"], [])
+        self.assertFalse(response.json()["lyrics"]["synced"])
         self.assertEqual(response.headers["cache-control"], "private, no-store")
         await self.request("DELETE", f"/api/mini/music/tracks/{track['id']}")
         self.assertEqual((await self.request("GET", path)).status_code, 404)

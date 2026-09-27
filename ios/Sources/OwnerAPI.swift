@@ -271,6 +271,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         if route == "/api/mini/music/library" { return .musicLibrary }
         if route.hasPrefix("/api/mini/music/tracks/") && route.hasSuffix("/ticket") { return .musicTicket }
         if route.hasSuffix("/lyrics") { return .musicLyrics }
+        if route.contains("/enrichment") { return .musicEnrichment }
         if route.hasSuffix("/files/upload") { return .upload }
         if route.hasPrefix("/api/native/") { return .authentication }
         if route == "/api/mini/bootstrap" { return .bootstrap }

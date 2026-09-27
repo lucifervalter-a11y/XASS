@@ -113,6 +113,8 @@ struct NativePlaybackQueue {
     @Published private(set) var position: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var trackID = 0
+    /// Application gain only. The visible MPVolumeView owns system volume.
+    @Published private(set) var playbackGain: Double = 100
     @Published private(set) var downloads: [DownloadedTrack] = []
     @Published private(set) var downloadIDs: Set<Int> = []
     @Published var error: String?
@@ -125,7 +127,7 @@ struct NativePlaybackQueue {
     var reportSession: (([String: Any]) -> Void)?
     var requestTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
     var canResumePlayback: () -> Bool = { true }
-    private let player = AVPlayer()
+    private let player: AVPlayer
     private var loader: SecureMediaLoader?
     private var origin: ServerOrigin?
     private var library: OfflineLibrary?
@@ -147,7 +149,9 @@ struct NativePlaybackQueue {
     private var cacheDownloadID: Int?
     private var recordedPlay = false
 
-    init() {
+    init(player: AVPlayer = AVPlayer()) {
+        self.player = player
+        player.volume = 1
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
             Task { @MainActor in self?.updateTime() }
         }
@@ -219,7 +223,7 @@ struct NativePlaybackQueue {
             case "resume": resume()
             case "stop": stop()
             case "seek": seek(command.position)
-            case "volume": player.volume = Float(command.volume / 100); publish()
+            case "volume": setPlaybackGain(command.volume); publish(forceReport: true)
             case "download": try download(command)
             case "downloads": emit?(["action": "downloads", "downloads": downloads.map(\.bridge)])
             case "route": showRoutes = true
@@ -239,7 +243,7 @@ struct NativePlaybackQueue {
         try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
         try AVAudioSession.sharedInstance().setActive(true)
     }
-    private func play(_ command: NativeAudioCommand) throws {
+    private func play(_ command: NativeAudioCommand, preservingGain: Bool = false) throws {
         guard let origin = origin else { throw XASSErr.invalidOrigin }
         let item: AVPlayerItem
         let nextLoader: SecureMediaLoader?
@@ -257,7 +261,10 @@ struct NativePlaybackQueue {
         player.pause(); player.replaceCurrentItem(with: nil); loader?.invalidate(); loader = nextLoader
         state = "loading"; title = command.title; artist = command.artist; trackID = command.trackID; recordedPlay = false
         position = command.position; duration = 0; error = nil
-        player.volume = Float(command.volume / 100)
+        // A fresh local play/handoff never inherits a stale zero/70% server
+        // gain behind the system slider. Queue advance preserves an explicit
+        // remote attenuation until the user resets it.
+        setPlaybackGain(preservingGain ? playbackGain : 100)
         itemObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self = self, item === self.player.currentItem else { return }
@@ -305,6 +312,28 @@ struct NativePlaybackQueue {
         return current.isFinite ? max(0, current) : position
     }
     var hasPlayableItem: Bool { player.currentItem != nil }
+    /// Local-only analysis may read an already downloaded, app-owned audio
+    /// file. Never resolves a ticket, URL, arbitrary path, or library ID alone.
+    func analysisFile(_ id: Int) -> URL? {
+        guard id > 0 else { return nil }
+        let candidates: [URL] = [
+            library.flatMap { library in downloads.first(where: { $0.id == id }).map { library.file(for: $0) } },
+            automaticCache.flatMap { cache in cachedTracks.first(where: { $0.id == id }).map { cache.file(id, suffix: $0.track.fileExtension ?? "audio") } }
+        ].compactMap { $0 }
+        return candidates.first { file in
+            guard file.isFileURL,
+                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { return false }
+            return true
+        }
+    }
+    func resetPlaybackGain() { setPlaybackGain(100); publish(forceReport: true) }
+    private func setPlaybackGain(_ value: Double) {
+        guard value.isFinite else { return }
+        let bounded = min(100, max(0, value))
+        player.volume = Float(bounded / 100)
+        playbackGain = bounded
+    }
     func seekConfirmed(_ seconds: Double) async {
         guard seconds.isFinite, seconds >= 0, player.currentItem != nil else { return }
         let request = UUID(); transition = request; awaitingTrack = false
@@ -324,7 +353,7 @@ struct NativePlaybackQueue {
     private func publish(forceReport: Bool = false) {
         MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled = queue?.next(currentID: trackID, direction: 1, automatic: false) != nil
         MPRemoteCommandCenter.shared().previousTrackCommand.isEnabled = player.currentItem != nil
-        var event: [String: Any] = ["state": state, "position": position, "duration": duration, "trackId": trackID, "native": true]
+        var event: [String: Any] = ["state": state, "position": position, "duration": duration, "trackId": trackID, "native": true, "playback_gain": playbackGain]
         if let error = error { event["error"] = error }
         emit?(event)
         if player.currentItem != nil {
@@ -333,7 +362,7 @@ struct NativePlaybackQueue {
                 MPNowPlayingInfoPropertyPlaybackRate: state == "playing" ? 1.0 : 0.0]
         }
         if var snapshot = sessionSnapshot, forceReport || Date().timeIntervalSince(lastReport) >= 5 {
-            snapshot["state"] = state; snapshot["position"] = position; snapshot["track_id"] = trackID
+            snapshot["state"] = state; snapshot["position"] = position; snapshot["track_id"] = trackID; snapshot["volume"] = playbackGain
             lastReport = Date(); reportSession?(snapshot)
         }
     }
@@ -347,8 +376,8 @@ struct NativePlaybackQueue {
         let start: (String) -> Void = { [weak self] url in
             guard let self = self, self.transition == generation else { return }
             do {
-                let command = try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist, "url": url, "volume": Double(self.player.volume) * 100])
-                try self.play(command)
+                let command = try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist, "url": url])
+                try self.play(command, preservingGain: true)
             } catch { self.state = "error"; self.error = "Не удалось включить следующий трек. Проверьте сеть или сохраните очередь на iPhone."; self.publish(forceReport: true) }
         }
         if let library = library, let saved = downloads.first(where: { $0.id == track.id }), FileManager.default.fileExists(atPath: library.file(for: saved).path) { start(""); return }

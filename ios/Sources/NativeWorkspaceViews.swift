@@ -202,8 +202,9 @@ import SwiftUI
         List {
             privacySection
             exportSection
-            eventsSection
+            // Keep routine actions above the history and clear of the pinned mini-player.
             clearSection
+            eventsSection
         }.navigationTitle("Журнал приложения").navigationBarTitleDisplayMode(.inline)
             .toolbar { Button { snapshot = recorder.snapshot() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Обновить журнал") }
             .confirmationDialog("Очистить технический журнал?", isPresented: $confirmClear, titleVisibility: .visible) {

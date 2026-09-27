@@ -21,7 +21,7 @@ enum XASSStyle {
             else { Image(systemName: "music.note").font(.system(size: large ? 64 : 24, weight: .medium)).foregroundStyle(XASSStyle.secondary) }
         }.aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: radius))
             .accessibilityHidden(true)
-            .task(id: trackID) {
+            .task(id: "\(trackID)-\(store.artworkRevision)") {
                 image = nil
                 let loaded = await store.artwork(trackID)
                 guard !Task.isCancelled else { return }
@@ -222,7 +222,6 @@ enum XASSStyle {
     @State private var showLyrics = false
     @State private var selectedTrack: LibraryTrack?
     @State private var scrubbing: Double?
-    @State private var volume: Double?
     var body: some View {
         GeometryReader { geometry in
             ScrollView {
@@ -241,7 +240,7 @@ enum XASSStyle {
                                 metadata(track)
                             }.frame(maxWidth: .infinity, alignment: .leading)
                             NativeLyricsContent(store: store, trackID: track.id)
-                                .frame(height: max(190, min(440, geometry.size.height - 500)))
+                                .frame(height: max(240, min(480, geometry.size.height - 430)))
                                 .transition(.opacity)
                         } else {
                             // Reserve native controls first; small screens and large type can scroll.
@@ -266,11 +265,7 @@ enum XASSStyle {
                             Button { store.run { try await store.step(1) } } label: { Image(systemName: "forward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Следующий трек")
                         }.padding(.horizontal, 32).foregroundStyle(.white).buttonStyle(MusicPressStyle()).disabled(store.busy)
                         if store.otherLocal { Text("Команды выполняются после ответа другого устройства. Для переноса выберите «Этот iPhone» ниже.").font(.caption).foregroundStyle(.secondary) }
-                        HStack(spacing: 14) {
-                            Image(systemName: "speaker.fill").font(.caption)
-                            Slider(value: Binding(get: { volume ?? store.volume }, set: { volume = $0 }), in: 0...100, onEditingChanged: { editing in if !editing, let value = volume { volume = nil; store.run { try await store.setVolume(value) } } }).tint(.white.opacity(0.7)).disabled(store.busy).accessibilityLabel("Громкость XASS")
-                            Image(systemName: "speaker.wave.2.fill").font(.caption)
-                        }.foregroundStyle(.white.opacity(0.55))
+                        NativePlayerVolumeSection(store: store)
                         HStack(alignment: .top) {
                             Button { showLyrics.toggle() } label: { Image(systemName: "quote.bubble").font(.title3).frame(width: 48, height: 44).background(showLyrics ? Color.white.opacity(0.17) : Color.clear, in: RoundedRectangle(cornerRadius: 12)) }.accessibilityLabel(showLyrics ? "Показать обложку" : "Текст песни").accessibilityIdentifier("nativePlayerLyrics")
                             Spacer()
@@ -349,6 +344,9 @@ enum XASSStyle {
             List {
                 Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
                 Button { perform { try await store.download(track) } } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }.disabled(store.audio.downloadIDs.contains(track.id)).accessibilityIdentifier("nativeDownload")
+                NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
+                    Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
+                }.accessibilityIdentifier("nativeTrackInformation")
                 if track.id == store.currentID {
                     Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
                         Label(store.shareSaving ? "Сохраняю…" : "Показывать на сайте", systemImage: "dot.radiowaves.left.and.right")

@@ -47,7 +47,7 @@ struct MusicArtworkPalette: Equatable {
             .overlay(Color.black.opacity(0.15))
             .ignoresSafeArea()
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.6), value: palette)
-            .task(id: trackID) {
+            .task(id: "\(trackID ?? 0)-\(store.artworkRevision)") {
                 guard let id = trackID else { palette = .neutral; return }
                 let image = await store.artwork(id)
                 guard !Task.isCancelled else { return }
