@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     media_root: str = "./data/media"
     music_root: str = "./data/music-library"
     music_max_upload_bytes: int = Field(default=128 * 1024 * 1024, gt=0, le=256 * 1024 * 1024)
+    music_max_archive_upload_bytes: int = Field(default=512 * 1024 * 1024, gt=0, le=1024 * 1024 * 1024)
     music_min_free_bytes: int = Field(default=512 * 1024 * 1024, ge=0)
     export_root: str = "./data/exports"
     profile_json_path: str = "./data/profile.json"

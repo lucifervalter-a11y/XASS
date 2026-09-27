@@ -43,6 +43,10 @@ import UIKit
     @Published var repeatMode = "off"
     @Published var uploadName: String?
     @Published var uploadProgress: Double = 0
+    @Published private(set) var musicImport: NativeMusicImportProgress?
+    @Published private(set) var musicImportResults: [NativeMusicImportResult] = []
+    private var musicImportTask: Task<Void, Never>?
+    private var standaloneUpload = false
     @Published private(set) var libraryHasMore = false
     @Published private(set) var libraryLoadingMore = false
     @Published private(set) var transferStatus: String?
@@ -84,6 +88,10 @@ import UIKit
     @Published private(set) var artworkRevision = 0
     @Published private(set) var lyricsRevision = 0
     private var maxUpload = 256 * 1024 * 1024
+    private var maxArchiveUpload = 256 * 1024 * 1024
+    var musicImportFileLimit: Int { maxUpload }
+    var musicImportArchiveLimit: Int { maxArchiveUpload }
+    var isMusicImporting: Bool { musicImport != nil || standaloneUpload }
     private var lastAudioDiagnosticFailed = false
 
     init(api: OwnerService, audio: AudioController) {
@@ -163,7 +171,9 @@ import UIKit
         let unique = incoming.filter { seen.insert($0.id).inserted }
         tracks = append ? tracks + unique : unique
         if let lists = page["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
-        maxUpload = page["max_upload_bytes"] as? Int ?? maxUpload
+        if let limit = NativeMusicImportPolicy.integer(page["max_upload_bytes"]), limit > 0, limit <= 256 * 1024 * 1024 { maxUpload = limit }
+        if let limit = NativeMusicImportPolicy.integer(page["max_archive_upload_bytes"]), limit > 0, limit <= NativeMusicImportPolicy.maximumArchiveBytes { maxArchiveUpload = limit }
+        else { maxArchiveUpload = maxUpload }
         libraryHasMore = page["has_more"] as? Bool == true
         libraryNextOffset = page["next_offset"] as? Int
     }
@@ -297,6 +307,7 @@ import UIKit
         }
     }
     func disconnect() {
+        cancelMusicImport()
         generation = UUID(); libraryRequest = UUID(); loading = false; foreground(false); ownsSession = false; pendingReport = nil; suppressReports = true
         reportTask?.cancel(); reportTask = nil; audio.disconnect(); imageCache.removeAllObjects()
         (api as? OwnerAPI)?.invalidate()
@@ -907,33 +918,150 @@ import UIKit
         let url = audio.cachedTracks.contains(where: { $0.id == track.id }) ? "" : try await ticket(track.id, purpose: "download")
         audio.handle(try NativeAudioCommand(["action": "download", "trackId": track.id, "url": url, "title": track.title, "artist": track.artist]))
     }
-    func upload(_ url: URL) async throws {
-        guard uploadName == nil else { return }
-        let scoped = url.startAccessingSecurityScopedResource(); defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        guard size > 0, size <= maxUpload else { throw OwnerAPIError(status: 413, message: "Аудиофайл пустой или больше лимита сервера.") }
-        uploadName = url.lastPathComponent; uploadProgress = 0; defer { uploadName = nil }
-        let started = try await api.request("/api/mini/music/uploads", method: "POST", body: ["filename": url.lastPathComponent, "size": size])
-        guard let id = started["upload_id"] as? String else { throw OwnerAPIError.invalidResponse }
-        let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
-        var offset = started["offset"] as? Int ?? 0
-        do {
-            while offset < size {
-                try Task.checkCancellation(); try handle.seek(toOffset: UInt64(offset))
-                let data = try handle.read(upToCount: min(512 * 1024, size - offset)) ?? Data()
-                guard !data.isEmpty else { throw OwnerAPIError.invalidResponse }
-                let result = try await api.request("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id), method: "PUT", body: ["offset": offset, "data": data.base64EncodedString()])
-                guard let next = result["offset"] as? Int, next > offset, next <= size else { throw OwnerAPIError.invalidResponse }
-                offset = next; uploadProgress = Double(offset) / Double(size)
+    func importMusicFiles(_ urls: [URL]) {
+        guard !isMusicImporting else { return }
+        guard !urls.isEmpty, urls.count <= NativeMusicImportPolicy.maximumSelection else {
+            error = "Выберите от 1 до \(NativeMusicImportPolicy.maximumSelection) файлов за один импорт."; return
+        }
+        var seen = Set<URL>()
+        let files = urls.filter { seen.insert($0.standardizedFileURL).inserted }
+        let selection = NativeMusicImportSelection(files)
+        NativeDiagnostics.shared.record(operation: .upload, step: .requested, target: .localPlayer)
+        musicImportResults = []; notice = nil; error = nil
+        musicImport = NativeMusicImportProgress(fileName: files[0].lastPathComponent, index: 1, total: files.count, completed: 0, failed: 0, phase: .preparing, fraction: 0)
+        musicImportTask = Task { [weak self] in
+            guard let self = self else { selection.close(); return }
+            defer { selection.close(); self.musicImport = nil; self.musicImportTask = nil; self.uploadName = nil }
+            for (index, url) in files.enumerated() {
+                if Task.isCancelled {
+                    self.appendUnattempted(Array(files.dropFirst(index)), message: "Не отправлен: импорт остановлен."); break
+                }
+                self.updateMusicImport(url.lastPathComponent, index: index + 1, total: files.count, phase: .preparing, fraction: 0)
+                do {
+                    let summary = try await self.uploadOne(url)
+                    self.musicImportResults.append(NativeMusicImportResult(fileName: url.lastPathComponent, outcome: .imported, message: summary))
+                } catch {
+                    let pending = error is NativeMusicImportPending
+                    let cancelled = error is CancellationError
+                    let message = pending ? error.localizedDescription : NativeMusicImportPolicy.message(error)
+                    self.musicImportResults.append(NativeMusicImportResult(fileName: url.lastPathComponent, outcome: pending ? .processing : cancelled ? .cancelled : .failed, message: message))
+                    NativeDiagnostics.shared.record(operation: .upload, step: cancelled ? .cancelled : pending ? .waiting : .failed,
+                        error: cancelled ? .cancelled : error is URLError ? .network : .unknown)
+                    if !cancelled { self.error = message }
+                    if let apiError = error as? OwnerAPIError, apiError.status == 401 { self.authorized = false; self.showLogin = true }
+                    if pending || NativeMusicImportPolicy.abortsBatch(error) {
+                        self.appendUnattempted(Array(files.dropFirst(index + 1)), message: "Не отправлен: сначала проверьте связь или состояние предыдущей загрузки."); break
+                    }
+                }
             }
-            let result = try await api.request("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id) + "/finish", method: "POST", body: nil)
-            if let value = result["track"] as? [String: Any], let track = LibraryTrack(value) { tracks.removeAll { $0.id == track.id }; tracks.insert(track, at: 0) }
-            if let values = result["tracks"] as? [[String: Any]] { let imported = values.compactMap(LibraryTrack.init); let ids = Set(imported.map(\.id)); tracks.removeAll { ids.contains($0.id) }; tracks.insert(contentsOf: imported, at: 0) }
-            notice = result["archive"] as? Bool == true ? "Архив обработан. Добавлено: \(result["added"] as? Int ?? 0), дубликатов: \(result["duplicates"] as? Int ?? 0), пропущено: \(result["skipped"] as? Int ?? 0)." : "Трек добавлен в библиотеку"
+            let completed = self.musicImportResults.filter { $0.outcome == .imported }.count
+            let failed = self.musicImportResults.filter { $0.outcome == .failed }.count
+            let remaining = self.musicImportResults.count - completed - failed
+            self.notice = "Импорт: обработано \(completed), ошибок \(failed), не завершено \(remaining). Уже добавленная музыка сохранена."
+        }
+    }
+    func cancelMusicImport() { musicImportTask?.cancel() }
+    private func appendUnattempted(_ urls: [URL], message: String) {
+        musicImportResults += urls.map { NativeMusicImportResult(fileName: $0.lastPathComponent, outcome: .notAttempted, message: message) }
+    }
+    private func updateMusicImport(_ name: String, index: Int? = nil, total: Int? = nil, phase: NativeMusicImportPhase, fraction: Double) {
+        guard let current = musicImport else { return }
+        musicImport = NativeMusicImportProgress(fileName: name, index: index ?? current.index, total: total ?? current.total,
+            completed: musicImportResults.filter { $0.outcome == .imported }.count,
+            failed: musicImportResults.filter { $0.outcome == .failed }.count, phase: phase, fraction: min(1, max(0, fraction)))
+    }
+    func upload(_ url: URL) async throws {
+        guard !isMusicImporting else { throw OwnerAPIError(status: 409, message: "Дождитесь текущего импорта или отмените его.") }
+        standaloneUpload = true; defer { standaloneUpload = false }
+        notice = try await uploadOne(url)
+    }
+    private func uploadOne(_ url: URL) async throws -> String {
+        uploadName = url.lastPathComponent; uploadProgress = 0; defer { uploadName = nil }
+        NativeDiagnostics.shared.record(operation: .upload, step: .started, target: .localPlayer)
+        let file = try await NativeMusicImportFile.stage(url, fileLimit: maxUpload, archiveLimit: maxArchiveUpload)
+        var uploadPath: String?
+        var finishing = false
+        do {
+            try Task.checkCancellation()
+            NativeDiagnostics.shared.record(operation: .upload, step: .acknowledged, target: .localPlayer, byteCount: file.size)
+            let started = try await api.request("/api/mini/music/uploads", method: "POST", body: ["filename": file.name, "size": file.size])
+            guard let id = started["upload_id"] as? String, id.range(of: #"^[A-Za-z0-9_-]{1,128}$"#, options: .regularExpression) != nil else { throw OwnerAPIError.invalidResponse }
+            let path = "/api/mini/music/uploads/" + OwnerAPI.pathComponent(id); uploadPath = path
+            guard var offset = NativeMusicImportPolicy.integer(started["offset"]), offset <= file.size else { throw OwnerAPIError.invalidResponse }
+            let chunk: Int
+            if let raw = started["chunk_bytes"] {
+                guard let value = NativeMusicImportPolicy.integer(raw) else { throw OwnerAPIError.invalidResponse }
+                chunk = value
+            } else { chunk = NativeMusicImportPolicy.chunkBytes }
+            guard chunk > 0, chunk <= NativeMusicImportPolicy.chunkBytes else { throw OwnerAPIError.invalidResponse }
+            while offset < file.size {
+                try Task.checkCancellation()
+                updateMusicImport(file.name, phase: .uploading, fraction: Double(offset) / Double(file.size))
+                let data = try await file.read(offset: offset, count: min(chunk, file.size - offset))
+                let reply = try await api.request(path, method: "PUT", body: ["offset": offset, "data": data.base64EncodedString()])
+                guard let next = NativeMusicImportPolicy.integer(reply["offset"]), next == offset + data.count else { throw OwnerAPIError.invalidResponse }
+                offset = next; uploadProgress = Double(offset) / Double(file.size)
+                updateMusicImport(file.name, phase: .uploading, fraction: uploadProgress)
+            }
+            try Task.checkCancellation()
+            finishing = true; updateMusicImport(file.name, phase: .finishing, fraction: 1)
+            let result = try await finishMusicUpload(path, archive: file.isArchive)
+            let message = try applyMusicImportReceipt(result)
+            await file.close()
+            NativeDiagnostics.shared.record(operation: .upload, step: .completed, byteCount: file.size)
+            return message
         } catch {
-            await cancelServerOperation("/api/mini/music/uploads/" + OwnerAPI.pathComponent(id), method: "DELETE")
+            await file.close()
+            if error is NativeMusicImportPending { throw error }
+            if let path = uploadPath {
+                if finishing {
+                    // A timed-out/cancelled mutation may already have committed. Never erase a live ZIP worker.
+                    let check = Task { try await api.request(path, method: "GET", body: nil) }
+                    let status = try? await check.value
+                    if let status = status, status["status"] as? String == "completed" { return try applyMusicImportReceipt(status) }
+                    if let state = status?["status"] as? String, ["uploading", "ready_to_finish", "failed"].contains(state) {
+                        await cancelServerOperation(path, method: "DELETE")
+                    } else {
+                        throw NativeMusicImportPending()
+                    }
+                } else { await cancelServerOperation(path, method: "DELETE") }
+            }
             throw error
         }
+    }
+    private func finishMusicUpload(_ path: String, archive: Bool) async throws -> [String: Any] {
+        var response = try await api.request(path + "/finish", method: "POST", body: archive ? ["async": true] : nil)
+        let deadline = Date().addingTimeInterval(600)
+        if response["status"] as? String == "processing" { NativeDiagnostics.shared.record(operation: .upload, step: .waiting) }
+        while response["status"] as? String == "processing" || response["status"] as? String == "ready_to_finish" {
+            if Task.isCancelled { throw NativeMusicImportPending() }
+            guard Date() < deadline else { throw NativeMusicImportPending() }
+            do {
+                try await Task.sleep(for: .seconds(min(5, max(1, NativeMusicImportPolicy.integer(response["retry_after"]) ?? 2))))
+                response = try await api.request(path, method: "GET", body: nil)
+            } catch { throw NativeMusicImportPending() }
+            if response["status"] as? String == "ready_to_finish" { response = try await api.request(path + "/finish", method: "POST", body: ["async": true]) }
+        }
+        if response["status"] as? String == "failed" {
+            throw OwnerAPIError(status: 422, message: "Сервер не смог обработать файл. Проверьте ZIP и повторите импорт.")
+        }
+        return response
+    }
+    private func applyMusicImportReceipt(_ result: [String: Any]) throws -> String {
+        let archive = result["archive"] as? Bool == true
+        var imported: [LibraryTrack] = []
+        if let value = result["track"] as? [String: Any], let track = LibraryTrack(value) { imported = [track] }
+        else if archive, let values = result["tracks"] as? [[String: Any]] {
+            imported = values.compactMap(LibraryTrack.init)
+            guard imported.count == values.count else { throw OwnerAPIError.invalidResponse }
+        } else { throw OwnerAPIError.invalidResponse }
+        let ids = Set(imported.map(\.id)); tracks.removeAll { ids.contains($0.id) }; tracks.insert(contentsOf: imported, at: 0); remember(imported)
+        guard archive else { return "Трек добавлен в библиотеку" }
+        let failures = result["errors"] as? [String] ?? []
+        let detail = failures.first.map { " " + String($0.replacingOccurrences(of: "\n", with: " ").prefix(160)) } ?? ""
+        let summary = "Добавлено: \(NativeMusicImportPolicy.integer(result["added"]) ?? 0), дубликатов: \(NativeMusicImportPolicy.integer(result["duplicates"]) ?? 0), восстановлено: \(NativeMusicImportPolicy.integer(result["restored"]) ?? 0), пропущено: \(NativeMusicImportPolicy.integer(result["skipped"]) ?? 0), ошибок: \(failures.count)." + detail
+        guard !imported.isEmpty else { throw OwnerAPIError(status: 422, message: "В архиве нет успешно обработанных аудиофайлов. " + summary) }
+        return (failures.isEmpty ? "Архив обработан. " : "Архив обработан частично. ") + summary
     }
     func enroll(pairInput: String) async throws {
         guard !busy else { return }; busy = true; confirmationActivity?(true)

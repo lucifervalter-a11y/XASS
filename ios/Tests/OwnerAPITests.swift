@@ -16,6 +16,16 @@ private final class OwnerHTTPFixture: URLProtocol {
 }
 
 final class OwnerAPITests: XCTestCase {
+    func testCatalogBudgetDoesNotChangeControlOrUploadDeadlines() {
+        XCTAssertEqual(OwnerAPI.jsonRequestTimeout(path: "/api/mini/music/tracks/1/enrichment", method: "POST"), 25)
+        XCTAssertEqual(OwnerAPI.jsonRequestTimeout(path: "/api/mini/music/tracks/1/enrichment/confirm", method: "POST"), 25)
+        XCTAssertEqual(OwnerAPI.jsonRequestTimeout(path: "/api/mini/music/tracks/1/lyrics", method: "GET"), 25)
+        for path in ["/api/mini/music/session", "/api/mini/music/transfers", "/api/mini/music/uploads/fixture/finish",
+                     "/api/mini/music/tracks/1/enrichment/restore", "/api/mini/music/tracks/1/enrichment\n"] {
+            XCTAssertEqual(OwnerAPI.jsonRequestTimeout(path: path, method: "POST"), 12)
+        }
+        XCTAssertEqual(OwnerAPI.jsonRequestTimeout(path: "/api/mini/music/tracks/1/enrichment", method: "GET"), 12)
+    }
     func testLegacyFailedTransferIsAReceiptNotAnUnsupportedResponse() throws {
         let id = String(repeating: "a", count: 32)
         let receipt: [String: Any] = ["ok": false, "transfer_id": id, "status": "failed",

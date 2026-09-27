@@ -28,7 +28,7 @@ import httpx
 from sqlalchemy import select
 
 from app.music_models import MusicTrack
-from app.services.music_library import FORMATS, content_lock, display_title, filename, inspect_audio, track_path
+from app.services.music_library import FORMATS, archive_upload_limit, content_lock, display_title, filename, inspect_audio, track_path
 from app.services.music_storage import lock_content, lock_track
 
 logger = logging.getLogger(__name__)
@@ -310,11 +310,12 @@ async def ingest_path(settings, session_factory, source: Path, original_name: st
         _no_link(part)
     if not source.resolve().is_relative_to(root) or not source.is_file():
         raise IngestError("Исходный файл должен находиться в приватном каталоге музыки")
-    if not 0 < source.stat().st_size <= settings.music_max_upload_bytes:
-        raise IngestError("Исходный файл превышает допустимый размер")
     extension = Path(original_name).suffix.lower()
     if extension not in FORMATS and extension != ".zip":
         raise IngestError("Поддерживаются MP3, WAV, FLAC, OGG, M4A и ZIP с музыкой")
+    maximum = archive_upload_limit(settings) if extension == ".zip" else settings.music_max_upload_bytes
+    if not 0 < source.stat().st_size <= maximum:
+        raise IngestError("Исходный файл превышает допустимый размер")
     staging = _private_dir(root / ".telegram-ingest")
     with tempfile.TemporaryDirectory(prefix="incoming-", dir=staging) as working:
         directory = Path(working)

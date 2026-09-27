@@ -6,6 +6,7 @@ enum NativeDiagnosticOperation: String, Codable, CaseIterable {
     case musicLibrary = "music_library", musicSession = "music_session", musicPlayers = "music_players"
     case musicControl = "music_control", musicTransfer = "music_transfer", musicTicket = "music_ticket"
     case musicLyrics = "music_lyrics", musicEnrichment = "music_enrichment", audioPlayback = "audio_playback"
+    case musicFileSelection = "music_file_selection"
     case artwork, download, upload, bootstrap, authentication
     case agentCommand = "agent_command", workspace, other
 
@@ -23,6 +24,7 @@ enum NativeDiagnosticOperation: String, Codable, CaseIterable {
         case .artwork: return "Обложка"
         case .download: return "Загрузка на iPhone"
         case .upload: return "Отправка файла"
+        case .musicFileSelection: return "Выбор музыки в Файлах"
         case .bootstrap: return "Загрузка приложения"
         case .authentication: return "Авторизация"
         case .agentCommand: return "Команда ПК"

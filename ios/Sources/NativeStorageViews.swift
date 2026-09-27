@@ -28,14 +28,14 @@ import UniformTypeIdentifiers
                 if store.tracks.isEmpty { Text("Добавьте треки в библиотеку, чтобы выбрать место хранения.").foregroundStyle(.secondary) }
             } header: { Text(source.map { "Управление копиями · " + $0 } ?? "Управление копиями") } footer: { Text("Выберите трек, чтобы проверить копии или сохранить его на ПК. Оригинал удаляется с сервера только после проверки и вашего подтверждения.") }
             Section("Импорт") {
-                Button { importFiles = true } label: { Label("Из файлов или ZIP", systemImage: "doc") }.disabled(store.uploadName != nil)
+                Button { importFiles = true } label: { Label(store.isMusicImporting ? "Ход импорта" : "Из файлов или ZIP", systemImage: "doc") }.disabled(!store.authorized)
                 if source != nil { Button { folderImport = true } label: { Label("Импортировать папку ПК", systemImage: "folder") } }
                 Button { info = "Откройте своего бота XASS и отправьте аудиофайлы или ZIP. Бот добавит поддерживаемые треки в вашу библиотеку; после завершения обновите список на iPhone." } label: { Label("Из Telegram", systemImage: "paperplane") }
                 Button { info = "Доступ VK Музыки не настроен. XASS не выдаёт обычный вход VK за доступ к полным аудиозаписям. Вы можете импортировать принадлежащие вам аудиофайлы или ZIP." } label: { HStack { Text("VK Музыка"); Spacer(); Text("Доступ не настроен").font(.caption).foregroundStyle(.secondary) } }
             }
             NativeMessage(store: store)
         }.navigationTitle("Хранение")
-            .fileImporter(isPresented: $importFiles, allowedContentTypes: [.audio, .zip], allowsMultipleSelection: true) { result in switch result { case .success(let urls): store.run { for url in urls { try await store.upload(url) } }; case .failure(let error): store.handle(error) } }
+            .sheet(isPresented: $importFiles) { NativeMusicImportView(store: store) }
             .alert("Импорт музыки", isPresented: Binding(get: { info != nil }, set: { if !$0 { info = nil } })) { Button("Понятно", role: .cancel) {} } message: { Text(info ?? "") }
             .confirmationDialog("Очистить автоматический кэш музыки?", isPresented: $clearCache, titleVisibility: .visible) {
                 Button("Очистить кэш", role: .destructive) { store.run { try await store.audio.clearAutomaticCache(); store.notice = "Автоматический кэш очищен. Ручные загрузки сохранены." } }

@@ -118,8 +118,11 @@ enum XASSStyle {
                 Picker("Библиотека", selection: $filter) {
                     Text("Все").tag("all"); Text("Избранное").tag("favorites"); Text("Плейлисты").tag("playlists")
                 }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16)).listRowBackground(Color.clear).listRowSeparator(.hidden)
-                if let name = store.uploadName {
-                    VStack(alignment: .leading) { Text(name).font(.callout).lineLimit(1); ProgressView(value: store.uploadProgress); Text("Загрузка на сервер…").font(.caption).foregroundStyle(.secondary) }.listRowBackground(Color.clear).accessibilityIdentifier("musicUploadProgress")
+                if store.isMusicImporting || !store.musicImportResults.isEmpty {
+                    Button { importFiles = true } label: {
+                        if store.isMusicImporting { NativeMusicImportStatus(store: store) }
+                        else { Label("Результат импорта", systemImage: "tray.full").font(.callout) }
+                    }.buttonStyle(.plain).listRowBackground(Color.clear).accessibilityIdentifier("musicImportStatus")
                 }
                 if filter == "playlists" {
                     Button { playlistToEdit = nil; editingPlaylist = true } label: { Label("Создать плейлист", systemImage: "plus") }.listRowBackground(Color.clear)
@@ -160,7 +163,7 @@ enum XASSStyle {
                 .navigationTitle("Музыка").searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск")
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) { NavigationLink { NativeDownloadsView(store: store, audio: store.audio) } label: { Image(systemName: "arrow.down.circle") }.accessibilityLabel("Загрузки") }
-                    ToolbarItem(placement: .topBarTrailing) { Button { importFiles = true } label: { Image(systemName: "plus").font(.title2) }.disabled(!store.authorized || store.uploadName != nil).accessibilityLabel("Добавить музыку") }
+                    ToolbarItem(placement: .topBarTrailing) { Button { importFiles = true } label: { Image(systemName: "plus").font(.title2) }.disabled(!store.authorized).accessibilityLabel("Добавить музыку") }
                 }
                 .refreshable { await store.refresh() }
                 .onChange(of: query) { _, value in
@@ -179,9 +182,7 @@ enum XASSStyle {
                 .overlay { if store.loading && store.tracks.isEmpty { ProgressView() } }
                 .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }
                 .sheet(isPresented: $editingPlaylist) { NativePlaylistEditor(store: store, playlist: playlistToEdit) }
-                .fileImporter(isPresented: $importFiles, allowedContentTypes: [.audio, .zip], allowsMultipleSelection: true) { result in
-                    switch result { case .success(let urls): store.run { for url in urls { try await store.upload(url) } }; case .failure(let error): store.handle(error) }
-                }
+                .sheet(isPresented: $importFiles) { NativeMusicImportView(store: store) }
         }
     }
 }

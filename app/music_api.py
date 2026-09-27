@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import logging
 import os
@@ -27,19 +28,27 @@ from app.music_playback import current_session, expire_active_transfer, install_
 from app.music_playback_models import MusicRemoteCommand, MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
 from app.services.agent_lifecycle import ensure_agent_attached
+from app.services.agent_workspace import AssetUploadTooLarge, read_bounded_body
 from app.services.control_status import canonical_web_app_url, source_is_online
-from app.services.music_library import CHUNK_BYTES, content_lock, filename, inspect_audio, issue_ticket, track_json, track_path, verify_ticket
+from app.services.music_library import CHUNK_BYTES, MAX_ARCHIVE_UPLOAD_BYTES, archive_upload_limit, content_lock, filename, inspect_audio, issue_ticket, track_json, track_path, verify_ticket
 from app.services.music_storage import ensure_restore_requested, lock_content, lock_track
 
 
 class StartUpload(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
-    size: int = Field(gt=0, le=256 * 1024 * 1024)
+    size: int = Field(gt=0, le=MAX_ARCHIVE_UPLOAD_BYTES)
 
 
 class UploadChunk(BaseModel):
     offset: int = Field(ge=0)
     data: str = Field(min_length=1, max_length=4 * ((CHUNK_BYTES + 2) // 3))
+
+
+CHUNK_JSON_BYTES = 4 * ((CHUNK_BYTES + 2) // 3) + 1024
+
+
+class FinishUpload(BaseModel):
+    async_mode: bool = Field(default=False, alias="async", strict=True)
 
 
 class EditTrack(BaseModel):
@@ -93,7 +102,26 @@ class SessionBody(BaseModel):
 
 
 def build_router(settings, require_owner, public_origin):
-    router = APIRouter()
+    # The supported deployment has one backend worker. At most one ZIP is
+    # extracted at once and one may wait; uploaded files/receipts survive restart.
+    zip_tasks: dict[str, asyncio.Task] = {}
+    zip_failures: dict[str, dict] = {}
+    zip_slot = asyncio.Semaphore(1)
+
+    @asynccontextmanager
+    async def upload_lifespan(_):
+        try:
+            yield
+        finally:
+            running = list(zip_tasks.values())
+            for task in running:
+                task.cancel()
+            if running:
+                # music_ingest._blocking waits for its worker before removing only
+                # its private staging directory. Never unlink the uploaded ZIP here.
+                await asyncio.gather(*running, return_exceptions=True)
+
+    router = APIRouter(lifespan=upload_lifespan)
     root = Path(settings.music_root).resolve()
     project = Path(__file__).resolve().parent.parent
     if root == project or root in project.parents:
@@ -111,7 +139,10 @@ def build_router(settings, require_owner, public_origin):
     def part_path(upload_id):
         if len(upload_id) != 32 or any(c not in "0123456789abcdef" for c in upload_id):
             raise HTTPException(404, "Загрузка не найдена")
-        path = (root / (upload_id + ".part")).resolve()
+        candidate = root / (upload_id + ".part")
+        if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
+            raise HTTPException(400, "Некорректный путь загрузки")
+        path = candidate.resolve()
         if path.parent != root:
             raise HTTPException(400, "Некорректный путь загрузки")
         return path
@@ -121,6 +152,56 @@ def build_router(settings, require_owner, public_origin):
         if item is None or item.deleted:
             raise HTTPException(404, "Трек не найден")
         return item
+
+    def processing(upload_id):
+        return {"ok": True, "status": "processing", "upload_id": upload_id, "retry_after": 1}
+
+    async def finish_archive(upload_id, original_name, sessions):
+        from app.services.music_ingest import IngestError, ingest_path
+        path = part_path(upload_id)
+        try:
+            async with zip_slot:
+                # No request/DB transaction stays open during extraction/parsing.
+                async with asyncio.timeout(300):
+                    imported = await ingest_path(settings, sessions, path, original_name)
+                    async with sessions() as session:
+                        ids = list(dict.fromkeys(imported.ordered))
+                        rows = {track.id: track for track in await session.scalars(select(MusicTrack).where(MusicTrack.id.in_(ids)))}
+                        result = {"ok": True, "tracks": [track_json(rows[value]) for value in ids if value in rows],
+                            "added": len(imported.added), "duplicates": len(imported.existing), "restored": imported.restored,
+                            "skipped": imported.skipped, "errors": imported.errors, "archive": True}
+                        if session.bind.dialect.name == "postgresql":
+                            from sqlalchemy.dialects.postgresql import insert
+                        else:
+                            from sqlalchemy.dialects.sqlite import insert
+                        await session.execute(insert(MusicUploadReceipt).values(upload_id=upload_id, result=result)
+                            .on_conflict_do_nothing(index_elements=["upload_id"]))
+                        await session.commit()
+                        result = (await session.get(MusicUploadReceipt, upload_id)).result
+                    path.unlink(missing_ok=True)  # Only this completed upload's temporary ZIP.
+                    zip_failures.pop(upload_id, None)
+                    return result
+        except asyncio.CancelledError:
+            # Shutdown interrupts the job, not the durable upload. A subsequent
+            # finish safely retries content-hash deduplication after restart.
+            raise
+        except IngestError as exc:
+            result = {"ok": True, "status": "failed", "upload_id": upload_id,
+                "detail": str(exc)[:300], "error_code": "archive_invalid", "retryable": False}
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Music ZIP processing failed (%s)", type(exc).__name__)
+            result = {"ok": True, "status": "failed", "upload_id": upload_id,
+                "detail": "Не удалось завершить импорт ZIP. Уже добавленные треки сохранены; можно повторить импорт.",
+                "error_code": "archive_processing_failed", "retryable": True}
+        finally:
+            if zip_tasks.get(upload_id) is asyncio.current_task():
+                zip_tasks.pop(upload_id, None)
+        # Pending uploads are already capped at 24. Keep failure state bounded
+        # independently as well, without logging filenames or exception text.
+        if len(zip_failures) >= 24:
+            zip_failures.pop(next(iter(zip_failures)))
+        zip_failures[upload_id] = result
+        return result
 
     async def audio_response(item, session, *, download=False):
         try:
@@ -168,6 +249,7 @@ def build_router(settings, require_owner, public_origin):
                 "next_offset": offset + len(rows) if offset + len(rows) < total else None,
                 "playlists": [{"id": item.id, "name": item.name, "track_ids": item.track_ids} for item in playlists],
                 "max_upload_bytes": settings.music_max_upload_bytes, "chunk_bytes": CHUNK_BYTES,
+                "max_archive_upload_bytes": archive_upload_limit(settings),
                 "formats": ["mp3", "wav", "flac", "ogg", "m4a"]}
 
     @router.post("/api/mini/music/uploads")
@@ -177,8 +259,9 @@ def build_router(settings, require_owner, public_origin):
                           if payload.filename.lower().endswith(".zip") else filename(payload.filename))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        if payload.size > settings.music_max_upload_bytes:
-            raise HTTPException(413, "Аудиофайл слишком большой")
+        maximum = archive_upload_limit(settings) if clean_name.lower().endswith(".zip") else settings.music_max_upload_bytes
+        if payload.size > maximum:
+            raise HTTPException(413, "ZIP-архив слишком большой" if clean_name.lower().endswith(".zip") else "Аудиофайл слишком большой")
         private_root()
         # Abandoned partial files are private temporary uploads, never tracks.
         unfinished = ~select(MusicUploadReceipt.upload_id).where(MusicUploadReceipt.upload_id == MusicUpload.id).exists()
@@ -186,7 +269,10 @@ def build_router(settings, require_owner, public_origin):
             MusicUpload.created_at < datetime.now(timezone.utc) - timedelta(days=1)).limit(100)))
         for old in expired:
             async with lock(old.id):
+                if old.id in zip_tasks or await session.get(MusicUploadReceipt, old.id):
+                    continue
                 part_path(old.id).unlink(missing_ok=True)
+                zip_failures.pop(old.id, None)
                 await session.delete(old)
         if expired:
             await session.commit()
@@ -200,6 +286,39 @@ def build_router(settings, require_owner, public_origin):
         await session.commit()
         return {"ok": True, "upload_id": item.id, "offset": 0, "chunk_bytes": CHUNK_BYTES}
 
+    @router.get("/api/mini/music/uploads/{upload_id}")
+    async def upload_status(upload_id: str, response: Response, user=Depends(require_owner), session=Depends(get_session)):
+        path = part_path(upload_id)
+        item = await session.get(MusicUpload, upload_id)
+        if item is None or item.owner_id != user.user_id:
+            raise HTTPException(404, "Загрузка не найдена")
+        response.headers["Cache-Control"] = "private, no-store"
+        receipt = await session.get(MusicUploadReceipt, upload_id)
+        if receipt:
+            if upload_id in zip_tasks:
+                return processing(upload_id)
+            # Reconcile a shutdown between receipt commit and temporary ZIP
+            # cleanup. The immutable receipt proves import already finished.
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logging.getLogger(__name__).warning("Completed music ZIP cleanup deferred")
+            return {**receipt.result, "status": "completed", "upload_id": upload_id}
+        if item.track_id:
+            return {"ok": True, "status": "completed", "upload_id": upload_id,
+                "track": track_json(await find_track(session, item.track_id))}
+        if upload_id in zip_tasks:
+            response.headers["Retry-After"] = "1"
+            return processing(upload_id)
+        if upload_id in zip_failures:
+            return zip_failures[upload_id]
+        created = item.created_at.replace(tzinfo=timezone.utc) if item.created_at.tzinfo is None else item.created_at
+        if (datetime.now(timezone.utc) - created).total_seconds() > 86400:
+            raise HTTPException(410, "Загрузка истекла, выберите файл заново")
+        ready = item.offset == item.size and path.is_file() and path.stat().st_size == item.size
+        return {"ok": True, "status": "ready_to_finish" if ready else "uploading", "upload_id": upload_id,
+            "offset": item.offset, "size": item.size, "chunk_bytes": CHUNK_BYTES}
+
     @router.delete("/api/mini/music/uploads/{upload_id}")
     async def cancel_upload(upload_id: str, user=Depends(require_owner), session=Depends(get_session)):
         path = part_path(upload_id)
@@ -209,15 +328,26 @@ def build_router(settings, require_owner, public_origin):
                 raise HTTPException(404, "Загрузка не найдена")
             if item.track_id or await session.get(MusicUploadReceipt, upload_id):
                 raise HTTPException(409, "Трек уже сохранён в библиотеке")
+            if upload_id in zip_tasks:
+                raise HTTPException(409, "ZIP уже обрабатывается. Дождитесь результата; добавленные треки сохранятся.")
             # Only the selected, unfinished operation's managed partial file.
             path.unlink(missing_ok=True)
+            zip_failures.pop(upload_id, None)
             await session.delete(item)
             await session.commit()
         return {"ok": True}
 
     @router.put("/api/mini/music/uploads/{upload_id}")
-    async def put_chunk(upload_id: str, payload: UploadChunk, user=Depends(require_owner), session=Depends(get_session)):
+    async def put_chunk(upload_id: str, request: Request, user=Depends(require_owner), session=Depends(get_session)):
         path = part_path(upload_id)
+        try:
+            body = await read_bounded_body(request, limit=CHUNK_JSON_BYTES)
+        except AssetUploadTooLarge as exc:
+            raise HTTPException(413, "Блок загрузки превышает допустимый размер") from exc
+        try:
+            payload = UploadChunk.model_validate_json(body)
+        except ValueError as exc:
+            raise HTTPException(422, "Некорректный блок загрузки") from exc
         try:
             data = base64.b64decode(payload.data, validate=True)
         except (ValueError, binascii.Error):
@@ -264,7 +394,8 @@ def build_router(settings, require_owner, public_origin):
             return {"ok": True, "offset": item.offset}
 
     @router.post("/api/mini/music/uploads/{upload_id}/finish")
-    async def finish(upload_id: str, user=Depends(require_owner), session=Depends(get_session)):
+    async def finish(upload_id: str, response: Response, payload: FinishUpload | None = None,
+                     user=Depends(require_owner), session=Depends(get_session)):
         path = part_path(upload_id)
         async with lock(upload_id):
             item = await session.scalar(select(MusicUpload).where(MusicUpload.id == upload_id).with_for_update())
@@ -272,36 +403,32 @@ def build_router(settings, require_owner, public_origin):
                 raise HTTPException(404, "Загрузка не найдена")
             receipt = await session.get(MusicUploadReceipt, upload_id)
             if receipt:
-                return receipt.result
+                return {**receipt.result, "status": "completed", "upload_id": upload_id} if payload and payload.async_mode else receipt.result
             if item.track_id:
                 return {"ok": True, "track": track_json(await find_track(session, item.track_id))}
             if item.offset != item.size or not path.is_file() or path.stat().st_size != item.size:
                 raise HTTPException(409, "Файл ещё не загружен целиком")
             if item.filename.lower().endswith(".zip"):
-                from app.services.music_ingest import IngestError, ingest_path
                 original_name = item.filename
                 sessions = async_sessionmaker(session.bind, expire_on_commit=False)
-                # The shared importer commits one deduplicated track at a time.
-                # Release the request transaction before opening its sessions.
                 await session.rollback()
-                try:
-                    imported = await ingest_path(settings, sessions, path, original_name)
-                except IngestError as exc:
-                    raise HTTPException(422, str(exc)) from exc
-                ids = list(dict.fromkeys(imported.ordered))
-                rows = {track.id: track for track in await session.scalars(select(MusicTrack).where(MusicTrack.id.in_(ids)))}
-                result = {"ok": True, "tracks": [track_json(rows[value]) for value in ids if value in rows],
-                    "added": len(imported.added), "duplicates": len(imported.existing), "restored": imported.restored,
-                    "skipped": imported.skipped, "errors": imported.errors, "archive": True}
-                if session.bind.dialect.name == "postgresql":
-                    from sqlalchemy.dialects.postgresql import insert
-                else:
-                    from sqlalchemy.dialects.sqlite import insert
-                await session.execute(insert(MusicUploadReceipt).values(upload_id=upload_id, result=result)
-                    .on_conflict_do_nothing(index_elements=["upload_id"]))
-                await session.commit()
-                path.unlink(missing_ok=True)  # Only this completed upload's managed temporary ZIP.
-                return (await session.get(MusicUploadReceipt, upload_id)).result
+                task = zip_tasks.get(upload_id)
+                if task is None:
+                    if len(zip_tasks) >= 2:
+                        raise HTTPException(429, "Уже обрабатываются другие ZIP. Повторите через несколько секунд.", headers={"Retry-After": "2"})
+                    zip_failures.pop(upload_id, None)
+                    task = asyncio.create_task(finish_archive(upload_id, original_name, sessions))
+                    zip_tasks[upload_id] = task
+                if payload and payload.async_mode:
+                    response.status_code = 202
+                    response.headers.update({"Cache-Control": "private, no-store", "Retry-After": "1"})
+                    return processing(upload_id)
+                # Existing Mini App/older iOS receive their original final
+                # receipt. Disconnecting a waiter cannot cancel the import.
+                result = await asyncio.shield(task)
+                if result.get("status") == "failed":
+                    raise HTTPException(422 if not result["retryable"] else 503, result["detail"])
+                return result
             try:
                 metadata = await asyncio.to_thread(inspect_audio, path, item.filename)
             except Exception as exc:

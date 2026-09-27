@@ -78,6 +78,9 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         var parts = URLComponents(url: origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
         parts.queryItems = [.init(name: "_p", value: path)]
         var request = URLRequest(url: parts.url!)
+        // Catalog lookup has a bounded 18-second server budget. It must not be
+        // cut off by the shorter control-request deadline while finding artwork.
+        request.timeoutInterval = Self.jsonRequestTimeout(path: path, method: method)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -98,6 +101,11 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         // cancelled, so callers can undo a handoff by its server-issued ID.
         if method == "GET" { try Task.checkCancellation() }
         return value
+    }
+    static func jsonRequestTimeout(path: String, method: String) -> TimeInterval {
+        let pattern = method == "POST" ? #"\A/api/mini/music/tracks/[1-9][0-9]*/enrichment(?:/confirm)?\z"# :
+            method == "GET" ? #"\A/api/mini/music/tracks/[1-9][0-9]*/lyrics\z"# : #"(?!)"#
+        return path.range(of: pattern, options: .regularExpression) != nil ? 25 : 12
     }
     @MainActor func artwork(trackID: Int) async throws -> Data? {
         try Task.checkCancellation()

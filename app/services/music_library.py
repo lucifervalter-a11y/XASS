@@ -19,7 +19,12 @@ from app.services.pwa_auth import _session_generation, _session_secret
 
 FORMATS = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
 CHUNK_BYTES = 512 * 1024
+MAX_ARCHIVE_UPLOAD_BYTES = 1024 * 1024 * 1024
 _content_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
+
+
+def archive_upload_limit(settings) -> int:
+    return min(MAX_ARCHIVE_UPLOAD_BYTES, max(1, int(getattr(settings, "music_max_archive_upload_bytes", 512 * 1024 * 1024))))
 
 
 def content_lock(root: Path, sha256: str) -> asyncio.Lock:
