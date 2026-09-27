@@ -17,6 +17,9 @@
   File inspection/audio startup no longer block Tk; the queue remains stable,
   idle redraws are eliminated and progress does not regenerate large images.
   This local-file player is separate from the remotely controlled server agent.
+- Upgrading Windows preserves an existing encrypted connection configuration
+  instead of replacing it with an old plaintext legacy config. Local music
+  paths are excluded from distributable source-update packages.
 
 ## Security
 
@@ -27,6 +30,9 @@
   approvals keep their existing separate contract.
 - Workspace upload limits are enforced while reading the body, including
   chunked uploads and misleading Content-Length, before saving any asset.
+- Single bounded HTTP byte ranges preserve audio seeking and download resume,
+  while malformed/multiple ranges are rejected before the pinned file parser.
+  Embedded-cover decoders are explicitly allowlisted before parsing.
 - Restore invalidates transient Passkey action approvals. The web cache version
   changes with the new parameter-bound confirmation client.
 
@@ -42,6 +48,7 @@ An unsigned IPA still requires the owner's signing method. Simulator tests
 cannot establish real-device Face ID, background audio or iPhone-to-PC handoff
 reliability on the owner's hardware. A security review reduces identified risk;
 it is not a guarantee that no vulnerabilities exist.
+See [targeted mitigations and dependency limitations](SECURITY_MITIGATIONS.md).
 
 Full VK/Apple Music catalog export is not advertised as implemented in this
 release. Apple Music playback/library integration requires authorized MusicKit

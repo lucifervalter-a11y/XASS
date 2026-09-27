@@ -20,6 +20,7 @@ class AgentUpdateTests(unittest.TestCase):
             sources = {
                 "client_agent.py": b"# source",
                 "desktop_app.py": b"# desktop source",
+                "desktop_music.py": b"# local music source",
                 "version.json": b'{"version":"1.2.3"}',
                 "assets/xass.ico": b"icon",
                 "assets/data/theme.json": b'{"color":"purple"}',
@@ -40,6 +41,7 @@ class AgentUpdateTests(unittest.TestCase):
                     "..command-results.json.12.34.tmp", ".agent-status.json.bak", ".update-result.json",
                     ".installed-revision", ".xass-managed-files.json", ".xass-archive-state.json",
                     "xass-archive.sqlite3-wal", "migration.json", "xass.log", "xass.log.1", ".env.local",
+                    "local-music.json", "LOCAL-MUSIC.JSON.BAK", ".local-music.json.12.34.tmp",
                     "data/.xass-master.key", "Archive/private-photo.jpg", "logs/debug.txt",
                     ".venv312/Lib/installed.py", "venv-test/Lib/installed.py", ".build-venv/secret",
                     ".updates/previous/config.json", "build/stale.exe", "dist/stale.exe",
@@ -92,6 +94,7 @@ class AgentUpdateTests(unittest.TestCase):
             with zipfile.ZipFile(package.path, "r") as archive:
                 names = set(archive.namelist())
             self.assertIn("desktop_app.py", names)
+            self.assertIn("desktop_music.py", names)
             self.assertIn("client_agent.py", names)
             self.assertIn("bootstrap_dependencies.py", names)
             self.assertIn("connection_file.py", names)

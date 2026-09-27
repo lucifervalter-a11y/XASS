@@ -180,7 +180,7 @@ class MusicStage(tk.Canvas):
         self._art = self.create_image(0, 0, anchor="nw")
         self._disc_art = self.create_image(0, 0, anchor="nw")
         self._title = self.create_text(252, 84, anchor="w", fill=TEXT, font=self._title_font)
-        self._artist = self.create_text(252, 126, anchor="w", fill="#c6c6ce", font=self._artist_font)
+        self._artist = self.create_text(252, 126, anchor="nw", fill="#c6c6ce", font=self._artist_font)
         self._state = self.create_text(252, 158, anchor="nw", fill=LILAC, font=self._state_font)
         self._elapsed = self.create_text(252, 214, anchor="nw", fill="#ececf1", font=self._time_font)
         self._total = self.create_text(0, 214, anchor="ne", fill="#ececf1", font=self._time_font)
@@ -216,11 +216,23 @@ class MusicStage(tk.Canvas):
     def _layout(self) -> None:
         self._resize_job = None
         width = max(1, self.winfo_width())
-        target = 300 if width < 8 or width >= 720 else 460
+        target = self._target_height(width)
         if int(self["height"]) != target:
             self.configure(height=target)
             return
         self._paint()
+
+    def _target_height(self, width: int) -> int:
+        wide = width < 8 or width >= 720
+        title_height = self._title_font.metrics("linespace")
+        # Keep the compact title below the 184px disc, even when point fonts
+        # grow at 150–200% Windows scaling. The text stack must also leave room
+        # for complete status/time lines and the scrubber rather than overlap.
+        title_top = max(24 if wide else 228, (86 if wide else 248) - title_height // 2)
+        stack = (title_height + 8 + self._artist_font.metrics("linespace") + 10
+                 + self._state_font.metrics("linespace") + 14
+                 + self._time_font.metrics("linespace") + 8 + 8 + 12)
+        return max(300 if wide else 460, title_top + stack + 2)
 
     def _disc(self, angle: int) -> Image.Image:
         key = int(angle) % 360
@@ -243,10 +255,9 @@ class MusicStage(tk.Canvas):
         self.coords(self._disc_art, *(36, max(24, (height - 184) // 2)) if wide else (24, 28))
         self._paint_disc()
         text_x = 252 if wide else 28
-        title_y = 86 if wide else 248
+        title_y = 86 if wide else max(248, 228 + self._title_font.metrics("linespace") // 2)
         wrap = max(160, width - text_x - 40)
         self.coords(self._title, text_x, title_y)
-        self.coords(self._artist, text_x, title_y + 42)
         self.itemconfigure(self._title, text=_fit(self._title_text, self._title_font, wrap), width=0)
         self.itemconfigure(self._artist, text=_fit(self._artist_text, self._artist_font, wrap), width=0)
         self.itemconfigure(self._state, text=_fit(self._state_text, self._state_font, wrap), width=0,
@@ -254,6 +265,10 @@ class MusicStage(tk.Canvas):
         # Tk's point fonts change height with Windows DPI. A fixed middle anchor
         # can overlap the artist's descenders; position the complete status line
         # beneath its actual glyph box using the same font we measure for fitting.
+        title_box = self.bbox(self._title)
+        artist_top = max(title_y + 42 - self._artist_font.metrics("linespace") // 2,
+                         (title_box[3] if title_box else title_y) + 8)
+        self.coords(self._artist, text_x, artist_top)
         artist_box = self.bbox(self._artist)
         state_y = max(title_y + 64, (artist_box[3] if artist_box else title_y + 54) + 10)
         self.coords(self._state, text_x, state_y)

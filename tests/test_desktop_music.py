@@ -131,20 +131,30 @@ class MusicRenderTests(unittest.TestCase):
         self.assertIs(stage._photo, photo)
         self.assertTrue(all(image.size == (184, 184) for image in stage._discs.values()))
 
-    def test_status_uses_measured_font_and_sits_below_artist_at_windows_dpi_scales(self):
+    def test_all_text_rows_have_measured_gaps_at_windows_dpi_scales(self):
         original = float(self.root.tk.call("tk", "scaling"))
         try:
             for scaling in (1.067, 1.333, 1.667, 2.0, 2.667):
                 self.root.tk.call("tk", "scaling", scaling)
-                for width, height in ((1184, 300), (560, 460)):
+                for width in (1184, 560):
                     with self.subTest(scaling=scaling, width=width):
                         stage = self.stage(width)
+                        height = stage._target_height(width)
                         stage.place_configure(height=height)
                         self.root.update_idletasks()
+                        stage._layout()
                         stage.show({"state": "idle"})
+                        self.assertEqual(int(stage["height"]), height)
+                        title_box, artist_box = stage.bbox(stage._title), stage.bbox(stage._artist)
+                        self.assertGreaterEqual(title_box[1], 0 if width >= 720 else 224)
+                        self.assertGreaterEqual(artist_box[1], title_box[3] + 8)
+                        for item in (stage._title, stage._artist):
+                            box = stage.bbox(item)
+                            self.assertGreaterEqual(box[0], 0)
+                            self.assertLessEqual(box[2], width)
                         self.assertEqual(stage.itemcget(stage._state, "font"), str(stage._state_font))
                         left, top, right, bottom = stage.bbox(stage._state)
-                        self.assertGreaterEqual(top, stage.bbox(stage._artist)[3] + 9)
+                        self.assertGreaterEqual(top, artist_box[3] + 10)
                         self.assertGreaterEqual(bottom - top, stage._state_font.metrics("linespace"))
                         for item in (stage._elapsed, stage._total):
                             self.assertEqual(stage.itemcget(item, "font"), str(stage._time_font))
@@ -152,6 +162,7 @@ class MusicRenderTests(unittest.TestCase):
                             self.assertGreaterEqual(time_box[1], bottom + 12)
                             self.assertGreaterEqual(time_box[3] - time_box[1], stage._time_font.metrics("linespace"))
                             self.assertLess(time_box[3], stage._bar_span()[2])
+                        self.assertLess(stage._bar_span()[2] + 8, height)
                         self.assertLessEqual(right, width)
                         stage.destroy()
         finally:

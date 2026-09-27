@@ -51,18 +51,40 @@ def _normalized(path: Path) -> str:
         return str(path.absolute()).casefold()
 
 
-def _valid_legacy_config(path: Path) -> bool:
+def _valid_legacy_config(path: Path, *, allow_sealed: bool = False) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return False
-    return isinstance(payload, dict) and bool(
-        str(payload.get("server_url") or "").strip() and str(payload.get("api_key") or "").strip()
+    if not isinstance(payload, dict) or not str(payload.get("server_url") or "").strip():
+        return False
+    if str(payload.get("api_key") or "").strip():
+        return True
+    # An installed v2 config intentionally has no plaintext API key. Recognize
+    # its envelope without decrypting it or touching its DPAPI/master key. Only
+    # use this check for the destination: copying a sealed legacy source needs
+    # a separate key-aware migration, not a blind config.json copy.
+    envelope = payload.get("sealed")
+    return bool(
+        allow_sealed
+        and payload.get("format") == "xass-config"
+        and payload.get("version") == 2
+        and isinstance(envelope, dict)
+        and isinstance(envelope.get("data"), str)
+        and envelope["data"].strip()
+        and (
+            envelope.get("cipher") == "dpapi"
+            or (
+                envelope.get("cipher") == "aes-256-gcm"
+                and isinstance(envelope.get("nonce"), str)
+                and envelope["nonce"].strip()
+            )
+        )
     )
 
 
 def migrate_config(legacy_roots: Iterable[Path], destination: Path) -> str:
-    if _valid_legacy_config(destination):
+    if _valid_legacy_config(destination, allow_sealed=True):
         return ""
     for root in legacy_roots:
         candidate = root / "config.json"
