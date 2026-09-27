@@ -21,7 +21,12 @@ enum XASSStyle {
             else { Image(systemName: "music.note").font(.system(size: large ? 64 : 24, weight: .medium)).foregroundStyle(XASSStyle.secondary) }
         }.aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: radius))
             .accessibilityHidden(true)
-            .task(id: trackID) { image = nil; image = await store.artwork(trackID) }
+            .task(id: trackID) {
+                image = nil
+                let loaded = await store.artwork(trackID)
+                guard !Task.isCancelled else { return }
+                image = loaded
+            }
     }
 }
 
@@ -58,8 +63,7 @@ enum XASSStyle {
             Text(NativeValue.time(track.duration)).font(.caption).monospacedDigit().foregroundStyle(XASSStyle.secondary)
             Button(action: menu) { Image(systemName: "ellipsis").font(.title3).frame(width: 36, height: 44).contentShape(Rectangle()) }
                 .buttonStyle(.plain).foregroundStyle(.white).accessibilityLabel("Действия: \(track.title)")
-        }.padding(.leading, 10).padding(.trailing, 4).padding(.vertical, 9)
-            .background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 12))
+        }.padding(.leading, 4).padding(.trailing, 4).padding(.vertical, 9)
     }
 }
 
@@ -72,6 +76,7 @@ enum XASSStyle {
     @State private var editingPlaylist = false
     @State private var playlistToEdit: LibraryPlaylist?
     @State private var searchTask: Task<Void, Never>?
+    @State private var collectionRoute: String?
     var body: some View {
         NavigationStack {
             List {
@@ -79,6 +84,12 @@ enum XASSStyle {
                     NativeLoginPrompt(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden)
                 }
                 if store.error != nil || store.notice != nil { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
+                HStack(spacing: 12) {
+                    // Multiple NavigationLinks in one List row activate together on iOS.
+                    // A single destination binding gives each explicit button one route.
+                    Button { collectionRoute = "albums" } label: { Label("Альбомы", systemImage: "square.stack").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeAlbums")
+                    Button { collectionRoute = "artists" } label: { Label("Исполнители", systemImage: "person.crop.circle").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeArtists")
+                }.font(.subheadline.weight(.medium)).listRowBackground(Color.clear).listRowSeparator(.hidden)
                 Picker("Библиотека", selection: $filter) {
                     Text("Все").tag("all"); Text("Избранное").tag("favorites"); Text("Плейлисты").tag("playlists")
                 }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16)).listRowBackground(Color.clear).listRowSeparator(.hidden)
@@ -105,6 +116,7 @@ enum XASSStyle {
                     ForEach(rows) { track in
                         NativeTrackRow(store: store, track: track, rows: rows) { selectedTrack = track }
                             .listRowInsets(EdgeInsets(top: 1, leading: 16, bottom: 1, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                            .overlay(alignment: .bottom) { Divider().padding(.leading, 72).padding(.trailing, 16).opacity(0.35) }
                             .onAppear { if track.id == rows.last?.id { store.run { await store.loadMoreTracks() } } }
                     }
                     if store.libraryLoadingMore {
@@ -138,6 +150,7 @@ enum XASSStyle {
                     store.run { await store.searchLibrary(query: query, favorite: value == "favorites") }
                 }
                 .onDisappear { searchTask?.cancel() }
+                .navigationDestination(item: $collectionRoute) { route in NativeCollectionLibrary(store: store, kind: route == "albums" ? .album : .artist) }
                 .overlay { if store.loading && store.tracks.isEmpty { ProgressView() } }
                 .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }
                 .sheet(isPresented: $editingPlaylist) { NativePlaylistEditor(store: store, playlist: playlistToEdit) }
@@ -150,20 +163,27 @@ enum XASSStyle {
 
 @MainActor struct NativeMiniPlayer: View {
     @ObservedObject var store: NativeStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         if let track = store.currentTrack {
             HStack(spacing: 12) {
                 Button { store.showPlayer = true } label: {
                     HStack(spacing: 12) {
-                        TrackArtwork(store: store, trackID: track.id).frame(width: 44, height: 44)
-                        VStack(alignment: .leading, spacing: 3) { Text(track.title).font(.body.weight(.medium)).lineLimit(1); Text(store.deviceLabel).font(.caption).foregroundStyle(XASSStyle.secondary).lineLimit(1) }
+                        TrackArtwork(store: store, trackID: track.id).frame(width: 38, height: 38)
+                        VStack(alignment: .leading, spacing: 2) { Text(track.title).font(.subheadline.weight(.medium)).lineLimit(1); Text(track.artist.isEmpty ? store.deviceLabel : track.artist).font(.caption).foregroundStyle(XASSStyle.secondary).lineLimit(1) }
                         Spacer(minLength: 0)
                     }.contentShape(Rectangle())
                 }.buttonStyle(.plain).accessibilityIdentifier("nativeMiniPlayer")
                 Button { store.run { try await store.toggle() } } label: { Image(systemName: store.playing ? "pause.fill" : "play.fill").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel(store.playing ? "Пауза" : "Слушать")
                 Button { store.run { try await store.step(1) } } label: { Image(systemName: "forward.end.fill").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel("Следующий трек")
-            }.foregroundStyle(.white).padding(.horizontal, 16).padding(.vertical, 10)
-                .background(XASSStyle.surface).overlay(alignment: .top) { Divider() }.disabled(store.busy)
+            }.foregroundStyle(.white).padding(.horizontal, 12).padding(.vertical, 7)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+                .overlay(alignment: .bottomLeading) {
+                    GeometryReader { size in
+                        Capsule().fill(.white.opacity(0.36)).frame(width: size.size.width * min(1, max(0, store.position / max(1, store.duration))), height: 2)
+                    }.frame(height: 2).padding(.horizontal, 15).padding(.bottom, 2).accessibilityHidden(true)
+                }.padding(.horizontal, 10).padding(.vertical, 5).background(Color.black.opacity(0.84)).disabled(store.busy)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: track.id)
         }
     }
 }
@@ -172,72 +192,95 @@ enum XASSStyle {
     @ObservedObject var store: NativeStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showQueue = false
+    @State private var showLyrics = false
+    @State private var selectedTrack: LibraryTrack?
     @State private var scrubbing: Double?
     @State private var volume: Double?
     var body: some View {
         GeometryReader { geometry in
             ScrollView {
-                VStack(spacing: 20) {
+                VStack(spacing: 18) {
                     HStack {
                         Button { dismiss() } label: { Image(systemName: "chevron.down").font(.title3).frame(width: 44, height: 36) }.accessibilityLabel("Свернуть плеер")
                         Spacer()
-                        Button { showQueue = true } label: { Image(systemName: "list.bullet").font(.title3).frame(width: 44, height: 36) }.accessibilityLabel("Очередь")
+                        Text(showLyrics ? "Текст песни" : "Моя музыка").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.6))
+                        Spacer()
+                        Button { selectedTrack = store.currentTrack } label: { Image(systemName: "ellipsis").font(.title3).frame(width: 44, height: 36) }.accessibilityLabel("Действия с треком").accessibilityIdentifier("nativePlayerMore")
                     }.foregroundStyle(.white)
                     if let track = store.currentTrack {
-                        TrackArtwork(store: store, trackID: track.id, radius: 16, large: true)
-                            .frame(width: min(geometry.size.width - 48, max(160, geometry.size.height * 0.33)), height: min(geometry.size.width - 48, max(160, geometry.size.height * 0.33)))
-                            .padding(.bottom, 4)
-                        HStack(spacing: 14) {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(track.title).font(.title2.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
-                                Text(track.artist.isEmpty ? "Моя коллекция" : track.artist).font(.subheadline).foregroundStyle(XASSStyle.secondary)
+                        if showLyrics {
+                            HStack(spacing: 12) {
+                                TrackArtwork(store: store, trackID: track.id).frame(width: 48, height: 48)
+                                metadata(track)
                             }.frame(maxWidth: .infinity, alignment: .leading)
-                            Button { store.run { try await store.favorite(track) } } label: { Image(systemName: track.favorite ? "heart.fill" : "heart").font(.title2).frame(width: 44, height: 44) }.accessibilityLabel(track.favorite ? "Убрать из избранного" : "В избранное")
+                            NativeLyricsContent(store: store, trackID: track.id)
+                                .frame(height: max(190, min(440, geometry.size.height - 500)))
+                                .transition(.opacity)
+                        } else {
+                            // Reserve native controls first; small screens and large type can scroll.
+                            let side = min(geometry.size.width - 56, max(190, min(400, geometry.size.height - 450)))
+                            TrackArtwork(store: store, trackID: track.id, radius: 14, large: true)
+                                .frame(width: side, height: side).shadow(color: .black.opacity(0.24), radius: 22, y: 12)
+                                .scaleEffect(!store.playing && !reduceMotion ? 0.96 : 1)
+                                .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.85), value: store.playing)
+                                .padding(.vertical, 8).transition(.opacity)
+                            metadata(track)
                         }
                         VStack(spacing: 0) {
-                            Slider(value: Binding(get: { scrubbing ?? min(store.position, max(1, store.duration)) }, set: { scrubbing = $0 }), in: 0...max(1, store.duration), onEditingChanged: { editing in if !editing, let value = scrubbing { scrubbing = nil; store.run { try await store.seek(value) } } }).accessibilityLabel("Позиция трека")
-                            HStack { Text(NativeValue.time(scrubbing ?? store.position)); Spacer(); Text(NativeValue.time(store.duration)) }.font(.caption).monospacedDigit().foregroundStyle(XASSStyle.secondary)
+                            Slider(value: Binding(get: { scrubbing ?? min(store.position, max(1, store.duration)) }, set: { scrubbing = $0 }), in: 0...max(1, store.duration), onEditingChanged: { editing in if !editing, let value = scrubbing { scrubbing = nil; store.run { try await store.seek(value) } } }).tint(.white.opacity(0.9)).disabled(store.duration <= 0 || store.busy).accessibilityLabel("Позиция трека")
+                            HStack { Text(NativeValue.time(scrubbing ?? store.position)); Spacer(); Text("−" + NativeValue.time(max(0, store.duration - (scrubbing ?? store.position)))) }.font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.55))
                         }
                         if store.busy || store.playbackState == "loading" { HStack { ProgressView(); Text(store.transferStatus ?? (store.busy ? "Выполняю действие…" : "Загрузка трека…")).font(.caption) }.accessibilityIdentifier("nativePlayerLoading") }
                         HStack {
-                            Button { store.run { try await store.setQueueMode(shuffled: !store.shuffle) } } label: { Image(systemName: "shuffle").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.shuffle ? XASSStyle.accent : XASSStyle.secondary).accessibilityLabel("Перемешивание").disabled(!store.canEditQueue)
-                            Spacer()
                             Button { store.run { try await store.step(-1) } } label: { Image(systemName: "backward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Предыдущий трек")
                             Spacer()
                             Button { store.run { try await store.toggle() } } label: { Image(systemName: store.playing ? "pause.fill" : "play.fill").font(.system(size: 36)).frame(width: 56, height: 56) }.accessibilityLabel(store.playing ? "Пауза" : "Слушать").accessibilityIdentifier("nativePlayerToggle")
                             Spacer()
                             Button { store.run { try await store.step(1) } } label: { Image(systemName: "forward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Следующий трек")
-                            Spacer()
-                            Button { store.run { try await store.setQueueMode(repeatMode: store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off") } } label: { Image(systemName: store.repeatMode == "one" ? "repeat.1" : "repeat").font(.title3).frame(width: 44, height: 48) }.foregroundStyle(store.repeatMode == "off" ? XASSStyle.secondary : XASSStyle.accent).accessibilityLabel("Повтор: \(store.repeatMode)").disabled(!store.canEditQueue)
-                        }.foregroundStyle(.white).disabled(store.busy)
+                        }.padding(.horizontal, 32).foregroundStyle(.white).buttonStyle(MusicPressStyle()).disabled(store.busy)
                         if store.otherLocal { Text("Команды выполняются после ответа другого устройства. Для переноса выберите «Этот iPhone» ниже.").font(.caption).foregroundStyle(.secondary) }
-                        Button { store.openRoutePicker() } label: { HStack(spacing: 12) { Image(systemName: store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer").font(.title3); Text(store.deviceLabel).foregroundStyle(.white); Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary) }.padding(16).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.07))) }.accessibilityIdentifier("nativePlayerDevices")
                         HStack(spacing: 14) {
-                            Image(systemName: "speaker.fill").foregroundStyle(.secondary)
-                            Slider(value: Binding(get: { volume ?? store.volume }, set: { volume = $0 }), in: 0...100, onEditingChanged: { editing in if !editing, let value = volume { volume = nil; store.run { try await store.setVolume(value) } } }).accessibilityLabel("Громкость XASS")
-                            Image(systemName: "speaker.wave.2.fill").foregroundStyle(.secondary)
-                        }
-                        ViewThatFits(in: .horizontal) {
-                            HStack(spacing: 12) { sharing; download(track) }
-                            VStack(spacing: 12) { sharing; download(track) }
-                        }
+                            Image(systemName: "speaker.fill").font(.caption)
+                            Slider(value: Binding(get: { volume ?? store.volume }, set: { volume = $0 }), in: 0...100, onEditingChanged: { editing in if !editing, let value = volume { volume = nil; store.run { try await store.setVolume(value) } } }).tint(.white.opacity(0.7)).disabled(store.busy).accessibilityLabel("Громкость XASS")
+                            Image(systemName: "speaker.wave.2.fill").font(.caption)
+                        }.foregroundStyle(.white.opacity(0.55))
+                        HStack(alignment: .top) {
+                            Button { showLyrics.toggle() } label: { Image(systemName: "quote.bubble").font(.title3).frame(width: 48, height: 44).background(showLyrics ? Color.white.opacity(0.17) : Color.clear, in: RoundedRectangle(cornerRadius: 12)) }.accessibilityLabel(showLyrics ? "Показать обложку" : "Текст песни").accessibilityIdentifier("nativePlayerLyrics")
+                            Spacer()
+                            Button { store.openRoutePicker() } label: { VStack(spacing: 5) { Image(systemName: store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer").font(.title3).frame(height: 30); Text(store.deviceLabel).font(.caption2).lineLimit(2).multilineTextAlignment(.center) }.frame(minWidth: 100, minHeight: 44) }.accessibilityIdentifier("nativePlayerDevices")
+                            Spacer()
+                            Button { showQueue = true } label: { Image(systemName: "list.bullet").font(.title3).frame(width: 48, height: 44) }.accessibilityLabel("Очередь").accessibilityIdentifier("nativePlayerQueue")
+                        }.foregroundStyle(.white.opacity(0.8)).buttonStyle(MusicPressStyle())
+                        if store.shareSite { Label("Сейчас на вашем сайте", systemImage: "dot.radiowaves.left.and.right").font(.caption2).foregroundStyle(.white.opacity(0.55)) }
                     }
                     NativeMessage(store: store)
-                }.padding(.horizontal, 24).padding(.top, 10).padding(.bottom, 24).frame(maxWidth: 560).frame(maxWidth: .infinity)
-            }.background(XASSStyle.surface).scrollBounceBehavior(.basedOnSize)
-        }.presentationDragIndicator(.visible).presentationDetents([.large])
+                }.padding(.horizontal, 28).padding(.top, 10).padding(.bottom, 24).frame(maxWidth: 560).frame(maxWidth: .infinity)
+            }.scrollBounceBehavior(.basedOnSize)
+                .background { NativeMusicBackdrop(store: store, trackID: store.currentID) }
+        }.presentationDragIndicator(.visible).presentationDetents([.large]).tint(.white)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showLyrics)
             .sheet(isPresented: $showQueue) { NativeQueueView(store: store) }
+            .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }
+            .onChange(of: store.currentID) { _, _ in scrubbing = nil }
+            .onAppear {
+                #if DEBUG && targetEnvironment(simulator)
+                if NativeFixture.enabled {
+                    if NativeFixture.screen == "lyrics" { showLyrics = true }
+                    if NativeFixture.screen == "queue" { showQueue = true }
+                }
+                #endif
+            }
     }
-    private var sharing: some View {
-        Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
-            Text(store.shareSaving ? "Сохраняю…" : "На сайте").font(.subheadline)
-        }.disabled(store.shareSaving || store.busy).padding(14).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).accessibilityIdentifier("nativeShareSite")
-    }
-    private func download(_ track: LibraryTrack) -> some View {
-        Button { store.run { try await store.download(track) } } label: {
-            Label(store.audio.downloads.contains(where: { $0.id == track.id }) ? "Сохранено" : "Загрузить", systemImage: "arrow.down.to.line").font(.subheadline.weight(.medium)).frame(maxWidth: .infinity).padding(18)
-        }.disabled(store.audio.downloadIDs.contains(track.id)).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 16)).accessibilityIdentifier("nativeDownload")
+    private func metadata(_ track: LibraryTrack) -> some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(track.title).font(.title2.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+                Text(track.artist.isEmpty ? "Моя коллекция" : track.artist).font(.body).foregroundStyle(.white.opacity(0.62))
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            Button { store.run { try await store.favorite(track) } } label: { Image(systemName: track.favorite ? "star.fill" : "star").font(.title3).frame(width: 44, height: 44) }.disabled(store.busy).accessibilityLabel(track.favorite ? "Убрать из избранного" : "В избранное")
+        }.foregroundStyle(.white)
     }
 }
 
@@ -246,24 +289,46 @@ enum XASSStyle {
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationStack {
-            List(store.queue.isEmpty ? store.tracks : store.queue) { track in
-                Button { store.run { try await store.play(track); dismiss() } } label: { HStack { Text(track.title); Spacer(); if track.id == store.currentID { Image(systemName: "waveform") } } }.disabled(store.busy)
-            }.navigationTitle("Очередь").toolbar { Button("Готово") { dismiss() } }
-        }
+            List {
+                HStack(spacing: 12) {
+                    Button { store.run { try await store.setQueueMode(shuffled: !store.shuffle) } } label: { Label("Перемешать", systemImage: "shuffle").frame(maxWidth: .infinity) }.tint(store.shuffle ? .white : XASSStyle.secondary).accessibilityIdentifier("nativeQueueShuffle")
+                    Button { store.run { try await store.setQueueMode(repeatMode: store.repeatMode == "off" ? "all" : store.repeatMode == "all" ? "one" : "off") } } label: { Label(store.repeatMode == "one" ? "Один трек" : "Повтор", systemImage: store.repeatMode == "one" ? "repeat.1" : "repeat").frame(maxWidth: .infinity) }.tint(store.repeatMode == "off" ? XASSStyle.secondary : .white).accessibilityIdentifier("nativeQueueRepeat")
+                }.buttonStyle(.bordered).disabled(!store.canEditQueue).listRowBackground(Color.clear).listRowSeparator(.hidden)
+                Section(store.queue.isEmpty ? "Выбрать из библиотеки" : "Следующие треки") {
+                    ForEach(store.queue.isEmpty ? store.tracks : store.queue) { track in
+                        Button { store.run { try await store.play(track); dismiss() } } label: {
+                            HStack(spacing: 12) {
+                                TrackArtwork(store: store, trackID: track.id).frame(width: 44, height: 44)
+                                VStack(alignment: .leading, spacing: 4) { Text(track.title).foregroundStyle(.white).lineLimit(2); Text(track.artist).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                                Spacer(); if track.id == store.currentID { Image(systemName: "waveform").foregroundStyle(.white) }
+                            }.padding(.vertical, 4)
+                        }.disabled(store.busy).listRowBackground(Color.clear).accessibilityIdentifier("queue-track-\(track.id)")
+                    }
+                }
+                NativeMessage(store: store).listRowBackground(Color.clear)
+            }.listStyle(.plain).scrollContentBackground(.hidden).background(XASSStyle.background).navigationTitle("Очередь").toolbar { Button("Готово") { dismiss() } }
+        }.tint(.white)
     }
 }
 
 @MainActor struct NativeTrackActions: View {
     @ObservedObject var store: NativeStore
     let track: LibraryTrack
+    var onDelete: ((Int) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var confirmDelete = false
     @State private var acting = false
+    private var current: LibraryTrack { store.resolvedTrack(track) }
     var body: some View {
         NavigationStack {
             List {
-                Button { perform { try await store.favorite(track) } } label: { Label(track.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
-                Button { perform { try await store.download(track) } } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }
+                Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
+                Button { perform { try await store.download(track) } } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }.disabled(store.audio.downloadIDs.contains(track.id)).accessibilityIdentifier("nativeDownload")
+                if track.id == store.currentID {
+                    Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
+                        Label(store.shareSaving ? "Сохраняю…" : "Показывать на сайте", systemImage: "dot.radiowaves.left.and.right")
+                    }.disabled(store.shareSaving || store.busy).accessibilityIdentifier("nativeShareSite")
+                }
                 Section("Добавить в плейлист") {
                     if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
                     ForEach(store.playlists) { playlist in Button(playlist.name) { perform { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) } } }
@@ -271,8 +336,8 @@ enum XASSStyle {
                 Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
                 NativeMessage(store: store)
             }.disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }
-                .confirmationDialog("Убрать трек из библиотеки? Файл останется на сервере для восстановления.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Убрать трек", role: .destructive) { perform { try await store.deleteTrack(track) } } }
-        }.presentationDetents([.medium, .large]).interactiveDismissDisabled(acting)
+                .confirmationDialog("Убрать трек из библиотеки? Файл останется на сервере для восстановления.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Убрать трек", role: .destructive) { perform { try await store.deleteTrack(track); onDelete?(track.id) } } }
+        }.presentationDetents([.medium, .large]).interactiveDismissDisabled(acting).tint(XASSStyle.accent)
     }
     private func perform(_ action: @escaping () async throws -> Void) {
         guard !acting else { return }

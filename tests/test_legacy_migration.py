@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pc_client.legacy_migration import run_migration
+from pc_client.legacy_migration import migrate_config, run_migration
 
 
 class LegacyMigrationTests(unittest.TestCase):
@@ -50,6 +50,47 @@ class LegacyMigrationTests(unittest.TestCase):
                 result = run_migration(data_root=data, legacy_roots=[legacy], startup_dir=startup)
             self.assertFalse(result.config_migrated)
             self.assertEqual(json.loads((data / "config.json").read_text(encoding="utf-8")), current)
+
+    def test_keeps_sealed_installed_config_and_key_untouched(self) -> None:
+        for envelope in (
+            {"cipher": "dpapi", "data": "synthetic-encrypted-fixture"},
+            {"cipher": "aes-256-gcm", "nonce": "synthetic-nonce", "data": "synthetic-encrypted-fixture"},
+        ):
+            with self.subTest(cipher=envelope["cipher"]), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                legacy, data, startup = root / "legacy", root / "data", root / "startup"
+                legacy.mkdir(); data.mkdir(); startup.mkdir()
+                (legacy / "config.json").write_text(json.dumps({
+                    "server_url": "https://old.example", "api_key": "synthetic-stale-key",
+                }), encoding="utf-8")
+                current = json.dumps({
+                    "server_url": "https://new.example", "source_name": "Current PC",
+                    "format": "xass-config", "version": 2, "sealed": envelope,
+                }, indent=2).encode("utf-8")
+                (data / "config.json").write_bytes(current)
+                key = data / ".xass-master.key"
+                key.write_bytes(b"synthetic-key-must-not-change")
+                with patch("pc_client.legacy_migration.stop_legacy_processes", return_value=0), \
+                        patch("pc_client.legacy_migration.shutil.copy2") as copy:
+                    result = run_migration(data_root=data, legacy_roots=[legacy], startup_dir=startup)
+                self.assertFalse(result.config_migrated)
+                copy.assert_not_called()
+                self.assertEqual((data / "config.json").read_bytes(), current)
+                self.assertEqual(key.read_bytes(), b"synthetic-key-must-not-change")
+                self.assertFalse((data / "config.json.migrating").exists())
+
+    def test_does_not_blindly_copy_sealed_source_without_its_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = root / "legacy"
+            legacy.mkdir()
+            (legacy / "config.json").write_text(json.dumps({
+                "server_url": "https://old.example", "format": "xass-config", "version": 2,
+                "sealed": {"cipher": "aes-256-gcm", "nonce": "fixture", "data": "fixture"},
+            }), encoding="utf-8")
+            destination = root / "new" / "config.json"
+            self.assertEqual(migrate_config([legacy], destination), "")
+            self.assertFalse(destination.exists())
 
 
 if __name__ == "__main__":

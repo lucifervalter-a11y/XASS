@@ -43,6 +43,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         var data = Data()
         var response: HTTPURLResponse?
         let completion: Completion
+        var path = ""
     }
     // URLSession delegates run on .main, like the @MainActor request entrypoint.
     private var transfers: [Int: Transfer] = [:]
@@ -67,8 +68,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     @MainActor func request(_ path: String, method: String = "GET", body: [String: Any]? = nil) async throws -> [String: Any] {
         let nativePaths = ["/api/native/enrollment/options", "/api/native/enrollment/verify", "/api/native/actions/options", "/api/native/actions/verify"]
         let enrollment = path == "/api/native/enrollment/options" || path == "/api/native/enrollment/verify"
-        guard (path.hasPrefix("/api/mini/") || nativePaths.contains(path)), !path.contains(".."), !path.contains("\\"), !path.contains("#"),
-              !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+        guard Self.allowsJSONPath(path),
               ["GET", "POST", "PUT", "PATCH", "DELETE"].contains(method), !nativePaths.contains(path) || method == "POST" else { throw OwnerAPIError.invalidResponse }
         let saved = savedSession()
         let validSession = saved.map { $0.expires > Date() && !$0.value.isEmpty && $0.value.utf8.count < 8192 && !$0.value.contains("\r") && !$0.value.contains("\n") && !$0.value.contains(";") } ?? false
@@ -89,7 +89,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         try Task.checkCancellation()
         let value: [String: Any] = try await withCheckedThrowingContinuation { completion in
             let task = session.dataTask(with: request)
-            transfers[task.taskIdentifier] = Transfer(completion: .json(completion))
+            transfers[task.taskIdentifier] = Transfer(completion: .json(completion), path: path)
             task.resume()
         }
         // Mutations must return their receipt even when the calling view was
@@ -186,14 +186,44 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         }
     }
 
-    static func decode(_ data: Data, status: Int) throws -> [String: Any] {
+    static func allowsJSONPath(_ path: String) -> Bool {
+        let route = String(path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+        let native = ["/api/native/enrollment/options", "/api/native/enrollment/verify", "/api/native/actions/options", "/api/native/actions/verify"]
+        guard let decoded = route.removingPercentEncoding,
+              route.hasPrefix("/api/mini/") || native.contains(route),
+              !native.contains(route) || route == path,
+              !decoded.contains(".."), !decoded.contains("\\"), !decoded.contains("?"), !decoded.contains("#"),
+              !path.contains("#"), !path.contains("\\"),
+              !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              !decoded.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return false }
+        return true
+    }
+
+    private static func unsupported(_ path: String, status: Int, html: Bool = false) -> OwnerAPIError {
+        let route = String(path.split(separator: "?", maxSplits: 1).first ?? "")
+        let label: String
+        switch route {
+        case "/api/mini/music/session": label = "Состояние плеера"
+        case "/api/mini/music/players": label = "Список устройств"
+        case "/api/mini/music/library": label = "Библиотека музыки"
+        case "/api/mini/bootstrap": label = "Сводка сервера"
+        default: label = "Запрос XASS"
+        }
+        let reason = html ? "сервер вернул веб-страницу вместо данных. Проверьте маршрутизацию proxy.php." : "не удалось разобрать ответ сервера. Повторите запрос; при повторной ошибке проверьте версию сервера."
+        // Never include response bodies, query strings, source names or secrets.
+        return OwnerAPIError(status: 0, message: "\(label): \(reason)", detail: ["code": "unsupported_response", "http_status": status])
+    }
+
+    static func decode(_ data: Data, status: Int, path: String = "") throws -> [String: Any] {
         guard data.count <= maxResponseBytes else { throw OwnerAPIError.invalidResponse }
         var code = status
+        var payload = data
         var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         if let envelope = object, envelope["_s"] != nil || envelope["_b"] != nil {
             guard let innerStatus = envelope["_s"] as? Int, let text = envelope["_b"] as? String,
                   let inner = text.data(using: .utf8), inner.count <= maxResponseBytes else { throw OwnerAPIError.invalidResponse }
             if (200..<300).contains(status) { code = innerStatus }
+            payload = inner
             object = (try? JSONSerialization.jsonObject(with: inner)) as? [String: Any]
         }
         guard (200..<300).contains(code) else {
@@ -202,7 +232,10 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
             let detail = ((object?["detail"] as? String) ?? (detailObject?["message"] as? String)).map { String($0.prefix(500)) }
             throw OwnerAPIError(status: code, message: detail ?? (code >= 500 ? "Сервер временно недоступен. Повторите позже." : "Сервер не разрешил действие. Обновите данные и повторите."), detail: object?["detail"] as? [String: Any])
         }
-        guard let object = object, object["ok"] as? Bool == true else { throw OwnerAPIError.invalidResponse }
+        guard let object = object, object["ok"] as? Bool == true else {
+            let sample = String(data: payload.prefix(200), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            throw unsupported(path, status: code, html: sample.hasPrefix("<!doctype html") || sample.hasPrefix("<html"))
+        }
         return object
     }
 
@@ -244,7 +277,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
             done.resume(returning: transfer.data); return
         }
         do {
-            let body = try Self.decode(transfer.data, status: status)
+            let body = try Self.decode(transfer.data, status: status, path: transfer.path)
             if let response = transfer.response, let url = response.url {
                 let headers = response.allHeaderFields.reduce(into: [String: String]()) { values, item in values[String(describing: item.key)] = String(describing: item.value) }
                 if let cookie = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url).first(where: {

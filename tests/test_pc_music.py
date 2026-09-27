@@ -178,6 +178,20 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertFalse(saved.exists())
         self.assertFalse(self.audio.devices[-1].running)
 
+    def test_local_file_plays_without_network_and_stop_keeps_it(self):
+        path = Path(self.directory.name) / "night.wav"
+        path.write_bytes(silent_wav())
+        snapshot = self.player.play_local(path, title="Ночь", artist="red!")
+        self.assertEqual(snapshot["state"], "playing")
+        self.assertEqual(snapshot["title"], "Ночь")
+        self.assertEqual(snapshot["artist"], "red!")
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.player.command("music_pause", {}, CONFIG)["state"], "paused")
+        self.assertEqual(self.player.command("music_stop", {}, CONFIG)["state"], "stopped")
+        self.assertTrue(path.is_file())
+        with self.assertRaises(mp.MusicError):
+            self.player.play_local(path.with_suffix(".txt"))
+
     def test_pause_during_download_cancels_worker_and_preserves_handoff_position(self):
         downloading = threading.Event()
         def slow_response(request):
@@ -194,6 +208,37 @@ class MusicPlayerTests(unittest.TestCase):
         self.player.close()
         self.player._worker.join(timeout=2)
         self.assertEqual(self.audio.devices, [], "cancelled download must not start audio")
+
+    def test_local_validation_reads_only_header_and_rejects_oversize_before_read(self):
+        path = Path(self.directory.name) / "local.wav"
+        path.write_bytes(silent_wav())
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded read")):
+            self.assertEqual(mp._local_audio_file(path), path.resolve())
+        with patch.object(mp, "MAX_DOWNLOAD_BYTES", 8), patch.object(Path, "open") as opened:
+            with self.assertRaises(mp.MusicError):
+                mp._local_audio_file(path)
+            opened.assert_not_called()
+
+    def test_stop_during_local_decode_never_starts_late_audio(self):
+        path = Path(self.directory.name) / "local.wav"
+        path.write_bytes(silent_wav())
+        started, release = threading.Event(), threading.Event()
+        def duration(_path):
+            started.set()
+            release.wait(2)
+            return 100
+        self.audio.duration = duration
+        worker = threading.Thread(target=lambda: self.player.play_local(path))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(1))
+            self.command("music_stop")
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.audio.devices, [])
+        self.assertTrue(path.is_file())
 
     def test_play_invalid_output_does_not_download_or_interrupt_existing(self):
         self.play()

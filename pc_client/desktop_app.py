@@ -26,6 +26,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from desktop_widgets import ModernButton, NavButton, RoundedPanel, icon_image
 from desktop_home import build_home
+from desktop_music import build_music
+from music_player import MusicPlayer
 from desktop_sections import build_connection, build_updates, build_commands
 
 import psutil
@@ -317,6 +319,7 @@ class XassDesktop:
 
         self.server_var = tk.StringVar(value=str(self.config.get("server_url") or "http://127.0.0.1:8001"))
         self.name_var = tk.StringVar(value=str(self.config.get("source_name") or socket.gethostname()))
+        self.owner_var = tk.StringVar(value=str(self.config.get("owner_name") or "red!"))
         self.pair_var = tk.StringVar()
         self.interval_var = tk.StringVar(value=str(self.config.get("interval_sec") or 30))
         self.auto_update_var = tk.BooleanVar(value=bool(self.config.get("auto_update", True)))
@@ -464,6 +467,7 @@ class XassDesktop:
             ("computer", "Этот компьютер", "monitor"),
             ("connection", "Подключение", "link"),
             ("files", "Файлы", "folder"),
+            ("music", "Музыка", "music"),
             ("archive", "Архив", "archive"),
             ("journal", "Журнал", "journal"),
             ("updates", "Обновления", "update"),
@@ -585,6 +589,8 @@ class XassDesktop:
             self._build_computer()
         elif name == "files":
             self._build_files()
+        elif name == "music":
+            build_music(self)
         elif name == "archive":
             self._build_archive()
         elif name == "updates":
@@ -1132,6 +1138,7 @@ class XassDesktop:
         tk.Label(runtime, text="Окно можно свернуть — связь с сервером и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 18))
         check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
         check.pack(anchor="w", pady=(6, 14))
+        self._field(runtime, "Имя с визитки", self.owner_var)
         self._field(runtime, "Интервал обновления показателей, секунд", self.interval_var)
         self._field(runtime, "Папка локального архива", self.archive_folder_var)
         self._button(runtime, "Выбрать папку архива", self.choose_archive_folder, kind="ghost").pack(fill="x", pady=(9, 0))
@@ -1307,7 +1314,7 @@ class XassDesktop:
         self.full_log.configure(state="disabled")
 
     def _build_archive(self) -> None:
-        self._header("Архив сообщений", "Тексты и медиа хранятся локально на этом компьютере")
+        self._header("Архив сообщений", "Тексты и файлы бизнес-чатов остаются на этом ПК, даже если в Telegram они уже исчезли")
         status = archive_status(self.config)
         summary = self._card(self.content, padding=18)
         summary.pack(fill="x", pady=(0, 14))
@@ -1492,6 +1499,7 @@ class XassDesktop:
             {
                 "server_url": normalize_server_url(self.server_var.get()),
                 "source_name": self.name_var.get().strip() or socket.gethostname(),
+                "owner_name": self.owner_var.get().strip() or "red!",
                 "source_type": "PC_AGENT",
                 "interval_sec": interval,
                 "auto_update": self.auto_update_var.get(),
@@ -2102,9 +2110,23 @@ class XassDesktop:
         except tk.TclError:
             pass
 
+    def local_music(self):
+        player = getattr(self, "_local_music", None)
+        if player is None:
+            player = MusicPlayer()
+            self._local_music = player
+        return player
+
+    def _close_local_music(self) -> None:
+        player = getattr(self, "_local_music", None)
+        if player is not None:
+            player.close()
+            self._local_music = None
+
     def close(self) -> None:
         if self.preview:
             self._closing = True
+            self._close_local_music()
             self.root.destroy()
             return
         # Closing the window keeps the background agent alive. A deliberate exit
@@ -2118,6 +2140,7 @@ class XassDesktop:
 
     def _destroy_for_update(self) -> None:
         self._closing = True
+        self._close_local_music()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -2127,6 +2150,7 @@ class XassDesktop:
 
     def exit_application(self) -> None:
         self._closing = True
+        self._close_local_music()
         self.stop_agent()
         if self.tray_icon is not None:
             try:

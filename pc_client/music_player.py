@@ -77,6 +77,35 @@ def approved_media_url(server_url: str, value: Any, track_id: Any) -> tuple[str,
     return raw, int(track_id)
 
 
+LOCAL_SUFFIXES = {".mp3": ".mp3", ".wav": ".wav", ".flac": ".flac", ".ogg": ".ogg"}
+
+
+def _local_audio_file(path: Path) -> Path:
+    try:
+        candidate = Path(path).expanduser()
+        if candidate.is_symlink():
+            raise MusicError("Нужен обычный аудиофайл на этом ПК")
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise MusicError("Файл музыки не найден") from None
+    if not resolved.is_file() or resolved.is_symlink():
+        raise MusicError("Нужен обычный аудиофайл на этом ПК")
+    expected = LOCAL_SUFFIXES.get(resolved.suffix.lower())
+    if expected is None:
+        raise MusicError("На ПК играют MP3, WAV, FLAC и OGG Vorbis")
+    try:
+        size = resolved.stat().st_size
+        if not 0 < size <= MAX_DOWNLOAD_BYTES:
+            raise MusicError("Аудиофайл пустой или больше 256 МБ")
+        with resolved.open("rb") as source:
+            header = source.read(16)
+    except OSError:
+        raise MusicError("Не удалось прочитать файл музыки") from None
+    if _audio_suffix(header) != expected:
+        raise MusicError("Содержимое файла не совпадает с его расширением")
+    return resolved
+
+
 def _audio_suffix(header: bytes) -> str:
     if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
         return ".wav"
@@ -151,6 +180,7 @@ class MusicPlayer:
         self._stream = None
         self._progress = {"position": 0.0, "ended": False, "error": ""}
         self._path: Path | None = None
+        self._ephemeral = False
         self._tempdir = None
         self._state = "idle"
         self._track_id = None
@@ -199,9 +229,12 @@ class MusicPlayer:
 
     def _discard_track(self):
         self._release_device()
-        if self._path is not None:
-            self._path.unlink(missing_ok=True)
-            self._path = None
+        path, ephemeral = self._path, self._ephemeral
+        self._path = None
+        self._ephemeral = False
+        # Server downloads are temporary. A file the user opened must stay on disk.
+        if path is not None and ephemeral:
+            path.unlink(missing_ok=True)
 
     def _callback(self, decoder, progress):
         try:
@@ -248,6 +281,35 @@ class MusicPlayer:
             self._error = str(exc) if isinstance(exc, MusicError) else "Не удалось открыть аудиовыход Windows"
             raise MusicError(self._error) from None
         self._state, self._error = "playing", ""
+
+    def play_local(self, path: Path, *, title: str = "", artist: str = "") -> dict[str, Any]:
+        """Play a file that already exists on this PC. No server and no copy."""
+        resolved = _local_audio_file(path)
+        with self._condition:
+            if self._closed:
+                raise MusicError("Музыкальный плеер завершает работу")
+            self._generation += 1
+            generation = self._generation
+            self._pending = None
+        try:
+            duration = self._engine().duration(resolved)
+        except MusicError:
+            raise
+        except Exception:
+            raise MusicError("Не удалось прочитать трек. Поддерживаются MP3, WAV, FLAC и OGG Vorbis") from None
+        with self._condition:
+            if self._closed:
+                raise MusicError("Музыкальный плеер завершает работу")
+            if generation != self._generation:
+                return self.snapshot()
+            self._discard_track()
+            self._track_id = None
+            self._title = (title.strip() or resolved.stem)[:256]
+            self._artist = artist.strip()[:256]
+            self._downloaded_bytes = self._total_bytes = resolved.stat().st_size
+            self._path, self._duration, self._ephemeral = resolved, duration, False
+            self._start_at(0)
+            return self.snapshot()
 
     def command(self, command: str, payload: dict, config: dict) -> dict[str, Any]:
         if "expires_at" in payload:
@@ -404,7 +466,7 @@ class MusicPlayer:
                         continue
                     if position > duration:
                         raise MusicError("Начальная позиция больше длительности трека")
-                    self._path, self._duration = path, duration
+                    self._path, self._duration, self._ephemeral = path, duration, True
                     path = None
                     self._start_at(position)
             except Exception as exc:

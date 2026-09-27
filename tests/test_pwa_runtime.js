@@ -194,10 +194,10 @@ test('inline and external application scripts are syntactically valid', () => {
   }
 });
 
-test('music release references match the new shell cache without changing control center URLs', async () => {
+test('shell cache includes the security-updated control client and current music assets', async () => {
   const h = workerHarness();
   await h.install();
-  assert.deepEqual(await h.caches.keys(), ['xass-shell-v14']);
+  assert.deepEqual(await h.caches.keys(), ['xass-shell-v15']);
   for (const extension of ['css', 'js']) {
     const music = `/assets/miniapp-music.${extension}?v=0170`;
     assert(pageSource.includes('"' + music + '"'), 'page must request the new music release');
@@ -205,8 +205,11 @@ test('music release references match the new shell cache without changing contro
     const old = `/assets/miniapp-music.${extension}?v=0160`;
     assert(!pageSource.includes(old));
     assert.equal(await h.caches.match(old), undefined);
-    const control = `/assets/miniapp-control-center.${extension}?v=0160`;
+    const controlVersion = extension === 'js' ? '0190' : '0160';
+    const control = `/assets/miniapp-control-center.${extension}?v=${controlVersion}`;
     assert(pageSource.includes('"' + control + '"'));
     assert.equal(await (await h.caches.match(control)).text(), 'cached:' + control);
   }
+  assert(!pageSource.includes('/assets/miniapp-control-center.js?v=0160'));
+  assert.equal(await h.caches.match('/assets/miniapp-control-center.js?v=0160'), undefined);
 });

@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import cbor2
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
+from starlette.responses import Response
 
 import app.main as main
 from app.db import Base
 from app.services import passkeys
 from app.services.miniapp import MiniAppUser
+from app.services.pwa_action_proofs import consume_action_proof
+from app.services.pwa_auth import rotate_session_generation
 
 
 class PasskeyFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -93,10 +99,10 @@ class PasskeyFlowTests(unittest.IsolatedAsyncioTestCase):
                 session, owner_user_id=42, rp_id=self.rp_id, origin=self.origin, purpose="server:update",
             )
             credential = self.assertion(options["options"]["challenge"])
-            stored, purpose = await passkeys.complete_authentication(
+            stored, approval = await passkeys.complete_authentication(
                 session, transaction=options["transaction"], credential=credential,
             )
-            self.assertEqual(purpose, "server:update")
+            self.assertEqual(approval.purpose, "server:update")
             self.assertEqual(stored.sign_count, 1)
             self.assertIsNotNone(stored.last_used_at)
             with self.assertRaises(ValueError):
@@ -134,6 +140,41 @@ class PasskeyFlowTests(unittest.IsolatedAsyncioTestCase):
                     credential=self.assertion(options["options"]["challenge"], signature_valid=False),
                 )
             self.assertEqual(saved.sign_count, 0)
+
+    async def test_verified_webauthn_issues_proof_for_original_challenge_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SimpleNamespace(owner_user_id=42, pwa_session_generation_path=directory + "/generation")
+            binding = {"source_id": 7, "command": "file_delete", "payload": {"root": "documents", "path": "first.txt"}}
+            async with self.sessions() as session:
+                await self.register(session)
+                request = Request({"type": "http", "scheme": "https", "path": "/", "query_string": b"", "headers": [(b"host", b"xass.example:8443")]})
+                with patch.object(main, "settings", settings):
+                    start = await main.pwa_passkey_login_options(request,
+                        main.PasskeyStartPayload(purpose="agent:file_delete:PC", binding=binding), session)
+                    # Extra fields in verify cannot replace the parameters the user approved.
+                    done = await main.pwa_passkey_login_verify(main.PasskeyCompletePayload(
+                        transaction=start["transaction"], credential=self.assertion(start["options"]["challenge"]),
+                        binding={"path": "other.txt"}), Response(), request, session)
+                token = done["action_proof"]
+                self.assertTrue(token.startswith("xpa_"))
+                self.assertFalse(await consume_action_proof(session, token, 42, "agent:file_delete:PC", {"path": "other.txt"}, settings))
+                self.assertTrue(await consume_action_proof(session, token, 42, "agent:file_delete:PC", binding, settings))
+                await session.commit()
+                self.assertFalse(await consume_action_proof(session, token, 42, "agent:file_delete:PC", binding, settings))
+
+    async def test_logout_during_user_verification_cannot_mint_new_action_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SimpleNamespace(owner_user_id=42, pwa_session_generation_path=directory + "/generation")
+            async with self.sessions() as session:
+                await self.register(session)
+                start = await passkeys.authentication_options(session, owner_user_id=42,
+                    rp_id=self.rp_id, origin=self.origin, purpose="server:restart", generation=0)
+                rotate_session_generation(settings)
+                with patch.object(main, "settings", settings), self.assertRaises(HTTPException) as failure:
+                    await main.pwa_passkey_login_verify(main.PasskeyCompletePayload(
+                        transaction=start["transaction"], credential=self.assertion(start["options"]["challenge"])),
+                        Response(), Request({"type": "http"}), session)
+                self.assertEqual(failure.exception.status_code, 401)
 
 
 class PasskeyOriginTests(unittest.TestCase):

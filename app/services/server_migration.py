@@ -56,6 +56,7 @@ CANCELLED_COMMAND_RESULT = {"ok": False, "message": "Команда отмене
 RESTORE_EPHEMERAL_UPDATES = {
     "native_challenges": "UPDATE native_challenges SET used=true",
     "native_action_proofs": "UPDATE native_action_proofs SET used=true",
+    "pwa_action_proofs": "UPDATE pwa_action_proofs SET used=true",
     "pwa_pair_tokens": "UPDATE pwa_pair_tokens SET is_active=false",
     "agent_pair_codes": "UPDATE agent_pair_codes SET is_active=false",
     "music_transfers": "UPDATE music_transfers SET status='failed', detail='server_migration' WHERE status NOT IN ('ready','failed')",

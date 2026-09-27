@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import PasskeyCredential
+from app.services.pwa_action_proofs import binding_hash
 
 
 CHALLENGE_TTL_SEC = 5 * 60
@@ -24,6 +25,8 @@ class PendingChallenge:
     origin: str
     purpose: str
     expires_at: float
+    binding_hash: str
+    generation: int
 
 
 _pending: dict[str, PendingChallenge] = {}
@@ -37,7 +40,8 @@ def _decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def _transaction(challenge: bytes, owner_user_id: int, rp_id: str, origin: str, purpose: str) -> str:
+def _transaction(challenge: bytes, owner_user_id: int, rp_id: str, origin: str, purpose: str,
+                 binding: dict | None = None, generation: int = 0) -> str:
     now = time.time()
     for key, item in list(_pending.items()):
         if item.expires_at <= now:
@@ -50,6 +54,8 @@ def _transaction(challenge: bytes, owner_user_id: int, rp_id: str, origin: str, 
         origin=origin,
         purpose=purpose,
         expires_at=now + CHALLENGE_TTL_SEC,
+        binding_hash=binding_hash(binding),
+        generation=generation,
     )
     return token
 
@@ -243,6 +249,8 @@ async def authentication_options(
     rp_id: str,
     origin: str,
     purpose: str,
+    binding: dict | None = None,
+    generation: int = 0,
 ) -> dict[str, Any]:
     lib = _library()
     credentials = await list_credentials(session, owner_user_id)
@@ -260,7 +268,7 @@ async def authentication_options(
         user_verification=lib["UserVerificationRequirement"].REQUIRED,
     )
     return {
-        "transaction": _transaction(options.challenge, owner_user_id, rp_id, origin, purpose),
+        "transaction": _transaction(options.challenge, owner_user_id, rp_id, origin, purpose, binding, generation),
         "options": json.loads(lib["options_to_json"](options)),
     }
 
@@ -270,7 +278,7 @@ async def complete_authentication(
     *,
     transaction: str,
     credential: dict[str, Any],
-) -> tuple[PasskeyCredential, str]:
+) -> tuple[PasskeyCredential, PendingChallenge]:
     pending = _consume(transaction)
     raw_id = str(credential.get("id") or credential.get("rawId") or "").strip()
     stored = await session.scalar(
@@ -301,4 +309,4 @@ async def complete_authentication(
     stored.backed_up = bool(getattr(result, "credential_backed_up", stored.backed_up))
     stored.last_used_at = datetime.now(timezone.utc)
     await session.commit()
-    return stored, pending.purpose
+    return stored, pending

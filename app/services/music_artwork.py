@@ -125,9 +125,13 @@ def _jpeg_thumbnail(data: bytes) -> bytes | None:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as source:
+            # Select decoders before Image.open, not only after format sniffing:
+            # untrusted audio tags must never invoke PSD/FITS/font plugins.
+            # WebP's animation decoder can allocate native canvas buffers during
+            # open, before our pixel budget can be checked. Exclude it here.
+            with Image.open(io.BytesIO(data), formats=("JPEG", "PNG", "GIF")) as source:
                 width, height = source.size
-                if (source.format not in {"JPEG", "PNG", "WEBP", "GIF"}
+                if (source.format not in {"JPEG", "PNG", "GIF"}
                         or width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS):
                     return None
                 # JPEG draft decoding avoids allocating its original full bitmap.

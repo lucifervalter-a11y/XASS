@@ -68,7 +68,7 @@ def is_agent_runtime_path(relative: Path, *, directory: bool = False) -> bool:
     runtime_names = {
         "config.json", "xass-master.key", "command-results.json", "agent-status.json",
         "update-result.json", "installed-revision", "xass-archive-state.json",
-        "xass-archive.sqlite3", "xass-managed-files.json", "migration.json",
+        "xass-archive.sqlite3", "xass-managed-files.json", "migration.json", "local-music.json",
     }
     if any(normalized == base or normalized.startswith((base + ".", base + "-")) for base in runtime_names):
         return True

@@ -20,6 +20,34 @@ SEALED_TYPE = "application/x-xass-sealed"
 DEFAULT_TTL_SECONDS = 30 * 60
 
 
+class AssetUploadTooLarge(ValueError):
+    pass
+
+
+async def read_asset_body(request, settings: Settings, *, kind: str) -> bytes:
+    """Bound accumulation while receiving, including untrusted/chunked uploads."""
+    limit = int(settings.agent_screenshot_max_bytes if kind == "screenshot" else settings.agent_file_max_bytes)
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    sealed = media_type == SEALED_TYPE or request.headers.get("x-xass-cipher", "").startswith("xass-sealed")
+    limit = max(0, limit) + (33 if sealed else 0)
+    return await read_bounded_body(request, limit=limit)
+
+
+async def read_bounded_body(request, *, limit: int) -> bytes:
+    """Receive at most the given byte budget, regardless of framing headers."""
+    limit = max(0, int(limit))
+    too_large = f"Файл превышает лимит загрузки {limit} байт"
+    declared = request.headers.get("content-length", "").strip()
+    if declared.isascii() and declared.isdecimal() and (len(declared) > 20 or int(declared) > limit):
+        raise AssetUploadTooLarge(too_large)
+    result = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > limit - len(result):
+            raise AssetUploadTooLarge(too_large)
+        result.extend(chunk)
+    return bytes(result)
+
+
 def _workspace_root(settings: Settings) -> Path:
     root = Path(settings.agent_workspace_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)

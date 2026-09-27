@@ -11,7 +11,7 @@ function harness(options = {}) {
   const item = {id: 8, source_name: 'ПК <дом>', is_online: false}, other = {id: 9, source_name: 'Other'};
   const calls = [], messages = [], status = {textContent: ''}, button = {disabled: false};
   const X = {demo: false, state: {boot: {user: {is_owner: true}, sources: [item, other]}},
-    toast: message => messages.push(message), passkeyAction: async purpose => { calls.push(['proof', purpose]); return 'proof'; },
+    toast: message => messages.push(message), passkeyAction: async (purpose, binding) => { calls.push(['proof', purpose, JSON.parse(JSON.stringify(binding))]); return 'proof'; },
     loadBoot: async () => { calls.push(['refresh']); }, age: () => '1 мин', valueText: () => '—', ...options.X};
   const context = vm.createContext({X, pendingCommands: new Map(), ui: {activeAgent: item.source_name}, $: () => status,
     confirmAction: async text => { calls.push(['confirm', text]); return options.confirm ?? true; },
@@ -48,6 +48,7 @@ test('non-owner, demonstration and missing immutable id never send a delete', as
 test('successful delete binds proof and confirmation to identity, preserves other source', async () => {
   const h = harness(); await h.run();
   assert.equal(h.calls[1][1], 'agent:detach:8:ПК <дом>');
+  assert.deepEqual(h.calls[1][2], {source_id: 8, confirm_name: h.item.source_name});
   const api = h.calls.find(x => x[0] === 'api');
   assert.equal(api[1], 'agents/' + encodeURIComponent(h.item.source_name));
   assert.equal(api[2].method, 'DELETE');

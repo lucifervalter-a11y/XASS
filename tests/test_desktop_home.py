@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import sys
 import tkinter as tk
@@ -7,10 +8,18 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pc_client"))
 try:
-    from desktop_home import HomeGrid
+    from desktop_home import HomeGrid, greeting_line
     from desktop_widgets import BG, CARD, TEXT, RoundedPanel
 finally:
     sys.path.pop(0)
+
+
+class GreetingTests(unittest.TestCase):
+    def test_uses_visit_card_name_for_each_part_of_day(self):
+        self.assertEqual(greeting_line(datetime(2026, 9, 27, 8, 30), "red!"), "Доброе утро, red!")
+        self.assertEqual(greeting_line(datetime(2026, 9, 27, 14, 0), "red!"), "Добрый день, red!")
+        self.assertEqual(greeting_line(datetime(2026, 9, 27, 19, 10), "red!"), "Добрый вечер, red!")
+        self.assertEqual(greeting_line(datetime(2026, 9, 27, 1, 5), "   "), "Доброй ночи, red!")
 
 
 class HomeGridLayoutTests(unittest.TestCase):

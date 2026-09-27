@@ -416,7 +416,8 @@
       const current = (X.state.boot?.sources || []).find(source => source.source_name === item.source_name);
       if (!current || current.id !== item.id) throw new Error('Подключение изменилось. Обновите список и выберите агент заново.');
       if (status) status.textContent = 'Подтверждаю отвязку…';
-      const proof = await X.passkeyAction('agent:detach:' + item.id + ':' + item.source_name);
+      const proof = await X.passkeyAction('agent:detach:' + item.id + ':' + item.source_name,
+        {source_id: item.id, confirm_name: item.source_name});
       if (status) status.textContent = 'Отзываю доступ…';
       const response = await ccApi('agents/' + encodeURIComponent(item.source_name), {
         method: 'DELETE', body: {source_id: item.id, confirm_name: item.source_name, action_proof: proof},
@@ -456,7 +457,9 @@
         if (after) await after(fake);
         return fake;
       }
-      const proof = dangerous ? await X.passkeyAction('agent:' + command + ':' + source) : '';
+      const binding = dangerous ? X.agentActionBinding(source, command, payload) : null;
+      if (binding) payload = binding.payload;
+      const proof = dangerous ? await X.passkeyAction('agent:' + command + ':' + source, binding) : '';
       const response = await ccApi('agents/' + encodeURIComponent(source) + '/commands', { method: 'POST', body: { command, payload, action_proof: proof } });
       if (!response.data?.ok) throw new Error(response.data?.detail || 'Команда не принята');
       const commandId = response.data.command.id;

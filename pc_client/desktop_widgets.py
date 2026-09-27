@@ -77,6 +77,12 @@ def _icon_raster(name, size=22, color=TEXT):
     def ellipse(bounds):
         draw.ellipse(tuple(round(v * factor) for v in bounds), outline=color, width=stroke)
 
+    def solid(values):
+        draw.polygon([(round(x * factor), round(y * factor)) for x, y in values], fill=color)
+
+    def solid_box(bounds, radius=0):
+        draw.rounded_rectangle(tuple(round(v * factor) for v in bounds), radius=round(radius * factor), fill=color)
+
     def arc(bounds, start, end):
         draw.arc(tuple(round(v * factor) for v in bounds), start=start, end=end, fill=color, width=stroke)
 
@@ -130,9 +136,20 @@ def _icon_raster(name, size=22, color=TEXT):
         line([(12, 2.5), (20, 6), (20, 12), (18, 17), (12, 22), (6, 17), (4, 12), (4, 6)], True)
         line([(8, 12), (11, 15), (16, 9)])
     elif name == "play":
-        line([(7, 3), (21, 12), (7, 21)], True)
+        solid([(8, 4), (19, 12), (8, 20)])
+    elif name == "music":
+        ellipse((6, 14, 12, 20))
+        line([(12, 17), (12, 4), (19, 6.5), (19, 11)])
     elif name == "pause":
-        box((6, 3, 9, 21), .8); box((15, 3, 18, 21), .8)
+        solid_box((6, 4, 10, 20), 1.2); solid_box((14, 4, 18, 20), 1.2)
+    elif name == "previous":
+        solid([(15, 5), (8, 12), (15, 19)])
+        solid_box((5, 5, 8, 19), 0.8)
+    elif name == "next":
+        solid([(9, 5), (16, 12), (9, 19)])
+        solid_box((16, 5, 19, 19), 0.8)
+    elif name == "stop":
+        solid_box((6, 6, 18, 18), 2)
     else:
         raise ValueError(f"Unknown XASS icon: {name}")
     return image.resize((size, size), Image.Resampling.LANCZOS)

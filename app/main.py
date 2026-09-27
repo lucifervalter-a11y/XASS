@@ -66,10 +66,13 @@ from app.services.agent_pairing import (
 )
 from app.services.agent_updates import build_agent_package, build_update_manifest
 from app.services.agent_workspace import (
+    AssetUploadTooLarge,
     delete_asset as delete_workspace_asset,
     latest_screenshot,
     load_asset as load_workspace_asset,
     normalize_remote_location,
+    read_asset_body,
+    read_bounded_body,
     store_asset as store_workspace_asset,
 )
 from app.services.app_config import (
@@ -106,12 +109,13 @@ from app.services.pwa_auth import (
     authenticate_session as pwa_authenticate_session,
     authenticate_telegram_login as pwa_authenticate_login,
     issue_session as issue_pwa_session,
-    issue_action_proof,
     issue_vk_connect_proof,
     rotate_session_generation,
-    verify_action_proof,
+    _session_generation,
     verify_vk_connect_proof,
 )
+from app.services.pwa_action_proofs import consume_action_proof, issue_action_proof
+from app.range_guard import SingleRangeGuard
 from app.services.passkeys import (
     authentication_options as passkey_authentication_options,
     complete_authentication as passkey_complete_authentication,
@@ -189,7 +193,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.18.0"
+APP_VERSION = "0.19.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -361,6 +365,7 @@ class PwaTelegramLoginPayload(BaseModel):
 
 class PasskeyStartPayload(BaseModel):
     purpose: str = Field(default="login", max_length=300)
+    binding: dict[str, Any] = Field(default_factory=dict)
 
 
 class PasskeyCompletePayload(BaseModel):
@@ -446,7 +451,13 @@ async def _require_pwa_action_proof(
             status_code=status.HTTP_428_PRECONDITION_REQUIRED,
             detail="Сначала добавьте Face ID / Passkey в разделе iPhone и веб-приложение",
         )
-    if not verify_action_proof(action_proof, user.user_id, purpose, settings):
+    # Commit the claim before restart/update/file side effects. A failed action
+    # needs a new approval; never commit unrelated work from the request session.
+    async with AsyncSession(bind=session.bind, expire_on_commit=False) as proof_session:
+        accepted = await consume_action_proof(proof_session, action_proof, user.user_id,
+                                              purpose, binding, settings)
+        await proof_session.commit()
+    if not accepted:
         raise HTTPException(
             status_code=status.HTTP_428_PRECONDITION_REQUIRED,
             detail="Подтвердите действие через Face ID / Passkey",
@@ -722,6 +733,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+app.add_middleware(SingleRangeGuard)
 
 
 @app.exception_handler(AgentDetachedError)
@@ -1001,7 +1013,10 @@ async def agent_workspace_asset_upload(
     expected_kind = {"screenshot": "screenshot", "file_download": "file_download"}.get(command.command if command else "")
     if command is None or command.source_name != source_name or command.status != "delivered" or expected_kind != kind:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Asset does not match the delivered command")
-    body = await request.body()
+    try:
+        body = await read_asset_body(request, settings, kind=kind)
+    except AssetUploadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     try:
         metadata = await asyncio.to_thread(
             store_workspace_asset,
@@ -1557,6 +1572,8 @@ async def pwa_passkey_login_options(
             rp_id=rp_id,
             origin=origin,
             purpose=(payload.purpose or "login").strip() or "login",
+            binding=payload.binding,
+            generation=_session_generation(settings),
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -1571,13 +1588,22 @@ async def pwa_passkey_login_verify(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        credential, purpose = await passkey_complete_authentication(
+        credential, approval = await passkey_complete_authentication(
             session,
             transaction=payload.transaction,
             credential=payload.credential,
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+    purpose = approval.purpose
+    action_proof = ""
+    if purpose != "login":
+        try:
+            action_proof = await issue_action_proof(session, owner_id=credential.owner_user_id,
+                credential_id=credential.id, purpose=purpose, parameters_hash=approval.binding_hash,
+                generation=approval.generation, settings=settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
     user = MiniAppUser(
         user_id=credential.owner_user_id,
         first_name="Владелец",
@@ -1614,7 +1640,7 @@ async def pwa_passkey_login_verify(
     return {
         "ok": True,
         "purpose": purpose,
-        "action_proof": issue_action_proof(user.user_id, purpose, settings) if purpose != "login" else "",
+        "action_proof": action_proof,
     }
 
 
@@ -2346,11 +2372,12 @@ async def mini_site_avatar_upload(
     request: Request,
     user: MiniAppUser = Depends(require_mini_owner),
 ) -> dict[str, Any]:
-    body = await request.body()
+    try:
+        body = await read_bounded_body(request, limit=8 * 1024 * 1024)
+    except AssetUploadTooLarge as exc:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Аватар должен быть меньше 8 МБ") from exc
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите изображение")
-    if len(body) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Аватар должен быть меньше 8 МБ")
     extension = _avatar_extension(request.headers.get("content-type", ""), body)
     if extension is None:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Поддерживаются JPG, PNG и WebP")
@@ -2472,11 +2499,12 @@ async def mini_site_project_cover_upload(
     project = next((item for item in projects if str(item.get("id")) == project_id), None)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Проект не найден")
-    body = await request.body()
+    try:
+        body = await read_bounded_body(request, limit=10 * 1024 * 1024)
+    except AssetUploadTooLarge as exc:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Обложка должна быть меньше 10 МБ") from exc
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите изображение")
-    if len(body) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Обложка должна быть меньше 10 МБ")
     extension = _avatar_extension(request.headers.get("content-type", ""), body)
     if extension is None:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Поддерживаются JPG, PNG и WebP")
@@ -2932,7 +2960,10 @@ async def mini_agent_file_upload(
         root_name, relative_path = normalize_remote_location(root, path)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    body = await request.body()
+    try:
+        body = await read_asset_body(request, settings, kind="file_upload")
+    except AssetUploadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     metadata: dict[str, Any] | None = None
     try:
         metadata = await asyncio.to_thread(

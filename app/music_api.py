@@ -383,6 +383,13 @@ def build_router(settings, require_owner, public_origin):
             await session.commit()
         return {"ok": True}
 
+    @router.get("/api/mini/music/tracks/{track_id}/lyrics")
+    async def lyrics(track_id: int, response: Response, user=Depends(require_owner), session=Depends(get_session)):
+        from app.services.music_lyrics import embedded_lyrics
+        track = await find_track(session, track_id)
+        response.headers["Cache-Control"] = "private, no-store"
+        return {"ok": True, "lyrics": await asyncio.to_thread(embedded_lyrics, root, track)}
+
     @router.get("/api/mini/music/tracks/{track_id}/artwork")
     async def artwork(track_id: int, user=Depends(require_owner), session=Depends(get_session)):
         from app.services.music_artwork import artwork_thumbnail

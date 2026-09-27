@@ -77,11 +77,58 @@ final class NativeInterfaceTests: XCTestCase {
         app.launchArguments = ["--native-ui-fixture", "--native-ui-screen", "player", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
         app.launch()
         XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 10))
-        let download = app.buttons["nativeDownload"]
-        for _ in 0..<8 { if download.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
-        XCTAssertTrue(download.isHittable, "Large Dynamic Type must scroll to sharing/download controls")
+        let lyrics = app.buttons["nativePlayerLyrics"]
+        for _ in 0..<8 { if lyrics.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(lyrics.isHittable, "Large Dynamic Type must scroll to bottom player controls")
         XCTAssertEqual(app.webViews.count, 0)
         capture(app, "Native-Player-LargeText")
+        let more = app.buttons["nativePlayerMore"]
+        for _ in 0..<8 { if more.isHittable { break }; app.scrollViews.firstMatch.swipeDown() }
+        XCTAssertTrue(more.isHittable); more.tap()
+        XCTAssertTrue(app.buttons["nativeDownload"].waitForExistence(timeout: 5), "Download remains available in native track actions")
+        XCTAssertTrue(app.switches["nativeShareSite"].exists, "Website sharing is preserved")
+    }
+
+    @MainActor func testNativeAlbumsAndArtistsUseActualMetadata() throws {
+        let app = launch(screen: "library")
+        let albums = app.buttons["nativeAlbums"]
+        XCTAssertTrue(albums.waitForExistence(timeout: 10)); albums.tap()
+        guard require(app.navigationBars["Альбомы"], in: app, name: "Album navigation") else { return }
+        XCTAssertFalse(app.navigationBars["Исполнители"].exists, "One collection tap must not push both List-row destinations")
+        let album = app.descendants(matching: .any).matching(identifier: "nativeAlbum-1").firstMatch
+        guard require(album, in: app, name: "Album artwork link") else { return }
+        album.tap()
+        XCTAssertTrue(app.buttons["nativeCollectionPlay"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Ночной маршрут"].exists)
+        XCTAssertTrue(app.buttons["track-1"].exists); XCTAssertTrue(app.buttons["track-2"].exists)
+        XCTAssertFalse(app.buttons["track-3"].exists)
+        XCTAssertEqual(app.webViews.count, 0)
+        capture(app, "Native-Album-Detail")
+        app.terminate()
+        app.launchArguments = ["--native-ui-fixture", "--native-ui-screen", "library"]
+        app.launch()
+        let artists = app.buttons["nativeArtists"]
+        XCTAssertTrue(artists.waitForExistence(timeout: 10)); artists.tap()
+        guard require(app.navigationBars["Исполнители"], in: app, name: "Artist navigation") else { return }
+        XCTAssertTrue(app.buttons["nativeArtist-1"].waitForExistence(timeout: 8))
+        capture(app, "Native-Artists")
+    }
+
+    @MainActor func testLyricsAndQueueKeepNativeControls() throws {
+        let app = launch(screen: "player")
+        let lyrics = app.buttons["nativePlayerLyrics"]
+        XCTAssertTrue(lyrics.waitForExistence(timeout: 10))
+        if !lyrics.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        lyrics.tap()
+        XCTAssertTrue(app.buttons["lyric-line-2"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.buttons["nativePlayerToggle"].exists)
+        capture(app, "Native-Lyrics")
+        app.buttons["nativePlayerQueue"].tap()
+        XCTAssertTrue(app.buttons["nativeQueueShuffle"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["nativeQueueRepeat"].exists)
+        XCTAssertTrue(app.buttons["queue-track-1"].exists)
+        XCTAssertEqual(app.webViews.count, 0)
+        capture(app, "Native-Queue")
     }
 
     @MainActor private func launch(screen: String) -> XCUIApplication {
@@ -110,5 +157,15 @@ final class NativeInterfaceTests: XCTestCase {
     @MainActor private func capture(_ app: XCUIApplication, _ name: String) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name; attachment.lifetime = .keepAlways; add(attachment)
+    }
+    @MainActor private func require(_ element: XCUIElement, in app: XCUIApplication, name: String, file: StaticString = #filePath, line: UInt = #line) -> Bool {
+        guard element.waitForExistence(timeout: 8) else {
+            capture(app, "Failure-" + name)
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "Accessibility-" + name; hierarchy.lifetime = .keepAlways; add(hierarchy)
+            XCTFail(name + " is missing. See the screenshot and accessibility attachment.", file: file, line: line)
+            return false
+        }
+        return true
     }
 }

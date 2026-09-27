@@ -47,7 +47,7 @@ jobs:
           sleep 2
           mkdir -p build/package
           xcrun simctl io "$XASS_SIMULATOR_ID" screenshot build/package/iOS-first-connection.png
-          for screen in home library site tools weather player devices routes storage; do
+          for screen in home library site tools weather player devices routes storage albums lyrics queue; do
             xcrun simctl launch --terminate-running-process "$XASS_SIMULATOR_ID" app.xass.mobile --native-ui-fixture --native-ui-screen "$screen"
             sleep 3
             xcrun simctl io "$XASS_SIMULATOR_ID" screenshot "build/package/iOS-native-$screen.png"
@@ -67,6 +67,13 @@ jobs:
           python3 -c 'import plistlib,sys,zipfile; archive=zipfile.ZipFile("XASS-unsigned.ipa"); info=plistlib.loads(archive.read("Payload/XASS.app/Info.plist")); assert info["CFBundleShortVersionString"] == sys.argv[1], "IPA version mismatch"; assert info["CFBundleSupportedPlatforms"] == ["iPhoneOS"], "IPA is not an iPhone device build"' "$expected_version"
           shasum -a 256 XASS-unsigned.ipa > XASS-unsigned.ipa.sha256
           cp ../../UNSIGNED.md .
+      - name: Export native test screenshots and accessibility attachments
+        if: always()
+        working-directory: ios
+        run: |
+          if [ -d build/Tests.xcresult ]; then
+            xcrun xcresulttool export attachments --path build/Tests.xcresult --output-path build/test-attachments
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: XASS-iOS-UNSIGNED-requires-signing
@@ -78,6 +85,13 @@ jobs:
             ios/build/package/iOS-native-*.png
           if-no-files-found: error
           retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: XASS-iOS-test-attachments
+          path: ios/build/test-attachments
+          if-no-files-found: ignore
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -1,6 +1,7 @@
 """Native Windows home surface. Live controls and metrics, never a screenshot UI."""
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import sys
 import tkinter as tk
@@ -13,6 +14,36 @@ from desktop_widgets import ModernButton, RoundedPanel, icon_image, rounded_imag
 
 BG, CARD, LINE = "#202022", "#2b2b2f", "#3b3b42"
 TEXT, MUTED, BLUE, LILAC = "#f5f5f7", "#b1b1bb", "#829cff", "#c495f4"
+CARD_NAME = "red!"
+
+
+def greeting_line(moment: datetime, name: str) -> str:
+    """Local greeting. The visit-card name is used even when the server is down."""
+    hour = moment.hour
+    if 5 <= hour < 12:
+        hello = "Доброе утро"
+    elif 12 <= hour < 17:
+        hello = "Добрый день"
+    elif 17 <= hour < 23:
+        hello = "Добрый вечер"
+    else:
+        hello = "Доброй ночи"
+    shown = name.strip() or CARD_NAME
+    return f"{hello}, {shown}"
+
+
+def owner_display_name(app: Any) -> str:
+    variable = getattr(app, "owner_var", None)
+    if variable is not None:
+        value = str(variable.get()).strip()
+        if value:
+            return value
+    config = getattr(app, "config", None)
+    if isinstance(config, dict):
+        value = str(config.get("owner_name") or "").strip()
+        if value:
+            return value
+    return CARD_NAME
 
 
 def _icon(parent: tk.Misc, name: str, *, size: int = 24, color: str = TEXT) -> tk.Label:
@@ -54,7 +85,8 @@ class HomeHero(tk.Canvas):
                 self._source = source.convert("RGB")
         self._art = self.create_image(0, 0, anchor="nw")
         self._heading = self.create_text(32, 110, anchor="w", fill=TEXT, font=("Segoe UI Semibold", 27))
-        self._description = self.create_text(32, 151, anchor="nw", text="Управление через Telegram и iPhone", fill="#c6c6ce", font=("Segoe UI", 12))
+        self._description = self.create_text(32, 158, anchor="nw", text="", fill="#c6c6ce", font=("Segoe UI", 12))
+        self._clock = None
         self.open_button = ModernButton(self, text="Открыть Mini App", command=app.open_miniapp,
                                        bg=BLUE, fg="#12131c", activebackground="#9aafff", parent_bg="#000000",
                                        padx=20, pady=11, font=("Segoe UI Semibold", 11))
@@ -64,11 +96,31 @@ class HomeHero(tk.Canvas):
         self.bind("<Configure>", self._schedule_draw)
         self.bind("<Destroy>", self._destroyed, add="+")
         _watch(self, app.name_var, self._schedule_draw)
+        owner_var = getattr(app, "owner_var", None)
+        if owner_var is not None:
+            _watch(self, owner_var, self._schedule_draw)
+        self._arm_clock()
+
+    def _arm_clock(self) -> None:
+        if self.winfo_exists():
+            self._clock = self.after(30_000, self._tick_clock)
+
+    def _tick_clock(self) -> None:
+        self._clock = None
+        if not self.winfo_exists():
+            return
+        self._apply_copy(max(1, self.winfo_width()))
+        self._arm_clock()
 
     def _destroyed(self, event) -> None:
-        if event.widget is self and self._pending:
+        if event.widget is not self:
+            return
+        if self._pending:
             self.after_cancel(self._pending)
             self._pending = None
+        if self._clock:
+            self.after_cancel(self._clock)
+            self._clock = None
 
     def _schedule_draw(self, _event=None) -> None:
         if _event is not None and (_event.width, _event.height) == self._render_size:
@@ -89,14 +141,22 @@ class HomeHero(tk.Canvas):
         if size != self._title_font_size:
             self._title_font.configure(size=size)
             self._title_font_size = size
-        name = self.app.name_var.get().strip() or "Мой компьютер"
-        available = width - 64 if width < 690 else max(190, int(width * .56) - 35)
-        while len(name) > 2 and self._title_font.measure(name) > available:
-            name = name[:-2].rstrip("…") + "…"
-        self.itemconfigure(self._heading, text=name, font=self._title_font)
-        self.itemconfigure(self._description, width=max(250, int(width * .53)))
+        self._apply_copy(width)
         self.open_button.place(x=32, y=height - 92)
         self.connect_button.place(x=32 + self.open_button.winfo_reqwidth() + 12, y=height - 92)
+
+    def _apply_copy(self, width: int) -> None:
+        greeting = greeting_line(datetime.now(), owner_display_name(self.app))
+        available = width - 64 if width < 690 else max(190, int(width * .56) - 35)
+        while len(greeting) > 2 and self._title_font.measure(greeting) > available:
+            greeting = greeting[:-2].rstrip("…") + "…"
+        machine = self.app.name_var.get().strip() or "Этот компьютер"
+        self.itemconfigure(self._heading, text=greeting, font=self._title_font)
+        self.itemconfigure(
+            self._description,
+            text=f"{machine} · Локальное управление и подключение к XASS",
+            width=max(250, int(width * .53)),
+        )
 
     def _render_backdrop(self, width: int, height: int) -> Image.Image:
         # Asset fitting is rendering, not a baked UI: all text remains native.
@@ -214,6 +274,18 @@ def build_home(app: Any) -> None:
             surface.configure(cursor="hand2")
             surface.bind("<ButtonRelease-1>", lambda _event, view=target: app.show_view(view))
     actions.after_idle(actions.arrange)
+
+    music = RoundedPanel(app.content, bg=CARD, padx=18, pady=16)
+    music.pack(fill="x", pady=(0, 14))
+    _icon(music, "music", size=34, color=LILAC).pack(side="left", padx=(0, 14))
+    music_copy = tk.Frame(music, bg=CARD)
+    music_copy.pack(side="left", fill="x", expand=True)
+    tk.Label(music_copy, text="Музыка", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w")
+    tk.Label(music_copy, text="Файлы на этом ПК, без сервера", bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
+    ModernButton(
+        music, text="Открыть", command=lambda: app.show_view("music"),
+        bg=BLUE, fg="#12131c", activebackground="#9aafff", padx=16, pady=8,
+    ).pack(side="right")
 
     event_card = RoundedPanel(app.content, bg=CARD, padx=20, pady=14)
     event_card.pack(fill="x")

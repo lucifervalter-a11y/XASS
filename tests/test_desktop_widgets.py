@@ -18,7 +18,8 @@ class DecorationTests(unittest.TestCase):
 
     def test_every_navigation_and_status_icon_has_visible_monoline_pixels(self):
         for name in ("home", "monitor", "link", "folder", "archive", "journal", "update", "settings",
-                     "terminal", "cpu", "memory", "disk", "chevron", "globe", "shield", "play", "pause"):
+                     "terminal", "cpu", "memory", "disk", "chevron", "globe", "shield", "play", "pause", "music",
+                     "previous", "next", "stop"):
             with self.subTest(name=name):
                 icon = _icon_raster(name, 24, ACCENT)
                 self.assertEqual(icon.size, (24, 24))
