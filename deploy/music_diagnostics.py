@@ -83,12 +83,38 @@ def version(value) -> str:
     return value if isinstance(value, str) and re.fullmatch(r"\d{1,3}\.\d{1,3}\.\d{1,3}", value) else "unknown"
 
 
+def age_bucket(value, *, now: datetime) -> str:
+    """Emit coarse freshness only, never timestamps supplied by stored rows."""
+    try:
+        if isinstance(value, str):
+            if len(value) > 64:
+                return "unknown"
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if not isinstance(value, datetime):
+            return "unknown"
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        seconds = (now - value).total_seconds()
+        if seconds < -5:
+            return "unknown"
+        if seconds < 15:
+            return "fresh"
+        if seconds < 60:
+            return "recent"
+        if seconds < 300:
+            return "stale"
+        return "abandoned"
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+
+
 def grouped(rows, keys):
     counts = Counter(tuple(row[key] for key in keys) for row in rows)
     return [{**dict(zip(keys, values)), "count": count} for values, count in sorted(counts.items())]
 
 
-def summarize(transfers, commands, sessions, agents) -> dict:
+def summarize(transfers, commands, sessions, agents, *, now=None) -> dict:
+    now = now or datetime.now(timezone.utc)
     transfer_rows = []
     for row in transfers[:ROW_LIMIT]:
         stored_code = row.get("failure_code")
@@ -105,7 +131,9 @@ def summarize(transfers, commands, sessions, agents) -> dict:
                 error = category(detail, empty="unknown" if row.get("status") == "failed" else "none",
                                  fallback="agent_command_failed")
         transfer_rows.append({"status": allowed(row.get("status"), TRANSFER_STATES),
-                              "target_kind": device_kind(row.get("device")), "error_category": error})
+                              "source_kind": device_kind(row.get("source_device")),
+                              "target_kind": device_kind(row.get("device")), "error_category": error,
+                              "age_bucket": age_bucket(row.get("created_at"), now=now)})
     command_rows = []
     for row in commands[:ROW_LIMIT]:
         result_ok = row.get("ok")
@@ -122,9 +150,10 @@ def summarize(transfers, commands, sessions, agents) -> dict:
                    "error_category": category(row.get("player_error"))} for row in agents[:AGENT_LIMIT]]
     return {"ok": True, "window_minutes": WINDOW_MINUTES,
             "limits": {"transfers": ROW_LIMIT, "commands": ROW_LIMIT, "agents": AGENT_LIMIT},
-            "transfers": {"count": len(transfer_rows), "groups": grouped(transfer_rows, ("status", "target_kind", "error_category"))},
+            "transfers": {"count": len(transfer_rows), "groups": grouped(transfer_rows, ("status", "source_kind", "target_kind", "error_category", "age_bucket"))},
             "agent_music_commands": {"count": len(command_rows), "groups": grouped(command_rows, ("command", "status", "player_state", "error_category"))},
-            "session": {"kind": device_kind(session.get("device")), "state": allowed(session.get("state"), STATES)},
+            "session": {"kind": device_kind(session.get("device")), "state": allowed(session.get("state"), STATES),
+                        "age_bucket": age_bucket(session.get("updated_at"), now=now)},
             "recent_online_agents": {"count": len(agent_rows), "window_seconds": 120,
                                      "groups": grouped(agent_rows, ("version", "player_state", "error_category"))}}
 
@@ -177,11 +206,11 @@ async def collect(database_url: str, *, now=None) -> dict:
             else:
                 await connection.execute(text("PRAGMA query_only = ON"))
             cutoff = now - timedelta(minutes=WINDOW_MINUTES)
-            transfers = await rows(connection, f"SELECT status, substr(detail,1,2000) AS detail, {field('target','device')} AS device, {field('target','failure_code')} AS failure_code, CASE WHEN start_command_id IS NULL THEN 'waiting' ELSE 'starting' END AS phase FROM music_transfers WHERE status = 'failed' AND created_at >= :cutoff ORDER BY created_at DESC LIMIT {ROW_LIMIT}", cutoff)
+            transfers = await rows(connection, f"SELECT status, source_device, created_at, substr(detail,1,2000) AS detail, {field('target','device')} AS device, {field('target','failure_code')} AS failure_code, CASE WHEN start_command_id IS NULL THEN 'waiting' ELSE 'starting' END AS phase FROM music_transfers WHERE status = 'failed' AND created_at >= :cutoff ORDER BY created_at DESC LIMIT {ROW_LIMIT}", cutoff)
             commands = await rows(connection, f"SELECT command, status, {field('result','ok')} AS ok, {field('result','message')} AS message, {field('result','details','state')} AS player_state, {field('result','details','error')} AS player_error FROM agent_commands WHERE substr(command,1,6) = 'music_' AND created_at >= :cutoff ORDER BY created_at DESC LIMIT {ROW_LIMIT}", cutoff)
-            sessions = await rows(connection, "SELECT device, state FROM music_sessions WHERE id=1 LIMIT 1")
+            sessions = await rows(connection, "SELECT device, state, updated_at FROM music_sessions WHERE id=1 LIMIT 1")
             agents = await rows(connection, f"SELECT {field('last_payload','agent_version')} AS version, {field('last_payload','music_player','state')} AS player_state, {field('last_payload','music_player','error')} AS player_error FROM heartbeat_sources WHERE is_online = TRUE AND source_type = 'PC_AGENT' AND last_seen_at >= :cutoff ORDER BY last_seen_at DESC LIMIT {AGENT_LIMIT}", now - timedelta(seconds=120))
-            return summarize(transfers, commands, sessions, agents)
+            return summarize(transfers, commands, sessions, agents, now=now)
     finally:
         await engine.dispose()
 

@@ -21,16 +21,16 @@ class RedactionTests(unittest.TestCase):
     def test_only_allowlisted_values_escape_from_untrusted_rows(self):
         report = diagnostics.summarize(
             [{"status": SECRET, "device": "agent:" + SECRET, "failure_code": SECRET, "detail": SECRET,
-              "id": SECRET, "source_key": SECRET, "phase": SECRET}],
+              "id": SECRET, "source_key": SECRET, "phase": SECRET, "source_device": SECRET, "created_at": SECRET}],
             [{"command": SECRET, "status": SECRET, "ok": "false", "message": SECRET,
               "player_state": SECRET, "player_error": "Не удалось декодировать аудиотрек " + SECRET}],
-            [{"device": "agent:" + SECRET, "state": SECRET, "session_key": SECRET}],
+            [{"device": "agent:" + SECRET, "state": SECRET, "session_key": SECRET, "updated_at": SECRET}],
             [{"version": "0.19.0" + SECRET, "player_state": SECRET, "player_error": SECRET, "source_name": SECRET}],
         )
         raw = json.dumps(report)
         for value in (SECRET, "topsecret", "private.invalid", "config.json", "session_key", "source_name", "ticket"):
             self.assertNotIn(value, raw)
-        self.assertEqual(report["session"], {"kind": "agent", "state": "unknown"})
+        self.assertEqual(report["session"], {"kind": "agent", "state": "unknown", "age_bucket": "unknown"})
         self.assertEqual(report["agent_music_commands"]["groups"][0]["error_category"], "agent_command_failed")
         self.assertEqual(report["recent_online_agents"]["groups"][0]["version"], "unknown")
 
@@ -41,6 +41,25 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(report["agent_music_commands"]["groups"][0]["error_category"], "agent_decode_failed")
         self.assertEqual(report["agent_music_commands"]["groups"][0]["count"], 4)
         self.assertEqual(diagnostics.category("Не удалось декодировать аудиотрек\n" + SECRET), "unknown")
+
+    def test_age_buckets_cover_boundaries_without_exposing_exact_timestamps(self):
+        now = datetime(2026, 9, 27, 18, 0, tzinfo=timezone.utc)
+        for seconds, expected in ((0, "fresh"), (14, "fresh"), (15, "recent"), (59, "recent"),
+                                  (60, "stale"), (299, "stale"), (300, "abandoned"), (86400, "abandoned")):
+            value = now - timedelta(seconds=seconds)
+            for source in (value, value.replace(tzinfo=None), value.isoformat(), value.replace(tzinfo=None).isoformat(" ")):
+                with self.subTest(seconds=seconds, source_type=type(source).__name__):
+                    self.assertEqual(diagnostics.age_bucket(source, now=now), expected)
+        for value in (None, SECRET, {}, now + timedelta(minutes=5)):
+            self.assertEqual(diagnostics.age_bucket(value, now=now), "unknown")
+        report = diagnostics.summarize(
+            [{"status": "failed", "source_device": "local", "device": "agent:" + SECRET,
+              "created_at": now - timedelta(minutes=10), "detail": "Время переключения истекло"}], [],
+            [{"device": "local", "state": "playing", "updated_at": now - timedelta(hours=2)}], [], now=now)
+        self.assertEqual(report["session"]["age_bucket"], "abandoned")
+        self.assertEqual(report["transfers"]["groups"][0]["source_kind"], "local")
+        self.assertEqual(report["transfers"]["groups"][0]["age_bucket"], "abandoned")
+        self.assertNotIn("2026", json.dumps(report))
 
     def test_transfer_codes_match_historical_phases_and_allowlisted_saved_codes(self):
         report = diagnostics.summarize([
@@ -88,18 +107,18 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 return (now - timedelta(minutes=minutes)).replace(tzinfo=None).isoformat(" ")
             with sqlite3.connect(path) as db:
                 db.executescript("""
-                    CREATE TABLE music_transfers(status TEXT, detail TEXT, target JSON, start_command_id INTEGER, created_at DATETIME);
+                    CREATE TABLE music_transfers(status TEXT, detail TEXT, target JSON, start_command_id INTEGER, created_at DATETIME, source_device TEXT);
                     CREATE TABLE agent_commands(command TEXT, status TEXT, result JSON, created_at DATETIME);
-                    CREATE TABLE music_sessions(id INTEGER, device TEXT, state TEXT);
+                    CREATE TABLE music_sessions(id INTEGER, device TEXT, state TEXT, updated_at DATETIME);
                     CREATE TABLE heartbeat_sources(is_online BOOLEAN, source_type TEXT, last_seen_at DATETIME, last_payload JSON);
                 """)
                 for index in range(30):
-                    db.execute("INSERT INTO music_transfers VALUES(?,?,?,?,?)", ("failed", "Не удалось декодировать аудиотрек", json.dumps({"device": "agent:" + SECRET, "ticket": SECRET}), 1, stamp(index)))
-                db.execute("INSERT INTO music_transfers VALUES(?,?,?,?,?)", ("ready", SECRET, "{}", None, stamp(0)))
-                db.execute("INSERT INTO music_transfers VALUES(?,?,?,?,?)", ("failed", SECRET, "{}", None, stamp(3000)))
+                    db.execute("INSERT INTO music_transfers VALUES(?,?,?,?,?,?)", ("failed", "Не удалось декодировать аудиотрек", json.dumps({"device": "agent:" + SECRET, "ticket": SECRET}), 1, stamp(index), "local"))
+                db.execute("INSERT INTO music_transfers VALUES(?,?,?,?,?,?)", ("ready", SECRET, "{}", None, stamp(0), "agent:" + SECRET))
+                db.execute("INSERT INTO music_transfers VALUES(?,?,?,?,?,?)", ("failed", SECRET, "{}", None, stamp(3000), "agent:" + SECRET))
                 for command in ("music_play", "musicXplay", "remote_clipboard"):
                     db.execute("INSERT INTO agent_commands VALUES(?,?,?,?)", (command, "failed", json.dumps({"ok": False, "message": SECRET, "details": {"state": "error", "error": "Не удалось декодировать аудиотрек", "url": SECRET}}), stamp(0)))
-                db.execute("INSERT INTO music_sessions VALUES(?,?,?)", (1, "agent:" + SECRET, "loading"))
+                db.execute("INSERT INTO music_sessions VALUES(?,?,?,?)", (1, "agent:" + SECRET, "loading", stamp(90)))
                 for online, minutes in ((True, 0), (False, 0), (True, 3)):
                     db.execute("INSERT INTO heartbeat_sources VALUES(?,?,?,?)", (online, "PC_AGENT", stamp(minutes), json.dumps({"agent_version": "0.17.0", "api_key": SECRET, "music_player": {"state": "error", "error": "Не удалось декодировать аудиотрек"}})))
             db.close()
@@ -107,7 +126,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             report = await diagnostics.collect("sqlite+aiosqlite:///" + path.as_posix(), now=now)
             self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), before)
             self.assertEqual(report["transfers"]["count"], 20)
-            self.assertEqual(report["transfers"]["groups"], [{"status": "failed", "target_kind": "agent", "error_category": "agent_decode_failed", "count": 20}])
+            groups = report["transfers"]["groups"]
+            self.assertEqual({row["age_bucket"]: row["count"] for row in groups}, {"fresh": 1, "stale": 4, "abandoned": 15})
+            self.assertTrue(all(row["source_kind"] == "local" and row["target_kind"] == "agent" and row["error_category"] == "agent_decode_failed" for row in groups))
+            self.assertEqual(report["session"]["age_bucket"], "abandoned")
             self.assertEqual(report["agent_music_commands"]["count"], 1)
             self.assertEqual(report["recent_online_agents"]["count"], 1)
             self.assertEqual(report["recent_online_agents"]["groups"][0]["version"], "0.17.0")
