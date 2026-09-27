@@ -27,6 +27,16 @@ final class NativeDiagnosticsInterfaceTests: XCTestCase {
         clear.tap()
         XCTAssertTrue(app.buttons["Отмена"].waitForExistence(timeout: 3))
         app.buttons["Отмена"].tap()
-        XCTAssertTrue(app.buttons["nativeDiagnosticsShare"].isHittable, "Cancelling clear keeps the prepared share document accessible")
+        // Wait for the native confirmation sheet to finish dismissing before testing hit targets.
+        let share = app.buttons["nativeDiagnosticsShare"]
+        let accessible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND isHittable == true"), object: share)
+        let result = XCTWaiter.wait(for: [accessible], timeout: 5)
+        if result != .completed {
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "Native-Diagnostics-After-Cancel"; screenshot.lifetime = .keepAlways; add(screenshot)
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "Native-Diagnostics-After-Cancel-Hierarchy"; hierarchy.lifetime = .keepAlways; add(hierarchy)
+        }
+        XCTAssertEqual(result, .completed, "Cancelling clear keeps the prepared share document accessible after dismissal")
     }
 }
