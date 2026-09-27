@@ -25,11 +25,19 @@ an incompatible Starlette version into the existing FastAPI constraint.
 
 The `Pillow==11.3.0` pin also has newer upstream advisories, including
 [PSD memory corruption](https://github.com/python-pillow/Pillow/security/advisories/GHSA-pwv6-vv43-88gr).
-Embedded music artwork invokes only JPEG, PNG, WebP and GIF plugins via
+Embedded music artwork invokes only JPEG, PNG and GIF plugins via
 `Image.open(..., formats=...)`; disallowed plugins are never used for sniffing or
 decoding. Byte/pixel budgets and private sanitized JPEG output remain enforced.
 This narrows that endpoint's attack surface, not every possible Pillow call.
 A tested Pillow upgrade remains required; no package pins were changed here.
+
+WebP embedded covers are temporarily excluded, independently of those
+advisories. Pillow's WebP plugin creates a native animation decoder during
+`Image.open`, and [libwebp allocates canvas buffers before returning dimensions](https://github.com/webmproject/libwebp/blob/v1.5.0/src/demux/anim_decode.c#L117-L127).
+The application's later pixel limit cannot prevent that initial allocation.
+Such covers use the existing no-artwork fallback; audio playback is unaffected.
+Profile/project WebP uploads are still accepted because those routes store
+bytes without invoking Pillow. This is not a complete bundled-C-library audit.
 
 ## Browser approvals and uploads
 
@@ -41,6 +49,8 @@ invalidates stored approvals. Native device approval semantics remain unchanged.
 Workspace uploads enforce their configured size while receiving the stream,
 including requests without an accurate Content-Length. Oversized bodies return
 413 before an asset is stored or a PC command is queued.
+Profile avatar and project-cover uploads use the same bounded receiver with
+their existing 8 MiB and 10 MiB limits, before any file/profile mutation.
 
 ## Unmerged VK import experiments
 

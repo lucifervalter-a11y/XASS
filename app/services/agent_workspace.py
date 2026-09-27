@@ -30,6 +30,12 @@ async def read_asset_body(request, settings: Settings, *, kind: str) -> bytes:
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     sealed = media_type == SEALED_TYPE or request.headers.get("x-xass-cipher", "").startswith("xass-sealed")
     limit = max(0, limit) + (33 if sealed else 0)
+    return await read_bounded_body(request, limit=limit)
+
+
+async def read_bounded_body(request, *, limit: int) -> bytes:
+    """Receive at most the given byte budget, regardless of framing headers."""
+    limit = max(0, int(limit))
     too_large = f"Файл превышает лимит загрузки {limit} байт"
     declared = request.headers.get("content-length", "").strip()
     if declared.isascii() and declared.isdecimal() and (len(declared) > 20 or int(declared) > limit):

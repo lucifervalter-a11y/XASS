@@ -132,7 +132,17 @@ class MusicArtworkTests(unittest.TestCase):
             self.assertIsNone(artwork._jpeg_thumbnail(b"8BPS" + bytes(128)))
         with patch.object(artwork.Image, "open", wraps=Image.open) as opened:
             self.assertIsNotNone(artwork._jpeg_thumbnail(png_bytes((32, 32))))
-            self.assertEqual(opened.call_args.kwargs["formats"], ("JPEG", "PNG", "WEBP", "GIF"))
+            self.assertEqual(opened.call_args.kwargs["formats"], ("JPEG", "PNG", "GIF"))
+
+    def test_webp_cover_is_rejected_before_detector_or_native_decoder(self):
+        Image.init()
+        with patch.dict(Image.OPEN, {"WEBP": (lambda *_: self.fail("WebP decoder invoked"),
+                                              lambda *_: self.fail("WebP detector invoked"))}):
+            self.assertIsNone(artwork._jpeg_thumbnail(b"RIFF" + bytes(4) + b"WEBPVP8X" + bytes(64)))
+        for format_name in ("JPEG", "PNG", "GIF"):
+            output = io.BytesIO()
+            Image.new("RGB", (16, 16), "red").save(output, format=format_name)
+            self.assertIsNotNone(artwork._jpeg_thumbnail(output.getvalue()))
 
     def test_metadata_reader_caps_bytes_and_seek_operations(self):
         with self.path.open("rb") as stream, patch.object(artwork, "MAX_METADATA_BYTES", 128):

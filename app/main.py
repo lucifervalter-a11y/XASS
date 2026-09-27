@@ -72,6 +72,7 @@ from app.services.agent_workspace import (
     load_asset as load_workspace_asset,
     normalize_remote_location,
     read_asset_body,
+    read_bounded_body,
     store_asset as store_workspace_asset,
 )
 from app.services.app_config import (
@@ -2371,11 +2372,12 @@ async def mini_site_avatar_upload(
     request: Request,
     user: MiniAppUser = Depends(require_mini_owner),
 ) -> dict[str, Any]:
-    body = await request.body()
+    try:
+        body = await read_bounded_body(request, limit=8 * 1024 * 1024)
+    except AssetUploadTooLarge as exc:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Аватар должен быть меньше 8 МБ") from exc
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите изображение")
-    if len(body) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Аватар должен быть меньше 8 МБ")
     extension = _avatar_extension(request.headers.get("content-type", ""), body)
     if extension is None:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Поддерживаются JPG, PNG и WebP")
@@ -2497,11 +2499,12 @@ async def mini_site_project_cover_upload(
     project = next((item for item in projects if str(item.get("id")) == project_id), None)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Проект не найден")
-    body = await request.body()
+    try:
+        body = await read_bounded_body(request, limit=10 * 1024 * 1024)
+    except AssetUploadTooLarge as exc:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Обложка должна быть меньше 10 МБ") from exc
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Выберите изображение")
-    if len(body) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Обложка должна быть меньше 10 МБ")
     extension = _avatar_extension(request.headers.get("content-type", ""), body)
     if extension is None:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Поддерживаются JPG, PNG и WebP")
