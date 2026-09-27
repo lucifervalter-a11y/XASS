@@ -200,66 +200,101 @@ import SwiftUI
 
     var body: some View {
         List {
-            Section {
-                Text("Если что-то не работает, подготовьте файл и отправьте его в чат поддержки. Журнал хранится только на iPhone и не отправляется автоматически.")
-                    .font(.callout).foregroundStyle(.secondary)
-                LabeledContent("Версия приложения", value: snapshot.appVersion + " (" + snapshot.appBuild + ")")
-                Toggle("Собирать технический журнал", isOn: $enabled)
-                    .onChange(of: enabled) { _, value in recorder.setEnabled(value) }
-                    .accessibilityIdentifier("nativeDiagnosticsEnabled")
-            }
-            Section("Отправить журнал") {
-                Button {
-                    preparing = true; failed = false; exportURL = nil
-                    Task {
-                        do { exportURL = try await recorder.exportFile(); snapshot = recorder.snapshot() }
-                        catch { failed = true }
-                        preparing = false
-                    }
-                } label: {
-                    HStack {
-                        Label(exportURL == nil ? "Подготовить файл" : "Подготовить свежий файл", systemImage: "doc.badge.arrow.up")
-                        Spacer(); if preparing { ProgressView() }
-                    }
-                }.disabled(preparing).accessibilityIdentifier("nativeDiagnosticsPrepare")
-                if let url = exportURL {
-                    ShareLink(item: url, preview: SharePreview("Диагностика XASS")) {
-                        Label("Поделиться файлом…", systemImage: "square.and.arrow.up")
-                    }.accessibilityIdentifier("nativeDiagnosticsShare")
-                    Text("Файл JSON готов. Выберите Telegram, «Файлы» или другое приложение в меню «Поделиться».")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                if failed { Text("Не удалось подготовить файл. Попробуйте ещё раз.").foregroundStyle(.orange).font(.callout) }
-                DisclosureGroup("Что попадёт в файл") {
-                    Text("Версия XASS, время событий, категории операций и ошибок, коды HTTP, размер ответа и время выполнения. Не более 200 последних событий.")
-                    Text("Без адресов сервера, URL, cookies, ключей, текста ответов, имён устройств, названий треков, путей к файлам и идентификаторов сессий.")
-                }.font(.callout).accessibilityIdentifier("nativeDiagnosticsDisclosure")
-            }
-            Section("Последние события · \(snapshot.events.count)") {
-                if snapshot.events.isEmpty {
-                    Text(enabled ? "Событий пока нет. Повторите действие, которое вызывает ошибку, и обновите журнал." : "Сбор выключен. Уже записанные события остаются до очистки.")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                ForEach(Array(snapshot.events.suffix(20).reversed().enumerated()), id: \.offset) { _, event in
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack { Text(event.operation.title).font(.subheadline.weight(.medium)); Spacer(); Text(event.time.formatted(date: .omitted, time: .standard)).font(.caption).foregroundStyle(.secondary) }
-                        Text(event.step.rawValue + " · " + event.target.rawValue + (event.error == .none ? "" : " · " + event.error.rawValue))
-                            .font(.caption.monospaced()).foregroundStyle(event.error == .none ? Color.secondary : Color.orange)
-                        if let code = event.httpStatus { Text("HTTP \(code)").font(.caption).foregroundStyle(.secondary) }
-                    }.padding(.vertical, 3)
-                }
-            }
-            Section {
-                Button("Очистить журнал", role: .destructive) { confirmClear = true }
-                    .disabled(preparing).accessibilityIdentifier("nativeDiagnosticsClear")
-                Text("Удаляет только технический журнал и подготовленный файл. Музыка, вход и настройки сохраняются.").font(.caption).foregroundStyle(.secondary)
-            }
+            privacySection
+            exportSection
+            eventsSection
+            clearSection
         }.navigationTitle("Журнал приложения").navigationBarTitleDisplayMode(.inline)
             .toolbar { Button { snapshot = recorder.snapshot() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Обновить журнал") }
             .confirmationDialog("Очистить технический журнал?", isPresented: $confirmClear, titleVisibility: .visible) {
                 Button("Очистить", role: .destructive) { recorder.clear(); snapshot = recorder.snapshot(); exportURL = nil; failed = false }
                 Button("Отмена", role: .cancel) {}
             }
+    }
+
+    private var privacySection: some View {
+        Section {
+            Text("Если что-то не работает, подготовьте файл и отправьте его в чат поддержки. Журнал хранится только на iPhone и не отправляется автоматически.")
+                .font(.callout).foregroundStyle(.secondary)
+            LabeledContent("Версия приложения", value: "\(snapshot.appVersion) (\(snapshot.appBuild))")
+            Toggle("Собирать технический журнал", isOn: $enabled)
+                .onChange(of: enabled) { _, value in recorder.setEnabled(value) }
+                .accessibilityIdentifier("nativeDiagnosticsEnabled")
+        }
+    }
+
+    private var exportSection: some View {
+        Section("Отправить журнал") {
+            Button(action: prepareExport) {
+                HStack {
+                    Label(exportURL == nil ? "Подготовить файл" : "Подготовить свежий файл", systemImage: "doc.badge.arrow.up")
+                    Spacer(); if preparing { ProgressView() }
+                }
+            }.disabled(preparing).accessibilityIdentifier("nativeDiagnosticsPrepare")
+            if let url = exportURL {
+                ShareLink(item: url, preview: SharePreview("Диагностика XASS")) {
+                    Label("Поделиться файлом…", systemImage: "square.and.arrow.up")
+                }.accessibilityIdentifier("nativeDiagnosticsShare")
+                Text("Файл JSON готов. Выберите Telegram, «Файлы» или другое приложение в меню «Поделиться».")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if failed { Text("Не удалось подготовить файл. Попробуйте ещё раз.").foregroundStyle(.orange).font(.callout) }
+            DisclosureGroup("Что попадёт в файл") {
+                Text("Версия XASS, время событий, категории операций и ошибок, коды HTTP, размер ответа и время выполнения. Не более 200 последних событий.")
+                Text("Без адресов сервера, URL, cookies, ключей, текста ответов, имён устройств, названий треков, путей к файлам и идентификаторов сессий.")
+            }.font(.callout).accessibilityIdentifier("nativeDiagnosticsDisclosure")
+        }
+    }
+
+    private var visibleEvents: [NativeDiagnosticEvent] { Array(snapshot.events.suffix(20).reversed()) }
+    private var eventsSection: some View {
+        let entries = visibleEvents
+        return Section("Последние события · \(snapshot.events.count)") {
+            if snapshot.events.isEmpty {
+                Text(enabled ? "Событий пока нет. Повторите действие, которое вызывает ошибку, и обновите журнал." : "Сбор выключен. Уже записанные события остаются до очистки.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            ForEach(entries.indices, id: \.self) { index in
+                NativeDiagnosticEventRow(event: entries[index])
+            }
+        }
+    }
+
+    private var clearSection: some View {
+        Section {
+            Button("Очистить журнал", role: .destructive) { confirmClear = true }
+                .disabled(preparing).accessibilityIdentifier("nativeDiagnosticsClear")
+            Text("Удаляет только технический журнал и подготовленный файл. Музыка, вход и настройки сохраняются.").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func prepareExport() {
+        preparing = true; failed = false; exportURL = nil
+        Task {
+            do { exportURL = try await recorder.exportFile(); snapshot = recorder.snapshot() }
+            catch { failed = true }
+            preparing = false
+        }
+    }
+}
+
+private struct NativeDiagnosticEventRow: View {
+    let event: NativeDiagnosticEvent
+    private var summary: String {
+        let result = event.step.rawValue + " · " + event.target.rawValue
+        return event.error == .none ? result : result + " · " + event.error.rawValue
+    }
+    private var tint: Color { event.error == .none ? .secondary : .orange }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(event.operation.title).font(.subheadline.weight(.medium))
+                Spacer()
+                Text(event.time.formatted(date: .omitted, time: .standard)).font(.caption).foregroundStyle(.secondary)
+            }
+            Text(summary).font(.caption.monospaced()).foregroundStyle(tint)
+            if let code = event.httpStatus { Text("HTTP \(code)").font(.caption).foregroundStyle(.secondary) }
+        }.padding(.vertical, 3)
     }
 }
 

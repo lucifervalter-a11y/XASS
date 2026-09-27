@@ -35,6 +35,10 @@ final class OwnerAPITests: XCTestCase {
             var malformed = receipt; malformed.removeValue(forKey: field)
             XCTAssertThrowsError(try OwnerAPI.decode(JSONSerialization.data(withJSONObject: malformed), status: 200, path: "/api/mini/music/transfers"))
         }
+        for invalidID in [id + "\n", id + "\r", id + "/cancel", String(repeating: "g", count: 32)] {
+            var malformed = receipt; malformed["transfer_id"] = invalidID
+            XCTAssertThrowsError(try OwnerAPI.decode(JSONSerialization.data(withJSONObject: malformed), status: 200, path: "/api/mini/music/transfers"))
+        }
         XCTAssertThrowsError(try OwnerAPI.decode(envelope, status: 401, path: "/api/mini/music/transfers"))
     }
 
@@ -44,6 +48,7 @@ final class OwnerAPITests: XCTestCase {
             OwnerHTTPFixture.requests = []
             let transferID = String(repeating: "c", count: 32)
             var fail = true
+            var ownerSessionKey = ""
             OwnerHTTPFixture.reply = { request in
                 let path = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value ?? ""
                 var result: [String: Any] = ["ok": true]
@@ -55,7 +60,7 @@ final class OwnerAPITests: XCTestCase {
                 } else if path == "/api/mini/music/transfers" {
                     result = ["ok": !oldServer || !fail, "transfer_id": transferID, "status": fail ? "failed" : "ready",
                         "detail": fail ? "ПК не подтвердил запуск музыки" : "", "error_code": "target_start_failed",
-                        "session": ["track_id": 1, "device": "agent:Fixture", "state": "playing", "position": 12]]
+                        "session": ["track_id": 1, "device": "agent:Fixture", "session_key": ownerSessionKey, "state": "playing", "position": 12]]
                 }
                 let data = try! JSONSerialization.data(withJSONObject: result)
                 let envelope = try! JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(decoding: data, as: UTF8.self)])
@@ -65,6 +70,7 @@ final class OwnerAPITests: XCTestCase {
             let api = OwnerAPI(origin: try ServerOrigin("https://native-api-fixture.invalid"), configuration: config,
                 savedSession: { SavedSession(value: "fixture-session", expires: Date().addingTimeInterval(60)) })
             let store = NativeStore(api: api, audio: AudioController())
+            ownerSessionKey = store.sessionKey
             defer { store.disconnect(); api.invalidate() }
             await store.refresh()
             do { try await store.pickRoute(device: "agent:Fixture"); XCTFail("Failed target must not become ready") }

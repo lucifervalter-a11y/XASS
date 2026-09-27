@@ -43,7 +43,7 @@ enum NativeDiagnosticError: String, Codable, CaseIterable {
     case none, network, timeout, cancelled, unauthorized, forbidden, http, html
     case invalidJSON = "invalid_json", invalidEnvelope = "invalid_envelope", unsupportedResponse = "unsupported_response"
     case tooLarge = "too_large", conflict, invalidState = "invalid_state", unknown
-    case sourceTimeout = "source_timeout", sourceStopFailed = "source_stop_failed"
+    case sourceTimeout = "source_timeout", targetTimeout = "target_timeout", sourceStopFailed = "source_stop_failed"
     case targetStartFailed = "target_start_failed", targetUnavailable = "target_unavailable"
     case transferCancelled = "transfer_cancelled", replaced, agentCommandFailed = "agent_command_failed"
 }

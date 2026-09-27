@@ -250,10 +250,10 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     /// operation; this is NOT a blanket acceptance of failed or malformed JSON.
     private static func legacyTransferFailure(_ object: [String: Any], path: String) -> Bool {
         let route = String(path.split(separator: "?", maxSplits: 1).first ?? "")
-        guard route.range(of: #"^/api/mini/music/transfers(?:/[a-f0-9]{32}(?:/cancel)?)?$"#, options: .regularExpression) != nil,
+        guard route.range(of: #"\A/api/mini/music/transfers(?:/[a-f0-9]{32}(?:/cancel)?)?\z"#, options: .regularExpression) != nil,
               object["ok"] as? Bool == false, object["status"] as? String == "failed",
               let id = object["transfer_id"] as? String,
-              id.range(of: #"^[a-f0-9]{32}$"#, options: .regularExpression) != nil,
+              id.range(of: #"\A[a-f0-9]{32}\z"#, options: .regularExpression) != nil,
               let detail = object["detail"] as? String, !detail.isEmpty, detail.utf8.count <= 4096,
               object["session"] is [String: Any] else { return false }
         if route != "/api/mini/music/transfers" {

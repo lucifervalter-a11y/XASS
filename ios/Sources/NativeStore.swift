@@ -24,7 +24,9 @@ import UIKit
     @Published var currentID: Int?
     @Published var selectedDevice = "local"
     @Published private(set) var canonicalClientID = ""
+    @Published private(set) var canRecoverPlayback = false
     private var canonicalSessionKey = ""
+    private var canonicalRevision = 0
     private var canonicalDevice = "local"
     private var canonicalDetail: String?
     @Published var outputID = "default"
@@ -78,6 +80,7 @@ import UIKit
     private var missingArtwork = Set<Int>()
     @Published private(set) var artworkBytes = 0
     private var maxUpload = 256 * 1024 * 1024
+    private var lastAudioDiagnosticFailed = false
 
     init(api: OwnerService, audio: AudioController) {
         self.api = api; self.audio = audio; authorization = NativeActionAuthorization(api: api)
@@ -332,6 +335,8 @@ import UIKit
         currentID = value["track_id"] as? Int
         canonicalClientID = value["client_id"] as? String ?? ""; canonicalSessionKey = value["session_key"] as? String ?? ""
         canonicalDevice = value["device"] as? String ?? "local"
+        canonicalRevision = value["revision"] as? Int ?? 0
+        canRecoverPlayback = value["recovery_available"] as? Bool == true && canonicalDevice == "local" && canonicalSessionKey != sessionKey
         if userPickedRoute || transferPending { selectedDevice = value["device"] as? String ?? selectedDevice } else { selectedDevice = "local" }
         playbackState = value["state"] as? String ?? "stopped"
         let detail = value["detail"] as? String
@@ -353,11 +358,13 @@ import UIKit
             applyNativeQueue()
         }
         let nextState = value["state"] as? String ?? playbackState
-        if nextState != playbackState || value["error"] != nil {
+        let audioFailed = value["error"] != nil || nextState == "error"
+        if nextState != playbackState || audioFailed != lastAudioDiagnosticFailed {
             NativeDiagnostics.shared.record(operation: .audioPlayback,
-                step: nextState == "error" || value["error"] != nil ? .failed : nextState == "loading" ? .waiting : .completed,
-                target: .localPlayer, error: value["error"] != nil || nextState == "error" ? .invalidState : .none)
+                step: audioFailed ? .failed : nextState == "loading" ? .waiting : .completed,
+                target: .localPlayer, error: audioFailed ? .invalidState : .none)
         }
+        lastAudioDiagnosticFailed = audioFailed
         playbackState = nextState
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
         if let message = value["error"] as? String { error = message }
@@ -530,6 +537,19 @@ import UIKit
             await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/cancel")
             throw OwnerAPIError(status: 409, message: error ?? "Нет сессии после переключения")
         }
+        guard session["session_key"] as? String == sessionKey,
+              session["device"] as? String == device,
+              session["track_id"] as? Int == chosenID else {
+            // Another controller may have replaced the lease before the ready
+            // receipt was read. Never apply its session or start our old track.
+            activeTransferID = nil; ownsSession = false
+            playbackState = "error"
+            error = "Управление изменилось во время переключения. Повторите воспроизведение."
+            NativeDiagnostics.shared.record(operation: .musicTransfer, step: .failed,
+                target: diagnosticTarget, error: .invalidState)
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
+            throw OwnerAPIError(status: 409, message: error ?? "Подтверждение другого плеера")
+        }
         offlinePlayback = false; applySession(session); currentID = chosenID; error = nil
         if selectedDevice == "local" {
             guard let track = currentTrack else {
@@ -570,7 +590,7 @@ import UIKit
     private static func transferDiagnosticError(_ code: String?) -> NativeDiagnosticError {
         switch code {
         case "source_timeout": return .sourceTimeout
-        case "target_timeout": return .timeout
+        case "target_timeout": return .targetTimeout
         case "source_stop_failed": return .sourceStopFailed
         case "target_start_failed": return .targetStartFailed
         case "target_unavailable": return .targetUnavailable
@@ -579,6 +599,25 @@ import UIKit
         case "agent_command_failed": return .agentCommandFailed
         default: return .invalidState
         }
+    }
+    /// Only called after the owner explicitly confirms that the previous player
+    /// is stopped. Never infer silence from a lost network connection.
+    func recoverStalePlayback() async throws {
+        guard canRecoverPlayback, !busy, !canonicalSessionKey.isEmpty else { return }
+        busy = true; defer { busy = false }
+        NativeDiagnostics.shared.record(operation: .musicControl, step: .requested, target: .localPlayer)
+        let response = try await api.request("/api/mini/music/session/recover", method: "POST", body: [
+            "session_key": sessionKey, "client_id": clientID,
+            "expected_source_key": canonicalSessionKey, "expected_revision": canonicalRevision, "confirm_stopped": true
+        ])
+        guard let session = response["session"] as? [String: Any],
+              session["session_key"] as? String == sessionKey,
+              session["device"] as? String == "local", session["state"] as? String == "paused" else { throw OwnerAPIError.invalidResponse }
+        ownsSession = false; pendingReport = nil; suppressReports = true; audio.pause(); suppressReports = false
+        selectedDevice = "local"; userPickedRoute = true; applySession(session)
+        canRecoverPlayback = false; error = nil
+        notice = "Прежняя сессия сброшена. Нажмите воспроизведение, чтобы продолжить здесь."
+        NativeDiagnostics.shared.record(operation: .musicControl, step: .completed, target: .localPlayer)
     }
     func toggle() async throws {
         guard currentID != nil, !busy else { return }

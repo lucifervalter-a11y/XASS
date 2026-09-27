@@ -199,6 +199,58 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertFalse(store.busy)
         XCTAssertTrue(store.showRoutePicker)
     }
+
+    @MainActor func testReadyTransferWithAnotherSessionKeyCannotClaimAudio() async throws {
+        try await assertMismatchedReadyReceipt(field: "session_key", value: String(repeating: "f", count: 32))
+    }
+
+    @MainActor func testReadyTransferWithAnotherDeviceCannotClaimAudio() async throws {
+        try await assertMismatchedReadyReceipt(field: "device", value: "agent:Other")
+    }
+
+    @MainActor func testPolledReadyTransferWithAnotherTrackCannotClaimAudio() async throws {
+        try await assertMismatchedReadyReceipt(field: "track_id", value: 999, afterWaiting: true)
+    }
+
+    @MainActor private func assertMismatchedReadyReceipt(field: String, value: Any, afterWaiting: Bool = false) async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        await store.refresh()
+        let id = String(repeating: "d", count: 32)
+        let path = "/api/mini/music/transfers/" + id
+        var ready: [String: Any] = [:]
+        api.handler = { requestPath, method, body in
+            if requestPath == "/api/mini/music/transfers", method == "POST" {
+                var session: [String: Any] = ["session_key": body!["session_key"]!, "device": body!["device"]!,
+                    "track_id": body!["track_id"]!, "state": "playing", "position": 81]
+                session[field] = value
+                ready = ["ok": true, "transfer_id": id, "status": "ready", "session": session]
+                return afterWaiting ? ["ok": true, "transfer_id": id, "status": "waiting"] : ready
+            }
+            if requestPath == path, method == "GET" { return ready }
+            if requestPath == path + "/cancel", method == "POST" {
+                return ["ok": true, "transfer_id": id, "status": "failed", "detail": "Fixture cleanup"]
+            }
+            return nil
+        }
+        do { try await store.pickRoute(device: "local"); XCTFail("A replaced lease must not be accepted") }
+        catch let failure as OwnerAPIError {
+            XCTAssertEqual(failure.status, 409)
+            XCTAssertEqual(failure.message, "Управление изменилось во время переключения. Повторите воспроизведение.")
+        }
+        XCTAssertEqual(api.requests.filter { $0.0 == path + "/cancel" && $0.1 == "POST" }.count, 1)
+        XCTAssertFalse(api.requests.contains { $0.0.hasSuffix("/ticket") }, "Reject the receipt before fetching audio")
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(audio.canResumePlayback())
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertEqual(store.currentID, 1)
+        XCTAssertEqual(store.position, 37, "Do not apply the foreign receipt's position")
+        XCTAssertEqual(store.playbackState, "error")
+        XCTAssertFalse(store.busy)
+        XCTAssertTrue(store.showRoutePicker)
+    }
+
     @MainActor func testRemoteCommandCancellationUsesCommandEndpoint() async {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
         defer { store.disconnect() }
