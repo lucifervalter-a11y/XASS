@@ -1,0 +1,78 @@
+name: Encrypted read-only enrichment diagnostics
+
+on:
+  push:
+    branches: [codex/music-import-fix-20260927]
+    paths:
+      - deploy/enrichment_diagnostics.py
+      - deploy/enrichment-diagnostic-request.json
+      - .github/workflows/enrichment-diagnostics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-enrichment-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/codex/music-import-fix-20260927' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate expiring public recipient request
+        run: |
+          python3 - <<'PY'
+          import base64,json,re,time
+          from pathlib import Path
+          data=json.loads(Path('deploy/enrichment-diagnostic-request.json').read_text())
+          assert re.fullmatch(r'[a-z0-9-]{1,80}', data['id'])
+          assert type(data['expires']) is int and time.time() < data['expires'] <= time.time()+86400
+          assert len(data['recipient']) < 4096
+          assert base64.b64decode(data['recipient'], validate=True).startswith(b'-----BEGIN PUBLIC KEY-----')
+          print('Current public recipient request validated; no private key is present.')
+          PY
+      - name: Collect recipient-encrypted read-only report over pinned SSH
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export SSH_HOST=51.250.80.137
+          mkdir -p delivery
+          request_b64="$(base64 -w0 deploy/enrichment-diagnostic-request.json)"
+          [[ "$request_b64" =~ ^[A-Za-z0-9+/=]+$ ]]
+          {
+            printf '%s\n' 'set -euo pipefail' 'cd /home/red/serverredus' 'export PYTHONDONTWRITEBYTECODE=1'
+            printf '%s\n' "timeout --signal=TERM --kill-after=5s 85s .venv/bin/python - '$request_b64' <<'XASS_ENRICHMENT_DIAGNOSTICS'"
+            cat deploy/enrichment_diagnostics.py
+            printf '\n%s\n' 'XASS_ENRICHMENT_DIAGNOSTICS'
+          } | timeout --signal=TERM --kill-after=5s 110s bash deploy/github_ssh.sh exec > delivery/enrichment.encrypted.json 2>/dev/null || {
+            printf '%s\n' 'Read-only diagnostic transport failed; no report published.'
+            exit 1
+          }
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path=Path('delivery/enrichment.encrypted.json')
+          assert path.stat().st_size < 512*1024
+          value=json.loads(path.read_text())
+          assert set(value) == {'format','id','wrapped_key','nonce','ciphertext'}
+          assert value['format'] == 'XASS-ENRICHMENT-DIAGNOSTIC-1'
+          print('Encrypted read-only report received.')
+          PY
+      - name: Retain ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: xass-enrichment-encrypted
+          path: delivery/enrichment.encrypted.json
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
