@@ -125,7 +125,9 @@ def _jpeg_thumbnail(data: bytes) -> bytes | None:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as source:
+            # Select decoders before Image.open, not only after format sniffing:
+            # untrusted audio tags must never invoke PSD/FITS/font plugins.
+            with Image.open(io.BytesIO(data), formats=("JPEG", "PNG", "WEBP", "GIF")) as source:
                 width, height = source.size
                 if (source.format not in {"JPEG", "PNG", "WEBP", "GIF"}
                         or width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS):

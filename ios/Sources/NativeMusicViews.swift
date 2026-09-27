@@ -76,6 +76,7 @@ enum XASSStyle {
     @State private var editingPlaylist = false
     @State private var playlistToEdit: LibraryPlaylist?
     @State private var searchTask: Task<Void, Never>?
+    @State private var collectionRoute: String?
     var body: some View {
         NavigationStack {
             List {
@@ -84,9 +85,11 @@ enum XASSStyle {
                 }
                 if store.error != nil || store.notice != nil { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
                 HStack(spacing: 12) {
-                    NavigationLink { NativeCollectionLibrary(store: store, kind: .album) } label: { Label("Альбомы", systemImage: "square.stack").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativeAlbums")
-                    NavigationLink { NativeCollectionLibrary(store: store, kind: .artist) } label: { Label("Исполнители", systemImage: "person.crop.circle").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativeArtists")
-                }.font(.subheadline.weight(.medium)).buttonStyle(.bordered).listRowBackground(Color.clear).listRowSeparator(.hidden)
+                    // Multiple NavigationLinks in one List row activate together on iOS.
+                    // A single destination binding gives each explicit button one route.
+                    Button { collectionRoute = "albums" } label: { Label("Альбомы", systemImage: "square.stack").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeAlbums")
+                    Button { collectionRoute = "artists" } label: { Label("Исполнители", systemImage: "person.crop.circle").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeArtists")
+                }.font(.subheadline.weight(.medium)).listRowBackground(Color.clear).listRowSeparator(.hidden)
                 Picker("Библиотека", selection: $filter) {
                     Text("Все").tag("all"); Text("Избранное").tag("favorites"); Text("Плейлисты").tag("playlists")
                 }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16)).listRowBackground(Color.clear).listRowSeparator(.hidden)
@@ -147,6 +150,7 @@ enum XASSStyle {
                     store.run { await store.searchLibrary(query: query, favorite: value == "favorites") }
                 }
                 .onDisappear { searchTask?.cancel() }
+                .navigationDestination(item: $collectionRoute) { route in NativeCollectionLibrary(store: store, kind: route == "albums" ? .album : .artist) }
                 .overlay { if store.loading && store.tracks.isEmpty { ProgressView() } }
                 .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }
                 .sheet(isPresented: $editingPlaylist) { NativePlaylistEditor(store: store, playlist: playlistToEdit) }

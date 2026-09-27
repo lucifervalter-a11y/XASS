@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Base, get_session
+from app.range_guard import SingleRangeGuard
 from app.models import AgentCommand, AgentCredential, HeartbeatSource
 from app.music_api import build_router
 from app.music_models import MusicSession, MusicTrack, MusicUpload
@@ -50,6 +51,7 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(user_id=int(value), is_owner=True)
 
         self.app = FastAPI()
+        self.app.add_middleware(SingleRangeGuard)
         self.app.dependency_overrides[get_session] = dependency
         self.app.include_router(build_router(self.settings, owner, lambda _: ("https", "fixture.invalid")))
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test")

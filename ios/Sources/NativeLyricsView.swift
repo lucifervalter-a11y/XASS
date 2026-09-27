@@ -65,6 +65,15 @@ struct NativeLyrics: Equatable {
                                 } else { Text(lyrics.text.isEmpty ? lyrics.lines.map(\.text).joined(separator: "\n") : lyrics.text).font(.title2.weight(.semibold)).lineSpacing(12).textSelection(.enabled).accessibilityIdentifier("nativePlainLyrics") }
                                 Text(lyrics.source == "embedded" ? "Текст из аудиофайла" : "Добавлено владельцем").font(.caption).foregroundStyle(.white.opacity(0.5))
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 18)
+                        }.mask {
+                            // Fade only the lyric viewport; playback controls and the
+                            // follow toggle remain fully opaque and independently tappable.
+                            LinearGradient(stops: [
+                                .init(color: .clear, location: 0),
+                                .init(color: .black, location: 0.06),
+                                .init(color: .black, location: 0.90),
+                                .init(color: .clear, location: 1)
+                            ], startPoint: .top, endPoint: .bottom)
                         }.onChange(of: active) { _, id in
                             guard follow, let id = id else { return }
                             if reduceMotion { proxy.scrollTo(id, anchor: .center) }

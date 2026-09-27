@@ -125,6 +125,15 @@ class MusicArtworkTests(unittest.TestCase):
         candidates = list(artwork._embedded_candidates(SimpleNamespace(tags={"covr": [data] * 100})))
         self.assertEqual(len(candidates), artwork.MAX_CANDIDATES)
 
+    def test_only_allowlisted_plugins_are_invoked_for_untrusted_cover_bytes(self):
+        Image.init()
+        with patch.dict(Image.OPEN, {"PSD": (lambda *_: self.fail("PSD decoder invoked"),
+                                             lambda *_: self.fail("PSD detector invoked"))}):
+            self.assertIsNone(artwork._jpeg_thumbnail(b"8BPS" + bytes(128)))
+        with patch.object(artwork.Image, "open", wraps=Image.open) as opened:
+            self.assertIsNotNone(artwork._jpeg_thumbnail(png_bytes((32, 32))))
+            self.assertEqual(opened.call_args.kwargs["formats"], ("JPEG", "PNG", "WEBP", "GIF"))
+
     def test_metadata_reader_caps_bytes_and_seek_operations(self):
         with self.path.open("rb") as stream, patch.object(artwork, "MAX_METADATA_BYTES", 128):
             reader = artwork._BoundedReader(stream)

@@ -114,6 +114,7 @@ from app.services.pwa_auth import (
     verify_vk_connect_proof,
 )
 from app.services.pwa_action_proofs import consume_action_proof, issue_action_proof
+from app.range_guard import SingleRangeGuard
 from app.services.passkeys import (
     authentication_options as passkey_authentication_options,
     complete_authentication as passkey_complete_authentication,
@@ -731,6 +732,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+app.add_middleware(SingleRangeGuard)
 
 
 @app.exception_handler(AgentDetachedError)
