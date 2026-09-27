@@ -405,10 +405,15 @@ import UIKit
     }
     func enrichTrack(_ id: Int, refresh: Bool = false) async throws -> [String: Any] {
         let response = try await api.request("/api/mini/music/tracks/\(id)/enrichment", method: "POST", body: ["refresh": refresh])
-        try Task.checkCancellation()
+        try applyEnrichmentMutationReceipt(response)
+        return response
+    }
+    func applyEnrichmentMutationReceipt(_ response: [String: Any]) throws {
+        // A dismissed view does not undo a successful server mutation. Refresh
+        // shared lyrics/artwork first; only view-local state stops on cancellation.
         applyEnrichedTrack(response)
         invalidateLyrics()
-        return response
+        try Task.checkCancellation()
     }
     // Only successful owner mutations call this. Applying a GET response must
     // not invalidate its own lyrics request and create a reload loop.

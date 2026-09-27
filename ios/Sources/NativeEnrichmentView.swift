@@ -143,8 +143,7 @@ enum NativeEnrichmentPresentation {
             defer { working = false }
             do {
                 let response = try await store.api.request("/api/mini/music/tracks/\(trackID)" + path, method: "POST", body: body)
-                try Task.checkCancellation(); store.applyEnrichedTrack(response)
-                store.invalidateLyrics()
+                try store.applyEnrichmentMutationReceipt(response)
                 info = response["enrichment"] as? [String: Any] ?? [:]
             } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
@@ -168,8 +167,8 @@ enum NativeEnrichmentPresentation {
         job = Task {
             defer { working = false }
             do {
-                _ = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "PUT", body: ["text": transcript, "source": "on_device_transcription"])
-                try Task.checkCancellation(); store.invalidateLyrics()
+                let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "PUT", body: ["text": transcript, "source": "on_device_transcription"])
+                try store.applyEnrichmentMutationReceipt(response)
                 transcript = ""; message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
             } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }

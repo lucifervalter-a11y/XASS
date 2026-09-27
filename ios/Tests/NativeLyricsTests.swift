@@ -122,14 +122,17 @@ final class NativeLyricsTests: XCTestCase {
     var state = "playing"
     var updatedAt = "2026-09-27T18:00:14Z"
     var failEnrichment = false
+    var mutationHandler: (() async throws -> [String: Any])?
     func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
         if path == "/api/mini/music/session" {
             return ["ok": true, "session": ["track_id": 7, "device": "agent:Fixture", "state": state, "position": 10,
                 "session_key": "fixture-remote-session", "server_time": "2026-09-27T18:00:15Z", "updated_at": updatedAt]]
         }
         if path == "/api/mini/music/players" { return ["ok": true, "players": []] }
-        if path == "/api/mini/music/tracks/7/enrichment", method == "POST" {
+        if (path.hasPrefix("/api/mini/music/tracks/7/enrichment") && method == "POST") ||
+            (path == "/api/mini/music/tracks/7/lyrics" && method == "PUT") {
             if failEnrichment { throw OwnerAPIError.invalidResponse }
+            if let mutationHandler = mutationHandler { return try await mutationHandler() }
             return ["ok": true, "track": ["id": 7, "title": "Fixture"]]
         }
         throw OwnerAPIError.invalidResponse
@@ -137,6 +140,42 @@ final class NativeLyricsTests: XCTestCase {
 }
 
 @MainActor final class NativeLyricsClockStoreTests: XCTestCase {
+    func testSuccessfulReceiptAfterCancellationRefreshesSharedLyricsBeforeDiscardingViewState() async throws {
+        for (suffix, method) in [("/enrichment", "POST"), ("/enrichment/confirm", "POST"),
+                                 ("/enrichment/restore", "POST"), ("/lyrics", "PUT")] {
+            let service = LyricsClockService()
+            let store = NativeStore(api: service, audio: AudioController())
+            defer { store.disconnect() }
+            store.currentID = 7
+            store.applyEnrichedTrack(["track": ["id": 7, "title": "Before mutation"]])
+            let artworkBefore = store.artworkRevision
+            let started = expectation(description: "Mutation is in flight: " + suffix)
+            var finishRequest: CheckedContinuation<Void, Never>?
+            service.mutationHandler = {
+                await withCheckedContinuation { done in finishRequest = done; started.fulfill() }
+                if suffix == "/lyrics" { return ["ok": true, "lyrics": ["text": "Saved transcript"]] }
+                return ["ok": true, "track": ["id": 7, "title": "Committed mutation"]]
+            }
+            var viewStateChanged = false
+            let operation = Task {
+                if suffix == "/enrichment" {
+                    _ = try await store.enrichTrack(7)
+                } else {
+                    let receipt = try await service.request("/api/mini/music/tracks/7" + suffix, method: method, body: [:])
+                    try store.applyEnrichmentMutationReceipt(receipt)
+                }
+                viewStateChanged = true
+            }
+            await fulfillment(of: [started], timeout: 2)
+            operation.cancel(); finishRequest?.resume()
+            do { try await operation.value; XCTFail("Dismissed view must stop updating its own state") }
+            catch is CancellationError { }
+            XCTAssertEqual(store.lyricsRevision, 1, suffix)
+            XCTAssertFalse(viewStateChanged, suffix)
+            XCTAssertEqual(store.currentTrack?.title, suffix == "/lyrics" ? "Before mutation" : "Committed mutation", suffix)
+            XCTAssertEqual(store.artworkRevision, artworkBefore + (suffix == "/lyrics" ? 0 : 1), suffix)
+        }
+    }
     func testOnlySuccessfulMutationsInvalidateLyricsNotReadResponseApplication() async throws {
         let service = LyricsClockService()
         let store = NativeStore(api: service, audio: AudioController())
