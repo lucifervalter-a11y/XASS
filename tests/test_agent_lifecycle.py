@@ -177,10 +177,11 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_pwa_requires_passkey_proof_bound_to_source_id_and_name(self):
         with patch.object(main, 'pwa_authenticate_session', return_value=self.owner), \
              patch.object(main, 'passkey_count_credentials', new=AsyncMock(return_value=1)), \
-             patch.object(main, 'verify_action_proof', return_value=False) as verify:
+             patch.object(main, 'consume_action_proof', new=AsyncMock(return_value=False)) as verify:
             denied = await self.client.request('DELETE', '/api/mini/agents/ПК', json=self.body)
             self.assertEqual(denied.status_code, 428)
-            verify.assert_called_once_with('', 42, f'agent:detach:{self.source.id}:ПК', main.settings)
+            self.assertEqual(verify.await_args.args[1:], ('', 42, f'agent:detach:{self.source.id}:ПК',
+                {'source_id': self.source.id, 'confirm_name': 'ПК'}, main.settings))
             verify.return_value = True
             accepted = await self.client.request('DELETE', '/api/mini/agents/ПК', json={**self.body, 'action_proof': 'approved'})
             self.assertEqual(accepted.status_code, 200, accepted.text)

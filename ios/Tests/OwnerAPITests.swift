@@ -16,6 +16,30 @@ private final class OwnerHTTPFixture: URLProtocol {
 }
 
 final class OwnerAPITests: XCTestCase {
+    func testSearchEllipsisIsNotMistakenForPathTraversal() {
+        XCTAssertTrue(OwnerAPI.allowsJSONPath("/api/mini/music/library?q=Mix..%20Tape"))
+        XCTAssertTrue(OwnerAPI.allowsJSONPath("/api/mini/music/library?q=.."))
+        for path in ["", "/api/mini/../admin", "/api/mini/%2e%2e/admin", "/api/mini/%5cadmin", "/api/mini/%0aadmin", "https://other.invalid/api/mini/library", "/api/native/enrollment/options?x=1"] {
+            XCTAssertFalse(OwnerAPI.allowsJSONPath(path), path)
+        }
+    }
+    func testUnsupportedResponseNamesOperationButNeverEchoesPrivateData() throws {
+        let html = Data("<!DOCTYPE html><html>secret-cookie</html>".utf8)
+        XCTAssertThrowsError(try OwnerAPI.decode(html, status: 200, path: "/api/mini/music/session?session_key=secret-key")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Состояние плеера"))
+            XCTAssertTrue(error.localizedDescription.contains("веб-страницу"))
+            XCTAssertFalse(error.localizedDescription.contains("secret"))
+            XCTAssertEqual((error as? OwnerAPIError)?.detail?["code"] as? String, "unsupported_response")
+        }
+        XCTAssertThrowsError(try OwnerAPI.decode(Data(#"{"players":[]}"#.utf8), status: 200, path: "/api/mini/music/players")) {
+            XCTAssertTrue($0.localizedDescription.contains("Список устройств"))
+        }
+        let envelope = try JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(data: html, encoding: .utf8)!])
+        XCTAssertThrowsError(try OwnerAPI.decode(envelope, status: 200, path: "/api/mini/music/library")) {
+            XCTAssertTrue($0.localizedDescription.contains("веб-страницу"))
+            XCTAssertFalse($0.localizedDescription.contains("secret"))
+        }
+    }
     func testPHPEnvelopeAllowsFullLibraryAndPreservesActualFailure() throws {
         let body = try JSONSerialization.data(withJSONObject: ["ok": true, "title": String(repeating: "Я", count: 40000)])
         let envelope = try JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(data: body, encoding: .utf8)!])

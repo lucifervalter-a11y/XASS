@@ -18,6 +18,39 @@ import XCTest
 }
 
 final class NativeStoreTests: XCTestCase {
+    @MainActor func testTransientSessionFailureRecoversWithoutDiscardingLibraryOrOtherActionError() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        api.handler = { path, _, _ in
+            if path == "/api/mini/music/players" { throw OwnerAPIError(status: 503, message: "Список устройств временно недоступен") }
+            return nil
+        }
+        await store.refresh()
+        XCTAssertEqual(store.tracks.count, 1)
+        XCTAssertTrue(store.authorized)
+        XCTAssertEqual(store.error, "Список устройств временно недоступен")
+        api.handler = nil
+        try await store.refreshSession()
+        XCTAssertNil(store.error, "A recovered refresh must clear its own stale error")
+        store.error = "Загрузка файла не выполнена"
+        try await store.refreshSession()
+        XCTAssertEqual(store.error, "Загрузка файла не выполнена", "Polling must not erase unrelated action failures")
+    }
+    @MainActor func testFavoriteUsesLatestTrackRatherThanStaleAlbumSnapshot() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        let stale = try XCTUnwrap(LibraryTrack(["id": 15, "title": "Album track", "favorite": false]))
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/tracks/15", method == "PATCH" {
+                return ["ok": true, "track": ["id": 15, "title": "Album track", "favorite": body!["favorite"]!]]
+            }
+            return nil
+        }
+        try await store.favorite(stale)
+        XCTAssertTrue(store.resolvedTrack(stale).favorite)
+        try await store.favorite(stale)
+        XCTAssertFalse(store.resolvedTrack(stale).favorite)
+    }
     @MainActor func testForeignPhoneIsNotThisPhoneAndCannotResumeControlCenter() async {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         await store.refresh()

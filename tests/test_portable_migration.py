@@ -54,12 +54,14 @@ class PortableMigrationTests(unittest.TestCase):
                 CREATE TABLE agent_commands (id INTEGER PRIMARY KEY, status TEXT, result TEXT);
                 CREATE TABLE heartbeat_sources (id INTEGER PRIMARY KEY, is_online BOOLEAN);
                 CREATE TABLE agent_credentials (id INTEGER PRIMARY KEY, api_key_hash TEXT);
+                CREATE TABLE pwa_action_proofs (id TEXT PRIMARY KEY, used BOOLEAN);
             """)
             database.execute("INSERT INTO media_assets VALUES (?, ?)", (1, str(root / "data" / "media" / "music.mp3")))
             database.execute("INSERT INTO agent_commands VALUES (1, 'pending', '{}')")
             database.execute("INSERT INTO agent_commands VALUES (2, 'completed', '{}')")
             database.execute("INSERT INTO heartbeat_sources VALUES (1, 1)")
             database.execute("INSERT INTO agent_credentials VALUES (1, 'device-hash')")
+            database.execute("INSERT INTO pwa_action_proofs VALUES ('fixture-proof-hash', 0)")
         return root, settings
 
     def mutate(self, source: Path, target: Path, change) -> None:
@@ -107,6 +109,7 @@ class PortableMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(new / "data" / "serverredus.db")) as restored:
                 self.assertEqual(restored.execute("SELECT local_path FROM media_assets").fetchone()[0], "./data/media/music.mp3")
                 self.assertEqual(restored.execute("SELECT count(*) FROM agent_credentials").fetchone()[0], 2)
+                self.assertEqual(restored.execute("SELECT used FROM pwa_action_proofs").fetchone()[0], 1)
                 self.assertEqual(restored.execute("SELECT status FROM agent_commands WHERE id=1").fetchone()[0], "failed")
                 self.assertEqual(restored.execute("SELECT status FROM agent_commands WHERE id=2").fetchone()[0], "completed")
                 self.assertEqual(restored.execute("SELECT is_online FROM heartbeat_sources").fetchone()[0], 0)

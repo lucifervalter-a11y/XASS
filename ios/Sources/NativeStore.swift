@@ -293,7 +293,18 @@ import UIKit
         reportTask?.cancel(); reportTask = nil; audio.disconnect(); imageCache.removeAllObjects()
         (api as? OwnerAPI)?.invalidate()
     }
-    private func refreshSession() async throws {
+    private var sessionRefreshFailure: String?
+    func refreshSession() async throws {
+        do {
+            try await loadSession()
+            if let previous = sessionRefreshFailure, error == previous { error = nil }
+            sessionRefreshFailure = nil
+        } catch {
+            if !(error is CancellationError) { sessionRefreshFailure = error.localizedDescription }
+            throw error
+        }
+    }
+    private func loadSession() async throws {
         let response = try await api.request("/api/mini/music/session", method: "GET", body: nil)
         let session = response["session"] as? [String: Any] ?? [:]
         let serverKey = session["session_key"] as? String

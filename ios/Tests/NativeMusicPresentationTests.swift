@@ -69,4 +69,12 @@ final class NativeMusicPresentationTests: XCTestCase {
         XCTAssertNotNil(catalog.error); XCTAssertFalse(catalog.complete)
         XCTAssertEqual(service.paths.count, 1)
     }
+    @MainActor func testConfirmedDeletionUpdatesParentAlbumAndArtistCatalog() async {
+        let catalog = MusicCollectionCatalog(api: CollectionServiceFixture())
+        await catalog.load()
+        catalog.remove(1)
+        XCTAssertEqual(catalog.tracks.map(\.id), [2, 3])
+        XCTAssertEqual(MusicCollection.groups(catalog.tracks, kind: .album).first?.tracks.map(\.id), [3])
+        XCTAssertFalse(MusicCollection.groups(catalog.tracks, kind: .artist).flatMap(\.tracks).contains { $0.id == 1 })
+    }
 }

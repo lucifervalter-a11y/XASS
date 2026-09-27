@@ -9,6 +9,7 @@ import SwiftUI
     private var nextOffset = 0
     private let api: OwnerService
     init(api: OwnerService) { self.api = api }
+    func remove(_ id: Int) { tracks.removeAll { $0.id == id } }
 
     func load() async {
         guard !loading, !complete else { return }
@@ -56,7 +57,7 @@ import SwiftUI
                 if kind == .album {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 260 : 145), spacing: 18)], spacing: 24) {
                         ForEach(groups) { group in
-                            NavigationLink { NativeCollectionDetail(store: store, collection: group, kind: kind, complete: catalog.complete) } label: {
+                            NavigationLink { NativeCollectionDetail(store: store, collection: group, kind: kind, complete: catalog.complete, onDelete: { catalog.remove($0) }) } label: {
                                 VStack(alignment: .leading, spacing: 8) {
                                     if let id = group.artworkID { TrackArtwork(store: store, trackID: id, radius: 12) }
                                     Text(group.title).font(.headline).foregroundStyle(.white).lineLimit(2)
@@ -68,7 +69,7 @@ import SwiftUI
                 } else {
                     LazyVStack(spacing: 0) {
                         ForEach(groups) { group in
-                            NavigationLink { NativeCollectionDetail(store: store, collection: group, kind: kind, complete: catalog.complete) } label: {
+                            NavigationLink { NativeCollectionDetail(store: store, collection: group, kind: kind, complete: catalog.complete, onDelete: { catalog.remove($0) }) } label: {
                                 HStack(spacing: 14) {
                                     if let id = group.artworkID { TrackArtwork(store: store, trackID: id, radius: 28).frame(width: 56, height: 56) }
                                     VStack(alignment: .leading, spacing: 4) { Text(group.title).foregroundStyle(.white); Text(group.subtitle).font(.caption).foregroundStyle(.secondary) }
@@ -100,6 +101,7 @@ import SwiftUI
     let collection: MusicCollection
     let kind: MusicCollection.Kind
     let complete: Bool
+    var onDelete: ((Int) -> Void)? = nil
     @State private var selectedTrack: LibraryTrack?
     @State private var removedTracks = Set<Int>()
     private var rows: [LibraryTrack] { collection.tracks.filter { !removedTracks.contains($0.id) }.map { store.resolvedTrack($0) } }
@@ -130,7 +132,7 @@ import SwiftUI
             }.padding(20).frame(maxWidth: 660).frame(maxWidth: .infinity)
         }.background { NativeMusicBackdrop(store: store, trackID: collection.artworkID) }
             .navigationBarTitleDisplayMode(.inline).toolbarBackground(.hidden, for: .navigationBar)
-            .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track, onDelete: { removedTracks.insert($0) }) }
+            .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track, onDelete: { id in removedTracks.insert(id); onDelete?(id) }) }
             .accessibilityIdentifier("nativeCollectionDetail")
     }
 }
