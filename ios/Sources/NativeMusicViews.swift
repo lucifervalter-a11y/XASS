@@ -32,14 +32,28 @@ enum XASSStyle {
 
 @MainActor struct NativeMessage: View {
     @ObservedObject var store: NativeStore
+    @State private var showDiagnostics = false
     var body: some View {
         if let text = store.error ?? store.notice {
+          VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: store.error == nil ? "checkmark.circle" : "exclamationmark.circle").foregroundStyle(store.error == nil ? Color.green : Color.orange)
                 Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
                 Button { store.error = nil; store.notice = nil } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }.accessibilityLabel("Скрыть сообщение")
-            }.padding(14).background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 14)).accessibilityElement(children: .contain)
+            }
+            if store.error != nil {
+                Button { showDiagnostics = true } label: { Label("Отправить диагностику", systemImage: "square.and.arrow.up") }
+                    .font(.subheadline).buttonStyle(.borderless).accessibilityIdentifier("musicErrorDiagnostics")
+            }
+          }.padding(14).background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 14)).accessibilityElement(children: .contain)
+                .sheet(isPresented: $showDiagnostics) {
+                    NavigationStack {
+                        NativeDiagnosticLogView().toolbar {
+                            ToolbarItem(placement: .confirmationAction) { Button("Готово") { showDiagnostics = false } }
+                        }
+                    }
+                }
         }
     }
 }

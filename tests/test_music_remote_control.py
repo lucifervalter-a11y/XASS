@@ -10,12 +10,17 @@ import test_music_api as fixtures
 class MusicRemoteControlTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = fixtures.MusicApiTests.asyncSetUp
     asyncTearDown = fixtures.MusicApiTests.asyncTearDown
-    request = fixtures.MusicApiTests.request
     start = fixtures.MusicApiTests.start
     chunk = fixtures.MusicApiTests.chunk
     upload = fixtures.MusicApiTests.upload
     key = "fixture-native-player-key"
     other_key = "different-native-player-key"
+
+    async def request(self, method, path, **kwargs):
+        response = await fixtures.MusicApiTests.request(self, method, path, **kwargs)
+        if path.startswith("/api/mini/music/session/") and 200 <= response.status_code < 300:
+            self.assertIs(response.json().get("ok"), True, response.text)
+        return response
 
     async def player(self, *, state="playing", device="local"):
         track = await self.upload()
@@ -47,7 +52,8 @@ class MusicRemoteControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_routes_require_owner_and_validate_input(self):
         command_id = "a" * 32
         for method, suffix in (("POST", "/control"), ("GET", "/commands"),
-                              ("GET", "/commands/" + command_id), ("POST", "/commands/" + command_id + "/ack")):
+                              ("GET", "/commands/" + command_id), ("POST", "/commands/" + command_id + "/ack"),
+                              ("POST", "/commands/" + command_id + "/cancel")):
             for headers, status in (({}, 401), ({"x-test-owner": "guest"}, 403)):
                 with self.subTest(method=method, suffix=suffix, status=status):
                     response = await self.request(method, "/api/mini/music/session" + suffix, headers=headers,
@@ -193,6 +199,21 @@ class MusicRemoteControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(response.json()["status"], "completed", "a playing response is not a confirmed pause")
         else:
             self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual((await self.state())[0].state, "playing")
+
+    async def test_cancelled_command_response_is_idempotent_and_does_not_claim_execution(self):
+        await self.player()
+        command_id = (await self.command()).json()["command_id"]
+        path = f"/api/mini/music/session/commands/{command_id}"
+        for _ in range(2):
+            response = await self.request("POST", path + "/cancel")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "cancelled")
+            self.assertEqual(response.json()["command_id"], command_id)
+            self.assertEqual(response.json()["error"], "Команда отменена")
+        self.assertEqual((await self.request("GET", path)).json()["status"], "cancelled")
+        self.assertEqual((await self.inbox()).json()["commands"], [])
+        self.assertEqual((await self.ack(command_id)).status_code, 409)
         self.assertEqual((await self.state())[0].state, "playing")
 
 

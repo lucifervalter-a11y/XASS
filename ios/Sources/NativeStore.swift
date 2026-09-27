@@ -258,6 +258,7 @@ import UIKit
 
     func cancelTransfer() {
         guard busy else { return }
+        NativeDiagnostics.shared.record(operation: .musicTransfer, step: .cancelled, error: .cancelled)
         transferCancelled = true; generation = UUID()
         transferStatus = "Отменяю на сервере…"; notice = "Переключение отменено"
         guard let id = activeTransferID, let kind = activeTransferKind else { return }
@@ -351,7 +352,13 @@ import UIKit
             // Slide the bounded AVPlayer queue window as long libraries advance.
             applyNativeQueue()
         }
-        playbackState = value["state"] as? String ?? playbackState
+        let nextState = value["state"] as? String ?? playbackState
+        if nextState != playbackState || value["error"] != nil {
+            NativeDiagnostics.shared.record(operation: .audioPlayback,
+                step: nextState == "error" || value["error"] != nil ? .failed : nextState == "loading" ? .waiting : .completed,
+                target: .localPlayer, error: value["error"] != nil || nextState == "error" ? .invalidState : .none)
+        }
+        playbackState = nextState
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
         if let message = value["error"] as? String { error = message }
     }
@@ -402,6 +409,7 @@ import UIKit
         let nextGeneration = UUID(); generation = nextGeneration
         transferCancelled = false
         error = nil
+        NativeDiagnostics.shared.record(operation: .audioPlayback, step: .started, target: .localPlayer)
         let url: String
         if audio.downloads.contains(where: { $0.id == track.id }) || audio.cachedTracks.contains(where: { $0.id == track.id }) { url = "" }
         else { url = try await ticket(track.id) }
@@ -438,6 +446,8 @@ import UIKit
     }
     func transfer(to device: String, trackID: Int? = nil, startPosition: Double? = nil, output: String? = nil) async throws {
         guard !busy else { return }; busy = true
+        let diagnosticTarget: NativeDiagnosticTarget = device == "local" ? .localPlayer : .pcPlayer
+        NativeDiagnostics.shared.record(operation: .musicTransfer, step: .started, target: diagnosticTarget)
         defer { busy = false; transferStatus = nil; transferProgress = 0; activeTransferID = nil; activeTransferKind = nil }
         let nextGeneration = UUID(); generation = nextGeneration; transferPending = true; transferCancelled = false; activeTransferKind = .handoff
         defer { transferPending = false }
@@ -464,6 +474,7 @@ import UIKit
         let started = try await api.request("/api/mini/music/transfers", method: "POST", body: body)
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
         activeTransferID = transferID
+        NativeDiagnostics.shared.record(operation: .musicTransfer, step: .acknowledged, target: diagnosticTarget)
         if Task.isCancelled || transferCancelled || generation != nextGeneration {
             await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
             throw CancellationError()
@@ -483,9 +494,12 @@ import UIKit
             }
             if response["status"] as? String == "failed" {
                 transferStatus = nil; transferProgress = 0; activeTransferID = nil
+                NativeDiagnostics.shared.record(operation: .musicTransfer, step: .failed, target: diagnosticTarget,
+                    error: Self.transferDiagnosticError(response["error_code"] as? String))
                 throw OwnerAPIError(status: 409, message: response["detail"] as? String ?? "Источник не подтвердил остановку. Переключение отменено.")
             }
             guard Date() < deadline else {
+                NativeDiagnostics.shared.record(operation: .musicTransfer, step: .failed, target: diagnosticTarget, error: .timeout)
                 let id = activeTransferID ?? transferID
                 await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel")
                 activeTransferID = nil
@@ -550,7 +564,21 @@ import UIKit
             activeTransferID = nil
         }
         // Close route picker only after handoff actually finished.
+        NativeDiagnostics.shared.record(operation: .musicTransfer, step: .completed, target: diagnosticTarget)
         showRoutePicker = false
+    }
+    private static func transferDiagnosticError(_ code: String?) -> NativeDiagnosticError {
+        switch code {
+        case "source_timeout": return .sourceTimeout
+        case "target_timeout": return .timeout
+        case "source_stop_failed": return .sourceStopFailed
+        case "target_start_failed": return .targetStartFailed
+        case "target_unavailable": return .targetUnavailable
+        case "transfer_cancelled": return .transferCancelled
+        case "replaced": return .replaced
+        case "agent_command_failed": return .agentCommandFailed
+        default: return .invalidState
+        }
     }
     func toggle() async throws {
         guard currentID != nil, !busy else { return }

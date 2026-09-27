@@ -16,6 +16,78 @@ private final class OwnerHTTPFixture: URLProtocol {
 }
 
 final class OwnerAPITests: XCTestCase {
+    func testLegacyFailedTransferIsAReceiptNotAnUnsupportedResponse() throws {
+        let id = String(repeating: "a", count: 32)
+        let receipt: [String: Any] = ["ok": false, "transfer_id": id, "status": "failed",
+            "detail": "ПК не подтвердил запуск музыки", "session": ["device": "local", "state": "paused"]]
+        let inner = try JSONSerialization.data(withJSONObject: receipt)
+        let envelope = try JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(decoding: inner, as: UTF8.self)])
+        for path in ["/api/mini/music/transfers", "/api/mini/music/transfers/" + id, "/api/mini/music/transfers/" + id + "/cancel"] {
+            let value = try OwnerAPI.decode(envelope, status: 200, path: path)
+            XCTAssertEqual(value["status"] as? String, "failed")
+            XCTAssertEqual(value["transfer_id"] as? String, id)
+            XCTAssertEqual(value["detail"] as? String, receipt["detail"] as? String)
+        }
+        for path in ["", "/api/mini/music/session", "/api/mini/music/transfers/" + String(repeating: "b", count: 32), "/api/mini/music/transfers/" + id + "/ack"] {
+            XCTAssertThrowsError(try OwnerAPI.decode(envelope, status: 200, path: path))
+        }
+        for field in ["transfer_id", "status", "detail", "session"] {
+            var malformed = receipt; malformed.removeValue(forKey: field)
+            XCTAssertThrowsError(try OwnerAPI.decode(JSONSerialization.data(withJSONObject: malformed), status: 200, path: "/api/mini/music/transfers"))
+        }
+        XCTAssertThrowsError(try OwnerAPI.decode(envelope, status: 401, path: "/api/mini/music/transfers"))
+    }
+
+    @MainActor func testActualProxyTransportPreservesFailedHandoffAndAllowsRetry() async throws {
+        // The older tests replaced OwnerService and missed this decode boundary.
+        for oldServer in [true, false] {
+            OwnerHTTPFixture.requests = []
+            let transferID = String(repeating: "c", count: 32)
+            var fail = true
+            OwnerHTTPFixture.reply = { request in
+                let path = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value ?? ""
+                var result: [String: Any] = ["ok": true]
+                if path == "/api/mini/bootstrap" { result["sources"] = [] }
+                else if path.contains("/music/library") { result["tracks"] = [["id": 1, "title": "Fixture", "duration": 99]]; result["playlists"] = [] }
+                else if path == "/api/mini/music/players" { result["players"] = [] }
+                else if path == "/api/mini/music/session" {
+                    result["session"] = ["track_id": 1, "device": "local", "state": "paused", "position": 12, "session_key": String(repeating: "z", count: 32)]
+                } else if path == "/api/mini/music/transfers" {
+                    result = ["ok": !oldServer || !fail, "transfer_id": transferID, "status": fail ? "failed" : "ready",
+                        "detail": fail ? "ПК не подтвердил запуск музыки" : "", "error_code": "target_start_failed",
+                        "session": ["track_id": 1, "device": "agent:Fixture", "state": "playing", "position": 12]]
+                }
+                let data = try! JSONSerialization.data(withJSONObject: result)
+                let envelope = try! JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(decoding: data, as: UTF8.self)])
+                return (200, ["Content-Type": "application/json"], envelope)
+            }
+            let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [OwnerHTTPFixture.self]
+            let api = OwnerAPI(origin: try ServerOrigin("https://native-api-fixture.invalid"), configuration: config,
+                savedSession: { SavedSession(value: "fixture-session", expires: Date().addingTimeInterval(60)) })
+            let store = NativeStore(api: api, audio: AudioController())
+            defer { store.disconnect(); api.invalidate() }
+            await store.refresh()
+            do { try await store.pickRoute(device: "agent:Fixture"); XCTFail("Failed target must not become ready") }
+            catch { XCTAssertEqual(error.localizedDescription, "ПК не подтвердил запуск музыки") }
+            XCTAssertFalse(store.busy)
+            XCTAssertEqual(store.selectedDevice, "local")
+            XCTAssertTrue(store.showRoutePicker)
+            fail = false
+            try await store.pickRoute(device: "agent:Fixture")
+            XCTAssertEqual(store.selectedDevice, "agent:Fixture")
+            XCTAssertFalse(store.busy)
+            XCTAssertFalse(store.showRoutePicker)
+        }
+    }
+
+    func testDiagnosticMappingCannotExposeQueryOrUnknownErrorText() {
+        XCTAssertEqual(OwnerAPI.diagnosticOperation("/api/mini/music/transfers?token=PRIVATE"), .musicTransfer)
+        XCTAssertEqual(OwnerAPI.diagnosticOperation("/api/mini/agents/PRIVATE/files/upload?path=PRIVATE"), .upload)
+        XCTAssertEqual(OwnerAPI.diagnosticOperation("/PRIVATE?secret=PRIVATE"), .other)
+        XCTAssertEqual(OwnerAPI.diagnosticError(OwnerAPIError(status: 409, message: "PRIVATE")), .conflict)
+        XCTAssertEqual(OwnerAPI.diagnosticError(URLError(.timedOut)), .timeout)
+    }
+
     func testSearchEllipsisIsNotMistakenForPathTraversal() {
         XCTAssertTrue(OwnerAPI.allowsJSONPath("/api/mini/music/library?q=Mix..%20Tape"))
         XCTAssertTrue(OwnerAPI.allowsJSONPath("/api/mini/music/library?q=.."))

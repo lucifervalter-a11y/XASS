@@ -44,6 +44,8 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         var response: HTTPURLResponse?
         let completion: Completion
         var path = ""
+        var method = "GET"
+        let startedAt = ProcessInfo.processInfo.systemUptime
     }
     // URLSession delegates run on .main, like the @MainActor request entrypoint.
     private var transfers: [Int: Transfer] = [:]
@@ -89,7 +91,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         try Task.checkCancellation()
         let value: [String: Any] = try await withCheckedThrowingContinuation { completion in
             let task = session.dataTask(with: request)
-            transfers[task.taskIdentifier] = Transfer(completion: .json(completion), path: path)
+            transfers[task.taskIdentifier] = Transfer(completion: .json(completion), path: path, method: method)
             task.resume()
         }
         // Mutations must return their receipt even when the calling view was
@@ -182,7 +184,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         try Task.checkCancellation()
         return try await withCheckedThrowingContinuation { done in
             let task = session.dataTask(with: request)
-            transfers[task.taskIdentifier] = Transfer(completion: .json(done)); task.resume()
+            transfers[task.taskIdentifier] = Transfer(completion: .json(done), path: path, method: "POST"); task.resume()
         }
     }
 
@@ -207,7 +209,11 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         case "/api/mini/music/players": label = "Список устройств"
         case "/api/mini/music/library": label = "Библиотека музыки"
         case "/api/mini/bootstrap": label = "Сводка сервера"
-        default: label = "Запрос XASS"
+        default:
+            if route.hasPrefix("/api/mini/music/transfers") { label = "Переключение устройства" }
+            else if route.hasPrefix("/api/mini/music/session/") { label = "Управление плеером" }
+            else if route.hasSuffix("/ticket") { label = "Доступ к аудиофайлу" }
+            else { label = "Запрос XASS" }
         }
         let reason = html ? "сервер вернул веб-страницу вместо данных. Проверьте маршрутизацию proxy.php." : "не удалось разобрать ответ сервера. Повторите запрос; при повторной ошибке проверьте версию сервера."
         // Never include response bodies, query strings, source names or secrets.
@@ -232,11 +238,75 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
             let detail = ((object?["detail"] as? String) ?? (detailObject?["message"] as? String)).map { String($0.prefix(500)) }
             throw OwnerAPIError(status: code, message: detail ?? (code >= 500 ? "Сервер временно недоступен. Повторите позже." : "Сервер не разрешил действие. Обновите данные и повторите."), detail: object?["detail"] as? [String: Any])
         }
-        guard let object = object, object["ok"] as? Bool == true else {
+        guard let object = object, object["ok"] as? Bool == true || legacyTransferFailure(object, path: path) else {
             let sample = String(data: payload.prefix(200), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
             throw unsupported(path, status: code, html: sample.hasPrefix("<!doctype html") || sample.hasPrefix("<html"))
         }
         return object
+    }
+
+    /// Servers through 0.19 used `ok:false` for a readable, failed transfer.
+    /// Keep the receipt so NativeStore can display its reason and release the
+    /// operation; this is NOT a blanket acceptance of failed or malformed JSON.
+    private static func legacyTransferFailure(_ object: [String: Any], path: String) -> Bool {
+        let route = String(path.split(separator: "?", maxSplits: 1).first ?? "")
+        guard route.range(of: #"^/api/mini/music/transfers(?:/[a-f0-9]{32}(?:/cancel)?)?$"#, options: .regularExpression) != nil,
+              object["ok"] as? Bool == false, object["status"] as? String == "failed",
+              let id = object["transfer_id"] as? String,
+              id.range(of: #"^[a-f0-9]{32}$"#, options: .regularExpression) != nil,
+              let detail = object["detail"] as? String, !detail.isEmpty, detail.utf8.count <= 4096,
+              object["session"] is [String: Any] else { return false }
+        if route != "/api/mini/music/transfers" {
+            return route == "/api/mini/music/transfers/" + id || route == "/api/mini/music/transfers/" + id + "/cancel"
+        }
+        return true
+    }
+
+    static func diagnosticOperation(_ path: String) -> NativeDiagnosticOperation {
+        let route = String(path.split(separator: "?", maxSplits: 1).first ?? "")
+        if route.hasPrefix("/api/mini/music/transfers") { return .musicTransfer }
+        if route.hasPrefix("/api/mini/music/session/") || route == "/api/mini/music/control" { return .musicControl }
+        if route == "/api/mini/music/session" { return .musicSession }
+        if route == "/api/mini/music/players" { return .musicPlayers }
+        if route == "/api/mini/music/library" { return .musicLibrary }
+        if route.hasPrefix("/api/mini/music/tracks/") && route.hasSuffix("/ticket") { return .musicTicket }
+        if route.hasSuffix("/lyrics") { return .musicLyrics }
+        if route.hasSuffix("/files/upload") { return .upload }
+        if route.hasPrefix("/api/native/") { return .authentication }
+        if route == "/api/mini/bootstrap" { return .bootstrap }
+        if route.hasPrefix("/api/mini/agents/") { return .agentCommand }
+        return .other
+    }
+
+    static func diagnosticError(_ error: Error) -> NativeDiagnosticError {
+        if error is CancellationError { return .cancelled }
+        if let value = error as? URLError {
+            if value.code == .cancelled { return .cancelled }
+            return value.code == .timedOut ? .timeout : .network
+        }
+        guard let value = error as? OwnerAPIError else { return .unknown }
+        if value.detail?["code"] as? String == "unsupported_response" { return .unsupportedResponse }
+        switch value.status {
+        case 401: return .unauthorized
+        case 403, 428: return .forbidden
+        case 408: return .timeout
+        case 409: return .conflict
+        case 0: return .invalidJSON
+        default: return .http
+        }
+    }
+
+    private func record(_ transfer: Transfer, error: Error? = nil, body: [String: Any]? = nil) {
+        guard case .json = transfer.completion else { return }
+        let operation = Self.diagnosticOperation(transfer.path)
+        // Idle five-second session polling must not bury the actual failure.
+        if error == nil && transfer.method == "GET" && [.musicSession, .musicPlayers].contains(operation) { return }
+        let envelope = (try? JSONSerialization.jsonObject(with: transfer.data)) as? [String: Any]
+        let failed = body?["status"] as? String == "failed"
+        NativeDiagnostics.shared.record(operation: operation, step: error == nil && !failed ? .completed : .failed,
+            httpStatus: transfer.response?.statusCode, envelopeStatus: envelope?["_s"] as? Int,
+            error: error.map(Self.diagnosticError) ?? (failed ? .invalidState : .none), byteCount: transfer.data.count,
+            elapsedMilliseconds: (ProcessInfo.processInfo.systemUptime - transfer.startedAt) * 1000)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
@@ -261,8 +331,8 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { finish(task.taskIdentifier, error: error) }
     private func finish(_ id: Int, error: Error?) {
         guard let transfer = transfers.removeValue(forKey: id) else { return }
-        if let error = error { transfer.completion.fail(error); return }
-        guard let status = transfer.response?.statusCode else { transfer.completion.fail(OwnerAPIError.invalidResponse); return }
+        if let error = error { record(transfer, error: error); transfer.completion.fail(error); return }
+        guard let status = transfer.response?.statusCode else { record(transfer, error: OwnerAPIError.invalidResponse); transfer.completion.fail(OwnerAPIError.invalidResponse); return }
         if case .binary(let done) = transfer.completion {
             guard status == 200, !transfer.data.isEmpty else {
                 done.resume(throwing: status == 401 ? OwnerAPIError.signedOut : OwnerAPIError(status: status, message: "Файл недоступен. Запросите его заново.")); return
@@ -278,6 +348,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         }
         do {
             let body = try Self.decode(transfer.data, status: status, path: transfer.path)
+            record(transfer, body: body)
             if let response = transfer.response, let url = response.url {
                 let headers = response.allHeaderFields.reduce(into: [String: String]()) { values, item in values[String(describing: item.key)] = String(describing: item.value) }
                 if let cookie = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url).first(where: {
@@ -286,7 +357,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
             }
             if case .json(let done) = transfer.completion { done.resume(returning: body) }
         }
-        catch { transfer.completion.fail(error) }
+        catch { record(transfer, error: error); transfer.completion.fail(error) }
     }
     @MainActor func invalidate() {
         session.invalidateAndCancel()

@@ -7,6 +7,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import unittest
+from unittest.mock import AsyncMock, patch
+
+from fastapi import HTTPException
 
 from sqlalchemy import select
 
@@ -20,13 +23,20 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
     # Reuse only the fixture helpers, not the unrelated test methods.
     asyncSetUp = fixtures.MusicApiTests.asyncSetUp
     asyncTearDown = fixtures.MusicApiTests.asyncTearDown
-    request = fixtures.MusicApiTests.request
     start = fixtures.MusicApiTests.start
     chunk = fixtures.MusicApiTests.chunk
     upload = fixtures.MusicApiTests.upload
 
     old_key = "old-player-session-key"
     new_key = "new-player-session-key"
+
+    async def request(self, method, path, **kwargs):
+        response = await fixtures.MusicApiTests.request(self, method, path, **kwargs)
+        if path.startswith("/api/mini/music/transfers") and 200 <= response.status_code < 300:
+            # The envelope confirms the resource response, not audible success.
+            # Native and web clients inspect status/detail before playing.
+            self.assertIs(response.json().get("ok"), True, response.text)
+        return response
 
     async def music_track(self):
         track = await self.upload()
@@ -83,7 +93,8 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def test_all_transfer_routes_require_owner(self):
-        for method, suffix in (("POST", ""), ("GET", "/" + "a" * 32), ("POST", "/" + "a" * 32 + "/ack")):
+        for method, suffix in (("POST", ""), ("GET", "/" + "a" * 32),
+                               ("POST", "/" + "a" * 32 + "/ack"), ("POST", "/" + "a" * 32 + "/cancel")):
             for headers, status in (({}, 401), ({"x-test-owner": "guest"}, 403)):
                 with self.subTest(method=method, suffix=suffix, status=status):
                     result = await self.request(method, "/api/mini/music/transfers" + suffix,
@@ -185,8 +196,9 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         command = (await self.commands())[0]
         await self.complete(command.id, state="playing")
         result = await self.poll(response.json()["transfer_id"])
-        self.assertFalse(result["ok"])
+        self.assertIs(result["ok"], True)
         self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "source_stop_failed")
         self.assertEqual(result["session"]["device"], "agent:PC")
         self.assertEqual(len(await self.commands()), 1)
 
@@ -202,7 +214,8 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
         result = await self.poll(transfer_id)
         self.assertEqual(result["status"], "failed")
-        self.assertFalse(result["ok"])
+        self.assertIs(result["ok"], True)
+        self.assertEqual(result["error_code"], "source_timeout")
         self.assertEqual([(item.command, item.status) for item in await self.commands()], [("music_pause", "cancelled")])
         async with self.sessions() as session:
             self.assertEqual((await session.get(MusicPlaybackState, 1)).transfer_id, "")
@@ -255,6 +268,7 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         response = await self.transfer(device="agent:PC", session_key=self.old_key)
         cancelled = await self.request("POST", f"/api/mini/music/transfers/{response.json()['transfer_id']}/cancel")
         self.assertEqual(cancelled.json()["status"], "failed")
+        self.assertEqual(cancelled.json()["error_code"], "transfer_cancelled")
         self.assertEqual(cancelled.json()["session"]["state"], "playing")
         self.assertEqual(cancelled.json()["session"]["device"], "local")
         self.assertEqual(await self.commands(), [])
@@ -297,7 +311,38 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         await self.complete((await self.commands())[0].id, state="paused")
         data = await self.poll(response.json()["transfer_id"])
         self.assertEqual(data["status"], "failed")
-        self.assertFalse(data["ok"])
+        self.assertIs(data["ok"], True)
+        self.assertEqual(data["error_code"], "target_start_failed")
+
+    async def test_failed_start_returns_readable_resource_and_original_failure_detail(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        reason = "Устройство не подтвердило постановку команды"
+        with patch("app.music_api.enqueue_agent_command", new=AsyncMock(side_effect=HTTPException(409, reason))):
+            response = await self.transfer(track, device="agent:PC")
+        self.assertEqual(response.status_code, 200, response.text)
+        started = response.json()
+        self.assertEqual(started["status"], "failed")
+        self.assertEqual(started["detail"], reason)
+        self.assertEqual(started["error_code"], "agent_command_failed")
+        self.assertEqual(started["session"]["state"], "error")
+        self.assertRegex(started["transfer_id"], r"^[a-f0-9]{32}$")
+        self.assertEqual(await self.commands(), [])
+        # The ID and failure remain readable for polling/cleanup, even when
+        # the first response was lost. No retry can start the failed target.
+        for _ in range(2):
+            polled = await self.poll(started["transfer_id"])
+            cancelled = await self.request("POST", f"/api/mini/music/transfers/{started['transfer_id']}/cancel")
+            for body in (polled, cancelled.json()):
+                self.assertIs(body["ok"], True)
+                self.assertEqual(body["status"], "failed")
+                self.assertEqual(body["transfer_id"], started["transfer_id"])
+                self.assertEqual(body["detail"], reason)
+                self.assertEqual(body["error_code"], "agent_command_failed")
+                self.assertNotEqual(body["session"]["state"], "playing")
+        self.assertEqual(await self.commands(), [])
+        async with self.sessions() as session:
+            self.assertEqual((await session.get(MusicPlaybackState, 1)).transfer_id, "")
 
     async def test_timeout_after_delivered_start_requires_actual_stop_before_new_player(self):
         track = await self.music_track()
