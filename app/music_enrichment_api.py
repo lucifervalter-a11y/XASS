@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from types import SimpleNamespace
+from typing import Literal
 from weakref import WeakValueDictionary
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -20,6 +21,7 @@ from app.services.music_library import track_json
 from app.services.music_lyrics import empty_lyrics, parse_lyrics
 
 _locks = WeakValueDictionary()
+CATALOG_BUDGET_SECONDS = 18
 
 
 def identity(track):
@@ -53,10 +55,36 @@ def result_json(record):
     if record and record.dismissed:
         result = {"status": "disabled", "lyrics": empty_lyrics()}
     result["can_restore"] = bool(record and record.original and not record.dismissed)
+    result["artwork_available"] = bool(record and record.artwork_data and not record.dismissed)
+    result["owner_lyrics_available"] = bool(record and (record.owner_lyrics or {}).get("text"))
+    result["owner_lyrics_enabled"] = result["owner_lyrics_available"] and not bool(record.owner_lyrics.get("disabled"))
     if record and result.get("candidates"):
         result["candidate_token"] = hashlib.sha256(json.dumps([record.revision, record.fingerprint,
             result["candidates"]], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return result
+
+
+async def catalog_lookup(snapshot, candidate=None, *, refresh=False):
+    """One bounded lookup; optional cover I/O never discards verified lyrics."""
+    from app.services.music_enrichment import enrich_track, enrich_confirmed_candidate, fetch_artwork_thumbnail
+    deadline = asyncio.get_running_loop().time() + CATALOG_BUDGET_SECONDS
+    kwargs = {"deadline": deadline - .1, **({"refresh": True} if refresh else {})}
+    try:
+        async with asyncio.timeout_at(deadline):
+            result = (await enrich_confirmed_candidate(snapshot, candidate, **kwargs)
+                if candidate is not None else await enrich_track(snapshot, **kwargs))
+    except (TimeoutError, OSError):
+        result = {"status": "unavailable", "reason": "catalog_unavailable", "lyrics": empty_lyrics()}
+    artwork = None
+    if result.get("status") == "matched":
+        try:
+            async with asyncio.timeout_at(deadline):
+                artwork = await fetch_artwork_thumbnail(result.get("artwork", {}))
+        except (TimeoutError, OSError):
+            pass
+        if artwork is None and result.get("artwork", {}).get("status") == "candidate":
+            result = {**result, "artwork_reason": "artwork_unavailable"}
+    return result, artwork
 
 
 async def enrich_saved_track(session, track_id, *, refresh=False):
@@ -71,9 +99,14 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
         if record:
             age = (now - record.checked_at.replace(tzinfo=timezone.utc)).total_seconds()
             ttl = 30 * 86400 if record.result.get("status") == "matched" else 6 * 3600
-            if record.result.get("status") in {"unavailable", "rate_limited"}:
+            retry_status = record.result.get("lookup_status") if record.result.get("using_cached_result") else record.result.get("status")
+            if retry_status in {"unavailable", "rate_limited"}:
                 ttl = max(60, min(86400, record.result.get("retry_after", 60)))
+            elif record.result.get("artwork_reason") in {"catalog_unavailable", "artwork_unavailable"}:
+                ttl = min(ttl, 60)
             same = record.fingerprint == fingerprint(track)
+            if same and not record.dismissed and record.result.get("status") == "matched":
+                previous_result, previous_artwork = deepcopy(record.result), record.artwork_data
             if same and not record.dismissed and record.result.get("status") == "confirmed":
                 # Owner selection is durable, not a six-hour search suggestion.
                 # Only an explicit refresh may revalidate the chosen provider ID.
@@ -94,16 +127,23 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
             (original.get("title", "") + " " + snapshot.filename).replace("_", " "), re.I))
         original["is_excerpt"] = snapshot.is_excerpt
         await session.rollback()
-        from app.services.music_enrichment import enrich_track, enrich_confirmed_candidate, fetch_artwork_thumbnail
-        try:
-            async with asyncio.timeout(18):
-                result = (await enrich_confirmed_candidate(snapshot, confirmed_candidate)
-                    if confirmed_candidate is not None else await enrich_track(snapshot))
-                artwork = await fetch_artwork_thumbnail(result.get("artwork", {})) if result.get("status") == "matched" else None
-        except (TimeoutError, OSError):
-            result, artwork = {"status": "unavailable", "lyrics": empty_lyrics()}, None
+        result, artwork = await catalog_lookup(snapshot, confirmed_candidate, refresh=refresh)
         if len(json.dumps(result, ensure_ascii=False).encode()) > 192 * 1024:
             result, artwork = {"status": "unavailable", "lyrics": empty_lyrics()}, None
+        if confirmed_candidate is None and previous_result is not None and result.get("status") in {"unavailable", "rate_limited"}:
+            failure = result
+            result = {key: value for key, value in previous_result.items()
+                if key not in {"lookup_status", "lookup_reason", "retry_after", "using_cached_result"}}
+            result.update(using_cached_result=True, lookup_status=failure["status"], lookup_reason=failure.get("reason", "catalog_unavailable"))
+            if failure.get("retry_after"):
+                result["retry_after"] = failure["retry_after"]
+            artwork = previous_artwork
+        elif (confirmed_candidate is None and previous_result is not None and result.get("status") == "matched"
+                and artwork is None and result.get("artwork_reason") in {"catalog_unavailable", "artwork_unavailable"}):
+            # Optional cover outages cannot erase an already verified thumbnail.
+            artwork = previous_artwork
+            if artwork:
+                result = {**result, "artwork": previous_result.get("artwork", {"status": "not_found"})}
         if confirmed_candidate is not None:
             retryable = result.get("status") in {"unavailable", "rate_limited"}
             if retryable:
@@ -115,6 +155,8 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
             result = {"status": "confirmed", "candidate": confirmed_candidate,
                 "lyrics": (previous_result.get("lyrics") if retryable else result.get("lyrics")) or empty_lyrics(),
                 "provenance": (previous_result.get("provenance", []) if retryable else result.get("provenance", [])),
+                "artwork": (previous_result.get("artwork", {"status": "not_found"}) if retryable else result.get("artwork", {"status": "not_found"})),
+                "artwork_reason": (previous_result.get("artwork_reason", "") if retryable else result.get("artwork_reason", "")),
                 "lookup_status": result.get("status", "not_found"), "lookup_reason": result.get("reason", ""),
                 **({"retry_after": result["retry_after"]} if result.get("retry_after") else {}),
                 **({"using_cached_result": True} if retryable else {})}
@@ -159,6 +201,10 @@ class EnrichBody(BaseModel):
 class TranscriptBody(BaseModel):
     text: str = Field(min_length=1, max_length=64000)
     source: str = Field(pattern=r"^on_device_transcription$")
+
+
+class LyricsSourceBody(BaseModel):
+    source: Literal["catalog", "owner"]
 
 
 class CandidateBody(BaseModel):
@@ -216,13 +262,7 @@ def build_router(require_owner):
             is_excerpt=bool(record.original.get("is_excerpt")))
         expected_revision = record.revision
         await session.rollback()
-        from app.services.music_enrichment import enrich_confirmed_candidate, fetch_artwork_thumbnail
-        try:
-            async with asyncio.timeout(18):
-                selected = await enrich_confirmed_candidate(snapshot, candidate)
-                artwork = await fetch_artwork_thumbnail(selected.get("artwork", {}))
-        except (TimeoutError, OSError):
-            selected, artwork = {"lyrics": empty_lyrics(), "status": "unavailable"}, None
+        selected, artwork = await catalog_lookup(snapshot, candidate)
         track = await lock_track_row(session, track_id)
         record = await session.get(MusicEnrichment, track_id, populate_existing=True)
         if not record or record.revision != expected_revision or record.fingerprint != fingerprint(track) or result_json(record).get("candidate_token") != payload.candidate_token:
@@ -231,7 +271,8 @@ def build_router(require_owner):
             setattr(track, key, value)
         record.result = {"status": "confirmed", "candidate": candidate, "lyrics": selected.get("lyrics") or empty_lyrics(),
             "provenance": selected.get("provenance") or record.result.get("provenance", []),
-            "lookup_status": selected.get("status", "not_found")}
+            "lookup_status": selected.get("status", "not_found"), "lookup_reason": selected.get("reason", ""),
+            "artwork": selected.get("artwork", {"status": "not_found"}), "artwork_reason": selected.get("artwork_reason", "")}
         record.artwork_data = artwork if artwork and len(artwork) <= 384 * 1024 else None
         record.dismissed = False
         record.revision += 1
@@ -255,5 +296,19 @@ def build_router(require_owner):
         record.revision = (record.revision or 0) + 1
         await session.commit()
         return {"ok": True, "lyrics": value}
+
+    @router.patch("/api/mini/music/tracks/{track_id}/lyrics/source")
+    async def lyrics_source(track_id: int, payload: LyricsSourceBody, user=Depends(require_owner), session=Depends(get_session)):
+        track = await lock_track_row(session, track_id)
+        record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+        if record is None or not (record.owner_lyrics or {}).get("text"):
+            raise HTTPException(409, "Сохранённой расшифровки пока нет.")
+        disabled = payload.source == "catalog"
+        if bool(record.owner_lyrics.get("disabled")) != disabled:
+            # Keep the text/timing intact so the owner can undo this preference.
+            record.owner_lyrics = {**record.owner_lyrics, "disabled": disabled}
+            record.revision = (record.revision or 0) + 1
+        await session.commit()
+        return {"ok": True, "track": track_json(track), "enrichment": result_json(record)}
 
     return router

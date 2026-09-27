@@ -8,6 +8,7 @@ from email.utils import format_datetime
 import io
 from types import SimpleNamespace
 import unittest
+import unicodedata
 from unittest.mock import patch
 
 import httpx
@@ -178,7 +179,8 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["lyrics"]["source"], "lrclib")
         self.assertIs(result["lyrics"]["synced"], True)
         self.assertEqual(result["provenance"], [{"source": "lrclib", "id": 123, "url": "https://lrclib.net/lyrics/123"}])
-        self.assertEqual([str(req.url) for req in self.requests], ["https://lrclib.net/api/get/123"])
+        self.assertEqual([str(req.url) for req in self.requests if req.url.host == "lrclib.net"], ["https://lrclib.net/api/get/123"])
+        self.assertEqual([req.url.host for req in self.requests], ["lrclib.net", "musicbrainz.org"])
 
     async def test_confirm_missing_invalid_id_and_unknown_source_never_fetch(self):
         service = self.service()
@@ -225,13 +227,13 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirm_cache_is_bound_to_id_and_file_signature(self):
         service = self.service(handler=lambda req: httpx.Response(200, json={**self.lyric, "id": int(req.url.path.rsplit("/", 1)[1])}))
         first, second = await asyncio.gather(service.confirm(self.track, self.selected()), service.confirm(self.track, self.selected()))
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len([req for req in self.requests if req.url.host == "lrclib.net"]), 1)
         first["lyrics"]["lines"].clear()
         self.assertEqual(len(second["lyrics"]["lines"]), 2)
         await service.confirm(self.track, {**self.selected(), "source_id": 124})
         self.track.duration = 99
         await service.confirm(self.track, self.selected())
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len([req for req in self.requests if req.url.host == "lrclib.net"]), 3)
 
     async def test_confirm_not_found_rate_limit_and_oversized_response_are_bounded(self):
         for bad, expected in ((httpx.Response(404), "not_found"),
@@ -440,6 +442,140 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.music_enrichment._jpeg_thumbnail") as decode:
             self.assertIsNone(await service.fetch_artwork(self.artwork()))
             decode.assert_not_called()
+
+    async def test_nfd_structured_filename_and_known_export_suffix_query_normalized_nfc(self):
+        self.track.title = unicodedata.normalize("NFD", "Певец Йота - Речной путь [facetext]")
+        self.track.artist = self.track.album = ""
+        original = self.track.title
+        lyric = {**self.lyric, "trackName": "Речной путь", "artistName": "Певец Йота", "albumName": ""}
+        result = await self.service(lyrics=[lyric], recordings=[]).enrich(self.track)
+        self.assertEqual(result["status"], "matched")
+        self.assertTrue(result["lyrics"]["synced"])
+        self.assertEqual(self.requests[0].url.params["track_name"], "Речной путь")
+        self.assertEqual(self.requests[0].url.params["artist_name"], "Певец Йота")
+        self.assertEqual(self.track.title, original, "Discovery does not mutate original metadata")
+
+    async def test_legacy_underscores_and_spaced_cut_duration_offer_only_confirmation(self):
+        for cut in ("cut99sec", "cut 99sec", "cut 99 sec"):
+            self.requests.clear()
+            self.track.title = ("Fixture Artist - Fixture Song reUploads " + cut).replace(" ", "_")
+            self.track.artist = self.track.album = ""
+            self.track.duration = 99
+            result = await self.service().enrich(self.track)
+            self.assertEqual(result["status"], "candidate", cut)
+            self.assertEqual(result["reason"], "duration_mismatch")
+            self.assertEqual(self.requests[0].url.params["track_name"], "Fixture Song")
+            self.assertEqual(result["lyrics"]["text"], "")
+
+    async def test_only_balanced_explicit_promo_suffix_is_removed_and_versions_remain(self):
+        self.track.artist = self.track.album = ""
+        self.track.title = "Fixture Artist - Fixture Song (telegram @fixture_channel)"
+        self.assertEqual((await self.service().enrich(self.track))["status"], "matched")
+        for suffix in (" [Live]", " (Remix)", " (telegram @fixture_channel]"):
+            self.requests.clear()
+            self.track.title = "Fixture Artist - Fixture Song" + suffix
+            result = await self.service().enrich(self.track)
+            self.assertNotEqual(result["status"], "matched", suffix)
+            self.assertIn(suffix.strip().replace("_", " "), self.requests[0].url.params["track_name"])
+
+    async def test_optional_catalog_outage_cache_retries_after_sixty_seconds(self):
+        failed = True
+        def handle(request):
+            if request.url.host == "musicbrainz.org" and failed:
+                return httpx.Response(503)
+        service = self.service(handler=handle)
+        first = await service.enrich(self.track)
+        self.assertEqual(first["status"], "matched")
+        self.assertEqual(first["artwork_reason"], "catalog_unavailable")
+        self.requests.clear()
+        self.clock.value += 59
+        self.assertEqual(await service.enrich(self.track), first)
+        self.assertEqual(self.requests, [])
+        failed = False
+        self.clock.value += 2
+        recovered = await service.enrich(self.track)
+        self.assertEqual(recovered["artwork"]["status"], "candidate")
+        self.assertNotIn("artwork_reason", recovered)
+        self.assertTrue(self.requests)
+
+    async def test_explicit_refresh_revalidates_positive_negative_and_selected_cache(self):
+        def handle(request):
+            if request.url.host == "lrclib.net":
+                return httpx.Response(200, json=self.lyric if "/get/" in request.url.path else [self.lyric])
+        service = self.service(handler=handle)
+        original = await service.enrich(self.track)
+        self.lyric["syncedLyrics"] = "[00:01.00]Updated fixture"
+        self.assertEqual((await service.enrich(self.track))["lyrics"], original["lyrics"])
+        self.assertIn("Updated fixture", (await service.enrich(self.track, refresh=True))["lyrics"]["text"])
+        selected = await service.confirm(self.track, self.selected())
+        self.lyric["syncedLyrics"] = "[00:01.00]Updated selected fixture"
+        self.assertEqual((await service.confirm(self.track, self.selected()))["lyrics"], selected["lyrics"])
+        self.assertIn("Updated selected fixture", (await service.confirm(self.track, self.selected(), refresh=True))["lyrics"]["text"])
+        rows = []
+        def negative(request):
+            return httpx.Response(200, json=rows if request.url.host == "lrclib.net" else {"recordings": []})
+        service = self.service(handler=negative)
+        self.assertEqual((await service.enrich(self.track))["status"], "not_found")
+        rows.append(self.lyric)
+        self.assertEqual((await service.enrich(self.track))["status"], "not_found")
+        self.assertEqual((await service.enrich(self.track, refresh=True))["status"], "matched")
+
+    async def test_explicit_refresh_never_clears_provider_retry_after(self):
+        service = self.service(handler=lambda request: httpx.Response(429, headers={"Retry-After": "120"}))
+        await service.enrich(self.track)
+        calls = len(self.requests)
+        result = await service.enrich(self.track, refresh=True)
+        self.assertEqual(result["status"], "rate_limited")
+        self.assertGreater(result["retry_after"], 100)
+        self.assertEqual(len(self.requests), calls)
+
+    async def test_optional_slow_catalog_cannot_exhaust_verified_lyrics_budget(self):
+        async def handle(request):
+            if request.url.host == "lrclib.net":
+                return httpx.Response(200, json=[self.lyric])
+            await asyncio.Event().wait()
+        service = MusicEnrichmentService(transport=httpx.MockTransport(handle), clock=self.clock.now, sleep=self.clock.sleep)
+        deadline = asyncio.get_running_loop().time() + .25
+        result = await asyncio.wait_for(service.enrich(self.track, deadline=deadline), .5)
+        self.assertEqual(result["status"], "matched")
+        self.assertTrue(result["lyrics"]["synced"])
+        self.assertEqual(result["artwork_reason"], "catalog_unavailable")
+
+    async def test_selected_lrclib_keeps_owner_id_and_adds_only_exact_catalog_artwork(self):
+        def handle(request):
+            return httpx.Response(200, json=self.lyric) if request.url.host == "lrclib.net" else None
+        result = await self.service(handler=handle).confirm(self.track, self.selected())
+        self.assertEqual(result["candidate"]["source_id"], 123)
+        self.assertEqual(result["artwork"]["release_id"], RELEASE)
+        self.assertEqual([row["source"] for row in result["provenance"]], ["lrclib", "musicbrainz"])
+        for change in ({"title": "Fixture Song (Live)"}, {"length": 220000},
+                       {"artist-credit": [{"name": "Another artist"}]}):
+            result = await self.service(recordings=[{**self.recording, **change}], handler=handle).confirm(self.track, self.selected())
+            self.assertEqual(result["status"], "matched")
+            self.assertEqual(result["candidate"]["source_id"], 123)
+            self.assertEqual(result["artwork"]["status"], "not_found")
+            self.assertTrue(result["lyrics"]["synced"])
+
+    async def test_provider_lock_wait_is_inside_budget_and_cancellation_propagates(self):
+        service = self.service()
+        await service._lock.acquire()
+        try:
+            result = await service.enrich(self.track, deadline=asyncio.get_running_loop().time() + .02)
+        finally:
+            service._lock.release()
+        self.assertEqual(result["reason"], "catalog_busy")
+        self.assertEqual(self.requests, [])
+        entered = asyncio.Event()
+        async def delayed(request):
+            entered.set()
+            await asyncio.Event().wait()
+        service = MusicEnrichmentService(transport=httpx.MockTransport(delayed))
+        task = asyncio.create_task(service.enrich(self.track))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(service._lock.locked())
 
 
 if __name__ == "__main__":

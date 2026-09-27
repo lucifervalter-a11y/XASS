@@ -32,13 +32,15 @@ MAX_THUMBNAIL_BYTES = 384 * 1024
 MAX_RECORDS = 100
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _VARIANTS = re.compile(r"\b(remix|live|acoustic|instrumental|karaoke|demo|edit|remaster(?:ed)?|sped|slowed|nightcore|cover|radio|extended|cut\w*|обрез\w*|ремикс|кавер|минус)\b", re.I)
-_CUT = re.compile(r"\b(?:cut(?:\d+(?:sec|s)?)?|clip|snippet|обрез\w*)\b", re.I)
+_CUT = re.compile(r"\b(?:cut(?:\s*\d+(?:\s*(?:sec|s))?)?|clip|snippet|обрез\w*)\b", re.I)
 _REUPLOAD = re.compile(r"\b(?:reuploads?|re-uploads?)\b", re.I)
+_PROMO_SUFFIX = re.compile(r"\s*(?:\[(?:facetext|telegram\s+@[a-z0-9_]{3,64})\]|\(telegram\s+@[a-z0-9_]{3,64}\))\s*$", re.I)
 
 
 def _text(value):
     if not isinstance(value, str) or len(value) > 480:
         return ""
+    value = unicodedata.normalize("NFC", value)
     return " ".join("".join(c for c in value if ord(c) >= 32 and unicodedata.category(c) not in {"Cf", "Cs"}).split())
 
 
@@ -58,10 +60,19 @@ def _duration(value, *, scale=1):
 
 def _signature(track):
     title, artist, album = (_text(getattr(track, field, "")) for field in ("title", "artist", "album"))
+    # Legacy imports stored filename stems with underscores. Treat separators
+    # as spaces before word-boundary annotation detection and provider queries,
+    # not just during the final comparison. Do not rewrite the original tags.
+    # Only explicit exporter/promotion suffixes, never musical version names.
+    # Strip balanced markers before normalizing underscores in file stems.
+    for _ in range(3):
+        title = _PROMO_SUFFIX.sub("", title)
+    title = title.replace("_", " ")
     # Keep variant qualifiers intact. Only remove explicit upload/cut labels for
     # discovery; the cut flag still forbids automatic lyrics or metadata.
     cut = getattr(track, "is_excerpt", False) is True or bool(_CUT.search(title))
-    cleaned = _REUPLOAD.sub(" ", _CUT.sub(" ", title)).strip(" -_()[]")
+    cleaned = _REUPLOAD.sub(" ", _CUT.sub(" ", title))
+    cleaned = " ".join(re.sub(r"\(\s*\)|\[\s*\]", " ", cleaned).strip(" -").split())
     if not artist and len(parts := re.split(r"\s+[-–—]\s+", cleaned)) == 2:
         artist, cleaned = map(str.strip, parts)
     return {"title": cleaned, "artist": artist, "album": album, "duration": _duration(getattr(track, "duration", 0)),
@@ -285,36 +296,58 @@ class MusicEnrichmentService:
         except (ValueError, UnicodeError, RecursionError) as exc:
             raise _ProviderFailure("unavailable") from exc
 
+    async def _json_before(self, url, params, deadline, *, optional=False):
+        # Leave a small margin to return already-verified results before the
+        # caller's absolute budget. Optional artwork discovery gets at most 4s.
+        remaining = deadline - asyncio.get_running_loop().time() - .1
+        if remaining <= 0:
+            raise _ProviderFailure("unavailable")
+        try:
+            async with asyncio.timeout(min(4, remaining) if optional else remaining):
+                return await self._json(url, params)
+        except TimeoutError as exc:
+            raise _ProviderFailure("unavailable") from exc
+
     def _put(self, key, result):
         size = len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
         ttl = 86400 if result["status"] in {"matched", "candidate", "ambiguous"} else 3600
         if result["status"] in {"unavailable", "rate_limited"}:
             ttl = min(60, result.get("retry_after", 60))
+        if result.get("artwork_reason") in {"catalog_unavailable", "artwork_unavailable"}:
+            ttl = min(ttl, 60)
         self._cache[key] = (self._clock() + ttl, deepcopy(result), size)
         self._cache_bytes += size
         while len(self._cache) > 64 or self._cache_bytes > 8 * 1024 * 1024:
             _, (_, _, old_size) = self._cache.popitem(last=False)
             self._cache_bytes -= old_size
 
-    async def enrich(self, track):
+    async def enrich(self, track, *, refresh=False, deadline=None):
         signature = _signature(track)
         if getattr(track, "deleted", False) or not _norm(signature["title"]) or not signature["duration"]:
             return _empty("insufficient_metadata")
         key = tuple(signature.values())
+        deadline = deadline if deadline is not None else asyncio.get_running_loop().time() + 17
         # Coalesce identical concurrent requests without launching parallel
         # lookups. Both providers require sequential, identified requests.
-        async with self._lock:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await self._lock.acquire()
+        except TimeoutError:
+            return _empty("unavailable", "catalog_busy")
+        try:
             cached = self._cache.get(key)
-            if cached and cached[0] > self._clock():
+            if cached and cached[0] > self._clock() and not refresh:
                 self._cache.move_to_end(key)
                 return deepcopy(cached[1])
             if cached:
                 self._cache_bytes -= self._cache.pop(key)[2]
-            result = await self._enrich(signature)
+            result = await self._enrich(signature, deadline)
             self._put(key, result)
             return deepcopy(result)
+        finally:
+            self._lock.release()
 
-    async def confirm(self, track, candidate):
+    async def confirm(self, track, candidate, *, refresh=False, deadline=None):
         """Resolve one owner-selected stored candidate, never an arbitrary URL.
 
         Selection resolves ambiguity only. It does not waive metadata/length or
@@ -339,17 +372,23 @@ class MusicEnrichmentService:
         if source == "musicbrainz":
             # A recording selection is not a lyrics selection. Ordinary exact
             # matching still decides whether an independent LRCLIB record fits.
-            return await self.enrich(snapshot)
+            return await self.enrich(snapshot, refresh=refresh, deadline=deadline)
         key = ("confirmed", source, identity, *signature.values())
-        async with self._lock:
+        deadline = deadline if deadline is not None else asyncio.get_running_loop().time() + 17
+        try:
+            async with asyncio.timeout_at(deadline):
+                await self._lock.acquire()
+        except TimeoutError:
+            return _empty("unavailable", "catalog_busy")
+        try:
             cached = self._cache.get(key)
-            if cached and cached[0] > self._clock():
+            if cached and cached[0] > self._clock() and not refresh:
                 self._cache.move_to_end(key)
                 return deepcopy(cached[1])
             if cached:
                 self._cache_bytes -= self._cache.pop(key)[2]
             try:
-                raw = await self._json(f"https://lrclib.net/api/get/{identity}", None)
+                raw = await self._json_before(f"https://lrclib.net/api/get/{identity}", None, deadline)
                 rows = _lrclib_rows([raw]) if isinstance(raw, dict) else []
                 if raw is None:
                     result = _empty("not_found")
@@ -361,6 +400,7 @@ class MusicEnrichmentService:
                     if match == "matched":
                         result = _empty("matched", candidate=fresh, lyrics=_lyrics(raw, fresh),
                             provenance=[{"source": "lrclib", "id": identity, "url": fresh["source_url"]}])
+                        await self._confirmed_artwork(result, signature, deadline)
                     else:
                         result = _empty("candidate", "duration_mismatch" if match == "duration_mismatch" else "candidate_changed",
                             candidate=selected, candidates=[selected])
@@ -370,14 +410,34 @@ class MusicEnrichmentService:
                 result = _empty("unavailable")
             self._put(key, result)
             return deepcopy(result)
+        finally:
+            self._lock.release()
 
-    async def _enrich(self, signature):
+    async def _confirmed_artwork(self, result, signature, deadline):
+        """Art from an exact recording; never replace the owner's lyrics ID."""
+        candidate = result["candidate"]
+        quote = lambda value: str(value).replace("\\", "\\\\").replace('"', '\\"')
+        query = f'recording:"{quote(candidate["title"])}" AND artist:"{quote(candidate["artist"])}"'
+        try:
+            data = await self._json_before("https://musicbrainz.org/ws/2/recording/",
+                {"query": query, "fmt": "json", "limit": 20}, deadline, optional=True)
+            status, choice, _ = _select(signature, _musicbrainz_rows({"recordings": []} if data is None else data, signature["album"]))
+            if status == "matched":
+                recording, raw = choice
+                result["artwork"] = _artwork(raw, candidate["album"])
+                result["provenance"].append({"source": "musicbrainz", "id": recording["source_id"], "url": recording["source_url"]})
+            else:
+                result["artwork_reason"] = "catalog_ambiguous" if status == "ambiguous" else "not_found"
+        except (_ProviderFailure, ValueError, TypeError):
+            result["artwork_reason"] = "catalog_unavailable"
+
+    async def _enrich(self, signature, deadline):
         result, lrc_choice = _empty("not_found"), None
         try:
             params = {"track_name": signature["title"], "artist_name": signature["artist"]} if signature["artist"] else {"q": signature["query"]}
             if signature["album"]:
                 params["album_name"] = signature["album"]
-            data = await self._json("https://lrclib.net/api/search", params)
+            data = await self._json_before("https://lrclib.net/api/search", params, deadline)
             status, lrc_choice, suggestions = _select(signature, _lrclib_rows([] if data is None else data))
             if status == "matched":
                 candidate, raw = lrc_choice
@@ -406,7 +466,8 @@ class MusicEnrichmentService:
                 if not words or len(words) > 20:
                     return result
                 query = " AND ".join(f'(recording:"{quote(word)}" OR artist:"{quote(word)}")' for word in words)
-            data = await self._json("https://musicbrainz.org/ws/2/recording/", {"query": query, "fmt": "json", "limit": 20})
+            data = await self._json_before("https://musicbrainz.org/ws/2/recording/", {"query": query, "fmt": "json", "limit": 20},
+                deadline, optional=result["status"] == "matched")
             status, choice, suggestions = _select(signature if not lrc_choice else {**signature, "title": known["title"], "artist": known["artist"]}, _musicbrainz_rows({"recordings": []} if data is None else data, signature["album"]))
             if status == "matched":
                 candidate, raw = choice
@@ -423,9 +484,13 @@ class MusicEnrichmentService:
             if result["status"] != "matched":
                 delay = max(result.get("retry_after", 0), exc.retry_after)
                 result = _empty("rate_limited" if delay else exc.status, **({"retry_after": delay} if delay else {}))
+            else:
+                result["artwork_reason"] = "catalog_unavailable"
         except (ValueError, TypeError):
             if result["status"] != "matched":
                 result = _empty("unavailable")
+            else:
+                result["artwork_reason"] = "catalog_unavailable"
         return result
 
     async def fetch_artwork(self, artwork):
@@ -468,15 +533,15 @@ def _artwork_redirect(value, identity):
 _service = MusicEnrichmentService()
 
 
-async def enrich_track(track):
+async def enrich_track(track, *, refresh=False, deadline=None):
     # A persistent caller may retain is_excerpt=True after the owner confirms
     # cleaned metadata, so later lookups cannot forget a known cut annotation.
-    return await _service.enrich(track)
+    return await _service.enrich(track, refresh=refresh, deadline=deadline)
 
 
 async def fetch_artwork_thumbnail(artwork):
     return await _service.fetch_artwork(artwork)
 
 
-async def enrich_confirmed_candidate(track, candidate):
-    return await _service.confirm(track, candidate)
+async def enrich_confirmed_candidate(track, candidate, *, refresh=False, deadline=None):
+    return await _service.confirm(track, candidate, refresh=refresh, deadline=deadline)

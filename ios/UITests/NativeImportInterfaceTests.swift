@@ -10,7 +10,7 @@ final class NativeImportInterfaceTests: XCTestCase {
         let choose = app.buttons["musicImportChooseFiles"]
         XCTAssertTrue(choose.waitForExistence(timeout: 5))
         XCTAssertTrue(choose.isEnabled)
-        XCTAssertTrue(app.staticTexts["Лимиты этого сервера"].exists)
+        XCTAssertTrue(app.staticTexts["musicImportLimits"].exists)
         XCTAssertTrue(app.staticTexts["ZIP-архив"].exists)
         XCTAssertEqual(app.webViews.count, 0)
         app.buttons["musicImportDone"].tap()

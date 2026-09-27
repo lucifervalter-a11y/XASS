@@ -14,6 +14,7 @@ private enum NativeMainSheet: String, Identifiable {
     @State private var fixtureDevice = false
     @State private var fixtureStorage = false
     @State private var fixtureAlbums = false
+    @State private var fixtureMusicImport = false
     init(app: AppState, store: NativeStore) {
         self.app = app; self.store = store
         _workspace = StateObject(wrappedValue: NativeWorkspaceStore(api: store.api))
@@ -49,6 +50,7 @@ private enum NativeMainSheet: String, Identifiable {
             .sheet(isPresented: $fixtureDevice) { NavigationStack { if let device = store.devices.first { NativeDeviceDetail(store: store, deviceID: device.id) } } }
             .sheet(isPresented: $fixtureStorage) { NavigationStack { NativeStorageView(store: store) } }
             .sheet(isPresented: $fixtureAlbums) { NavigationStack { NativeCollectionLibrary(store: store, kind: .album) } }
+            .sheet(isPresented: $fixtureMusicImport) { NativeMusicImportView(store: store) }
             .onAppear {
                 #if DEBUG && targetEnvironment(simulator)
                 if NativeFixture.enabled {
@@ -56,6 +58,7 @@ private enum NativeMainSheet: String, Identifiable {
                     case "library": selectedTab = 1
                     case "player", "lyrics", "queue": selectedTab = 1; store.showPlayer = true
                     case "albums": selectedTab = 1; fixtureAlbums = true
+                    case "import": selectedTab = 1; fixtureMusicImport = true
                     case "devices": selectedTab = 3; fixtureDevice = true
                     case "routes": selectedTab = 1; store.showRoutePicker = true
                     case "storage": selectedTab = 3; fixtureStorage = true

@@ -44,7 +44,9 @@ class UploadChunk(BaseModel):
     data: str = Field(min_length=1, max_length=4 * ((CHUNK_BYTES + 2) // 3))
 
 
-CHUNK_JSON_BYTES = 4 * ((CHUNK_BYTES + 2) // 3) + 1024
+# JSON encoders may escape every '/' in base64 as '\\/'. Accept that legal
+# representation without allowing a larger decoded block or unbounded bodies.
+CHUNK_JSON_BYTES = 2 * 4 * ((CHUNK_BYTES + 2) // 3) + 1024
 
 
 class FinishUpload(BaseModel):
@@ -538,7 +540,7 @@ def build_router(settings, require_owner, public_origin):
         track = await find_track(session, track_id)
         response.headers["Cache-Control"] = "private, no-store"
         record = await session.get(MusicEnrichment, track_id)
-        if record and record.owner_lyrics:
+        if record and record.owner_lyrics and not record.owner_lyrics.get("disabled", False):
             return {"ok": True, "lyrics": record.owner_lyrics}
         embedded = await asyncio.to_thread(embedded_lyrics, root, track)
         if embedded["text"]:

@@ -115,6 +115,16 @@ final class NativeLyricsTests: XCTestCase {
         XCTAssertNil(NativeEnrichmentPresentation.transcriptProblem(String(repeating: "я", count: 32_000)))
         XCTAssertNotNil(NativeEnrichmentPresentation.transcriptProblem(String(repeating: "я", count: 32_001)))
     }
+    func testCatalogStatusSeparatesUnavailableLyricsFromUnconfirmedAndUntimedText() {
+        XCTAssertEqual(NativeEnrichmentPresentation.lyricsStatus(["status": "unavailable"]), "Каталог не ответил")
+        XCTAssertEqual(NativeEnrichmentPresentation.lyricsStatus(["status": "matched", "owner_lyrics_enabled": true]), "Ваша расшифровка с iPhone")
+        XCTAssertEqual(NativeEnrichmentPresentation.lyricsStatus(["status": "candidate"]), "Совпадение не подтверждено")
+        XCTAssertEqual(NativeEnrichmentPresentation.lyricsStatus(["status": "matched", "lyrics": ["text": "Fixture", "synced": false]]), "Найден без таймкодов")
+        XCTAssertEqual(NativeEnrichmentPresentation.lyricsStatus(["status": "matched", "lyrics": ["text": "Fixture", "synced": true]]), "Найден с таймкодами")
+        XCTAssertEqual(NativeEnrichmentPresentation.lyricsStatus(["status": "matched", "lyrics": ["status": "instrumental"]]), "Инструментальная запись")
+        XCTAssertTrue(NativeEnrichmentPresentation.reason(["lookup_reason": "duration_mismatch"])?.contains("отрывок") == true)
+        XCTAssertNil(NativeEnrichmentPresentation.reason(["reason": "untrusted provider message"]))
+    }
 }
 
 @MainActor private final class LyricsClockService: OwnerService {

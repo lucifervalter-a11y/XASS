@@ -16,4 +16,10 @@
 
 ## Verification boundary
 
+Production diagnosis also confirmed a Unicode query bug: a decomposed-Cyrillic query returned zero LRCLIB records, while the same owner-supplied title normalized to NFC returned five, including duration-matching candidates. Other observed failures were upstream LRCLIB 503 responses and MusicBrainz TLS/connectivity failures; certificate verification remains enabled. Reports were encrypted on the VPS to a one-time local recipient before passing through public CI. No audio or lyrics content was exported.
+
+Catalog queries normalize Unicode and legacy separators, remove only recognized upload/promotion markers, and preserve musical version qualifiers. Explicit refresh can bypass local negative-result caching without bypassing provider backoff. Optional cover failures no longer discard verified lyrics; retryable partial failures have short cache lifetimes. A narrowly longer native catalog-request deadline accommodates the server's bounded lookup budget without slowing PC controls or upload chunks.
+
+The track-information screen separates catalog text/cover status from owner transcription, explains ambiguous or duration-mismatched results, and displays album names when choosing between releases. Owner transcription can be disabled in favor of embedded/catalog lyrics and re-enabled without deleting it.
+
 The device's Files extension and iCloud/provider materialization require a physical-iPhone check. Automated tests cannot prove that every external Files provider responds to Open. Catalog coverage and singing-transcription accuracy remain distinct from importing a file. Windows binaries are unchanged by this release.

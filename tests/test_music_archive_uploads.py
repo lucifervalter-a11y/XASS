@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timedelta, timezone
 import io
+import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -224,7 +226,7 @@ class MusicArchiveUploadTests(unittest.IsolatedAsyncioTestCase):
 
         async def oversized():
             nonlocal consumed
-            for _ in range(20):
+            for _ in range(40):
                 consumed += 64 * 1024
                 yield b"x" * (64 * 1024)
 
@@ -237,6 +239,18 @@ class MusicArchiveUploadTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(consumed, CHUNK_JSON_BYTES + 64 * 1024)
             decoder.assert_not_called()
         self.assertFalse((Path(self.settings.music_root) / (identity + ".part")).exists())
+
+    async def test_legal_escaped_base64_slashes_keep_full_chunk_compatible_with_ios_json(self):
+        data = b"\xff" * CHUNK_BYTES
+        identity = await self.start(data)
+        body = json.dumps({"offset": 0, "data": base64.b64encode(data).decode()}).replace("/", "\\/").encode()
+        self.assertGreater(len(body), CHUNK_BYTES * 2)
+        self.assertLessEqual(len(body), CHUNK_JSON_BYTES)
+        response = await self.request("PUT", f"/api/mini/music/uploads/{identity}",
+            headers={**self.headers, "Content-Type": "application/json"}, content=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["offset"], len(data))
+        self.assertEqual((Path(self.settings.music_root) / (identity + ".part")).read_bytes(), data)
 
     async def test_shutdown_waits_for_unpack_thread_and_retains_retryable_source(self):
         identity = await self.archive()

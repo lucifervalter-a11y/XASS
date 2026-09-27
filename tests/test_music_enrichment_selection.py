@@ -118,7 +118,7 @@ class MusicEnrichmentSelectionTests(unittest.IsolatedAsyncioTestCase):
         identity, route, _, _, _ = await self.prepared()
         entered, release = asyncio.Event(), asyncio.Event()
 
-        async def lookup(*_):
+        async def lookup(*_, **_kwargs):
             entered.set()
             await asyncio.wait_for(release.wait(), 5)
             return {"status": "unavailable", "lyrics": empty_lyrics()}

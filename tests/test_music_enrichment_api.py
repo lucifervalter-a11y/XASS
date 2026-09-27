@@ -32,7 +32,7 @@ class MusicEnrichmentApiTests(MusicApiTests):
         """A separate owner request commits while the mocked network is pending."""
         entered, release = asyncio.Event(), asyncio.Event()
 
-        async def lookup(_):
+        async def lookup(_, **_kwargs):
             entered.set()
             await asyncio.wait_for(release.wait(), timeout=5)
             return self.matched() if result is None else result
@@ -111,7 +111,7 @@ class MusicEnrichmentApiTests(MusicApiTests):
 
     async def test_edit_while_catalog_request_runs_prevents_stale_apply(self):
         track, route = await self.prepared()
-        async def change(_):
+        async def change(_, **_kwargs):
             async with self.sessions() as session:
                 row = await session.get(MusicTrack, track["id"])
                 row.title = "Concurrent edit"
@@ -261,7 +261,7 @@ class MusicEnrichmentApiTests(MusicApiTests):
                 token = found.json()["enrichment"]["candidate_token"]
                 entered, release = asyncio.Event(), asyncio.Event()
 
-                async def selected_lookup(_, selected_candidate):
+                async def selected_lookup(_, selected_candidate, **_kwargs):
                     self.assertEqual(selected_candidate, candidate)
                     entered.set()
                     await asyncio.wait_for(release.wait(), timeout=5)
@@ -326,11 +326,11 @@ class MusicEnrichmentApiTests(MusicApiTests):
         candidate = {"title": "Clean catalog title", "artist": "Artist", "album": "", "duration": 180,
                      "source": "lrclib", "source_id": 123, "source_url": "https://lrclib.net/lyrics/123"}
 
-        async def lookup(snapshot):
+        async def lookup(snapshot, **_kwargs):
             seen_cuts.append(snapshot.is_excerpt)
             return {"status": "candidate", "candidates": [candidate], "lyrics": empty_lyrics()}
 
-        async def selected_lookup(snapshot, selected):
+        async def selected_lookup(snapshot, selected, **_kwargs):
             self.assertEqual(selected, candidate)
             selected_cuts.append((snapshot.title, snapshot.is_excerpt))
             return {"status": "candidate", "reason": "duration_mismatch", "candidate": selected,

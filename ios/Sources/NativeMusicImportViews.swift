@@ -79,6 +79,7 @@ import UniformTypeIdentifiers
     var body: some View {
         NavigationStack {
             List {
+                if store.error != nil || store.notice != nil { Section { NativeMessage(store: store) } }
                 Section {
                     Label("Ваша музыка в XASS", systemImage: "music.note.list").font(.title3.weight(.semibold))
                     Text("Добавьте один трек, несколько файлов или ZIP. Исходные файлы останутся на месте.")
@@ -115,11 +116,13 @@ import UniformTypeIdentifiers
                         Button("Обновить библиотеку") { store.run { await store.refresh() } }
                     }.accessibilityIdentifier("musicImportResults")
                 }
-                Section("Лимиты этого сервера") {
+                Section {
                     LabeledContent("Аудиофайл", value: size(store.musicImportFileLimit))
                     LabeledContent("ZIP-архив", value: size(store.musicImportArchiveLimit))
                     Text("MP3, M4A, WAV, FLAC и OGG. В ZIP — до 200 аудиофайлов и 512 МиБ после распаковки. Повторные файлы не создают дубликатов.")
                         .font(.caption).foregroundStyle(.secondary)
+                } header: {
+                    Text("Лимиты этого сервера").accessibilityIdentifier("musicImportLimits")
                 }
                 Section {
                     Button { diagnostics = true } label: { Label("Отправить диагностику", systemImage: "square.and.arrow.up") }
@@ -137,7 +140,7 @@ import UniformTypeIdentifiers
                 .confirmationDialog("Остановить оставшиеся файлы?", isPresented: $confirmCancel, titleVisibility: .visible) {
                     Button("Остановить импорт", role: .destructive) { store.cancelMusicImport() }
                     Button("Продолжить", role: .cancel) {}
-                } message: { Text("Добавленные треки сохранятся. Если ZIP уже обрабатывается сервером, обработка завершится: обновите библиотеку перед повторной загрузкой.") }
+                } message: { Text("Добавленные треки сохранятся. Если ZIP уже принят сервером, обработка может продолжиться: обновите библиотеку перед повторной загрузкой.") }
         }
     }
     private func size(_ bytes: Int) -> String { ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file) }
