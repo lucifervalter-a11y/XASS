@@ -46,9 +46,10 @@ final class NativeMusicPresentationTests: XCTestCase {
         let lyrics = NativeLyrics(["lyrics": ["source": "embedded", "synced": true, "text": "Real text", "lines": [
             ["time": 20, "text": "Second"], ["time": -1, "text": "Invalid"], ["time": Double.infinity, "text": "Invalid"],
             ["time": 0, "text": "First"], ["time": 20, "text": "Same timestamp"], ["time": 50, "text": "  "]]]])
-        XCTAssertEqual(lyrics.lines.map(\.text), ["First", "Second", "Same timestamp"])
+        XCTAssertEqual(lyrics.lines.filter { !$0.isPause }.map(\.text), ["First", "Second", "Same timestamp"])
         XCTAssertEqual(lyrics.activeLine(at: 19), 0)
         XCTAssertEqual(lyrics.activeLine(at: 20), 2)
+        XCTAssertNil(lyrics.activeLine(at: 50), "An empty timed marker ends vocal highlighting")
         XCTAssertNil(lyrics.activeLine(at: .nan))
     }
     func testMissingLyricsAreHonestAndPlainLyricsAreNotSeekable() {

@@ -47,15 +47,23 @@ enum NativeTranscriptFormat {
     static func lrc(_ words: [NativeTranscriptWord]) -> String {
         guard words.count <= 8000 else { return "" }
         var lines: [String] = [], group: [NativeTranscriptWord] = []
-        var byteCount = 0, oversized = false
-        func flush() {
-            guard let first = group.first else { return }
-            let centiseconds = Int((first.time * 100).rounded())
-            let text = group.map(\.text).joined(separator: " ")
-            let line = String(format: "[%02d:%02d.%02d] %@", centiseconds / 6000, centiseconds / 100 % 60, centiseconds % 100, text)
+        var byteCount = 0, oversized = false, vocalEnd: Double = 0
+        func append(centiseconds: Int, text: String) {
+            let stamp = String(format: "[%02d:%02d.%02d]", centiseconds / 6000, centiseconds / 100 % 60, centiseconds % 100)
+            let line = text.isEmpty ? stamp : stamp + " " + text
             byteCount += line.utf8.count + (lines.isEmpty ? 0 : 1)
             if byteCount <= NativeTranscriptPolicy.maximumBytes { lines.append(line) }
             else { oversized = true }
+        }
+        func flush(pauseAt: Double? = nil) {
+            guard let first = group.first else { return }
+            let centiseconds = Int((first.time * 100).rounded())
+            append(centiseconds: centiseconds, text: group.map(\.text).joined(separator: " "))
+            if let end = pauseAt {
+                // Empty LRC rows stop highlighting at the actual last word's
+                // end, not at the next phrase or throughout an instrumental.
+                append(centiseconds: max(centiseconds + 1, Int((end * 100).rounded())), text: "")
+            }
             group = []
         }
         let safeWords = words.prefix(8000).enumerated().compactMap { index, word -> (Int, NativeTranscriptWord)? in
@@ -70,11 +78,14 @@ enum NativeTranscriptFormat {
         }.sorted { $0.1.time == $1.1.time ? $0.0 < $1.0 : $0.1.time < $1.1.time }
         for (_, word) in safeWords {
             if let first = group.first, let last = group.last,
-               group.count >= 7 || word.time - first.time > 4 || word.time - last.time - last.duration > 1 { flush() }
+               group.count >= 7 || word.time - first.time > 4 || word.time - last.time - last.duration > 1 {
+                flush(pauseAt: word.time - vocalEnd > 1 ? vocalEnd : nil)
+            }
             if oversized { return "" } // Never silently save a truncated transcript.
             group.append(word)
+            vocalEnd = max(vocalEnd, min(NativeTranscriptPolicy.maximumDuration, word.time + word.duration))
         }
-        flush()
+        flush(pauseAt: vocalEnd)
         return oversized ? "" : lines.joined(separator: "\n")
     }
 }

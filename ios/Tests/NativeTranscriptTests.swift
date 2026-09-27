@@ -29,14 +29,14 @@ final class NativeTranscriptTests: XCTestCase {
         let result = NativeTranscriptFormat.lrc([
             word("Later", 45.127), word("First", 0), word("Same", 0), word("After minute", 61.239)
         ])
-        XCTAssertEqual(result, "[00:00.00] First Same\n[00:45.13] Later\n[01:01.24] After minute")
+        XCTAssertEqual(result, "[00:00.00] First Same\n[00:00.20]\n[00:45.13] Later\n[00:45.33]\n[01:01.24] After minute\n[01:01.44]")
     }
 
     func testLRCGroupingBreaksOnLongPauseSevenWordsAndLongPhrase() {
         let phrase = (0..<8).map { word("w\($0)", Double($0) * 0.1) }
-        XCTAssertEqual(NativeTranscriptFormat.lrc(phrase), "[00:00.00] w0 w1 w2 w3 w4 w5 w6\n[00:00.70] w7")
-        XCTAssertEqual(NativeTranscriptFormat.lrc([word("One", 0), word("Two", 1.3)]), "[00:00.00] One\n[00:01.30] Two")
-        XCTAssertEqual(NativeTranscriptFormat.lrc([word("One", 0, 5), word("Two", 4.01)]), "[00:00.00] One\n[00:04.01] Two")
+        XCTAssertEqual(NativeTranscriptFormat.lrc(phrase), "[00:00.00] w0 w1 w2 w3 w4 w5 w6\n[00:00.70] w7\n[00:00.90]")
+        XCTAssertEqual(NativeTranscriptFormat.lrc([word("One", 0), word("Two", 1.3)]), "[00:00.00] One\n[00:00.20]\n[00:01.30] Two\n[00:01.50]")
+        XCTAssertEqual(NativeTranscriptFormat.lrc([word("One", 0, 5), word("Two", 4.01)]), "[00:00.00] One\n[00:04.01] Two\n[00:05.00]")
     }
 
     func testLRCRejectsInvalidNumbersAndPreventsTimestampInjection() {
@@ -46,8 +46,21 @@ final class NativeTranscriptTests: XCTestCase {
             word("Out of range", 900), word("Bad duration", 2, .nan), word("Huge duration", 3, 1e50),
             word("   ", 4), word("Negative duration", 5, -1)
         ])
-        XCTAssertEqual(result, "[00:01.23] Actual words (99:00.00)")
+        XCTAssertEqual(result, "[00:01.23] Actual words (99:00.00)\n[00:01.43]")
         XCTAssertFalse(result.contains("\u{0000}")); XCTAssertFalse(result.contains("\r"))
+    }
+
+    func testMeasuredPauseAndFinalWordEndStopLyricsHighlighting() {
+        let text = NativeTranscriptFormat.lrc([word("First", 0, 0.6), word("Next phrase", 4, 0.8)])
+        XCTAssertEqual(text, "[00:00.00] First\n[00:00.60]\n[00:04.00] Next phrase\n[00:04.80]")
+        let lyrics = NativeLyrics(["lyrics": ["synced": true, "source": "on_device_transcription", "text": text, "lines": [
+            ["time": 0.0, "text": "First"], ["time": 0.6, "text": ""],
+            ["time": 4.0, "text": "Next phrase"], ["time": 4.8, "text": ""]
+        ]]])
+        XCTAssertNotNil(lyrics.activeLine(at: 0.5))
+        XCTAssertNil(lyrics.activeLine(at: 2))
+        XCTAssertNotNil(lyrics.activeLine(at: 4.5))
+        XCTAssertNil(lyrics.activeLine(at: 15))
     }
 
     func testOversizedTranscriptsFailWithoutSavingSilentTruncation() {
