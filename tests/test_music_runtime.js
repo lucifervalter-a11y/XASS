@@ -202,6 +202,18 @@ test('server transfer conflict stays actionable without legacy takeover fallback
   assert.equal(r.requests.length,1);assert.equal(r.nodes.get('audio').paused,true);
 });
 
+for (const waiting of [false, true]) test(`failed transfer receipt ${waiting ? 'after polling' : 'at start'} never starts another player`,async()=>{
+  const id='a'.repeat(32),message='ПК не подтвердил запуск музыки';
+  const r=runtime(async(p)=>{
+    if(p==='music/transfers' || p==='music/transfers/'+id) return {status:200,data:{ok:true,
+      status:waiting && p==='music/transfers'?'waiting':'failed',transfer_id:id,detail:message,error_code:'target_start_failed'}};
+  },{fastTimers:true});
+  await assert.rejects(r.music.play({id:1,title:'One',duration:90}),new RegExp(message));
+  assert.equal(r.nodes.get('audio').paused,true);
+  assert.equal(r.music.state.sessionOwned,false);
+  assert(!r.requests.some(q=>q.path.endsWith('/ticket')));
+});
+
 test('switching a paused device preserves position and needs a real start before resume',async()=>{
   const r=runtime(),track={id:1,title:'One',duration:90,mime:'audio/mpeg'};
   Object.assign(r.music.state,{tracks:[track],current:track,device:'local',sessionOwned:true,state:'paused',position:33});r.nodes.get('audio').currentTime=33;

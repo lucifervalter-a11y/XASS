@@ -5,6 +5,7 @@ import asyncio
 import base64
 import binascii
 from datetime import datetime, timedelta, timezone
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -22,8 +23,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.db import get_session
 from app.models import AgentCommand, AgentCredential, AppConfig, HeartbeatSource
 from app.music_models import MusicPlaylist, MusicSession, MusicTrack, MusicUpload, MusicUploadReceipt
-from app.music_playback import current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta
-from app.music_playback_models import MusicTransfer
+from app.music_playback import current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta, stale_local_recovery_available
+from app.music_playback_models import MusicRemoteCommand, MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
 from app.services.agent_lifecycle import ensure_agent_attached
 from app.services.control_status import canonical_web_app_url, source_is_online
@@ -65,6 +66,14 @@ class ControlBody(BaseModel):
     position_sec: float = Field(default=0, ge=0, le=86400, allow_inf_nan=False)
     volume: int = Field(default=70, ge=0, le=100)
     expires_at: int | None = Field(default=None, gt=0)
+
+
+class RecoverSessionBody(BaseModel):
+    session_key: str = Field(min_length=16, max_length=64)
+    client_id: str = Field(min_length=1, max_length=128)
+    expected_source_key: str = Field(min_length=16, max_length=64)
+    expected_revision: int = Field(ge=0, strict=True)
+    confirm_stopped: Literal[True]
 
 
 class SessionBody(BaseModel):
@@ -561,6 +570,41 @@ def build_router(settings, require_owner, public_origin):
         from app.services.music_broadcast import sync_music_profile
         await sync_music_profile(session, settings)
         return {"ok": True, "session": await current_session(session)}
+
+    @router.post("/api/mini/music/session/recover")
+    async def recover_session(payload: RecoverSessionBody, user=Depends(require_owner), session=Depends(get_session)):
+        # Use the same lock order as publish/handoff. Staleness is not evidence
+        # that a disconnected player is silent: the owner must confirm this.
+        # Do not expire/fake-ACK a handoff or enqueue any playback command here.
+        meta = await playback_meta(session)
+        item = await session.scalar(select(MusicSession).where(MusicSession.id == 1).with_for_update())
+        transfer = await session.get(MusicTransfer, meta.transfer_id) if meta.transfer_id else None
+        if (not stale_local_recovery_available(item, meta, transfer)
+                or item.session_key != payload.expected_source_key
+                or meta.revision != payload.expected_revision
+                or payload.session_key == payload.expected_source_key):
+            raise HTTPException(409, {"code": "stale_session_recovery_unavailable",
+                "message": "Сессия изменилась или прежний плеер ещё на связи. Обновите состояние; восстановление доступно только после пяти минут без обновлений и остановки звука на прежнем устройстве."})
+        await session.execute(update(MusicRemoteCommand).where(
+            MusicRemoteCommand.session_key == item.session_key,
+            MusicRemoteCommand.status == "pending").values(status="cancelled", error="Владелец восстановил управление"))
+        item.session_key = payload.session_key
+        item.state = "paused"
+        item.updated_at = datetime.now(timezone.utc)
+        meta.client_id = payload.client_id
+        meta.transfer_id = ""
+        meta.revision += 1
+        await session.commit()
+        result = {"ok": True, "session": await current_session(session)}
+        from app.services.music_broadcast import sync_music_profile
+        try:
+            await sync_music_profile(session, settings)
+        except Exception:
+            # The lease is already safely recovered. A public-profile I/O fault
+            # must not turn that committed operation into an ambiguous failure.
+            logging.getLogger(__name__).warning("Music recovery completed; public profile refresh deferred")
+            await session.rollback()
+        return result
 
     install_transfer_routes(router, settings, require_owner, control, ControlBody)
     from app.music_remote_control import install_remote_control_routes

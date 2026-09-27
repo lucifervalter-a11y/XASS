@@ -32,14 +32,39 @@ enum XASSStyle {
 
 @MainActor struct NativeMessage: View {
     @ObservedObject var store: NativeStore
+    @State private var showDiagnostics = false
+    @State private var confirmRecovery = false
     var body: some View {
-        if let text = store.error ?? store.notice {
+        if let text = store.error ?? store.notice ?? (store.canRecoverPlayback ? "Прежний плеер давно не отвечает. Если музыка на нём остановлена, можно сбросить зависшую сессию." : nil) {
+          VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: store.error == nil ? "checkmark.circle" : "exclamationmark.circle").foregroundStyle(store.error == nil ? Color.green : Color.orange)
                 Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
                 Button { store.error = nil; store.notice = nil } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }.accessibilityLabel("Скрыть сообщение")
-            }.padding(14).background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 14)).accessibilityElement(children: .contain)
+            }
+            if store.error != nil {
+                Button { showDiagnostics = true } label: { Label("Отправить диагностику", systemImage: "square.and.arrow.up") }
+                    .font(.subheadline).buttonStyle(.borderless).accessibilityIdentifier("musicErrorDiagnostics")
+            }
+            if store.canRecoverPlayback {
+                Button("Сбросить зависший плеер") { confirmRecovery = true }
+                    .font(.subheadline).buttonStyle(.borderless).disabled(store.busy).accessibilityIdentifier("recoverStaleMusic")
+            }
+          }.padding(14).background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 14)).accessibilityElement(children: .contain)
+                .sheet(isPresented: $showDiagnostics) {
+                    NavigationStack {
+                        NativeDiagnosticLogView().toolbar {
+                            ToolbarItem(placement: .confirmationAction) { Button("Готово") { showDiagnostics = false } }
+                        }
+                    }
+                }
+                .confirmationDialog("Музыка на прежнем устройстве остановлена?", isPresented: $confirmRecovery, titleVisibility: .visible) {
+                    Button("Да, звук остановлен — сбросить сессию") { store.run { try await store.recoverStalePlayback() } }
+                    Button("Отмена", role: .cancel) {}
+                } message: {
+                    Text("Закройте старый плеер или остановите музыку на нём. Сервер не может выключить звук на устройстве без связи. После сброса старый плеер потеряет управление сессией.")
+                }
         }
     }
 }
@@ -83,7 +108,7 @@ enum XASSStyle {
                 if !store.authorized {
                     NativeLoginPrompt(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden)
                 }
-                if store.error != nil || store.notice != nil { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
+                if store.error != nil || store.notice != nil || store.canRecoverPlayback { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
                 HStack(spacing: 12) {
                     // Multiple NavigationLinks in one List row activate together on iOS.
                     // A single destination binding gives each explicit button one route.

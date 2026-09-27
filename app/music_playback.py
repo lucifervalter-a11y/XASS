@@ -17,6 +17,7 @@ from app.music_models import MusicSession, MusicTrack
 from app.music_playback_models import MusicPlaybackState, MusicTransfer, MusicRemoteCommand
 from app.services.control_status import source_is_online
 from app.services.agent_lifecycle import ensure_agent_attached
+from app.services.music_diagnostics import classify_transfer_failure, transfer_failure_code
 
 
 def aware(value):
@@ -45,6 +46,7 @@ async def fail_transfer(session, transfer, detail):
     previous_status = transfer.status
     transfer.status = "failed"
     transfer.detail = detail
+    transfer.target = {**(transfer.target or {}), "failure_code": classify_transfer_failure(detail, phase=previous_status)}
     start_command = await session.get(AgentCommand, transfer.start_command_id) if transfer.start_command_id else None
     target_may_play = bool(start_command and (
         start_command.delivered_at is not None or start_command.status in {"delivered", "completed"}))
@@ -78,6 +80,15 @@ async def expire_active_transfer(session):
     if (transfer and transfer.status not in {"ready", "failed"}
             and (datetime.now(timezone.utc) - aware(transfer.created_at)).total_seconds() > 30):
         await fail_transfer(session, transfer, "Время переключения истекло. Повторите действие")
+
+
+def stale_local_recovery_available(item, meta, transfer, *, now=None):
+    """Staleness permits an explicit owner-confirmed pause, never automatic play."""
+    active_handoff = bool(meta and meta.transfer_id and (
+        transfer is None or transfer.status not in {"ready", "failed"}))
+    return bool(item and item.session_key and item.device == "local"
+        and item.state in {"playing", "loading"} and not active_handoff
+        and ((now or datetime.now(timezone.utc)) - aware(item.updated_at)).total_seconds() >= 300)
 
 
 async def current_session(session):
@@ -120,8 +131,9 @@ async def current_session(session):
         result["duration"] = track.duration
     result["updated_at"] = timestamp.isoformat()
     result["server_time"] = now.isoformat()
+    transfer = await session.get(MusicTransfer, meta.transfer_id) if meta and meta.transfer_id else None
+    result["recovery_available"] = stale_local_recovery_available(item, meta, transfer, now=now)
     if meta and meta.transfer_id:
-        transfer = await session.get(MusicTransfer, meta.transfer_id)
         if transfer and transfer.status not in {"ready", "failed"}:
             result["active_transfer_id"] = transfer.id
             result["active_transfer_status"] = transfer.status
@@ -236,9 +248,13 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                 await fail(session, transfer, (command.result or {}).get("message") or "ПК не запустил музыку")
 
     async def result(transfer, session):
-        return {"ok": transfer.status != "failed", "transfer_id": transfer.id,
+        # This is a valid resource response, including failed/cancelled handoffs.
+        # Playback success is ONLY status == "ready"; clients must retain the
+        # transfer ID and failure detail instead of treating them as malformed JSON.
+        return {"ok": True, "transfer_id": transfer.id,
                 "status": transfer.status if transfer.status in {"ready", "failed"} else "waiting",
-                "detail": transfer.detail, "session": await current_session(session)}
+                "detail": str(transfer.detail or "")[:500], "session": await current_session(session),
+                **({"error_code": transfer_failure_code(transfer)} if transfer.status == "failed" else {})}
 
     @router.post("/api/mini/music/transfers")
     async def start(payload: TransferBody, request: Request, user=Depends(require_owner), session=Depends(get_session)):

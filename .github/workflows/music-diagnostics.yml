@@ -1,0 +1,45 @@
+name: Read-only music diagnostics
+
+on:
+  push:
+    branches: [codex/music-handoff-diagnostics-20260927]
+    paths:
+      - deploy/music_diagnostics.py
+      - .github/workflows/music-diagnostics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-music-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/codex/music-handoff-diagnostics-20260927' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect only bounded anonymized music state
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          # A literal previously verified VPS address avoids DNS failures; the
+          # shared transport still validates its pinned ED25519 host key first.
+          export SSH_HOST=51.250.80.137
+          {
+            printf '%s\n' 'set -euo pipefail' 'cd /home/red/serverredus'
+            printf '%s\n' "timeout --signal=TERM --kill-after=5s 40s .venv/bin/python - <<'XASS_MUSIC_DIAGNOSTICS'"
+            cat deploy/music_diagnostics.py
+            printf '\n%s\n' 'XASS_MUSIC_DIAGNOSTICS'
+          } | timeout --signal=TERM --kill-after=5s 75s bash deploy/github_ssh.sh exec 2>/dev/null || {
+            printf '%s\n' '{"ok":false,"error_category":"transport_unavailable"}'
+            exit 1
+          }
