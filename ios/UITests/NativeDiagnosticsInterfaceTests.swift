@@ -5,7 +5,7 @@ final class NativeDiagnosticsInterfaceTests: XCTestCase {
 
     @MainActor func testDiagnosticsCanPrepareShareDocumentAndClearWithoutServerActions() {
         let app = XCUIApplication()
-        app.launchArguments = ["--native-ui-fixture", "--native-ui-screen", "tools"]
+        app.launchArguments = ["--native-ui-fixture", "--native-ui-diagnostics-filled", "--native-ui-screen", "tools"]
         app.launch()
         let entry = app.buttons["nativeToolsAppDiagnostics"]
         for _ in 0..<4 { if entry.isHittable { break }; app.swipeUp() }
@@ -19,11 +19,14 @@ final class NativeDiagnosticsInterfaceTests: XCTestCase {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = "Native-App-Diagnostics"; attachment.lifetime = .keepAlways; add(attachment)
         let clear = app.buttons["nativeDiagnosticsClear"]
-        for _ in 0..<6 { if clear.isHittable { break }; app.swipeUp() }
-        XCTAssertTrue(clear.isHittable); clear.tap()
+        XCTAssertTrue(clear.waitForExistence(timeout: 5))
+        XCTAssertTrue(clear.isHittable, "Clear remains reachable without scrolling through a full history")
+        let miniPlay = app.buttons["Слушать"].firstMatch
+        XCTAssertTrue(miniPlay.exists)
+        XCTAssertLessThan(clear.frame.maxY, miniPlay.frame.minY, "The entire Clear button stays above the pinned mini-player")
+        clear.tap()
         XCTAssertTrue(app.buttons["Отмена"].waitForExistence(timeout: 3))
         app.buttons["Отмена"].tap()
-        for _ in 0..<6 { if app.buttons["nativeDiagnosticsShare"].isHittable { break }; app.swipeDown() }
-        XCTAssertTrue(app.buttons["nativeDiagnosticsShare"].exists, "Cancelling clear keeps the prepared share document")
+        XCTAssertTrue(app.buttons["nativeDiagnosticsShare"].isHittable, "Cancelling clear keeps the prepared share document accessible")
     }
 }
