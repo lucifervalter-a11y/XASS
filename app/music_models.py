@@ -1,7 +1,7 @@
 """Private music library; file bytes stay outside the public web tree."""
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, JSON, String
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, JSON, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -34,6 +34,20 @@ class MusicUpload(Base):
     owner_id: Mapped[int] = mapped_column(BigInteger)
     track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MusicEnrichment(Base):
+    """Reversible catalog metadata; never rewrites the owner's source audio."""
+    __tablename__ = "music_enrichment"
+    track_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    original: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    owner_lyrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    artwork_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    dismissed: Mapped[bool] = mapped_column(Boolean, default=False)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class MusicPlaylist(Base):

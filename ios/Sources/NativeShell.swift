@@ -26,6 +26,10 @@ private enum NativeMainSheet: String, Identifiable {
             content(NativeToolsView(app: app, store: store, workspace: workspace)).tabItem { Label("Инструменты", systemImage: "square.grid.2x2") }.tag(3).accessibilityIdentifier("tab-tools")
             content(NativeWeatherView(store: store, workspace: workspace)).tabItem { Label("Погода", systemImage: "cloud.sun") }.tag(4).accessibilityIdentifier("tab-weather")
         }.tint(XASSStyle.accent)
+            .task(id: store.currentID) {
+                // Enrichment never delays Play or takes over the current route.
+                if let id = store.currentID, store.authorized { _ = try? await store.enrichTrack(id) }
+            }
             .sheet(item: presentedSheet) { sheet in
                 switch sheet {
                 case .player: NativePlayerView(store: store)
