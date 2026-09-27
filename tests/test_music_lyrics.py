@@ -21,7 +21,8 @@ class MusicLyricsTests(unittest.TestCase):
         self.assertFalse(lyrics.parse_lyrics("Plain text")["synced"])
 
     def test_untrusted_text_is_bounded_and_not_fetched(self):
-        for value in (None, "Я" * lyrics.MAX_TEXT_BYTES, "x\n" * (lyrics.MAX_LINES + 1), "[00:01]" * (lyrics.MAX_LINES + 1) + "x"):
+        for value in (None, "Я" * lyrics.MAX_TEXT_BYTES, "x\n" * (lyrics.MAX_LINES + 1), "[00:01]" * (lyrics.MAX_LINES + 1) + "x",
+                      "[00:01]" * 100 + "x" * 60000):
             self.assertEqual(lyrics.parse_lyrics(value), lyrics.empty_lyrics())
         self.assertEqual(lyrics.parse_lyrics("https://example.invalid/lyrics")["text"], "https://example.invalid/lyrics")
 

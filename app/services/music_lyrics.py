@@ -36,7 +36,7 @@ def parse_lyrics(text: str) -> dict:
         return empty_lyrics()
     offsets = re.findall(r"^\[offset:([+-]?\d{1,7})\]\s*$", text, re.I | re.M)
     offset = max(-86400, min(86400, int(offsets[-1]) / 1000)) if offsets else 0
-    timed, plain = [], []
+    timed, plain, rendered_bytes = [], [], 0
     for row in rows:
         if _meta.fullmatch(row.strip()):
             continue
@@ -52,6 +52,9 @@ def parse_lyrics(text: str) -> dict:
             plain.append(value)
         for stamp in stamps:
             if 0 <= stamp <= 86400:
+                rendered_bytes += len(value.encode("utf-8"))
+                if rendered_bytes > MAX_TEXT_BYTES:
+                    return empty_lyrics()
                 timed.append({"time": round(stamp, 3), "text": value})
                 if len(timed) > MAX_LINES:
                     return empty_lyrics()
