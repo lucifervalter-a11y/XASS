@@ -292,7 +292,7 @@ private struct NativeLyricHeightKey: PreferenceKey {
                         lyricLine(line, active: active).id(line.id).accessibilityFocused(focus, equals: line.id)
                     }
                 } else {
-                    Text(lyrics.text.isEmpty ? lyrics.lines.map(\.text).joined(separator: "\n") : lyrics.text)
+                    Text(NativeLRCText.plainText(lyrics.text.isEmpty ? lyrics.lines.map(\.text).joined(separator: "\n") : lyrics.text))
                         .font(.title2.weight(.semibold)).lineSpacing(12).textSelection(.enabled)
                         .foregroundStyle(.white.opacity(0.88)).accessibilityIdentifier("nativePlainLyrics")
                 }

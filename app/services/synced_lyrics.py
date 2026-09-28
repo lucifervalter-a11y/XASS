@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from app.services.music_lyrics import parse_lyrics
+from app.services.music_query import clean_search_text, search_names
 
 LOG = logging.getLogger(__name__)
 USER_AGENT = "XASS-SyncedLyrics/1.0 (https://github.com/lucifervalter-a11y/XASS)"
@@ -42,7 +43,8 @@ _UNKNOWN = {"", "unknown", "unknown artist", "various artists", "неизвес�
 
 
 def clean(value: Any) -> str:
-    text = _EXT.sub("", str(value or "")).replace("_", " ")
+    # Site tags ("[mp3xa.cc]"), bare domains and upload noise first; query only.
+    text = clean_search_text(_EXT.sub("", str(value or "")))
     text = _NOISE.sub("", text)
     text = _FEAT.sub("", text)
     return re.sub(r"\s+", " ", text).strip(" -–—.")
@@ -58,6 +60,10 @@ def queries(title: Any, artist: Any, filename: Any = "") -> list[tuple[str, str]
             out.append((a, t))
 
     title_s, artist_s = str(title or ""), str(artist or "")
+    # Best guess first: cleaned names with "Artist - Title" split out of the title.
+    guessed_artist, guessed_title = search_names(title_s, artist_s)
+    if guessed_title and guessed_artist:
+        add(guessed_artist, guessed_title)
     if artist_s.strip().lower() not in _UNKNOWN:
         add(artist_s, title_s)
     for raw in (title_s, Path(str(filename or "")).stem):

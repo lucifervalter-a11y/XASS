@@ -55,7 +55,10 @@ enum NativeEnrichmentPresentation {
     @State private var info: [String: Any] = [:]
     @State private var working = false
     @State private var message: String?
+    /// What the owner sees and edits: plain lines, no `[mm:ss.xx]` tags.
     @State private var transcript = ""
+    /// The recognizer's LRC; its timestamps are put back on save.
+    @State private var transcriptLRC = ""
     @AppStorage("xass.transcription.allowNetwork") private var allowNetworkRecognition = false
     @State private var language = "ru-RU"
     @State private var job: Task<Void, Never>?
@@ -159,14 +162,18 @@ enum NativeEnrichmentPresentation {
             if !transcript.isEmpty {
                 Text("Автоматическая расшифровка · проверьте слова").font(.caption).foregroundStyle(.orange)
                 TextEditor(text: $transcript).frame(minHeight: 200).font(.body).accessibilityIdentifier("transcriptPreview")
-                if let problem = NativeEnrichmentPresentation.transcriptProblem(transcript) {
+                Text("Таймкоды не показываются, но сохраняются. Если изменить число строк, время распределится по песне приблизительно.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                if let problem = NativeEnrichmentPresentation.transcriptProblem(transcriptToSave) {
                     Text(problem).font(.footnote).foregroundStyle(.orange).accessibilityIdentifier("transcriptLimit")
                 }
                 Button("Сохранить проверенный текст") { saveTranscript() }
-                    .disabled(working || transcriber.running || NativeEnrichmentPresentation.transcriptProblem(transcript) != nil)
+                    .disabled(working || transcriber.running || NativeEnrichmentPresentation.transcriptProblem(transcriptToSave) != nil)
             }
         }
     }
+    /// Edited plain lines with the recognizer's timestamps restored (valid LRC).
+    private var transcriptToSave: String { NativeLRCText.applyEdit(transcript, to: transcriptLRC) }
     private func lookup(refresh: Bool) {
         guard !working, !transcriber.running else { return }; working = true; message = nil
         job = Task {
@@ -195,22 +202,23 @@ enum NativeEnrichmentPresentation {
         job = Task {
             do {
                 let result = try await transcriber.transcribe(file: file, language: language, allowNetwork: allowNetworkRecognition)
-                try Task.checkCancellation(); transcript = result
+                try Task.checkCancellation(); transcriptLRC = result; transcript = NativeLRCText.plainText(result)
             }
             catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
     }
     private func saveTranscript() {
         guard !working, !transcriber.running else { return }
-        if let problem = NativeEnrichmentPresentation.transcriptProblem(transcript) { message = problem; return }
+        let text = transcriptToSave
+        if let problem = NativeEnrichmentPresentation.transcriptProblem(text) { message = problem; return }
         working = true; message = nil
         job = Task {
             defer { working = false }
             do {
-                let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "PUT", body: ["text": transcript, "source": "on_device_transcription"])
+                let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "PUT", body: ["text": text, "source": "on_device_transcription"])
                 try store.applyEnrichmentMutationReceipt(response)
                 info["owner_lyrics_available"] = true; info["owner_lyrics_enabled"] = true
-                transcript = ""; message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
+                transcript = ""; transcriptLRC = ""; message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
             } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
     }

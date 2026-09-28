@@ -38,7 +38,9 @@ struct SyncedLyrics: Equatable, Codable {
             }
             let start = seconds(row["start"]), end = seconds(row["end"])
             guard start >= 0, start <= 86_400, end >= start, let text = row["text"] as? String, !text.isEmpty else { continue }
-            parsed.append(SyncedLyricLine(id: parsed.count, start: start, end: end, text: String(text.prefix(500))))
+            let shown = NativeLRCText.plainText(String(text.prefix(500)))
+            guard !shown.isEmpty else { continue }
+            parsed.append(SyncedLyricLine(id: parsed.count, start: start, end: end, text: shown))
         }
         parsed.sort { $0.start < $1.start }
         lines = parsed.enumerated().map { SyncedLyricLine(id: $0.offset, start: $0.element.start, end: $0.element.end, text: $0.element.text) }
@@ -47,7 +49,8 @@ struct SyncedLyrics: Equatable, Codable {
         status = ["synced", "plain", "instrumental", "not_found", "unavailable", "insufficient_metadata"].contains(raw) ? raw : "not_found"
         synced = value["synced"] as? Bool == true && !lines.isEmpty
         source = String((value["source"] as? String ?? "none").prefix(40))
-        text = String((value["text"] as? String ?? "").prefix(64_000))
+        // Plain lyrics are shown as text: never with raw LRC tags.
+        text = NativeLRCText.plainText(String((value["text"] as? String ?? "").prefix(64_000)))
     }
 
     var isEmpty: Bool { lines.isEmpty && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
