@@ -10,6 +10,9 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
     private let mediaURL: URL
     private let configuration: URLSessionConfiguration
     private var requests: [Int: Transfer] = [:]
+    /// AVPlayer may still ask for data after the player was torn down. A task
+    /// on an invalidated URLSession raises NSGenericException, so refuse.
+    private var invalidated = false
     private lazy var session: URLSession = {
         let config = configuration
         config.httpShouldSetCookies = false
@@ -40,9 +43,10 @@ final class SecureMediaLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessi
     }
     func invalidate() {
         for transfer in requests.values { transfer.request.finishLoading(with: URLError(.cancelled)) }
-        requests.removeAll(); session.invalidateAndCancel()
+        requests.removeAll(); invalidated = true; session.invalidateAndCancel()
     }
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
+        guard !invalidated else { loadingRequest.finishLoading(with: URLError(.cancelled)); return false }
         var request = URLRequest(url: mediaURL)
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         let data = loadingRequest.dataRequest

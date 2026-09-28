@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.db import get_session
 from app.models import AgentCommand, AgentCredential, AppConfig, HeartbeatSource
 from app.music_models import MusicEnrichment, MusicPlaylist, MusicSession, MusicTrack, MusicUpload, MusicUploadReceipt
-from app.music_playback import canonical_lan_url, current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta, stale_local_recovery_available
+from app.music_playback import canonical_lan_url, current_session, expire_active_transfer, install_transfer_routes, music_source_live, pending_handoff, playback_meta, stale_local_recovery_available
 from app.music_playback_models import MusicRemoteCommand, MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
 from app.services.agent_lifecycle import ensure_agent_attached
@@ -641,9 +641,10 @@ def build_router(settings, require_owner, public_origin):
         for source in await session.scalars(select(HeartbeatSource).where(HeartbeatSource.source_type == "PC_AGENT")):
             payload = source.last_payload or {}
             online = source_is_online(source, 2)
+            live = music_source_live(source)
             details = payload.get("music_player")
-            rows.append({"source_name": source.source_name, "online": online,
-                         "available": online and source.source_name in credentials and isinstance(details, dict),
+            rows.append({"source_name": source.source_name, "online": online, "live": live,
+                         "available": live and source.source_name in credentials and isinstance(details, dict),
                          "music_player": details if isinstance(details, dict) else {},
                          "agent_version": str(payload.get("agent_version") or "0.0.0")})
         return {"ok": True, "players": rows}
@@ -651,7 +652,9 @@ def build_router(settings, require_owner, public_origin):
     @router.post("/api/mini/music/control")
     async def control(payload: ControlBody, request: Request, user=Depends(require_owner), session=Depends(get_session)):
         source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == payload.source_name))
-        if source is None or source.source_type != "PC_AGENT" or not source_is_online(source, 2):
+        if source is None or source.source_type != "PC_AGENT" or not music_source_live(source):
+            # A stale heartbeat answers at once: the phone falls back to its
+            # own player instead of waiting 25 s for a switched-off PC.
             raise HTTPException(409, "Компьютер не в сети")
         credential = await session.scalar(select(AgentCredential).where(AgentCredential.source_name == source.source_name, AgentCredential.is_active.is_(True)))
         if credential is None:
@@ -724,6 +727,7 @@ def build_router(settings, require_owner, public_origin):
         changed_player = bool(item.session_key and (item.session_key != payload.session_key or
             ("device" in payload.model_fields_set and item.device != payload.device)))
         stop_pc = ""
+        takeover_from_pc = False
         if changed_player and item.state in {"playing", "loading"}:
             from app.music_playback import pc_source_released
             released = item.device.startswith("agent:") and await pc_source_released(session, item)
@@ -732,6 +736,16 @@ def build_router(settings, require_owner, public_origin):
                     "message": "Переключите устройство через «Где слушать», чтобы сохранить позицию и остановить старый плеер"})
             if item.device.startswith("agent:") and item.device != payload.device:
                 stop_pc = item.device[6:]
+                takeover_from_pc = True
+        elif changed_player and payload.takeover and item.device.startswith("agent:") and item.device != payload.device:
+            takeover_from_pc = True
+        if takeover_from_pc:
+            # The phone explicitly plays here. A PC auto-advance reservation
+            # (queue lease) belonged to the PC; keeping it made every phone
+            # claim fail with agent_playback_authoritative, i.e. silence while
+            # the PC was off. Release it before the phone writes its lease.
+            from app.services.music_agent_queue import cancel_agent_queue
+            await cancel_agent_queue(session, item.device[6:])
         if item.session_key and item.session_key != payload.session_key and not payload.takeover:
             raise HTTPException(409, "Воспроизведение уже изменено на другом устройстве")
         queue_command = await session.get(AgentCommand, meta.queue_command_id) if meta.queue_command_id else None

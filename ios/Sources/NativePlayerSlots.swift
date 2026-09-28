@@ -10,7 +10,9 @@ import SwiftUI
                 HStack(spacing: 8) {
                     ProgressView().tint(.white)
                     Text(store.transferStatus ?? (store.busy ? "Выполняю действие…" : "Загрузка трека…")).font(.caption)
-                    if store.transferStatus != nil {
+                    if store.pcConnecting != nil {
+                        NativePlayHereButton(store: store).font(.caption.weight(.semibold))
+                    } else if store.transferStatus != nil {
                         Button("Отмена") { store.cancelTransfer() }
                             .font(.caption.weight(.semibold)).accessibilityIdentifier("nativeTransferCancel")
                     }
@@ -38,5 +40,17 @@ import SwiftUI
             .disabled(store.busy)
             .accessibilityLabel(track.favorite ? "Убрать из избранного" : "В избранное")
         }
+    }
+}
+
+/// While a live PC confirms play/resume: switch to this iPhone at once,
+/// from the current position.
+@MainActor struct NativePlayHereButton: View {
+    @ObservedObject var store: NativeStore
+    var body: some View {
+        Button { PlayerHaptics.tap(); store.playHereInsteadOfPC() } label: {
+            Label("Играть на iPhone", systemImage: "iphone")
+        }
+        .accessibilityIdentifier("nativePlayHereInsteadOfPC")
     }
 }
