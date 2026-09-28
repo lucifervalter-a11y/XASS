@@ -550,8 +550,13 @@ def build_router(settings, require_owner, public_origin):
         if embedded["text"]:
             return {"ok": True, "lyrics": embedded}
         from app.music_enrichment_api import enrich_saved_track
+        from app.services.transcription_queue import as_owner_lyrics, done_result
+        transcription = await done_result(session, track_id)
         result = await enrich_saved_track(session, track_id)
         value = dict(result["enrichment"].get("lyrics") or embedded)
+        if transcription and not value.get("synced"):
+            # Catalog first; the finished PC transcription only fills a gap.
+            value = as_owner_lyrics(transcription)
         value.setdefault("status", result["enrichment"].get("lookup_status") or result["enrichment"].get("status", "not_found"))
         return {"ok": True, "lyrics": value, "track": result["track"]}
 
@@ -573,14 +578,18 @@ def build_router(settings, require_owner, public_origin):
         from types import SimpleNamespace
         snapshot = SimpleNamespace(**{key: getattr(track, key) for key in
             ("id", "title", "artist", "album", "duration", "filename", "sha256")})
-        from app.services.transcription_queue import done_result
+        from app.services.transcription_queue import done_result, job_state
         # A finished PC transcription is used only when the catalog has no timed lyrics.
         transcription = await done_result(session, track_id)
+        pending = await job_state(session, track_id) in {"queued", "assigned", "running"}
         # Release the DB connection while the provider is contacted.
         await session.rollback()
         value = await resolve_synced_lyrics(snapshot, owner=owner, embedded=embedded, enrichment=enrichment,
                                             cache=lyrics_cache, client=lyrics_client, refresh=refresh,
                                             transcription=transcription)
+        if pending and not value.get("synced"):
+            # Lets Now Playing re-check soon instead of caching "no lyrics" for hours.
+            value["transcription_pending"] = True
         return {"ok": True, "lyrics": value}
 
     async def catalog_has_timed_lyrics(session, track) -> bool:

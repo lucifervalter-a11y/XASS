@@ -273,6 +273,9 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         self.assertEqual(created.status_code, 200, created.text)
         self.assertEqual(created.json()["status"], "waiting_for_pc")
         self.assertEqual(created.json()["message"], "Расшифруем, когда включится компьютер")
+        with await self.no_catalog():
+            pending = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/timed-lyrics")
+        self.assertTrue(pending.json()["lyrics"]["transcription_pending"])
         # A disabled PC does not get work.
         off = await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body(enabled=False))
         self.assertIsNone(off.json()["job"])
@@ -303,6 +306,11 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         value = lyrics.json()["lyrics"]
         self.assertEqual((value["source"], value["synced"], value["automatic"]), ("pc_transcription", True, True))
         self.assertEqual(value["lines"], [{"start": 0.5, "end": 1.5, "text": "первая строка"}])
+        self.assertNotIn("transcription_pending", value)
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value={"status": "not_found"})):
+            plain = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/lyrics")
+        self.assertEqual(plain.json()["lyrics"]["source"], "pc_transcription")
+        self.assertEqual(plain.json()["lyrics"]["lines"], [{"time": 0.5, "text": "первая строка"}])
         # Joining a done job never re-runs it.
         again = await self.request("POST", route, json={"force": True})
         self.assertEqual(again.json()["status"], "done")

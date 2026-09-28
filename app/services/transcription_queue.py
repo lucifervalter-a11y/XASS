@@ -266,6 +266,17 @@ async def done_result(session, track_id: int) -> dict | None:
     return dict(job.result) if job and isinstance(job.result, dict) and job.result.get("lines") else None
 
 
+async def job_state(session, track_id: int) -> str | None:
+    return await session.scalar(select(TranscriptionJob.state).where(TranscriptionJob.track_id == track_id))
+
+
+def as_owner_lyrics(result: dict) -> dict:
+    """PC result in the /lyrics payload shape ({text, lines:[{time, text}], synced})."""
+    lines = [{"time": row["start"], "text": row["text"]} for row in result.get("lines") or []]
+    return {"text": "\n".join(row["text"] for row in lines), "lines": lines, "synced": bool(lines),
+            "source": "pc_transcription", "status": "transcribed", "automatic": True}
+
+
 # ---------------------------------------------------------------- worker protocol
 
 async def release_worker_jobs(session, worker: TranscriptionWorker, now: datetime, *, running_job_id: int | None) -> None:

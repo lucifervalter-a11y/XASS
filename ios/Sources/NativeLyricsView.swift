@@ -22,6 +22,7 @@ struct NativeLyrics: Equatable {
         case "owner": return "Добавлено владельцем"
         case "lrclib": return "Текст · LRCLIB"
         case "on_device_transcription": return "Расшифровка на устройстве"
+        case "pc_transcription": return "Текст · " + PCTranscriptionStatus.automaticLabel.lowercased()
         default: return "Текст песни"
         }
     }
@@ -29,7 +30,7 @@ struct NativeLyrics: Equatable {
         let value = response["lyrics"] as? [String: Any] ?? [:]
         text = String((value["text"] as? String ?? "").prefix(64_000))
         let sourceValue = value["source"] as? String ?? "none"
-        source = ["embedded", "owner", "lrclib", "on_device_transcription"].contains(sourceValue) ? sourceValue : "none"
+        source = ["embedded", "owner", "lrclib", "on_device_transcription", "pc_transcription"].contains(sourceValue) ? sourceValue : "none"
         sourceURL = Self.provenanceURL(value["source_url"] as? String, source: source)
         let enrichment = response["enrichment"] as? [String: Any] ?? [:]
         let statusValue = value["status"] as? String ?? enrichment["status"] as? String ?? ""
