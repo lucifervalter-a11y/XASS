@@ -439,12 +439,15 @@ class MusicPlayer:
                 elif command == "music_volume":
                     self._volume = _number(payload.get("volume"), "Громкость", 0, 100)
                 elif command in {"music_pause", "music_resume", "music_seek"}:
-                    if command == "music_pause" and self._state == "loading":
-                        # A handoff must be able to silence a download too. Merely
-                        # returning an error leaves the worker free to start later.
-                        self._generation += 1
-                        self._pending = None
-                        self._discard_track()
+                    if command == "music_pause" and (self._path is None or self._state in {"idle", "loading", "stopped", "error"}):
+                        # A handoff only needs proof of silence. An idle player
+                        # must not raise: that leaves the phone session stuck.
+                        # Cancelling a download also stops the worker from
+                        # starting audio after the pause was acknowledged.
+                        if self._state == "loading":
+                            self._generation += 1
+                            self._pending = None
+                            self._discard_track()
                         self._state, self._error = "stopped", ""
                         return self.snapshot()
                     if self._path is None or self._state in {"idle", "loading", "stopped", "error"}:

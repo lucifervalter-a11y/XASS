@@ -213,6 +213,29 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reason"], "duration_mismatch")
         self.assertEqual(result["lyrics"]["text"], "")
 
+    async def test_empty_structured_search_uses_one_broader_query(self):
+        def handle(request):
+            if request.url.host != "lrclib.net":
+                return None
+            if request.url.params.get("q"):
+                return httpx.Response(200, json=[self.lyric])
+            return httpx.Response(200, json=[])
+        result = await self.service(recordings=[], handler=handle).enrich(self.track)
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["lyrics"]["text"], self.lyric["plainLyrics"])
+        lrclib = [request for request in self.requests if request.url.host == "lrclib.net"]
+        self.assertEqual(len(lrclib), 2)
+        self.assertEqual(lrclib[0].url.params["track_name"], "Fixture Song")
+        self.assertEqual(lrclib[1].url.params["q"], "Fixture Artist Fixture Song")
+
+    async def test_confirm_duration_drift_keeps_lyrics_off_and_keeps_the_cover(self):
+        self.track.duration = 99
+        result = await self.service(handler=lambda request: httpx.Response(200, json=self.lyric) if request.url.host == "lrclib.net" else None).confirm(self.track, self.selected())
+        self.assertEqual(result["reason"], "duration_mismatch")
+        self.assertEqual(result["lyrics"]["text"], "")
+        self.assertEqual(result["lyrics"]["lines"], [])
+        self.assertEqual(result["artwork"]["release_id"], RELEASE)
+
     async def test_confirm_known_cut_never_fetches_or_adds_full_recording_lyrics(self):
         service = self.service()
         self.track.is_excerpt = True
@@ -302,7 +325,7 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         service = self.service(lyrics=[], recordings=[])
         await service.enrich(self.track)
         await service.enrich(self.track)
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.requests), 3)
 
     async def test_rate_limit_retry_after_is_honored_across_different_queries(self):
         service = self.service(recordings=[], handler=lambda req: httpx.Response(429, headers={"Retry-After": "120"}) if req.url.host == "lrclib.net" else None)
@@ -356,7 +379,7 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
             await service.enrich(self.track)
         self.assertEqual(len(service._cache), 64)
         self.assertLessEqual(service._cache_bytes, 8 * 1024 * 1024)
-        self.assertEqual(len(self.requests), 132)
+        self.assertEqual(len(self.requests), 198)
 
     async def test_catalog_invalid_ids_and_nonfinite_duration_never_gain_auto_match(self):
         result = await self.service(lyrics=[{**self.lyric, "id": "../../path"}], recordings=[]).enrich(self.track)

@@ -188,6 +188,30 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         await self.complete(commands[1].id, state="playing", position=21)
         self.assertEqual((await self.poll(transfer_id))["status"], "ready")
 
+    async def test_failed_pause_of_an_already_silent_pc_hands_playback_to_the_phone(self):
+        track = await self.music_track()
+        await self.agent("PC", track_id=track, state="playing")
+        await self.playing(track, device="agent:PC", state="loading")
+        response = await self.transfer()
+        command = (await self.commands())[0]
+        await self.complete(command.id, state="idle", ok=False)
+        result = await self.poll(response.json()["transfer_id"])
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["session"]["device"], "local")
+        self.assertEqual(result["session"]["state"], "loading")
+
+    async def test_failed_pause_while_pc_still_playing_does_not_start_the_phone(self):
+        track = await self.music_track()
+        await self.agent("PC", track_id=track, state="playing")
+        await self.playing(track, device="agent:PC")
+        response = await self.transfer()
+        command = (await self.commands())[0]
+        await self.complete(command.id, state="playing", ok=False)
+        result = await self.poll(response.json()["transfer_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["session"]["device"], "agent:PC")
+        self.assertEqual(result["session"]["state"], "playing")
+
     async def test_completed_pause_command_without_silence_fails_closed(self):
         track = await self.music_track()
         await self.agent("PC", track_id=track, state="playing")

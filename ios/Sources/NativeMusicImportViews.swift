@@ -1,5 +1,26 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
+
+/// The document picker has to be presented by a normal controller. As the root
+/// of a SwiftUI cover, Open never calls the delegate and Files stays on screen.
+@MainActor final class NativeMusicPickerHost: UIViewController {
+    var wantsPicker = false
+    var makePicker: (() -> UIDocumentPickerViewController)?
+    private var started = false
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        presentPickerIfNeeded()
+    }
+    func presentPickerIfNeeded() {
+        guard wantsPicker, !started, presentedViewController == nil, let makePicker else { return }
+        started = true
+        present(makePicker(), animated: true)
+    }
+    func resetIfIdle() {
+        if presentedViewController == nil { started = false }
+    }
+}
 
 /// Opens in place: Files must not silently copy an entire archive before it
 /// delivers the selection. The import engine coordinates its own bounded copy.
@@ -8,24 +29,43 @@ import UniformTypeIdentifiers
     var selected: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+    static func openingController(delegate: UIDocumentPickerDelegate) -> UIDocumentPickerViewController {
         var types: [UTType] = [.audio, .zip]
         for ext in ["mp3", "m4a", "wav", "flac", "ogg"] {
             if let type = UTType(filenameExtension: ext), !types.contains(type) { types.append(type) }
         }
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
         picker.allowsMultipleSelection = true
-        picker.delegate = context.coordinator
+        picker.delegate = delegate
         picker.shouldShowFileExtensions = true
         return picker
     }
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
+    func makeUIViewController(context: Context) -> NativeMusicPickerHost {
+        let host = NativeMusicPickerHost()
+        host.view.backgroundColor = .clear
+        host.view.isUserInteractionEnabled = false
+        return host
+    }
+    func updateUIViewController(_ host: NativeMusicPickerHost, context: Context) {
         context.coordinator.parent = self
+        host.makePicker = {
+            context.coordinator.prepareForNewPicker()
+            return Self.openingController(delegate: context.coordinator)
+        }
+        host.wantsPicker = presented
+        if presented {
+            DispatchQueue.main.async { host.presentPickerIfNeeded() }
+        } else if host.presentedViewController != nil {
+            host.dismiss(animated: true) { host.resetIfIdle() }
+        } else {
+            host.resetIfIdle()
+        }
     }
     @MainActor final class Coordinator: NSObject, UIDocumentPickerDelegate {
         var parent: NativeMusicDocumentPicker
         private var delivered = false
         init(_ parent: NativeMusicDocumentPicker) { self.parent = parent }
+        func prepareForNewPicker() { delivered = false }
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard !delivered else { return }; delivered = true
             NativeDiagnostics.shared.record(operation: .musicFileSelection, step: .acknowledged, target: .localPlayer)
@@ -131,8 +171,8 @@ import UniformTypeIdentifiers
                 }
             }.navigationTitle("Добавить музыку").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { dismiss() }.accessibilityIdentifier("musicImportDone") } }
-                .fullScreenCover(isPresented: $picker) {
-                    NativeMusicDocumentPicker(presented: $picker) { urls in store.importMusicFiles(urls) }.ignoresSafeArea()
+                .background {
+                    NativeMusicDocumentPicker(presented: $picker) { urls in store.importMusicFiles(urls) }
                 }
                 .sheet(isPresented: $diagnostics) {
                     NavigationStack { NativeDiagnosticLogView().toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { diagnostics = false } } } }

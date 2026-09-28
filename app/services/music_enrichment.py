@@ -404,6 +404,13 @@ class MusicEnrichmentService:
                     else:
                         result = _empty("candidate", "duration_mismatch" if match == "duration_mismatch" else "candidate_changed",
                             candidate=selected, candidates=[selected])
+                        same_recording = (match == "duration_mismatch" and fresh["source_id"] == identity
+                            and _norm(fresh["title"]) == _norm(title) and _norm(fresh["artist"]) == _norm(artist))
+                        if same_recording:
+                            # The owner already picked this recording. A few
+                            # seconds of duration drift keep the timed lyrics
+                            # off, but the cover still belongs to that release.
+                            await self._cover_for_named_recording(result, signature, deadline)
             except _ProviderFailure as exc:
                 result = _empty(exc.status, **({"retry_after": exc.retry_after} if exc.retry_after else {}))
             except (ValueError, TypeError):
@@ -412,6 +419,34 @@ class MusicEnrichmentService:
             return deepcopy(result)
         finally:
             self._lock.release()
+
+    async def _cover_for_named_recording(self, result, signature, deadline):
+        """Cover for the chosen title and artist when only the duration differs."""
+        candidate = result["candidate"]
+        quote = lambda value: str(value).replace("\\", "\\\\").replace('"', '\\"')
+        query = f'recording:"{quote(candidate["title"])}" AND artist:"{quote(candidate["artist"])}"'
+        try:
+            data = await self._json_before("https://musicbrainz.org/ws/2/recording/",
+                {"query": query, "fmt": "json", "limit": 20}, deadline, optional=True)
+            rows = _musicbrainz_rows({"recordings": []} if data is None else data, candidate.get("album") or signature["album"])
+            covers = []
+            for row, raw in rows:
+                verdict = _match(signature, row)
+                exact = _norm(row["title"]) == _norm(candidate["title"]) and _norm(row["artist"]) == _norm(candidate["artist"])
+                art = _artwork(raw, candidate.get("album") or "")
+                if art.get("status") == "candidate" and (verdict == "matched" or (verdict == "duration_mismatch" and exact)):
+                    covers.append((row, art))
+            unique = {art["release_id"]: (row, art) for row, art in covers}
+            if len(unique) == 1:
+                row, art = next(iter(unique.values()))
+                result["artwork"] = art
+                result["provenance"].append({"source": "musicbrainz", "id": row["source_id"], "url": row["source_url"]})
+            elif covers:
+                result["artwork_reason"] = "catalog_ambiguous"
+            else:
+                result["artwork_reason"] = "not_found"
+        except (_ProviderFailure, ValueError, TypeError):
+            result["artwork_reason"] = "catalog_unavailable"
 
     async def _confirmed_artwork(self, result, signature, deadline):
         """Art from an exact recording; never replace the owner's lyrics ID."""
@@ -439,6 +474,12 @@ class MusicEnrichmentService:
                 params["album_name"] = signature["album"]
             data = await self._json_before("https://lrclib.net/api/search", params, deadline)
             status, lrc_choice, suggestions = _select(signature, _lrclib_rows([] if data is None else data))
+            if status == "not_found" and signature["artist"] and params.get("track_name"):
+                # A field search can miss a real recording that the same words
+                # find as text. Rejected rows are not retried: a remix must
+                # not be replaced by the original recording.
+                broader = await self._json_before("https://lrclib.net/api/search", {"q": signature["query"]}, deadline)
+                status, lrc_choice, suggestions = _select(signature, _lrclib_rows([] if broader is None else broader))
             if status == "matched":
                 candidate, raw = lrc_choice
                 result = _empty("matched", candidate=candidate, lyrics=_lyrics(raw, candidate))

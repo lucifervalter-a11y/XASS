@@ -192,6 +192,19 @@ class MusicPlayerTests(unittest.TestCase):
         with self.assertRaises(mp.MusicError):
             self.player.play_local(path.with_suffix(".txt"))
 
+    def test_pause_on_idle_stopped_or_error_confirms_silence_without_raising(self):
+        for state in ("idle", "stopped", "error"):
+            with self.subTest(state=state):
+                self.player._state = state
+                self.player._error = "old"
+                paused = self.command("music_pause")
+                self.assertEqual(paused["state"], "stopped")
+                self.assertEqual(paused["error"], "")
+        with self.assertRaises(mp.MusicError):
+            self.command("music_resume")
+        with self.assertRaises(mp.MusicError):
+            self.command("music_seek", position_sec=1)
+
     def test_pause_during_download_cancels_worker_and_preserves_handoff_position(self):
         downloading = threading.Event()
         def slow_response(request):

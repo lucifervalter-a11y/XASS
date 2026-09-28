@@ -76,13 +76,14 @@ async def catalog_lookup(snapshot, candidate=None, *, refresh=False):
     except (TimeoutError, OSError):
         result = {"status": "unavailable", "reason": "catalog_unavailable", "lyrics": empty_lyrics()}
     artwork = None
-    if result.get("status") == "matched":
+    described = result.get("artwork", {}).get("status") == "candidate"
+    if result.get("status") == "matched" or described:
         try:
             async with asyncio.timeout_at(deadline):
                 artwork = await fetch_artwork_thumbnail(result.get("artwork", {}))
         except (TimeoutError, OSError):
             pass
-        if artwork is None and result.get("artwork", {}).get("status") == "candidate":
+        if artwork is None and described:
             result = {**result, "artwork_reason": "artwork_unavailable"}
     return result, artwork
 

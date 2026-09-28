@@ -267,8 +267,17 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                     transfer.position = number(details.get("position_sec"), transfer.position)
                 transfer.status = "stopped"
             elif command and command.status in {"failed", "cancelled"}:
-                await fail(session, transfer, (command.result or {}).get("message") or "Не удалось остановить прежний ПК")
-                return
+                details = (command.result or {}).get("details") or {}
+                # Older agents raised when asked to pause an idle player. A
+                # snapshot that is already quiet is the stop ACK. Playing or
+                # loading is not, and a bare cancellation has no snapshot.
+                if command.status == "failed" and details.get("state") in {"paused", "stopped", "ended", "idle", "error"}:
+                    if target.get("preserve_position"):
+                        transfer.position = number(details.get("position_sec"), transfer.position)
+                    transfer.status = "stopped"
+                else:
+                    await fail(session, transfer, (command.result or {}).get("message") or "Не удалось остановить прежний ПК")
+                    return
         if transfer.status == "stopped":
             item = await session.get(MusicSession, 1)
             if item is None:
