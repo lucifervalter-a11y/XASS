@@ -365,6 +365,64 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         self.assertEqual(job["track_id"], track["id"])
         self.assertEqual((await self.request("GET", route)).json()["status"], "running")
 
+    async def test_empty_catalog_lyrics_queue_the_pc_once(self):
+        """Found recording, no words: the lyrics screen and Now Playing start the PC."""
+        track = await self.upload()
+        page = f"/api/mini/music/tracks/{track['id']}/lyrics"
+        timed = f"/api/mini/music/tracks/{track['id']}/timed-lyrics"
+        found_without_words = {"status": "candidate", "reason": "duration_mismatch",
+                               "lyrics": {"text": "", "lines": [], "synced": False, "source": "none", "status": "instrumental"}}
+        nothing = {"status": "instrumental", "synced": False, "lines": [], "text": "", "source": "lrclib"}
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=found_without_words)), \
+             patch("app.services.synced_lyrics.LrclibClient.lookup", AsyncMock(return_value=nothing)):
+            opened = await self.request("GET", page)
+            playing = await self.request("GET", timed)
+            again = await self.request("GET", timed)
+        self.assertEqual(opened.json()["lyrics"]["text"], "")
+        self.assertTrue(playing.json()["lyrics"]["transcription_pending"])
+        self.assertTrue(again.json()["lyrics"]["transcription_pending"])
+        async with self.sessions() as session:
+            jobs = list(await session.scalars(select(TranscriptionJob)))
+        self.assertEqual([(job.track_id, job.state, job.language) for job in jobs], [(track["id"], "queued", "ru")])
+
+    async def test_real_catalog_text_and_outages_do_not_queue(self):
+        synced = {"status": "synced", "synced": True, "lines": [{"start": 0, "end": 1, "text": "есть текст"}],
+                  "text": "есть текст", "source": "lrclib"}
+        with_words = {"status": "candidate", "reason": "duration_mismatch",
+                      "lyrics": {"text": "есть текст", "lines": [{"time": 1, "text": "есть текст"}],
+                                 "synced": True, "source": "lrclib"}}
+        down = {"status": "unavailable", "synced": False, "lines": [], "text": ""}
+        outage = {"status": "unavailable", "lyrics": {"text": "", "lines": [], "synced": False}}
+        cases = ((self.audio, synced, with_words, "есть текст"),
+                 (test_music_api.silent_wav(6), down, outage, ""))
+        for data, lookup, enrich, text in cases:
+            track = await self.upload(data)
+            with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=enrich)), \
+                 patch("app.services.synced_lyrics.LrclibClient.lookup", AsyncMock(return_value=lookup)):
+                page = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/lyrics")
+                playing = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/timed-lyrics")
+            self.assertEqual(page.json()["lyrics"]["text"], text)
+            self.assertEqual(playing.json()["lyrics"].get("text", ""), text)
+            self.assertNotIn("transcription_pending", playing.json()["lyrics"])
+        async with self.sessions() as session:
+            self.assertIsNone(await session.scalar(select(TranscriptionJob)))
+
+    async def test_failed_transcription_is_not_requeued_by_opening_the_song(self):
+        track = await self.upload()
+        with await self.no_catalog():
+            created = await self.request("POST", f"/api/mini/music/tracks/{track['id']}/transcription", json={})
+        self.assertEqual(created.json()["status"], "waiting_for_pc")
+        async with self.sessions() as session:
+            job = await session.scalar(select(TranscriptionJob))
+            job.state = "failed"
+            await session.commit()
+        with await self.no_catalog():
+            playing = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/timed-lyrics")
+        self.assertNotIn("transcription_pending", playing.json()["lyrics"])
+        async with self.sessions() as session:
+            jobs = list(await session.scalars(select(TranscriptionJob)))
+        self.assertEqual([job.state for job in jobs], ["failed"])
+
     async def test_catalog_lyrics_prevent_job_unless_forced(self):
         track = await self.upload()
         route = f"/api/mini/music/tracks/{track['id']}/transcription"

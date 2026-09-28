@@ -18,6 +18,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.music_models import MusicTrack
 from app.transcription_models import TranscriptionJob, TranscriptionWorker
 
 WORKER_STALE_SEC = 75          # idle workers poll every ~20 s
@@ -298,6 +299,44 @@ async def done_result(session, track_id: int) -> dict | None:
 
 async def job_state(session, track_id: int) -> str | None:
     return await session.scalar(select(TranscriptionJob.state).where(TranscriptionJob.track_id == track_id))
+
+
+_TEMPORARY_LYRICS = frozenset({"unavailable", "rate_limited"})
+_ACTIVE_JOB = frozenset({"queued", "assigned", "running"})
+
+
+def shown_lyrics_missing(value: dict | None) -> bool:
+    """The screen would say there is no text. A catalog outage is not that."""
+    if not isinstance(value, dict) or value.get("status") in _TEMPORARY_LYRICS:
+        return False
+    if str(value.get("text") or "").strip():
+        return False
+    if value.get("synced"):
+        for row in value.get("lines") or []:
+            if isinstance(row, dict) and str(row.get("text") or "").strip():
+                return False
+    return True
+
+
+async def queue_pc_if_no_lyrics(session, track_id: int, value, *, user_id: int | None, now: datetime) -> bool:
+    """Queue the owner's PC when the catalog found nothing to show.
+
+    Timed or plain catalog text is left as-is. A finished job is not run again,
+    and a failed one waits for an explicit retry. Returns True while a job is
+    still queued, assigned or running.
+    """
+    state = await job_state(session, track_id)
+    if state in _ACTIVE_JOB:
+        return True
+    if state in {"done", "failed"} or not shown_lyrics_missing(value):
+        return False
+    track = await session.get(MusicTrack, track_id)
+    if track is None or track.deleted:
+        return False
+    # Same default as the phone's language picker.
+    await request_job(session, track, language="ru", user_id=user_id, now=now)
+    await session.commit()
+    return True
 
 
 def as_owner_lyrics(result: dict) -> dict:
