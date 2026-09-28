@@ -395,17 +395,72 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack.status_code, 200, ack.text)
         self.assertEqual((await self.poll(transfer_id))["session"]["position"], 600)
 
-    async def test_offline_source_or_target_cannot_trigger_optimistic_play(self):
+    async def test_offline_target_is_rejected_but_offline_source_no_longer_blocks_the_phone(self):
         track = await self.music_track()
         await self.agent("Offline", track_id=track, state="playing", online=False)
         target = await self.transfer(track, device="agent:Offline")
         self.assertEqual(target.status_code, 409, target.text)
         await self.playing(track, device="agent:Offline")
-        response = await self.transfer()
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertEqual(await self.commands(), [])
         state = (await self.request("GET", "/api/mini/music/session")).json()["session"]
         self.assertEqual(state["state"], "unavailable")
+        # An offline PC cannot ACK a pause. The phone used to get HTTP 409
+        # forever ("Предыдущий ПК не в сети") and could never play again.
+        response = await self.transfer()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "ready")
+        self.assertEqual(response.json()["session"]["device"], "local")
+        self.assertEqual(await self.commands(), [])
+
+    async def claim(self, track, **extra):
+        return await self.request("POST", "/api/mini/music/session", json={
+            "session_key": self.new_key, "track_id": track, "device": "local", "state": "loading",
+            "position": 0, "takeover": True, "client_id": "new-controller", **extra})
+
+    async def test_phone_claim_over_stale_pc_lease_with_quiet_heartbeat_plays_immediately(self):
+        track = await self.music_track()
+        await self.agent("PC", track_id=None, state="idle")
+        await self.playing(track, device="agent:PC", state="loading")
+        async with self.sessions() as session:
+            item = await session.get(MusicSession, 1)
+            item.updated_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+            await session.commit()
+        state = (await self.request("GET", "/api/mini/music/session")).json()["session"]
+        self.assertEqual(state["state"], "idle")
+        response = await self.claim(track)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["session"]["device"], "local")
+        commands = await self.commands()
+        self.assertEqual([c.command for c in commands], ["music_stop"])
+
+    async def test_phone_claim_over_offline_pc_plays(self):
+        track = await self.music_track()
+        await self.agent("PC", track_id=track, state="playing")
+        await self.playing(track, device="agent:PC", state="playing")
+        async with self.sessions() as session:
+            source = await session.scalar(select(HeartbeatSource))
+            source.last_seen_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+            await session.commit()
+        response = await self.claim(track)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["session"]["session_key"], self.new_key)
+
+    async def test_phone_claim_over_audible_pc_requires_handoff_unless_forced(self):
+        track = await self.music_track()
+        await self.agent("PC", track_id=track, state="playing")
+        await self.playing(track, device="agent:PC", state="playing")
+        response = await self.claim(track)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "transfer_required")
+        forced = await self.claim(track, force=True)
+        self.assertEqual(forced.status_code, 200, forced.text)
+        self.assertEqual(forced.json()["session"]["device"], "local")
+        self.assertIn("music_stop", [c.command for c in await self.commands()])
+
+    async def test_force_without_takeover_is_not_a_bypass(self):
+        track = await self.music_track()
+        await self.playing(track, device="local", state="playing")
+        response = await self.claim(track, force=True, takeover=False)
+        self.assertEqual(response.status_code, 409, response.text)
 
     async def test_unpaired_target_rejected_before_current_player_is_interrupted(self):
         track = await self.music_track()

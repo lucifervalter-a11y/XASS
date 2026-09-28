@@ -286,7 +286,10 @@ def build_router(require_owner):
     async def transcript(track_id: int, payload: TranscriptBody, user=Depends(require_owner), session=Depends(get_session)):
         track = await lock_track_row(session, track_id)
         value = parse_lyrics(payload.text)
-        if not value["text"] or any(row["time"] > track.duration + 1 for row in value["lines"]):
+        # Imported files often have duration 0 (unknown). That used to reject
+        # every transcript line after 1 s with "Некорректный текст".
+        limit = track.duration + 1 if track.duration and track.duration > 0 else 86400
+        if not value["text"] or any(row["time"] > limit for row in value["lines"]):
             raise HTTPException(400, "Некорректный текст или время строк.")
         value.update(source="on_device_transcription", status="transcribed")
         record = await session.get(MusicEnrichment, track_id)

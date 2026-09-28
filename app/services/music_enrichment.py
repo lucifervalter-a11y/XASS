@@ -24,6 +24,7 @@ import httpx
 
 from app.services.music_artwork import _jpeg_thumbnail
 from app.services.music_lyrics import empty_lyrics, parse_lyrics
+from app.services.music_query import clean_search_text, is_unknown_artist
 
 USER_AGENT = "XASS-MusicEnrichment/1.0 (https://github.com/lucifervalter-a11y/XASS)"
 MAX_JSON_BYTES = 1024 * 1024
@@ -68,13 +69,21 @@ def _signature(track):
     for _ in range(3):
         title = _PROMO_SUFFIX.sub("", title)
     title = title.replace("_", " ")
+    # Query/matching text only (stored tags stay): drop download-site tags such
+    # as "[mp3xa.cc]", bare domains and "(Official Video)"-style upload noise.
+    title = clean_search_text(title)
+    artist = "" if is_unknown_artist(artist) else clean_search_text(artist)
     # Keep variant qualifiers intact. Only remove explicit upload/cut labels for
     # discovery; the cut flag still forbids automatic lyrics or metadata.
     cut = getattr(track, "is_excerpt", False) is True or bool(_CUT.search(title))
     cleaned = _REUPLOAD.sub(" ", _CUT.sub(" ", title))
     cleaned = " ".join(re.sub(r"\(\s*\)|\[\s*\]", " ", cleaned).strip(" -").split())
-    if not artist and len(parts := re.split(r"\s+[-–—]\s+", cleaned)) == 2:
+    parts = re.split(r"\s+[-–—]\s+", cleaned)
+    if not artist and len(parts) == 2:
         artist, cleaned = map(str.strip, parts)
+    elif artist and len(parts) == 2 and _norm(parts[0]) == _norm(artist) and parts[1].strip():
+        # "Artist - Title" repeated in the title field of a tagged file.
+        cleaned = parts[1].strip()
     return {"title": cleaned, "artist": artist, "album": album, "duration": _duration(getattr(track, "duration", 0)),
             "cut": cut, "query": cleaned if not artist else f"{artist} {cleaned}"}
 

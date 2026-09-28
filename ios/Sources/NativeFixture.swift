@@ -76,6 +76,16 @@ import UIKit
             if nextOffset < filtered.count { result["next_offset"] = nextOffset }
             return result
         }
+        if endpoint.hasPrefix("/api/mini/music/tracks/"), endpoint.hasSuffix("/timed-lyrics") {
+            if endpoint == "/api/mini/music/tracks/1/timed-lyrics" {
+                // Labelled fixture text, not copied lyrics or a production response.
+                return ["ok": true, "lyrics": ["track_id": 1, "status": "synced", "synced": true, "source": "owner",
+                    "text": "Проверка текста\nЭто тестовая строка\nСинхронизация с позицией\nКонец тестового фрагмента",
+                    "lines": [["start": 0, "end": 60, "text": "Проверка текста"], ["start": 60, "end": 84, "text": "Это тестовая строка"],
+                              ["start": 84, "end": 120, "text": "Синхронизация с позицией"], ["start": 120, "end": 128, "text": "Конец тестового фрагмента"]]]]
+            }
+            return ["ok": true, "lyrics": ["track_id": 0, "status": "not_found", "synced": false, "source": "none", "text": "", "lines": []]]
+        }
         if endpoint.hasPrefix("/api/mini/music/tracks/"), endpoint.hasSuffix("/lyrics") {
             if endpoint == "/api/mini/music/tracks/1/lyrics" {
                 // Labelled fixture text, not copied lyrics or a production response.

@@ -231,8 +231,9 @@ enum NativeShellSheet: Hashable, Identifiable {
         }
         slots.status = { [store] in AnyView(NativePlayerStatus(store: store)) }
         slots.titleAccessory = { [store] in AnyView(NativeFavoriteButton(store: store)) }
-        slots.deviceLabel = store.deviceLabel
-        slots.deviceSymbol = store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer"
+        // The audible device: a PC that owns playback is shown (and remote-controlled) even while "local" is selected.
+        slots.deviceLabel = store.playingDeviceName
+        slots.deviceSymbol = store.playingDevice.hasPrefix("agent:") ? "desktopcomputer" : "airplayaudio"
         slots.onDevices = { [store] in returnToNowPlaying = true; store.openRoutePicker() }
         slots.onQueue = { showQueue = true }
         slots.onMore = { [store] in playerActions = store.currentTrack }

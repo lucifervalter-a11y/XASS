@@ -7,7 +7,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.20.1"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "2"
     TARGETED_DEVICE_FAMILY: "1,2"
     SUPPORTS_MACCATALYST: NO
     ENABLE_USER_SCRIPT_SANDBOXING: YES
@@ -30,7 +30,7 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSFaceIDUsageDescription: "Защитить управление устройствами XASS и вашу библиотеку."
-        NSSpeechRecognitionUsageDescription: "По вашему запросу расшифровать скачанную песню на iPhone. XASS требует локальное распознавание и не передаёт аудио в облако."
+        NSSpeechRecognitionUsageDescription: "По вашему запросу расшифровать скачанную песню. По умолчанию распознавание локальное; распознавание Apple через интернет используется только если вы явно включите его."
         NSLocalNetworkUsageDescription: "Передать уже скачанный трек на ваш компьютер XASS в той же сети Wi-Fi. Другие устройства библиотеку не получают."
         UIBackgroundModes: [audio]
         UILaunchScreen: {}
