@@ -11,11 +11,12 @@ import UniformTypeIdentifiers
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         presentPickerIfNeeded()
+        DispatchQueue.main.async { [weak self] in self?.presentPickerIfNeeded() }
     }
     func presentPickerIfNeeded() {
-        guard wantsPicker, !started, presentedViewController == nil, let makePicker else { return }
-        started = true
+        guard wantsPicker, !started, presentedViewController == nil, viewIfLoaded?.window != nil, let makePicker else { return }
         present(makePicker(), animated: true)
+        started = presentedViewController != nil
     }
     func resetIfIdle() {
         if presentedViewController == nil { started = false }
@@ -171,8 +172,8 @@ import UniformTypeIdentifiers
                 }
             }.navigationTitle("Добавить музыку").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { dismiss() }.accessibilityIdentifier("musicImportDone") } }
-                .background {
-                    NativeMusicDocumentPicker(presented: $picker) { urls in store.importMusicFiles(urls) }
+                .fullScreenCover(isPresented: $picker) {
+                    NativeMusicDocumentPicker(presented: $picker) { urls in store.importMusicFiles(urls) }.ignoresSafeArea()
                 }
                 .sheet(isPresented: $diagnostics) {
                     NavigationStack { NativeDiagnosticLogView().toolbar { ToolbarItem(placement: .confirmationAction) { Button("Готово") { diagnostics = false } } } }

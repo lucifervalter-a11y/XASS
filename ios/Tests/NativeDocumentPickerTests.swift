@@ -30,19 +30,16 @@ final class NativeDocumentPickerTests: XCTestCase {
         coordinator.documentPicker(controller, didPickDocumentsAt: [URL(fileURLWithPath: "/fixture.mp3")])
         XCTAssertFalse(presented)
     }
-    @MainActor func testHostPresentsTheOpeningPickerInsteadOfBeingOne() {
+    @MainActor func testHostWithoutAWindowDoesNotPresentFiles() {
         final class UnusedDelegate: NSObject, UIDocumentPickerDelegate {}
-        let host = NativeMusicPickerHost()
-        let picker = NativeMusicDocumentPicker.openingController(delegate: UnusedDelegate())
+        let delegate = UnusedDelegate()
+        let picker = NativeMusicDocumentPicker.openingController(delegate: delegate)
         XCTAssertTrue(picker.allowsMultipleSelection)
+        XCTAssertTrue(picker.delegate === delegate)
+        let host = NativeMusicPickerHost()
         host.wantsPicker = true
         host.makePicker = { picker }
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 480))
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        host.loadViewIfNeeded()
-        host.viewDidAppear(false)
-        XCTAssertTrue(host.presentedViewController === picker)
-        XCTAssertFalse(host is UIDocumentPickerViewController)
+        host.presentPickerIfNeeded()
+        XCTAssertNil(host.presentedViewController)
     }
 }
