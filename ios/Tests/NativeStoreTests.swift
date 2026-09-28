@@ -23,19 +23,18 @@ final class NativeStoreTests: XCTestCase {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
         defer { store.disconnect() }
         await store.refresh()
-        let clock = expectation(description: "playback clock moved")
-        let clockSubscription = store.playback.objectWillChange.sink { _ in clock.fulfill() }
-        let library = expectation(description: "library store published")
-        library.isInverted = true
-        let librarySubscription = store.objectWillChange.sink { _ in library.fulfill() }
+        var clockChanges = 0
+        var libraryChanges = 0
+        let clockSubscription = store.playback.objectWillChange.sink { _ in clockChanges += 1 }
+        let librarySubscription = store.objectWillChange.sink { _ in libraryChanges += 1 }
         store.position = 12
         store.duration = 80
         XCTAssertEqual(store.position, 12)
         XCTAssertEqual(store.duration, 80)
         try await store.refreshSession()
         XCTAssertEqual(store.position, 37, "A session poll still records the reported position")
-        await fulfillment(of: [clock], timeout: 1)
-        await fulfillment(of: [library], timeout: 0.2)
+        XCTAssertGreaterThan(clockChanges, 0)
+        XCTAssertEqual(libraryChanges, 0, "A playback tick must not republish the library")
         clockSubscription.cancel()
         librarySubscription.cancel()
     }
