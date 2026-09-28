@@ -29,6 +29,9 @@ import UIKit
     /// Mini player pill in host space, captured only while the mini player is the visible source.
     @State private var miniFrame: CGRect = .zero
     @State private var transitionID = 0
+    /// The mini player is only kept under the card while a transition needs it as
+    /// hero partner; once Now Playing has settled it is removed entirely.
+    @State private var miniMounted = true
 
     struct FileArtwork { let trackID: String; let image: UIImage }
 
@@ -59,10 +62,10 @@ import UIKit
             let fullHeight = geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
             let dragProgress = min(1, max(0, dragOffset / max(1, fullHeight)))
             ZStack(alignment: .bottom) {
-                if miniAvailable, let track = player.track {
+                if miniAvailable, miniMounted || !cardMounted, let track = player.track {
                     MiniPlayerBar(player: player, track: track, artwork: artwork, namespace: namespace,
                                   heroSource: !expanded, onExpand: { expand() },
-                                  onFrameChange: { frame in if !cardMounted { miniFrame = frame } })
+                                  onFrameChange: { frame in miniFrame = frame })
                         .background {
                             GeometryReader { proxy in
                                 Color.clear
@@ -103,7 +106,7 @@ import UIKit
         }
         .onChange(of: tabContentBottom) { _, _ in updateClearance() }
         .ignoresSafeArea(.keyboard)
-        .onAppear { if wantsCard { cardMounted = true; expanded = true } }
+        .onAppear { if wantsCard { cardMounted = true; expanded = true; miniMounted = false } }
         .onChange(of: wantsCard) { _, want in
             if want { presentCard() } else { dismissCard(animated: overlay == .miniPlayer || overlay == .transferBanner) }
         }
@@ -137,19 +140,19 @@ import UIKit
     private func presentCard() {
         transitionID += 1
         let id = transitionID
-        if cardMounted {
-            // Re-opened mid-collapse: reverse with the same spring.
-            withAnimation(PlayerMotion.expand(reduceMotion)) { expanded = true; dragOffset = 0 }
-            return
-        }
         var still = Transaction(); still.disablesAnimations = true
-        // First pass: the card is mounted clipped to the mini player, with the mini as
-        // hero source; the mini hides in the same pass, so nothing is ever doubled.
-        withTransaction(still) { dragOffset = 0; expanded = false; cardMounted = true }
-        DispatchQueue.main.async {
-            DispatchQueue.main.async {
+        if !cardMounted {
+            // First pass: the card is mounted clipped to the mini player, with the mini as
+            // hero source; the mini hides in the same pass, so nothing is ever doubled.
+            withTransaction(still) { dragOffset = 0; expanded = false; miniMounted = true; cardMounted = true }
+        }
+        afterLayout {
+            guard id == transitionID, cardMounted else { return }
+            withAnimation(PlayerMotion.expand(reduceMotion), completionCriteria: .removed) {
+                expanded = true; dragOffset = 0
+            } completion: {
                 guard id == transitionID, cardMounted else { return }
-                withAnimation(PlayerMotion.expand(reduceMotion)) { expanded = true }
+                miniMounted = false
             }
         }
     }
@@ -157,20 +160,30 @@ import UIKit
     private func dismissCard(animated: Bool) {
         transitionID += 1
         let id = transitionID
-        guard cardMounted else { return }
+        guard cardMounted else { miniMounted = true; return }
+        var still = Transaction(); still.disablesAnimations = true
         guard animated else {
-            var still = Transaction(); still.disablesAnimations = true
-            withTransaction(still) { cardMounted = false; expanded = false; dragOffset = 0 }
+            withTransaction(still) { cardMounted = false; expanded = false; dragOffset = 0; miniMounted = true }
             return
         }
-        // The card springs into the mini player's frame and is removed only once the
-        // animation has fully finished; the mini (same frame) then shows at once.
-        withAnimation(PlayerMotion.expand(reduceMotion), completionCriteria: .removed) {
-            expanded = false; dragOffset = 0
-        } completion: {
-            guard id == transitionID else { return }
-            cardMounted = false
+        // Mount the (hidden) mini player first, so it is laid out as the landing frame
+        // and hero partner; then the card springs into it and is removed only once the
+        // animation has fully finished. The mini (same frame) then shows at once.
+        withTransaction(still) { miniMounted = true }
+        afterLayout {
+            guard id == transitionID, cardMounted else { return }
+            withAnimation(PlayerMotion.expand(reduceMotion), completionCriteria: .removed) {
+                expanded = false; dragOffset = 0
+            } completion: {
+                guard id == transitionID else { return }
+                cardMounted = false
+            }
         }
+    }
+
+    /// Runs after the current update has been laid out and committed.
+    private func afterLayout(_ work: @escaping () -> Void) {
+        DispatchQueue.main.async { DispatchQueue.main.async { work() } }
     }
 
     private func refreshLook() async {
