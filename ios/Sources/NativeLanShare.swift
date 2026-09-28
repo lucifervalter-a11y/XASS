@@ -253,8 +253,7 @@ final class NativeLanOffer: @unchecked Sendable {
             guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
             let text = String(cString: host)
             guard let rank = rank(text) else { continue }
-            let rawName = item.pointee.ifa_name
-            let name = rawName == nil ? "" : String(cString: rawName)
+            let name = item.pointee.ifa_name.map { String(cString: $0) } ?? ""
             let score = rank + (name == "en0" ? 0 : 10)
             if best == nil || score < best!.rank { best = (score, text) }
         }
