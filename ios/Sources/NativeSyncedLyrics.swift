@@ -22,6 +22,8 @@ struct SyncedLyrics: Equatable, Codable {
     let lines: [SyncedLyricLine]
     let text: String
     var cachedAt: Date = Date()
+    /// A PC transcription job for this track is queued or running: re-check soon.
+    var transcriptionPending: Bool? = nil
 
     init(trackID: Int, status: String, synced: Bool, source: String, lines: [SyncedLyricLine], text: String, cachedAt: Date = Date()) {
         self.trackID = trackID; self.status = status; self.synced = synced; self.source = source
@@ -51,7 +53,11 @@ struct SyncedLyrics: Equatable, Codable {
         source = String((value["source"] as? String ?? "none").prefix(40))
         // Plain lyrics are shown as text: never with raw LRC tags.
         text = NativeLRCText.plainText(String((value["text"] as? String ?? "").prefix(64_000)))
+        transcriptionPending = value["transcription_pending"] as? Bool == true ? true : nil
     }
+
+    /// Server-side PC transcription (Demucs + Whisper): shown with a caution label.
+    var isAutomatic: Bool { source == "pc_transcription" }
 
     var isEmpty: Bool { lines.isEmpty && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
@@ -75,6 +81,7 @@ struct SyncedLyrics: Equatable, Codable {
         case "embedded": return "Из аудиофайла"
         case "owner": return "Добавлено вами"
         case "on_device_transcription": return "Расшифровка"
+        case "pc_transcription": return PCTranscriptionStatus.automaticLabel
         default: return ""
         }
     }
@@ -93,6 +100,9 @@ struct SyncedLyrics: Equatable, Codable {
 
     static let foundTTL: TimeInterval = 14 * 86_400
     static let missTTL: TimeInterval = 6 * 3_600
+    static let pendingTTL: TimeInterval = 30
+    static let pendingRecheck: Duration = .seconds(45)
+    private var pendingTask: Task<Void, Never>?
     private var memory: [Int: SyncedLyrics] = [:]
     private var inflight: [Int: Task<SyncedLyrics?, Never>] = [:]
     private let directory: URL?
@@ -124,8 +134,37 @@ struct SyncedLyrics: Equatable, Codable {
             guard self.currentTrackID == id else { return }
             if let value = value { self.current = value } else if self.current == nil { self.error = "Нет связи с сервером. Текст появится, когда сеть вернётся." }
             self.loading = false
+            self.recheckWhilePending(id)
         }
         if let next = next, next != id { prefetch(next) }
+    }
+
+    /// Drops the cached copy (e.g. a PC transcription just finished) and reloads it if it is playing.
+    func invalidate(_ id: Int) {
+        memory.removeValue(forKey: id)
+        if let file = file(id) { try? FileManager.default.removeItem(at: file) }
+        guard id == currentTrackID, autoFetch else { return }
+        Task { [weak self] in
+            guard let self = self else { return }
+            let value = await self.fetch(id)
+            if self.currentTrackID == id, let value = value { self.current = value }
+        }
+    }
+
+    /// While the server transcribes the playing track, re-check so Now Playing shows the text by itself.
+    private func recheckWhilePending(_ id: Int) {
+        pendingTask?.cancel()
+        guard current?.trackID == id, current?.transcriptionPending == true, autoFetch else { return }
+        pendingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.pendingRecheck)
+                guard let self = self, !Task.isCancelled, self.currentTrackID == id else { return }
+                self.memory.removeValue(forKey: id)
+                guard let value = await self.fetch(id), self.currentTrackID == id else { continue }
+                self.current = value
+                if value.transcriptionPending != true { return }
+            }
+        }
     }
 
     func prefetch(_ id: Int) {
@@ -171,6 +210,7 @@ struct SyncedLyrics: Equatable, Codable {
     }
 
     private func fresh(_ value: SyncedLyrics) -> Bool {
+        if value.transcriptionPending == true { return Date().timeIntervalSince(value.cachedAt) < Self.pendingTTL }
         let ttl = value.synced || value.status == "plain" || value.status == "instrumental" ? Self.foundTTL : Self.missTTL
         return Date().timeIntervalSince(value.cachedAt) < ttl
     }

@@ -62,6 +62,8 @@ enum NativeEnrichmentPresentation {
     @AppStorage("xass.transcription.allowNetwork") private var allowNetworkRecognition = false
     @State private var language = "ru-RU"
     @State private var job: Task<Void, Never>?
+    /// The on-device recognizer is a hidden fallback; the PC transcription is primary.
+    @State private var showPhoneTranscription = false
     private var candidates: [[String: Any]] { info["candidates"] as? [[String: Any]] ?? [] }
     private var title: String { store.tracks.first { $0.id == trackID }?.title ?? (store.currentTrack?.id == trackID ? store.currentTrack?.title : nil) ?? "Песня" }
     var body: some View {
@@ -112,6 +114,7 @@ enum NativeEnrichmentPresentation {
                     }.disabled(working || transcriber.running).accessibilityIdentifier("lyricsSourceToggle")
                 }
             }
+            PCTranscriptionSection(store: store, trackID: trackID)
             transcriptionSection
             if let message = message { Section { Text(message).font(.callout).textSelection(.enabled) } }
             Section("Источники и оригинал") {
@@ -139,7 +142,15 @@ enum NativeEnrichmentPresentation {
     }
 
     private var transcriptionSection: some View {
-        Section("Если готового текста нет") {
+        Section {
+            DisclosureGroup("Другой способ: расшифровать на iPhone", isExpanded: $showPhoneTranscription) {
+                phoneTranscription
+            }.accessibilityIdentifier("phoneTranscriptionDisclosure")
+        }
+    }
+
+    @ViewBuilder private var phoneTranscription: some View {
+        Group {
             Text("Расшифровать скачанную песню на iPhone").font(.headline)
             Text("Без микрофона. По умолчанию аудио остаётся на iPhone (нужна локальная модель языка iOS); облачное распознавание Apple используется только если вы включите его ниже. Проверенный текст сохраняется на вашем сервере. Пение может распознаться с ошибками — проверьте результат.")
                 .font(.footnote).foregroundStyle(.secondary)

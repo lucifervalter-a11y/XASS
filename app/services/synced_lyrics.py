@@ -267,14 +267,40 @@ def from_existing(lyrics: dict | None, duration: float, source: str) -> dict | N
     return None
 
 
+PC_TRANSCRIPTION_LABEL = "Автоматически, может быть с ошибками"
+
+
 def public(value: dict, track_id: int) -> dict:
-    return {"track_id": track_id, "status": value.get("status", "not_found"), "synced": bool(value.get("synced")),
-            "source": value.get("source") or "none", "lines": value.get("lines") or [], "text": value.get("text") or ""}
+    out = {"track_id": track_id, "status": value.get("status", "not_found"), "synced": bool(value.get("synced")),
+           "source": value.get("source") or "none", "lines": value.get("lines") or [], "text": value.get("text") or ""}
+    if out["source"] == "pc_transcription":
+        out.update(automatic=True, label=PC_TRANSCRIPTION_LABEL)
+    return out
+
+
+def from_transcription(value: dict | None) -> dict | None:
+    """Finished PC transcription job result: already [{start, end, text}]."""
+    if not isinstance(value, dict):
+        return None
+    lines = [row for row in (value.get("lines") or [])[:MAX_LINES] if isinstance(row, dict) and str(row.get("text") or "").strip()]
+    if not lines:
+        return None
+    return {"status": "synced", "synced": True, "lines": lines, "text": "\n".join(str(row["text"]) for row in lines),
+            "source": "pc_transcription"}
 
 
 async def resolve(track, *, owner: dict | None, embedded: dict | None, enrichment: dict | None,
-                  cache: LyricsCache, client: LrclibClient, refresh: bool = False) -> dict:
+                  cache: LyricsCache, client: LrclibClient, refresh: bool = False,
+                  transcription: dict | None = None) -> dict:
+    """Order: owner/embedded/catalog timed lines → LRCLIB → PC transcription → plain text.
+
+    The on-device iPhone transcription (owner, hidden fallback) yields to a
+    finished PC transcription, which is generally much better on rap.
+    """
     duration = float(getattr(track, "duration", 0) or 0)
+    automatic = from_transcription(transcription)
+    if automatic and isinstance(owner, dict) and owner.get("source") == "on_device_transcription":
+        owner = None
     plain = None
     for payload, source in ((owner, "owner"), (embedded, "embedded"), (enrichment, "lrclib")):
         found = from_existing(payload, duration, source)
@@ -291,6 +317,8 @@ async def resolve(track, *, owner: dict | None, embedded: dict | None, enrichmen
             cached = cache.put(track.id, print_, looked)
     if cached.get("synced") or cached.get("status") == "instrumental":
         return public(cached, track.id)
+    if automatic:
+        return public(automatic, track.id)
     if plain:
         return public(plain, track.id)
     return public(cached, track.id)

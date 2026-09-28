@@ -75,6 +75,7 @@ from client_update import (
 from connection_file import ConnectionProfile, load_connection_file, parse_connection_text
 from archive_store import archive_root, archive_status, cleanup_archive, conversation_rows
 from network_client import create_http_client
+from transcription_worker import read_status_file as read_transcription_status, status_text as transcription_status_text
 from remote_tools import ROOT_LABELS, clipboard_get, list_files
 try:
     from runtime_state import acquire_single_instance, append_log, configure_utf8_logging, read_log_tail
@@ -324,6 +325,10 @@ class XassDesktop:
         self.pair_var = tk.StringVar()
         self.interval_var = tk.StringVar(value=str(self.config.get("interval_sec") or 30))
         self.auto_update_var = tk.BooleanVar(value=bool(self.config.get("auto_update", True)))
+        self.transcription_var = tk.BooleanVar(value=bool(self.config.get("transcription_enabled", False)))
+        self.transcription_state_var = tk.StringVar(value="")
+        self._transcription_error = False
+        self._transcription_retry: Any | None = None
         self.archive_folder_var = tk.StringVar(value=str(self.config.get("archive_folder") or archive_root(self.config)))
         self.archive_max_gb_var = tk.StringVar(value=str(self.config.get("archive_max_gb") or ""))
         self.archive_retention_days_var = tk.StringVar(value=str(self.config.get("archive_retention_days") or ""))
@@ -361,6 +366,7 @@ class XassDesktop:
         self.root.after(450, self._refresh_agent_status)
         self.root.after(700, self._refresh_update_status)
         self.root.after(220, self._refresh_local_metrics)
+        self.root.after(900, self._refresh_transcription_status)
         if preview:
             self._set_status("Предпросмотр", ACCENT)
             self.last_seen_var.set("Агент не запущен в режиме предпросмотра")
@@ -1138,7 +1144,16 @@ class XassDesktop:
         tk.Label(runtime, text="Фоновая работа", bg=CARD, fg=TEXT, font=("Segoe UI", 20)).pack(anchor="w", pady=(11, 4))
         tk.Label(runtime, text="Окно можно свернуть — связь с сервером и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 18))
         check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
-        check.pack(anchor="w", pady=(6, 14))
+        check.pack(anchor="w", pady=(6, 4))
+        transcription = tk.Checkbutton(runtime, text="Использовать этот ПК для расшифровки текста", variable=self.transcription_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
+        transcription.pack(anchor="w", pady=(4, 2))
+        tk.Label(runtime, text="Песни без текста в каталоге распознаются на этом компьютере (Demucs + Whisper) с низким приоритетом. При первом включении XASS сам скачает Python и модели (~3–6 ГБ), права администратора не нужны.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 2))
+        transcription_status = tk.Frame(runtime, bg=CARD)
+        transcription_status.pack(fill="x", pady=(0, 14))
+        tk.Label(transcription_status, textvariable=self.transcription_state_var, bg=CARD, fg=AMBER, justify="left", wraplength=360, font=("Segoe UI", 9)).pack(anchor="w")
+        self._transcription_retry = self._button(transcription_status, "Повторить установку", self.restart_agent, kind="ghost")
+        if self._transcription_error:
+            self._transcription_retry.pack(fill="x", pady=(6, 0))
         self._field(runtime, "Имя с визитки", self.owner_var)
         self._field(runtime, "Интервал обновления показателей, секунд", self.interval_var)
         self._field(runtime, "Папка локального архива", self.archive_folder_var)
@@ -1504,6 +1519,7 @@ class XassDesktop:
                 "source_type": "PC_AGENT",
                 "interval_sec": interval,
                 "auto_update": self.auto_update_var.get(),
+                "transcription_enabled": bool(self.transcription_var.get()),
                 "archive_folder": self.archive_folder_var.get().strip(),
                 "archive_max_gb": max_gb,
                 "archive_retention_days": retention_days,
@@ -1708,6 +1724,26 @@ class XassDesktop:
         )
         self._set_status("Подключение…", AMBER)
         threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+
+    def _refresh_transcription_status(self) -> None:
+        """Stage + percent of the first-time setup, written by the agent to status.json."""
+        if self._closing or self.preview:
+            return
+        try:
+            payload = read_transcription_status(DATA_ROOT)
+            self.transcription_state_var.set(transcription_status_text(payload, bool(self.config.get("transcription_enabled"))))
+            error = bool(payload and payload.get("state") == "error" and self.config.get("transcription_enabled"))
+            if error != self._transcription_error:
+                self._transcription_error = error
+                button = self._transcription_retry
+                if button is not None and button.winfo_exists():
+                    if error:
+                        button.pack(fill="x", pady=(6, 0))
+                    else:
+                        button.pack_forget()
+        except (tk.TclError, OSError, ValueError):
+            pass
+        self.root.after(1500, self._refresh_transcription_status)
 
     def _refresh_agent_status(self) -> None:
         if self._closing:

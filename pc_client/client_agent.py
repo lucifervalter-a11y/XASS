@@ -18,6 +18,7 @@ import psutil
 
 from client_update import (
     DATA_ROOT,
+    RESOURCE_ROOT,
     clear_command_results,
     current_revision,
     current_version,
@@ -765,6 +766,15 @@ def run_agent(config: dict[str, Any]) -> str:
             print("[pc-client] music bridge did not bind; playback continues", flush=True)
     except Exception as exc:
         print(f"[pc-client] music bridge unavailable: {exc}", flush=True)
+    try:
+        # Opt-in (default off). When off it only tells the server once.
+        try:
+            from transcription_worker import start_transcription_worker
+        except ModuleNotFoundError:
+            from pc_client.transcription_worker import start_transcription_worker
+        start_transcription_worker(config, DATA_ROOT, RESOURCE_ROOT)
+    except Exception as exc:
+        print(f"[pc-client] transcription worker unavailable: {exc}", flush=True)
     print(
         f"[pc-client] endpoint={endpoint} source_name={source_name} "
         f"source_type={source_type} trust_env_proxy={trust_env_proxy}",
@@ -1024,6 +1034,8 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
         config["archive_folder"] = ""
     if "archive_enabled" not in config:
         config["archive_enabled"] = False
+    if "transcription_enabled" not in config:
+        config["transcription_enabled"] = False
     return config
 
 

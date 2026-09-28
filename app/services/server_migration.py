@@ -65,6 +65,7 @@ RESTORE_EPHEMERAL_UPDATES = {
     "music_sessions": "UPDATE music_sessions SET state='stopped', session_key='', share_site=false, share_discord=false",
     "music_storage_jobs": "UPDATE music_storage_jobs SET status='failed', error_code='server_migration' WHERE status IN ('pending','running')",
     "music_import_runs": "UPDATE music_import_runs SET status='cancelled' WHERE status IN ('pending','running')",
+    "transcription_jobs": "UPDATE transcription_jobs SET state='queued', worker_id=NULL, lease_expires_at=NULL, deadline_at=NULL WHERE state IN ('assigned','running')",
 }
 
 
