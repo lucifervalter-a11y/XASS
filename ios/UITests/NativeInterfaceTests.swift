@@ -78,13 +78,20 @@ final class NativeInterfaceTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 10))
         let lyrics = app.buttons["nativePlayerLyrics"]
-        for _ in 0..<8 { if lyrics.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        // Scroll the Now Playing content itself (swipe up only: a downward swipe at
+        // the top edge is the dismiss gesture now, not a scroll).
+        let namedScroll = app.scrollViews["nowPlayingScroll"]
+        let scroll = namedScroll.exists ? namedScroll : app.scrollViews.firstMatch
+        for _ in 0..<8 { if lyrics.isHittable { break }; scroll.swipeUp() }
         XCTAssertTrue(lyrics.isHittable, "Large Dynamic Type must scroll to bottom player controls")
         XCTAssertEqual(app.webViews.count, 0)
         capture(app, "Native-Player-LargeText")
+        // «Ещё» lives in the pinned header, so it stays reachable after scrolling
+        // to the bottom controls without swiping back (which would dismiss).
         let more = app.buttons["nativePlayerMore"]
-        for _ in 0..<8 { if more.isHittable { break }; app.scrollViews.firstMatch.swipeDown() }
-        XCTAssertTrue(more.isHittable); more.tap()
+        XCTAssertTrue(more.isHittable, "Pinned header actions must stay reachable at large text")
+        XCTAssertTrue(app.buttons["nativePlayerToggle"].exists, "Now Playing must still be open after scrolling")
+        more.tap()
         XCTAssertTrue(app.buttons["nativeDownload"].waitForExistence(timeout: 5), "Download remains available in native track actions")
         XCTAssertTrue(app.switches["nativeShareSite"].exists, "Website sharing is preserved")
     }

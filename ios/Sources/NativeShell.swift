@@ -1,10 +1,37 @@
 import SwiftUI
 import AVKit
 
-private enum NativeMainSheet: String, Identifiable {
-    // Now Playing is not a sheet any more: it is the root player overlay below.
-    case route, enrollment
-    var id: String { rawValue }
+/// Every sheet the shell can show, in one place. SwiftUI presents only one sheet
+/// per view at a time, so separate `.sheet` modifiers silently lose the lower one
+/// (e.g. a 401 while the queue was open never showed enrollment). `resolve`
+/// picks exactly one by priority: account/enrollment beats everything.
+enum NativeShellSheet: Hashable, Identifiable {
+    case enrollment, route, actions(Int), queue, fixtureDevice, fixtureStorage, fixtureAlbums, fixtureMusicImport
+    var id: String {
+        switch self {
+        case .enrollment: return "enrollment"
+        case .route: return "route"
+        case .actions(let id): return "actions-\(id)"
+        case .queue: return "queue"
+        case .fixtureDevice: return "fixtureDevice"
+        case .fixtureStorage: return "fixtureStorage"
+        case .fixtureAlbums: return "fixtureAlbums"
+        case .fixtureMusicImport: return "fixtureMusicImport"
+        }
+    }
+    static func resolve(enrollment: Bool, route: Bool, actionsTrackID: Int?, queue: Bool,
+                        fixtureDevice: Bool = false, fixtureStorage: Bool = false,
+                        fixtureAlbums: Bool = false, fixtureMusicImport: Bool = false) -> NativeShellSheet? {
+        if enrollment { return .enrollment }
+        if route { return .route }
+        if let id = actionsTrackID { return .actions(id) }
+        if queue { return .queue }
+        if fixtureDevice { return .fixtureDevice }
+        if fixtureStorage { return .fixtureStorage }
+        if fixtureAlbums { return .fixtureAlbums }
+        if fixtureMusicImport { return .fixtureMusicImport }
+        return nil
+    }
 }
 
 @MainActor struct NativeShell: View {
@@ -20,6 +47,11 @@ private enum NativeMainSheet: String, Identifiable {
     @State private var nowPlayingLyrics = false
     @State private var showQueue = false
     @State private var playerActions: LibraryTrack?
+    /// Set when the device picker was opened from Now Playing: closing the picker
+    /// returns to Now Playing instead of dropping to the mini player.
+    @State private var returnToNowPlaying = false
+    @State private var miniHeight: CGFloat = 64
+    @State private var tabContentBottom: CGFloat?
     #if DEBUG && targetEnvironment(simulator)
     @StateObject private var fixturePlayer: FixturePlayerState
     @State private var fixtureExpanded = false
@@ -41,27 +73,35 @@ private enum NativeMainSheet: String, Identifiable {
                 // Enrichment never delays Play or takes over the current route.
                 if let id = store.currentID, store.authorized { _ = try? await store.enrichTrack(id) }
             }
-            .sheet(item: presentedSheet) { sheet in
-                switch sheet {
-                case .route: NativeRoutePicker(store: store)
-                case .enrollment: NativeEnrollmentView(store: store)
-                }
-            }
-            .sheet(isPresented: $showQueue) { NativeQueueView(store: store) }
-            .sheet(item: $playerActions) { track in NativeTrackActions(store: store, track: track) }
+            .sheet(item: presentedSheet) { sheet in sheetContent(sheet) }
             .onChange(of: store.showRoutePicker) { _, open in
-                if open { store.showPlayer = false; store.showLogin = false; store.showEnrollment = false; showQueue = false; playerActions = nil }
+                if open {
+                    store.showPlayer = false; store.showLogin = false; store.showEnrollment = false
+                    showQueue = false; playerActions = nil
+                } else if returnToNowPlaying {
+                    returnToNowPlaying = false
+                    if store.currentTrack != nil && !store.showEnrollment && !store.showLogin {
+                        #if DEBUG && targetEnvironment(simulator)
+                        if usesFixturePlayer { fixtureExpanded = true } else { store.showPlayer = true }
+                        #else
+                        store.showPlayer = true
+                        #endif
+                    }
+                }
             }
             .onChange(of: store.showPlayer) { _, open in
                 if open { store.showRoutePicker = false }
             }
             .onChange(of: store.showLogin) { _, open in
-                if open { store.showRoutePicker = false; store.showPlayer = false; store.showLogin = false; store.showEnrollment = true }
+                // 401: enrollment must win over whatever sheet is up (queue, actions, route).
+                if open {
+                    returnToNowPlaying = false; showQueue = false; playerActions = nil
+                    store.showRoutePicker = false; store.showPlayer = false; store.showLogin = false; store.showEnrollment = true
+                }
             }
-            .sheet(isPresented: $fixtureDevice) { NavigationStack { if let device = store.devices.first { NativeDeviceDetail(store: store, deviceID: device.id) } } }
-            .sheet(isPresented: $fixtureStorage) { NavigationStack { NativeStorageView(store: store) } }
-            .sheet(isPresented: $fixtureAlbums) { NavigationStack { NativeCollectionLibrary(store: store, kind: .album) } }
-            .sheet(isPresented: $fixtureMusicImport) { NativeMusicImportView(store: store) }
+            .onChange(of: store.showEnrollment) { _, open in
+                if open { returnToNowPlaying = false; showQueue = false; playerActions = nil; store.showRoutePicker = false; store.showPlayer = false }
+            }
             .onAppear {
                 #if DEBUG && targetEnvironment(simulator)
                 if NativeFixture.enabled {
@@ -96,21 +136,48 @@ private enum NativeMainSheet: String, Identifiable {
     }
     private var tabs: some View {
         TabView(selection: $selectedTab) {
-            content(NativeHomeView(store: store, workspace: workspace)).tabItem { Label("Главная", systemImage: "house") }.tag(0).accessibilityIdentifier("tab-home")
-            content(NativeLibraryView(store: store)).tabItem { Label("Музыка", systemImage: "music.note") }.tag(1).accessibilityIdentifier("tab-music")
-            content(NativeSiteView(store: store, workspace: workspace)).tabItem { Label("Сайт", systemImage: "person.crop.square") }.tag(2).accessibilityIdentifier("tab-site")
-            content(NativeToolsView(app: app, store: store, workspace: workspace)).tabItem { Label("Инструменты", systemImage: "square.grid.2x2") }.tag(3).accessibilityIdentifier("tab-tools")
-            content(NativeWeatherView(store: store, workspace: workspace)).tabItem { Label("Погода", systemImage: "cloud.sun") }.tag(4).accessibilityIdentifier("tab-weather")
+            content(NativeHomeView(store: store, workspace: workspace), tag: 0).tabItem { Label("Главная", systemImage: "house") }.tag(0).accessibilityIdentifier("tab-home")
+            content(NativeLibraryView(store: store), tag: 1).tabItem { Label("Музыка", systemImage: "music.note") }.tag(1).accessibilityIdentifier("tab-music")
+            content(NativeSiteView(store: store, workspace: workspace), tag: 2).tabItem { Label("Сайт", systemImage: "person.crop.square") }.tag(2).accessibilityIdentifier("tab-site")
+            content(NativeToolsView(app: app, store: store, workspace: workspace), tag: 3).tabItem { Label("Инструменты", systemImage: "square.grid.2x2") }.tag(3).accessibilityIdentifier("tab-tools")
+            content(NativeWeatherView(store: store, workspace: workspace), tag: 4).tabItem { Label("Погода", systemImage: "cloud.sun") }.tag(4).accessibilityIdentifier("tab-weather")
         }.tint(XASSStyle.accent)
     }
-    private var presentedSheet: Binding<NativeMainSheet?> {
+    private var presentedSheet: Binding<NativeShellSheet?> {
         Binding(get: {
-            if store.showRoutePicker { return .route }
-            if store.showEnrollment { return .enrollment }
-            return nil
+            NativeShellSheet.resolve(enrollment: store.showEnrollment, route: store.showRoutePicker,
+                                     actionsTrackID: playerActions?.id, queue: showQueue,
+                                     fixtureDevice: fixtureDevice, fixtureStorage: fixtureStorage,
+                                     fixtureAlbums: fixtureAlbums, fixtureMusicImport: fixtureMusicImport)
         }, set: { value in
-            if value == nil { store.showRoutePicker = false; store.showEnrollment = false }
+            guard value == nil else { return }
+            // Clear only what was actually on screen; lower-priority flags stay.
+            switch presentedSheet.wrappedValue {
+            case .enrollment: store.showEnrollment = false
+            case .route: store.showRoutePicker = false
+            case .actions: playerActions = nil
+            case .queue: showQueue = false
+            case .fixtureDevice: fixtureDevice = false
+            case .fixtureStorage: fixtureStorage = false
+            case .fixtureAlbums: fixtureAlbums = false
+            case .fixtureMusicImport: fixtureMusicImport = false
+            case nil: break
+            }
         })
+    }
+
+    @ViewBuilder private func sheetContent(_ sheet: NativeShellSheet) -> some View {
+        switch sheet {
+        case .enrollment: NativeEnrollmentView(store: store)
+        case .route: NativeRoutePicker(store: store)
+        case .actions:
+            if let track = playerActions { NativeTrackActions(store: store, track: track) }
+        case .queue: NativeQueueView(store: store)
+        case .fixtureDevice: NavigationStack { if let device = store.devices.first { NativeDeviceDetail(store: store, deviceID: device.id) } }
+        case .fixtureStorage: NavigationStack { NativeStorageView(store: store) }
+        case .fixtureAlbums: NavigationStack { NativeCollectionLibrary(store: store, kind: .album) }
+        case .fixtureMusicImport: NativeMusicImportView(store: store)
+        }
     }
 
     // MARK: Root player overlay
@@ -132,14 +199,16 @@ private enum NativeMainSheet: String, Identifiable {
     /// device picker and transfer banner are mutually exclusive.
     private var rootOverlay: NativeRootOverlay {
         NativeRootOverlay.resolve(hasTrack: usesFixturePlayer || store.currentTrack != nil, expanded: playerExpanded,
-                                  devicePicker: store.showRoutePicker, transferActive: store.transferStatus != nil)
+                                  devicePicker: store.showRoutePicker, transferActive: store.transferStatus != nil,
+                                  accountSheet: store.showEnrollment)
     }
 
     @ViewBuilder private var playerLayer: some View {
         #if DEBUG && targetEnvironment(simulator)
         if usesFixturePlayer {
             NativePlayerOverlayHost(player: fixturePlayer, overlay: rootOverlay, showLyrics: $nowPlayingLyrics,
-                                    slots: fixtureSlots, setExpanded: { fixtureExpanded = $0 })
+                                    slots: fixtureSlots, tabContentBottom: tabContentBottom, setExpanded: { fixtureExpanded = $0 },
+                                    onMiniHeightChange: { miniHeight = $0 })
         } else {
             storePlayerLayer
         }
@@ -150,7 +219,8 @@ private enum NativeMainSheet: String, Identifiable {
 
     private var storePlayerLayer: some View {
         NativePlayerOverlayHost(player: storePlayer, overlay: rootOverlay, showLyrics: $nowPlayingLyrics,
-                                slots: storeSlots, setExpanded: { store.showPlayer = $0 })
+                                slots: storeSlots, tabContentBottom: tabContentBottom, setExpanded: { store.showPlayer = $0 },
+                                onMiniHeightChange: { miniHeight = $0 })
     }
 
     private var storeSlots: NowPlayingSlots {
@@ -163,7 +233,7 @@ private enum NativeMainSheet: String, Identifiable {
         slots.titleAccessory = { [store] in AnyView(NativeFavoriteButton(store: store)) }
         slots.deviceLabel = store.deviceLabel
         slots.deviceSymbol = store.selectedDevice == "local" ? "airplayaudio" : "desktopcomputer"
-        slots.onDevices = { [store] in store.openRoutePicker() }
+        slots.onDevices = { [store] in returnToNowPlaying = true; store.openRoutePicker() }
         slots.onQueue = { showQueue = true }
         slots.onMore = { [store] in playerActions = store.currentTrack }
         return slots
@@ -175,19 +245,35 @@ private enum NativeMainSheet: String, Identifiable {
         slots.sourceLabel = "Тестовый плеер"
         slots.deviceLabel = store.deviceLabel
         // Opens the existing route sheet: proves Now Playing yields to `.devicePicker`.
-        slots.onDevices = { [store] in store.openRoutePicker() }
+        slots.onDevices = { [store] in returnToNowPlaying = true; store.openRoutePicker() }
         return slots
     }
     #endif
 
-    private func content<Content: View>(_ view: Content) -> some View {
+    private var hasTrack: Bool { usesFixturePlayer || store.currentTrack != nil }
+
+    private func content<Content: View>(_ view: Content, tag: Int) -> some View {
         // Reserve space inside each tab's content area. An inset on TabView itself
         // overlaps the native tab bar on iPhone and intercepts navigation taps.
+        // The reserve stays while the picker/enrollment sheet covers the player,
+        // so the tab content does not jump when the mini player is temporarily gone.
         view.safeAreaInset(edge: .bottom, spacing: 0) {
-            switch rootOverlay {
-            case .transferBanner: NativeTransferWait(store: store)
-            case .miniPlayer, .nowPlaying: Color.clear.frame(height: PlayerLayout.miniReservedHeight).allowsHitTesting(false)
-            case .hidden, .devicePicker: EmptyView()
+            if rootOverlay == .transferBanner {
+                NativeTransferWait(store: store)
+            } else if hasTrack {
+                Color.clear.frame(height: max(PlayerLayout.miniReservedHeight, miniHeight + 12)).allowsHitTesting(false)
+            }
+        }
+        .background {
+            // Bottom of the tab content (= top of the tab bar on iPhone, safe bottom
+            // on iPad iOS 18 where the tab bar is on top). The player host turns this
+            // into the mini player's clearance instead of a hardcoded 49/50 pt.
+            GeometryReader { proxy in
+                let bottom = proxy.frame(in: .global).maxY
+                Color.clear
+                    .onAppear { if selectedTab == tag { tabContentBottom = bottom } }
+                    .onChange(of: bottom) { _, value in if selectedTab == tag { tabContentBottom = value } }
+                    .onChange(of: selectedTab) { _, selected in if selected == tag { tabContentBottom = bottom } }
             }
         }
     }

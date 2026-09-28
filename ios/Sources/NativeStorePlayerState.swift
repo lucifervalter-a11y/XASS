@@ -44,9 +44,10 @@ import UIKit
             return
         }
         let id = String(current.id)
-        // Keep the previous image of the same song while a new revision loads: no flashing.
+        // Keep the previous image (even of the previous song) until the new one is
+        // decoded: the UI never flashes a placeholder between two covers.
         let next = PlayerTrack(id: id, title: current.title, artist: current.artist.isEmpty ? "Моя коллекция" : current.artist,
-                               artworkImage: track?.id == id ? track?.artworkImage : nil)
+                               artworkImage: track?.artworkImage)
         if next != track { track = next }
         let key = "\(current.id)-\(store.artworkRevision)"
         if key != artworkKey { artworkKey = key; loadArtwork(trackID: current.id, key: key) }
@@ -65,7 +66,9 @@ import UIKit
         artworkTask?.cancel()
         artworkTask = Task { [weak self] in
             guard let self = self else { return }
-            let image = await self.store.artwork(trackID)
+            let loaded = await self.store.artwork(trackID)
+            // Decode off the main thread so the first frame of the new cover is cheap.
+            let image = await Task.detached(priority: .userInitiated) { loaded?.preparingForDisplay() ?? loaded }.value
             guard !Task.isCancelled, self.artworkKey == key, var updated = self.track, updated.id == String(trackID) else { return }
             updated.artworkImage = image
             if updated != self.track { self.track = updated }

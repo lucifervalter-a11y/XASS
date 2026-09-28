@@ -16,10 +16,11 @@ struct PlayerArtworkLook: Equatable, @unchecked Sendable {
 
     static func == (lhs: PlayerArtworkLook, rhs: PlayerArtworkLook) -> Bool { lhs.key == rhs.key }
 
-    /// Stable per track + image instance.
+    /// Keyed by the image instance: while a provider still shows the previous
+    /// cover for a new song, the background keeps its colors (no flash).
     static func cacheKey(trackID: String, image: UIImage?) -> String {
-        guard let image = image else { return "\(trackID)-none" }
-        return "\(trackID)-\(ObjectIdentifier(image).hashValue)"
+        guard let image = image else { return "none-\(trackID)" }
+        return "image-\(ObjectIdentifier(image).hashValue)"
     }
 }
 
@@ -28,6 +29,8 @@ struct PlayerArtworkLook: Equatable, @unchecked Sendable {
     private var cache: [String: PlayerArtworkLook] = [:]
     private var order: [String] = []
     private var running: [String: Task<PlayerArtworkLook, Never>] = [:]
+    /// Keeps keyed images alive so an ObjectIdentifier is never reused while cached.
+    private var pinned: [String: UIImage] = [:]
     private let limit = 24
 
     func cached(_ key: String) -> PlayerArtworkLook? { cache[key] }
@@ -41,8 +44,9 @@ struct PlayerArtworkLook: Equatable, @unchecked Sendable {
         let look = await task.value
         running[key] = nil
         cache[key] = look
+        pinned[key] = image
         order.removeAll { $0 == key }; order.append(key)
-        while order.count > limit { cache[order.removeFirst()] = nil }
+        while order.count > limit { let evicted = order.removeFirst(); cache[evicted] = nil; pinned[evicted] = nil }
         return look
     }
 }

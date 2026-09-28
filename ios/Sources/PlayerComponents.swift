@@ -85,10 +85,34 @@ struct PlayerArtworkImage: View {
 }
 
 /// Pre-blurred artwork over a gradient of its dominant colors. The blur is a
-/// cached bitmap; a track change crossfades both layers without a flash.
+/// cached bitmap. On a track change the new look fades in ON TOP of the old,
+/// fully opaque one (gradients are not interpolated), so there is no dip or flash.
 struct NowPlayingBackground: View {
     let look: PlayerArtworkLook
     let reduceMotion: Bool
+    @State private var previous: PlayerArtworkLook?
+    @State private var topOpacity: Double = 1
+
+    var body: some View {
+        ZStack {
+            if let previous = previous { NowPlayingBackgroundLayer(look: previous) }
+            NowPlayingBackgroundLayer(look: look).opacity(topOpacity)
+        }
+        .onChange(of: look) { old, _ in
+            previous = old
+            topOpacity = 0
+            withAnimation(reduceMotion ? PlayerMotion.fade : PlayerMotion.background) {
+                topOpacity = 1
+            } completion: {
+                previous = nil
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+private struct NowPlayingBackgroundLayer: View {
+    let look: PlayerArtworkLook
     var body: some View {
         ZStack {
             LinearGradient(colors: look.colors, startPoint: .top, endPoint: .bottom)
@@ -97,27 +121,28 @@ struct NowPlayingBackground: View {
                     .overlay { Image(uiImage: blurred).resizable().scaledToFill().scaleEffect(1.25) }
                     .clipped()
                     .opacity(0.62)
-                    .id(look.key)
-                    .transition(.opacity)
             }
             LinearGradient(colors: look.colors.map { $0.opacity(0.55) }, startPoint: .topLeading, endPoint: .bottomTrailing)
             LinearGradient(colors: [.black.opacity(0.05), .black.opacity(0.42)], startPoint: .top, endPoint: .bottom)
         }
-        .animation(reduceMotion ? PlayerMotion.fade : PlayerMotion.background, value: look.key)
-        .accessibilityHidden(true)
+        .drawingGroup()
     }
 }
 
 /// Apple Music-style capsule scrubber. Selection haptics while dragging.
 struct PlayerScrubber: View {
+    let trackID: String
     let position: TimeInterval
     let duration: TimeInterval
     let disabled: Bool
     let reduceMotion: Bool
+    /// True while the finger is on the scrubber: Now Playing must not start a swipe-down.
+    var onEditingChanged: (Bool) -> Void = { _ in }
     let onSeek: (TimeInterval) -> Void
     @State private var dragValue: TimeInterval?
     @State private var pendingSeek: TimeInterval?
     @State private var hapticStep = -1
+    @GestureState private var touching = false
 
     private var shown: TimeInterval { min(max(0, dragValue ?? pendingSeek ?? position), max(0, duration)) }
 
@@ -134,7 +159,7 @@ struct PlayerScrubber: View {
                 .frame(height: active ? 11 : 6)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                .gesture(DragGesture(minimumDistance: 0).updating($touching) { _, state, _ in state = true }.onChanged { value in
                     guard duration > 0, !disabled else { return }
                     if dragValue == nil { PlayerHaptics.prepareScrub() }
                     let next = min(1, max(0, value.location.x / width))
@@ -157,6 +182,15 @@ struct PlayerScrubber: View {
         }
         .onChange(of: position) { _, value in
             if let pending = pendingSeek, abs(value - pending) < 1.5 { pendingSeek = nil }
+        }
+        .onChange(of: trackID) { _, _ in
+            // A new song never inherits the previous song's pending seek or drag.
+            pendingSeek = nil; dragValue = nil; hapticStep = -1
+        }
+        .onChange(of: touching) { _, active in
+            onEditingChanged(active)
+            // onEnded has already committed the seek; this only cleans up a cancelled drag.
+            if !active { DispatchQueue.main.async { if dragValue != nil { dragValue = nil; hapticStep = -1 } } }
         }
         .task(id: pendingSeek) {
             // A remote seek may never echo back exactly; do not pin the knob forever.
@@ -183,8 +217,10 @@ struct PlayerScrubber: View {
 struct PlayerVolumeSlider: View {
     let volume: Double
     let reduceMotion: Bool
+    var onEditingChanged: (Bool) -> Void = { _ in }
     let onChange: (Double) -> Void
     @State private var dragValue: Double?
+    @GestureState private var touching = false
 
     var body: some View {
         let value = min(1, max(0, dragValue ?? volume))
@@ -199,7 +235,7 @@ struct PlayerVolumeSlider: View {
                 .frame(height: dragValue == nil ? 6 : 11)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                .gesture(DragGesture(minimumDistance: 0).updating($touching) { _, state, _ in state = true }.onChanged { gesture in
                     let next = min(1, max(0, gesture.location.x / width))
                     dragValue = next; onChange(next)
                 }.onEnded { _ in dragValue = nil })
@@ -207,6 +243,10 @@ struct PlayerVolumeSlider: View {
             .frame(height: 30)
             .animation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8), value: dragValue == nil)
             Image(systemName: "speaker.wave.3.fill").font(.caption)
+        }
+        .onChange(of: touching) { _, active in
+            onEditingChanged(active)
+            if !active { dragValue = nil }
         }
         .foregroundStyle(.white.opacity(0.6))
         .accessibilityElement(children: .ignore)
@@ -220,5 +260,58 @@ struct PlayerVolumeSlider: View {
             }
         }
         .accessibilityIdentifier("nowPlayingVolume")
+    }
+}
+
+/// Tunes the enclosing UIScrollView of Now Playing: no rubber-band bounce (a
+/// swipe-down must move only the card) and an exact "offset == 0" signal, so
+/// the dismiss gesture only starts when the content is scrolled to the top.
+struct PlayerScrollViewTuner: UIViewRepresentable {
+    var onAtTopChange: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
+    }
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.onAtTopChange = onAtTopChange
+        DispatchQueue.main.async { [weak view] in
+            guard let view = view else { return }
+            context.coordinator.attach(from: view)
+        }
+    }
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.detach() }
+
+    final class Coordinator: NSObject {
+        var onAtTopChange: (Bool) -> Void = { _ in }
+        private weak var scrollView: UIScrollView?
+        private var observation: NSKeyValueObservation?
+        private var atTop = true
+
+        func attach(from view: UIView) {
+            var current: UIView? = view.superview
+            while let candidate = current, !(candidate is UIScrollView) { current = candidate.superview }
+            guard let found = current as? UIScrollView, found !== scrollView else { return }
+            detach()
+            scrollView = found
+            found.bounces = false
+            found.alwaysBounceVertical = false
+            observation = found.observe(\.contentOffset, options: [.initial, .new]) { [weak self] scroll, _ in
+                let top = scroll.contentOffset.y <= -scroll.adjustedContentInset.top + 0.5
+                DispatchQueue.main.async { self?.report(top) }
+            }
+        }
+        private func report(_ top: Bool) {
+            guard top != atTop else { return }
+            atTop = top
+            onAtTopChange(top)
+        }
+        func detach() {
+            observation?.invalidate(); observation = nil
+            scrollView = nil
+        }
     }
 }

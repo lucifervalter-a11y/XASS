@@ -9,12 +9,17 @@ import UIKit
     let overlay: NativeRootOverlay
     @Binding var showLyrics: Bool
     let slots: NowPlayingSlots
+    /// Global maxY of the tab content area (= top of the tab bar, or the safe
+    /// bottom when the tab bar is elsewhere, e.g. iPad iOS 18). Measured by the shell.
+    let tabContentBottom: CGFloat?
     let setExpanded: (Bool) -> Void
+    var onMiniHeightChange: (CGFloat) -> Void = { _ in }
     @Namespace private var namespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var look = PlayerArtworkLook.neutral
     @State private var fileArtwork: FileArtwork?
+    @State private var hostBottom: CGFloat?
+    @State private var clearance: CGFloat = 49
 
     struct FileArtwork { let trackID: String; let image: UIImage }
 
@@ -25,8 +30,13 @@ import UIKit
         return nil
     }
     private var lookKey: String { PlayerArtworkLook.cacheKey(trackID: player.track?.id ?? "none", image: artwork) }
-    /// The mini player floats just above the system tab bar.
-    private var tabBarHeight: CGFloat { sizeClass == .regular ? 50 : 49 }
+    /// Distance from the host's safe bottom to the top of the tab bar. Keeps the
+    /// last plausible value (keyboard or rotation mid-flight produce outliers).
+    private func updateClearance() {
+        guard let hostBottom = hostBottom, let tabBottom = tabContentBottom else { return }
+        let value = (hostBottom - tabBottom).rounded()
+        if value >= 0, value <= 140, abs(value - clearance) > 0.5 { clearance = value }
+    }
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -37,12 +47,28 @@ import UIKit
                     .zIndex(2)
             } else if overlay == .miniPlayer, let track = player.track {
                 MiniPlayerBar(player: player, track: track, artwork: artwork, namespace: namespace, onExpand: { expand() })
-                    .padding(.bottom, tabBarHeight)
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear
+                                .onAppear { onMiniHeightChange(proxy.size.height) }
+                                .onChange(of: proxy.size.height) { _, height in onMiniHeightChange(height) }
+                        }
+                    }
+                    .padding(.bottom, clearance)
                     .transition(.opacity)
                     .zIndex(1)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .background {
+            GeometryReader { proxy in
+                let bottom = proxy.frame(in: .global).maxY
+                Color.clear
+                    .onAppear { hostBottom = bottom; updateClearance() }
+                    .onChange(of: bottom) { _, value in hostBottom = value; updateClearance() }
+            }
+        }
+        .onChange(of: tabContentBottom) { _, _ in updateClearance() }
         .ignoresSafeArea(.keyboard)
         .animation(PlayerMotion.expand(reduceMotion), value: overlay)
         .task(id: lookKey) { await refreshLook() }
@@ -152,7 +178,7 @@ import UIKit
         .buttonStyle(MusicPressStyle())
         .foregroundStyle(.white)
         .padding(.leading, 8).padding(.trailing, 10)
-        .frame(height: 64)
+        .frame(minHeight: 64)
         .background {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(.ultraThinMaterial)
@@ -223,9 +249,9 @@ private struct NowPlayingHeaderZoneKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
-private struct NowPlayingScrollTopKey: PreferenceKey {
+private struct NowPlayingBelowArtworkKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 private enum PlayerDragMode { case undecided, active, ignored }
@@ -251,6 +277,11 @@ private enum PlayerDragMode { case undecided, active, ignored }
     @State private var artworkMode = PlayerDragMode.undecided
     @GestureState private var artworkTouching = false
     @State private var slideDirection: CGFloat = 1
+    /// A scrubber/volume drag is in progress: never start a swipe-down meanwhile.
+    @State private var sliderEditing = false
+    /// Measured height of title + controls; the artwork gets whatever is left.
+    @State private var belowArtworkHeight: CGFloat = 340
+    @AccessibilityFocusState private var titleFocused: Bool
 
     private var hero: Bool { !reduceMotion }
 
@@ -261,7 +292,7 @@ private enum PlayerDragMode { case undecided, active, ignored }
             ZStack(alignment: .top) {
                 // What shows behind the card while it is dragged down.
                 Color.black.opacity(0.5 * (1 - progress)).ignoresSafeArea()
-                card(width: geometry.size.width, radius: min(38, dragOffset * 0.35))
+                card(width: geometry.size.width, insets: geometry.safeAreaInsets, radius: min(38, dragOffset * 0.35))
                     .offset(y: dragOffset)
                     .scaleEffect(reduceMotion ? 1 : 1 - progress * 0.08, anchor: .top)
             }
@@ -279,20 +310,31 @@ private enum PlayerDragMode { case undecided, active, ignored }
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { onCollapse() }
         .accessibilityIdentifier("nowPlayingView")
+        .onAppear {
+            // VoiceOver: land on the song title once the expand animation settles.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { titleFocused = true }
+        }
     }
 
-    private func card(width: CGFloat, radius: CGFloat) -> some View {
+    private func card(width: CGFloat, insets: EdgeInsets, radius: CGFloat) -> some View {
         VStack(spacing: 0) {
             header
-            if showLyrics { lyricsLayout } else { artworkLayout(width: width) }
+            if showLyrics { lyricsLayout } else { artworkLayout }
         }
         .foregroundStyle(.white)
         .tint(.white)
         .background {
-            NowPlayingBackground(look: look, reduceMotion: reduceMotion)
-                .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-                .playerHero("container", in: namespace, enabled: hero)
-                .ignoresSafeArea()
+            GeometryReader { proxy in
+                // The hero frame IS the full-screen frame (safe area included), so the
+                // expand animation ends exactly where the background stays: no jump
+                // when a trailing ignoresSafeArea would otherwise resize it.
+                NowPlayingBackground(look: look, reduceMotion: reduceMotion)
+                    .frame(width: proxy.size.width + insets.leading + insets.trailing,
+                           height: proxy.size.height + insets.top + insets.bottom)
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                    .playerHero("container", in: namespace, enabled: hero)
+                    .padding(EdgeInsets(top: -insets.top, leading: -insets.leading, bottom: -insets.bottom, trailing: -insets.trailing))
+            }
         }
     }
 
@@ -332,27 +374,44 @@ private enum PlayerDragMode { case undecided, active, ignored }
 
     // MARK: Artwork mode
 
-    private func artworkLayout(width: CGFloat) -> some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 22) {
-                bigArtwork(side: max(120, min(width - 56, 420)))
-                    .padding(.top, 10)
-                metadata(large: true)
-                controls(compact: false)
-            }
-            .padding(.horizontal, 28).padding(.bottom, 28)
-            .frame(maxWidth: 560).frame(maxWidth: .infinity)
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(key: NowPlayingScrollTopKey.self, value: proxy.frame(in: .named("nowPlayingScroll")).minY)
+    /// Fits the screen without scrolling at default Dynamic Type: the artwork
+    /// shrinks to the height left after title + controls. Only when even a
+    /// minimum artwork does not fit (large text, landscape) does it scroll.
+    private var artworkLayout: some View {
+        GeometryReader { box in
+            let horizontal: CGFloat = 28
+            let topPadding: CGFloat = 10, gap: CGFloat = 22, bottomPadding: CGFloat = 16
+            let widthLimit = min(box.size.width - horizontal * 2, 420)
+            let heightLimit = box.size.height - belowArtworkHeight - topPadding - gap - bottomPadding
+            let side = max(120, min(widthLimit, heightLimit))
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 0) {
+                    bigArtwork(side: side)
+                        .padding(.top, topPadding)
+                    Spacer(minLength: gap)
+                    VStack(spacing: 22) {
+                        metadata(large: true)
+                        controls(compact: false)
+                    }
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: NowPlayingBelowArtworkKey.self, value: proxy.size.height)
+                        }
+                    }
+                }
+                .padding(.horizontal, horizontal).padding(.bottom, bottomPadding)
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity, minHeight: box.size.height, alignment: .top)
+                .background(alignment: .topLeading) {
+                    PlayerScrollViewTuner { atTop in scrollAtTop = atTop }
+                        .frame(width: 1, height: 1).accessibilityHidden(true)
                 }
             }
+            .scrollBounceBehavior(.basedOnSize)
+            .accessibilityIdentifier("nowPlayingScroll")
         }
-        .coordinateSpace(.named("nowPlayingScroll"))
-        .scrollBounceBehavior(.basedOnSize)
-        .onPreferenceChange(NowPlayingScrollTopKey.self) { value in
-            let atTop = value >= -1
-            if atTop != scrollAtTop { scrollAtTop = atTop }
+        .onPreferenceChange(NowPlayingBelowArtworkKey.self) { value in
+            if value > 0, abs(value - belowArtworkHeight) > 0.5 { belowArtworkHeight = value }
         }
         .transition(.opacity)
     }
@@ -420,7 +479,14 @@ private enum PlayerDragMode { case undecided, active, ignored }
             .contentShape(Rectangle())
             .background { zoneReporter }
             Group {
-                if let custom = slots.lyrics { custom().padding(.horizontal, 20) }
+                if let custom = slots.lyrics {
+                    // Legacy lyrics view: keep its first line clear of the header row.
+                    custom().padding(.horizontal, 20).padding(.top, 10)
+                        .mask {
+                            LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.06),
+                                                   .init(color: .black, location: 1)], startPoint: .top, endPoint: .bottom)
+                        }
+                }
                 else { TimedLyricsView(player: player, reduceMotion: reduceMotion) }
             }
             .frame(maxWidth: 640, maxHeight: .infinity)
@@ -439,6 +505,8 @@ private enum PlayerDragMode { case undecided, active, ignored }
                 Text(track.title).font(large ? .title2.weight(.bold) : .headline).lineLimit(large ? 2 : 1)
                 Text(track.artist).font(large ? .title3 : .subheadline).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityFocused($titleFocused)
             .id(track.id)
             .transition(.opacity)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -450,9 +518,9 @@ private enum PlayerDragMode { case undecided, active, ignored }
 
     private func controls(compact: Bool) -> some View {
         VStack(spacing: compact ? 12 : 20) {
-            PlayerScrubber(position: player.position, duration: player.duration, disabled: player.isBusy, reduceMotion: reduceMotion) { value in
-                player.seek(to: value)
-            }
+            PlayerScrubber(trackID: track.id, position: player.position, duration: player.duration, disabled: player.isBusy,
+                           reduceMotion: reduceMotion, onEditingChanged: { sliderEditing = $0 },
+                           onSeek: { value in player.seek(to: value) })
             transport(compact: compact)
             if let status = slots.status { status() }
             if !compact { volume }
@@ -493,7 +561,10 @@ private enum PlayerDragMode { case undecided, active, ignored }
 
     @ViewBuilder private var volume: some View {
         if let custom = slots.volume { custom() }
-        else { PlayerVolumeSlider(volume: player.volume, reduceMotion: reduceMotion) { player.setVolume($0) } }
+        else {
+            PlayerVolumeSlider(volume: player.volume, reduceMotion: reduceMotion,
+                               onEditingChanged: { sliderEditing = $0 }, onChange: { player.setVolume($0) })
+        }
     }
 
     private var footer: some View {
@@ -555,7 +626,8 @@ private enum PlayerDragMode { case undecided, active, ignored }
                     // Lyrics scroll on their own: there only the header/artwork row starts a dismiss.
                     let inHeader = value.startLocation.y <= headerZone
                     let allowed = showLyrics ? inHeader : (scrollAtTop || inHeader)
-                    dragMode = downward && allowed && !dismissing ? .active : .ignored
+                    // A scrubber/volume drag that drifts downward seeks; it never dismisses.
+                    dragMode = downward && allowed && !dismissing && !sliderEditing ? .active : .ignored
                 }
                 guard dragMode == .active else { return }
                 dragOffset = max(0, value.translation.height)

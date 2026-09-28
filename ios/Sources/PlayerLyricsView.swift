@@ -9,7 +9,12 @@ import UIKit
     let reduceMotion: Bool
     @State private var following = true
     @State private var resumeTask: Task<Void, Never>?
+    /// Line the user tapped: shown as current until the (possibly async) seek
+    /// catches up, so the highlight never bounces back to the old line.
+    @State private var heldIndex: Int?
     static var resumeDelay: Duration { .milliseconds(3500) }
+
+    private var displayedIndex: Int? { heldIndex ?? player.currentLyricIndex }
 
     var body: some View {
         Group {
@@ -20,6 +25,15 @@ import UIKit
             }
         }
         .onDisappear { resumeTask?.cancel(); resumeTask = nil }
+        .onChange(of: player.currentLyricIndex) { _, index in
+            if let held = heldIndex, index == held { heldIndex = nil }
+        }
+        .task(id: heldIndex) {
+            // A seek that never lands (remote player, error) must not pin the line forever.
+            guard heldIndex != nil else { return }
+            try? await Task.sleep(for: .seconds(3))
+            if !Task.isCancelled { heldIndex = nil }
+        }
     }
 
     private var placeholder: some View {
@@ -39,10 +53,11 @@ import UIKit
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: false) {
                     // Equatable: playback ticks do not rebuild the lines, only a new current line does.
-                    TimedLyricLinesColumn(lines: lyrics.lines, current: player.currentLyricIndex, reduceMotion: reduceMotion,
+                    TimedLyricLinesColumn(lines: lyrics.lines, current: displayedIndex, reduceMotion: reduceMotion,
                                           topInset: geometry.size.height * 0.30, bottomInset: geometry.size.height * 0.62) { index in
                         guard lyrics.lines.indices.contains(index) else { return }
                         PlayerHaptics.tap()
+                        heldIndex = index
                         player.seek(to: lyrics.lines[index].start)
                         resumeTask?.cancel(); resumeTask = nil
                         following = true
@@ -50,10 +65,16 @@ import UIKit
                     }
                     .equatable()
                     .background(alignment: .topLeading) {
-                        PlayerScrollPanObserver(onBegan: userBeganScrolling, onEnded: userEndedScrolling)
-                            .frame(width: 1, height: 1).accessibilityHidden(true)
+                        if #available(iOS 18.0, *) {
+                            EmptyView()
+                        } else {
+                            // iOS 17 fallback: UIKit pan + end of deceleration.
+                            PlayerScrollPanObserver(onBegan: userBeganScrolling, onEnded: userEndedScrolling)
+                                .frame(width: 1, height: 1).accessibilityHidden(true)
+                        }
                     }
                 }
+                .modifier(LyricsScrollPhaseModifier(onBegan: userBeganScrolling, onEnded: userEndedScrolling))
                 .mask {
                     LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.1),
                                            .init(color: .black, location: 0.85), .init(color: .clear, location: 1)],
@@ -63,14 +84,14 @@ import UIKit
                     // After the first layout pass, so scrollTo knows the row frames.
                     DispatchQueue.main.async { scroll(proxy, to: player.currentLyricIndex ?? 0, animated: false) }
                 }
-                .onChange(of: player.currentLyricIndex) { _, index in
+                .onChange(of: displayedIndex) { _, index in
                     if following { scroll(proxy, to: index, animated: true) }
                 }
                 .onChange(of: following) { _, enabled in
-                    if enabled { scroll(proxy, to: player.currentLyricIndex, animated: true) }
+                    if enabled { scroll(proxy, to: displayedIndex, animated: true) }
                 }
                 .onChange(of: player.track?.id) { _, _ in
-                    resumeTask?.cancel(); resumeTask = nil; following = true
+                    resumeTask?.cancel(); resumeTask = nil; following = true; heldIndex = nil
                     DispatchQueue.main.async { scroll(proxy, to: player.currentLyricIndex ?? 0, animated: false) }
                 }
             }
@@ -97,6 +118,27 @@ import UIKit
             try? await Task.sleep(for: Self.resumeDelay)
             guard !Task.isCancelled else { return }
             following = true
+        }
+    }
+}
+
+/// iOS 18+: pause on a user drag, resume timer starts only when scrolling is
+/// fully idle (after deceleration). Programmatic scrollTo reports `.animating`
+/// and is ignored.
+private struct LyricsScrollPhaseModifier: ViewModifier {
+    let onBegan: () -> Void
+    let onEnded: () -> Void
+    @ViewBuilder func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { old, new in
+                switch new {
+                case .interacting: onBegan()
+                case .idle where old == .interacting || old == .decelerating: onEnded()
+                default: break
+                }
+            }
+        } else {
+            content
         }
     }
 }
@@ -184,13 +226,26 @@ struct PlayerScrollPanObserver: UIViewRepresentable {
             scrollView = found
         }
         func detach() {
+            decelerationTimer?.invalidate(); decelerationTimer = nil
             scrollView?.panGestureRecognizer.removeTarget(self, action: #selector(panned(_:)))
             scrollView = nil
         }
+        private var decelerationTimer: Timer?
         @objc private func panned(_ gesture: UIPanGestureRecognizer) {
             switch gesture.state {
-            case .began: onBegan()
-            case .ended, .cancelled, .failed: onEnded()
+            case .began:
+                decelerationTimer?.invalidate(); decelerationTimer = nil
+                onBegan()
+            case .ended, .cancelled, .failed:
+                // Report the end only once the flick has stopped decelerating.
+                decelerationTimer?.invalidate()
+                decelerationTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
+                    guard let self = self else { timer.invalidate(); return }
+                    if self.scrollView?.isDecelerating != true {
+                        timer.invalidate(); self.decelerationTimer = nil
+                        self.onEnded()
+                    }
+                }
             default: break
             }
         }

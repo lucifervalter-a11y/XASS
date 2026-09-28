@@ -95,15 +95,18 @@ enum NativeRootOverlay: Equatable {
     /// picker from `ux/device-picker-remote`). Hides the whole player layer.
     case devicePicker
     case transferBanner
+    /// Login / enrollment sheet: highest priority, the whole player layer yields.
+    case accountSheet
 
-    /// Priority: picker > Now Playing > transfer banner > mini player.
+    /// Priority: account sheet > picker > Now Playing > transfer banner > mini player.
     /// While Now Playing is open, transfer progress is shown inside it.
-    static func resolve(hasTrack: Bool, expanded: Bool, devicePicker: Bool, transferActive: Bool) -> NativeRootOverlay {
+    static func resolve(hasTrack: Bool, expanded: Bool, devicePicker: Bool, transferActive: Bool,
+                        accountSheet: Bool = false) -> NativeRootOverlay {
+        if accountSheet { return .accountSheet }
         if devicePicker { return .devicePicker }
         if expanded && hasTrack { return .nowPlaying }
         if transferActive { return .transferBanner }
         return hasTrack ? .miniPlayer : .hidden
     }
 
-    var reservesMiniPlayerSpace: Bool { self == .miniPlayer || self == .nowPlaying }
 }

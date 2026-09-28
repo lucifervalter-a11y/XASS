@@ -15,6 +15,9 @@ final class NativePlayerOverlayTests: XCTestCase {
         // Collapsed: the banner replaces the mini player instead of stacking with it.
         XCTAssertEqual(O.resolve(hasTrack: true, expanded: false, devicePicker: false, transferActive: true), .transferBanner)
         XCTAssertEqual(O.resolve(hasTrack: false, expanded: true, devicePicker: false, transferActive: false), .hidden)
+        // Enrollment (401 / account) outranks everything, including Now Playing.
+        XCTAssertEqual(O.resolve(hasTrack: true, expanded: true, devicePicker: true, transferActive: true, accountSheet: true), .accountSheet)
+        XCTAssertEqual(O.resolve(hasTrack: true, expanded: true, devicePicker: false, transferActive: false, accountSheet: true), .accountSheet)
     }
 
     func testTimedLyricsIndexFollowsStartTimes() {
@@ -57,5 +60,16 @@ final class NativePlayerOverlayTests: XCTestCase {
         XCTAssertEqual(look.colors.count, 3)
         XCTAssertNotNil(look.blurred)
         XCTAssertEqual(look.key, "red")
+    }
+
+    func testShellSheetPriorityKeepsEnrollmentOnTop() {
+        typealias S = NativeShellSheet
+        XCTAssertNil(S.resolve(enrollment: false, route: false, actionsTrackID: nil, queue: false))
+        XCTAssertEqual(S.resolve(enrollment: true, route: true, actionsTrackID: 7, queue: true), .enrollment)
+        XCTAssertEqual(S.resolve(enrollment: true, route: false, actionsTrackID: nil, queue: true), .enrollment)
+        XCTAssertEqual(S.resolve(enrollment: false, route: true, actionsTrackID: 7, queue: true), .route)
+        XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: 7, queue: true), .actions(7))
+        XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: nil, queue: true), .queue)
+        XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: nil, queue: false, fixtureAlbums: true), .fixtureAlbums)
     }
 }
