@@ -33,7 +33,7 @@ import UIKit
     @Published var showPlayer = false
     @Published var currentID: Int? { didSet { if oldValue != currentID { lyricsTrackChanged() } } }
     /// Synced lyrics for the current track (prefetches the next one).
-    let lyrics: TimedLyricsStore
+    let lyrics: SyncedLyricsStore
     @Published var selectedDevice = "local"
     @Published private(set) var canonicalClientID = ""
     @Published private(set) var canRecoverPlayback = false
@@ -121,7 +121,7 @@ import UIKit
 
     init(api: OwnerService, audio: AudioController) {
         self.api = api; self.audio = audio; authorization = NativeActionAuthorization(api: api)
-        lyrics = TimedLyricsStore(namespace: api.origin.namespace)
+        lyrics = SyncedLyricsStore(namespace: api.origin.namespace)
         lyrics.attach(api)
         sessionKey = Self.persistedID("native-player-", origin: api.origin)
         clientID = Self.persistedID("native-client-", origin: api.origin)

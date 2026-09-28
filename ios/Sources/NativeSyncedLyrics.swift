@@ -4,7 +4,7 @@ import CoreFoundation
 import Combine
 
 /// One synced line. `start`/`end` are seconds into the track.
-struct TimedLyricLine: Identifiable, Equatable, Codable {
+struct SyncedLyricLine: Identifiable, Equatable, Codable {
     let id: Int
     let start: Double
     let end: Double
@@ -13,24 +13,24 @@ struct TimedLyricLine: Identifiable, Equatable, Codable {
 
 /// Apple-Music-style lyrics for one track, as returned by
 /// `GET /api/mini/music/tracks/{id}/timed-lyrics` and cached on disk.
-struct TimedLyrics: Equatable, Codable {
+struct SyncedLyrics: Equatable, Codable {
     let trackID: Int
     /// synced | plain | instrumental | not_found | unavailable | insufficient_metadata
     let status: String
     let synced: Bool
     let source: String
-    let lines: [TimedLyricLine]
+    let lines: [SyncedLyricLine]
     let text: String
     var cachedAt: Date = Date()
 
-    init(trackID: Int, status: String, synced: Bool, source: String, lines: [TimedLyricLine], text: String, cachedAt: Date = Date()) {
+    init(trackID: Int, status: String, synced: Bool, source: String, lines: [SyncedLyricLine], text: String, cachedAt: Date = Date()) {
         self.trackID = trackID; self.status = status; self.synced = synced; self.source = source
         self.lines = lines; self.text = text; self.cachedAt = cachedAt
     }
 
     init?(response: [String: Any], trackID: Int) {
         guard let value = response["lyrics"] as? [String: Any] else { return nil }
-        var parsed: [TimedLyricLine] = []
+        var parsed: [SyncedLyricLine] = []
         for row in (value["lines"] as? [[String: Any]] ?? []).prefix(2000) {
             func seconds(_ raw: Any?) -> Double {
                 guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else { return -1 }
@@ -38,10 +38,10 @@ struct TimedLyrics: Equatable, Codable {
             }
             let start = seconds(row["start"]), end = seconds(row["end"])
             guard start >= 0, start <= 86_400, end >= start, let text = row["text"] as? String, !text.isEmpty else { continue }
-            parsed.append(TimedLyricLine(id: parsed.count, start: start, end: end, text: String(text.prefix(500))))
+            parsed.append(SyncedLyricLine(id: parsed.count, start: start, end: end, text: String(text.prefix(500))))
         }
         parsed.sort { $0.start < $1.start }
-        lines = parsed.enumerated().map { TimedLyricLine(id: $0.offset, start: $0.element.start, end: $0.element.end, text: $0.element.text) }
+        lines = parsed.enumerated().map { SyncedLyricLine(id: $0.offset, start: $0.element.start, end: $0.element.end, text: $0.element.text) }
         self.trackID = trackID
         let raw = value["status"] as? String ?? "not_found"
         status = ["synced", "plain", "instrumental", "not_found", "unavailable", "insufficient_metadata"].contains(raw) ? raw : "not_found"
@@ -79,8 +79,8 @@ struct TimedLyrics: Equatable, Codable {
 
 /// Loads, caches (disk, per server + track) and prefetches synced lyrics, and
 /// publishes the active line for the current playback position.
-@MainActor final class TimedLyricsStore: ObservableObject {
-    @Published private(set) var current: TimedLyrics?
+@MainActor final class SyncedLyricsStore: ObservableObject {
+    @Published private(set) var current: SyncedLyrics?
     @Published private(set) var currentTrackID: Int?
     @Published private(set) var loading = false
     @Published private(set) var error: String?
@@ -90,8 +90,8 @@ struct TimedLyrics: Equatable, Codable {
 
     static let foundTTL: TimeInterval = 14 * 86_400
     static let missTTL: TimeInterval = 6 * 3_600
-    private var memory: [Int: TimedLyrics] = [:]
-    private var inflight: [Int: Task<TimedLyrics?, Never>] = [:]
+    private var memory: [Int: SyncedLyrics] = [:]
+    private var inflight: [Int: Task<SyncedLyrics?, Never>] = [:]
     private let directory: URL?
     private weak var api: OwnerService?
 
@@ -131,7 +131,7 @@ struct TimedLyrics: Equatable, Codable {
     }
 
     /// Awaitable load (used by retry paths and tests).
-    @discardableResult func load(_ id: Int) async -> TimedLyrics? {
+    @discardableResult func load(_ id: Int) async -> SyncedLyrics? {
         let value = await fetch(id)
         if currentTrackID == id, let value = value { current = value }
         return value
@@ -158,30 +158,30 @@ struct TimedLyrics: Equatable, Codable {
         if index != currentLyricIndex { currentLyricIndex = index }
     }
 
-    func cached(_ id: Int) -> TimedLyrics? {
+    func cached(_ id: Int) -> SyncedLyrics? {
         if let value = memory[id], fresh(value) { return value }
         guard let file = file(id), let data = try? Data(contentsOf: file),
-              let value = try? JSONDecoder().decode(TimedLyrics.self, from: data), value.trackID == id else { return nil }
+              let value = try? JSONDecoder().decode(SyncedLyrics.self, from: data), value.trackID == id else { return nil }
         memory[id] = value
         // Stale disk entries still display offline; fetch() refreshes them.
         return value
     }
 
-    private func fresh(_ value: TimedLyrics) -> Bool {
+    private func fresh(_ value: SyncedLyrics) -> Bool {
         let ttl = value.synced || value.status == "plain" || value.status == "instrumental" ? Self.foundTTL : Self.missTTL
         return Date().timeIntervalSince(value.cachedAt) < ttl
     }
 
     private func file(_ id: Int) -> URL? { directory?.appendingPathComponent("\(max(0, id)).json") }
 
-    private func fetch(_ id: Int) async -> TimedLyrics? {
+    private func fetch(_ id: Int) async -> SyncedLyrics? {
         if let value = memory[id], fresh(value) { return value }
         if let running = inflight[id] { return await running.value }
         guard let api = api else { return nil }
-        let task = Task<TimedLyrics?, Never> { @MainActor in
+        let task = Task<SyncedLyrics?, Never> { @MainActor in
             do {
                 let response = try await api.request("/api/mini/music/tracks/\(id)/timed-lyrics", method: "GET", body: nil)
-                return TimedLyrics(response: response, trackID: id)
+                return SyncedLyrics(response: response, trackID: id)
             } catch { return nil }
         }
         inflight[id] = task
@@ -196,91 +196,5 @@ struct TimedLyrics: Equatable, Codable {
             }
         }
         return memory[id]
-    }
-}
-
-/// Simple, working synced-lyrics screen: auto-scrolls to the active line,
-/// highlights it, and seeks when a line is tapped. The visual design can be
-/// replaced freely; everything it needs lives in `TimedLyricsStore`.
-@MainActor struct NativeTimedLyricsView: View {
-    @ObservedObject var store: NativeStore
-    @ObservedObject var lyrics: TimedLyricsStore
-    var onMore: (() -> Void)? = nil
-    @State private var following = true
-
-    var body: some View {
-        Group {
-            if let value = lyrics.current, value.trackID == store.currentID, !value.isEmpty {
-                if value.synced { syncedList(value) } else { plain(value) }
-            } else if lyrics.loading {
-                ProgressView("Ищем текст песни…").frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "quote.bubble").font(.system(size: 32)).foregroundStyle(.white.opacity(0.5))
-                    Text(lyrics.current?.status == "instrumental" ? "Инструментальная композиция" : "Текст пока не найден").font(.title3.weight(.semibold))
-                    if let error = lyrics.error { Text(error).font(.callout).multilineTextAlignment(.center).foregroundStyle(.white.opacity(0.65)) }
-                    HStack {
-                        Button("Повторить") { lyrics.retry() }
-                        if let onMore = onMore { Button("Найти или расшифровать") { onMore() } }
-                    }.font(.callout.weight(.semibold))
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }.foregroundStyle(.white).accessibilityIdentifier("nativeTimedLyrics")
-            .onReceive(Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()) { now in
-                // Smooth between 0.5 s AVPlayer ticks and 5 s PC heartbeats.
-                let clock = store.playback
-                let position = NativeLyricsClock.position(clock.position, duration: clock.duration, playing: store.playing,
-                    sampledAt: clock.sampleAt, now: now, projectionLimit: clock.projectionLimit)
-                lyrics.tick(position: position, trackID: store.currentID)
-            }
-    }
-
-    private func syncedList(_ value: TimedLyrics) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 20) {
-                    ForEach(value.lines) { line in
-                        let active = lyrics.currentLyricIndex == line.id
-                        Button {
-                            following = true
-                            store.run { try await store.seek(line.start) }
-                        } label: {
-                            Text(line.text).font(.title2.weight(.bold)).multilineTextAlignment(.leading)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .foregroundStyle(.white.opacity(active ? 1 : 0.35))
-                                .scaleEffect(active ? 1 : 0.97, anchor: .leading)
-                                .animation(.easeOut(duration: 0.25), value: active)
-                        }.buttonStyle(.plain).id(line.id)
-                            .accessibilityIdentifier("timed-lyric-\(line.id)")
-                            .accessibilityValue(active ? "Текущая строка" : "")
-                    }
-                }.padding(.vertical, 140).padding(.horizontal, 8)
-            }.scrollIndicators(.hidden)
-                .simultaneousGesture(DragGesture(minimumDistance: 14).onChanged { _ in following = false })
-                .onChange(of: lyrics.currentLyricIndex) { _, index in
-                    guard following, let index = index else { return }
-                    withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) }
-                }
-                .onAppear { if let index = lyrics.currentLyricIndex { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) } }
-                .overlay(alignment: .bottomTrailing) {
-                    if !following {
-                        Button {
-                            following = true
-                            if let index = lyrics.currentLyricIndex { withAnimation { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) } }
-                        } label: { Label("К текущей строке", systemImage: "arrow.uturn.backward").font(.caption.weight(.semibold)).padding(8).background(.white.opacity(0.16), in: Capsule()) }
-                            .buttonStyle(.plain).padding(8)
-                    }
-                }
-        }
-    }
-
-    private func plain(_ value: TimedLyrics) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(value.text).font(.title3.weight(.semibold)).lineSpacing(8).textSelection(.enabled).foregroundStyle(.white.opacity(0.88))
-                Text("Текст без таймкодов").font(.caption).foregroundStyle(.white.opacity(0.5))
-                if let onMore = onMore { Button("Найти или расшифровать") { onMore() }.font(.caption.weight(.semibold)) }
-            }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 }

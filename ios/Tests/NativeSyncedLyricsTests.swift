@@ -1,7 +1,7 @@
 import XCTest
 @testable import XASS
 
-@MainActor private final class TimedLyricsFixture: OwnerService {
+@MainActor private final class SyncedLyricsFixture: OwnerService {
     let origin = try! ServerOrigin("https://timed-lyrics-fixture.invalid")
     var calls = 0
     func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
@@ -12,9 +12,9 @@ import XCTest
     }
 }
 
-final class NativeTimedLyricsTests: XCTestCase {
+final class NativeSyncedLyricsTests: XCTestCase {
     func testParsingSortsLinesAndFindsActiveLineWithGaps() {
-        let value = TimedLyrics(response: ["lyrics": ["status": "synced", "synced": true, "source": "lrclib",
+        let value = SyncedLyrics(response: ["lyrics": ["status": "synced", "synced": true, "source": "lrclib",
             "lines": [["start": 12.0, "end": 15.5, "text": "B"], ["start": 1.0, "end": 4.0, "text": "A"]]]], trackID: 4)!
         XCTAssertEqual(value.lines.map(\.text), ["A", "B"])
         XCTAssertNil(value.lineIndex(at: 0.5))
@@ -29,8 +29,8 @@ final class NativeTimedLyricsTests: XCTestCase {
     @MainActor func testStoreCachesOnDiskAndPublishesActiveLine() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("timed-lyrics-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let api = TimedLyricsFixture()
-        let store = TimedLyricsStore(namespace: "fixture", root: root)
+        let api = SyncedLyricsFixture()
+        let store = SyncedLyricsStore(namespace: "fixture", root: root)
         store.attach(api)
         store.trackChanged(to: 4, next: nil)
         let loaded = await store.load(4)
@@ -40,7 +40,7 @@ final class NativeTimedLyricsTests: XCTestCase {
         XCTAssertEqual(store.currentLyricIndex, 1)
         store.tick(position: 13, trackID: 5)
         XCTAssertNil(store.currentLyricIndex, "Another track never highlights these lines")
-        let second = TimedLyricsStore(namespace: "fixture", root: root)
+        let second = SyncedLyricsStore(namespace: "fixture", root: root)
         XCTAssertEqual(second.cached(4)?.lines.map(\.text), ["A", "B"], "Offline playback reads the disk cache")
         XCTAssertEqual(api.calls, 1)
     }
