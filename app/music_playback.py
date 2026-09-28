@@ -2,9 +2,12 @@
 from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
+import ipaddress
 import math
+import re
 import secrets
-from typing import Literal
+from typing import Any, Literal
+from urllib.parse import parse_qs, urlsplit
 from weakref import WeakValueDictionary
 
 from fastapi import Depends, HTTPException, Request
@@ -142,6 +145,67 @@ async def current_session(session):
     return result
 
 
+_LAN_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,64}\Z")
+_RFC1918 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _private_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    try:
+        value = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if not isinstance(value, ipaddress.IPv4Address):
+        return None
+    if not any(value in network for network in _RFC1918):
+        return None
+    return value
+
+
+def lan_media_url(host: Any, port: Any, token: Any, track_id: Any) -> str | None:
+    """Build one canonical private URL, or drop the offer. Never raises."""
+    if isinstance(port, bool) or isinstance(track_id, bool):
+        return None
+    if not isinstance(host, str) or not isinstance(token, str) or not _LAN_TOKEN.fullmatch(token):
+        return None
+    address = _private_ipv4(host)
+    if address is None or host != str(address):
+        return None
+    try:
+        number = int(port)
+        track = int(track_id)
+    except (TypeError, ValueError):
+        return None
+    if not 1024 <= number <= 65535 or not 0 < track < 2**63:
+        return None
+    return f"http://{address}:{number}/xass-lan/{track}?token={token}"
+
+
+def canonical_lan_url(value: Any, track_id: Any) -> str | None:
+    """Re-check a stored offer. A public, loopback or rewritten URL is omitted."""
+    if isinstance(track_id, bool) or not isinstance(value, str) or len(value) > 300:
+        return None
+    if any(ord(char) <= 32 or ord(char) == 127 for char in value) or "\\" in value:
+        return None
+    try:
+        track = int(track_id)
+        parts = urlsplit(value)
+        if (parts.scheme != "http" or parts.username is not None or parts.password is not None
+                or parts.fragment or not parts.hostname or parts.port is None
+                or parts.path != f"/xass-lan/{track}"):
+            return None
+        query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    token = query.get("token", [])
+    if set(query) != {"token"} or len(token) != 1:
+        return None
+    return lan_media_url(parts.hostname, parts.port, token[0], track)
+
+
 async def pending_handoff(session, session_key):
     meta = await session.get(MusicPlaybackState, 1)
     transfer = await session.get(MusicTransfer, meta.transfer_id) if meta and meta.transfer_id else None
@@ -161,6 +225,11 @@ class TransferBody(BaseModel):
     autoplay: bool = True
     queue: list[int] | None = Field(default=None, max_length=2000)
     repeat_mode: Literal["off", "one", "all"] = "off"
+    # Optional same-LAN file offer. Invalid values are dropped, not a 422:
+    # the paired server stream still has to start playback.
+    lan_host: str | None = Field(default=None, max_length=256)
+    lan_port: int | None = None
+    lan_token: str | None = Field(default=None, max_length=256)
 
 
 class TransferAck(BaseModel):
@@ -224,7 +293,8 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
             try:
                 sent = await control(control_body(source_name=target["device"][6:], action="play",
                     track_id=target["track_id"], output_id=target["output_id"], position_sec=transfer.position,
-                    volume=target["volume"], expires_at=int(aware(transfer.created_at).timestamp()) + 30), request, user, session)
+                    volume=target["volume"], expires_at=int(aware(transfer.created_at).timestamp()) + 30,
+                    lan_url=target.get("lan_url") or None), request, user, session)
                 transfer.start_command_id = sent["command_id"]
                 await session.commit()
             except HTTPException as exc:
@@ -292,6 +362,9 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                 await cancel_agent_queue(session, item.device[6:])
                 state = await current_session(session)
             target = payload.model_dump()
+            offer = lan_media_url(target.pop("lan_host", None), target.pop("lan_port", None), target.pop("lan_token", None), track_id)
+            if offer:
+                target["lan_url"] = offer
             target["track_id"] = track_id
             target["preserve_position"] = payload.position is None and state.get("track_id") == track_id
             position = payload.position if payload.position is not None else state.get("position", 0) if target["preserve_position"] else 0

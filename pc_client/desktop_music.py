@@ -1,4 +1,4 @@
-"""Local music page. Files on this PC play here; the server is not involved."""
+"""Music page. Local files play here. A track sent from the phone is shown and controlled through the agent."""
 from __future__ import annotations
 
 import json
@@ -31,6 +31,41 @@ STATE_LABELS = {
     "stopped": "Остановлено",
     "ended": "Трек закончился",
 }
+CAST_LABELS = {
+    "loading": "Загрузка с телефона",
+    "playing": "Играет на этом компьютере",
+    "paused": "Пауза",
+    "error": "Не удалось включить",
+}
+
+
+def _cast_status() -> dict:
+    try:
+        from music_bridge import read_playback
+        payload = read_playback()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _cast_live(status: dict) -> bool:
+    state = str(status.get("state") or "")
+    track = status.get("track_id")
+    return state in {"loading", "playing", "paused", "error"} and isinstance(track, int) and not isinstance(track, bool) and track > 0
+
+
+def _cast_display(status: dict) -> dict:
+    shown = dict(status)
+    if not str(shown.get("title") or "").strip():
+        shown["title"] = "Трек с телефона"
+    if not str(shown.get("artist") or "").strip():
+        shown["artist"] = "С телефона"
+    return shown
+
+
+def _send_cast(command: str, payload: dict | None = None) -> None:
+    from music_bridge import send_command
+    send_command(command, payload or {})
 
 
 def playlist_file() -> Path:
@@ -399,7 +434,37 @@ class MusicControls(tk.Frame):
 
 def build_music(app) -> None:
     player = app.local_music()
-    app._header("Музыка", "Локальные файлы. Музыка из Telegram управляется отдельно в Mini App.")
+    app._header("Музыка", "Файлы на этом компьютере и трек, который вывели с телефона.")
+    cast_state = {"status": _cast_status()}
+
+    def cast_drives() -> bool:
+        local = player.snapshot()
+        local_busy = str(local.get("state") or "") in {"loading", "playing", "paused"} and getattr(player, "_path", None)
+        return _cast_live(cast_state["status"]) and not local_busy
+
+    def shown_snapshot() -> dict:
+        if cast_drives():
+            shown = _cast_display(cast_state["status"])
+            state = str(shown.get("state") or "")
+            if shown.get("error"):
+                return shown
+            shown = dict(shown)
+            shown["error"] = ""
+            if state in CAST_LABELS:
+                shown["state"] = state
+            return shown
+        return player.snapshot()
+
+    cast_panel = RoundedPanel(app.content, bg=CARD, padx=14, pady=12)
+    cast_copy = tk.Frame(cast_panel, bg=CARD)
+    cast_copy.pack(fill="x")
+    tk.Label(cast_copy, text="С телефона", bg=CARD, fg=LILAC, font=("Segoe UI Semibold", 11)).pack(anchor="w")
+    cast_title = tk.StringVar(value="")
+    cast_meta = tk.StringVar(value="")
+    tk.Label(cast_copy, textvariable=cast_title, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 14), anchor="w").pack(fill="x", pady=(4, 0))
+    tk.Label(cast_copy, textvariable=cast_meta, bg=CARD, fg=MUTED, font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=(2, 8))
+    cast_buttons = tk.Frame(cast_panel, bg=CARD)
+    cast_buttons.pack(fill="x")
     previous = getattr(app, "_music_poll", None)
     if previous is not None:
         try:
@@ -439,7 +504,43 @@ def build_music(app) -> None:
             return
         play_path(chosen)
 
+    def cast_control(command: str, payload: dict | None = None) -> None:
+        try:
+            notice.set("")
+            _send_cast(command, payload)
+        except MusicError as exc:
+            notice.set(str(exc))
+        except Exception:
+            notice.set("Не удалось связаться с плеером компьютера")
+
+    def refresh_cast() -> None:
+        if not cast_panel.winfo_exists():
+            return
+        cast_state["status"] = _cast_status()
+        status = cast_state["status"]
+        if not _cast_live(status):
+            if cast_panel.winfo_ismapped():
+                cast_panel.pack_forget()
+            return
+        title = str(status.get("title") or "").strip() or "Трек с телефона"
+        artist = str(status.get("artist") or "").strip() or "С телефона"
+        state = str(status.get("state") or "")
+        error = str(status.get("error") or "").strip()
+        label = error or CAST_LABELS.get(state, state)
+        try:
+            position = float(status.get("position_sec") or 0)
+            duration = float(status.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            position, duration = 0.0, 0.0
+        cast_title.set(title)
+        cast_meta.set(f"{artist} · {label} · {int(position)} / {int(duration)} с")
+        if not cast_panel.winfo_ismapped():
+            cast_panel.pack(fill="x", pady=(0, 12), before=stage)
+
     def control(command: str) -> None:
+        if command == "music_stop" and cast_drives():
+            cast_control("music_stop")
+            return
         try:
             notice.set("")
             stage.show(player.command(command, {}, {}))
@@ -447,6 +548,13 @@ def build_music(app) -> None:
             notice.set(str(exc))
 
     def toggle() -> None:
+        if cast_drives():
+            state = str(cast_state["status"].get("state") or "")
+            if state == "playing":
+                cast_control("music_pause")
+            elif state in {"paused", "ended"}:
+                cast_control("music_resume")
+            return
         state = str(player.snapshot().get("state") or "idle")
         if state == "playing":
             control("music_pause")
@@ -456,6 +564,9 @@ def build_music(app) -> None:
             choose()
 
     def control_seek(seconds: float) -> None:
+        if cast_drives():
+            cast_control("music_seek", {"position_sec": seconds})
+            return
         try:
             notice.set("")
             stage.show(player.command("music_seek", {"position_sec": seconds}, {}))
@@ -463,6 +574,9 @@ def build_music(app) -> None:
             notice.set(str(exc))
 
     def control_volume(value: float) -> None:
+        if cast_drives():
+            cast_control("music_volume", {"volume": value})
+            return
         try:
             player.command("music_volume", {"volume": value}, {})
         except MusicError as exc:
@@ -586,7 +700,8 @@ def build_music(app) -> None:
         if app.current_view != "music" or not stage.winfo_exists():
             app._music_poll = None
             return
-        snapshot = player.snapshot()
+        refresh_cast()
+        snapshot = shown_snapshot()
         job = getattr(app, "_local_music_job", None)
         if job is not None and job.done.is_set():
             app._local_music_job = None
@@ -599,6 +714,17 @@ def build_music(app) -> None:
             refresh_rows()
         app._music_poll = app.root.after(250, tick)
 
+    def cast_button(text: str, command) -> None:
+        ModernButton(
+            cast_buttons, text=text, command=command,
+            bg="#252529", fg=TEXT, activebackground="#33333a", parent_bg=CARD,
+            border_color="#44444c", padx=14, pady=8, font=("Segoe UI Semibold", 10),
+        ).pack(side="left", padx=(0, 8))
+
+    cast_button("Пауза", lambda: cast_control("music_pause"))
+    cast_button("Дальше", lambda: cast_control("music_resume"))
+    cast_button("Стоп", lambda: cast_control("music_stop"))
     refresh_rows()
-    stage.show(player.snapshot())
+    refresh_cast()
+    stage.show(shown_snapshot())
     app._music_poll = app.root.after(250, tick)

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import CoreFoundation
 
 struct NativeLyrics: Equatable {
@@ -132,6 +133,8 @@ struct NativeLyricsFollowing: Equatable {
     @State private var retry = 0
     @State private var showInformation = false
     @State private var following = NativeLyricsFollowing()
+    @State private var activeLine: Int?
+    @State private var lyricHeight: CGFloat = 320
 
     var body: some View {
         Group {
@@ -143,20 +146,12 @@ struct NativeLyricsFollowing: Equatable {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let lyrics = lyrics {
                 if lyrics.empty { emptyLyrics(lyrics) }
-                else {
-                    TimelineView(.animation(minimumInterval: 0.1, paused: !store.playing || scenePhase != .active)) { context in
-                        let position = NativeLyricsClock.position(store.position, duration: store.duration,
-                            playing: store.playing && store.currentID == trackID,
-                            sampledAt: store.playbackSampleAt, now: context.date,
-                            projectionLimit: store.playbackProjectionLimit)
-                        lyricViewport(lyrics, position: position)
-                    }
-                }
+                else { lyricViewport(lyrics) }
             } else {
                 ProgressView("Ищем текст песни…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }.task(id: "\(trackID)-\(retry)-\(store.lyricsRevision)") {
-            lyrics = nil; error = nil; following.resume(); focusedLine = nil
+            lyrics = nil; error = nil; following.resume(); focusedLine = nil; activeLine = nil
             do {
                 let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "GET", body: nil)
                 try Task.checkCancellation(); lyrics = NativeLyrics(response)
@@ -194,42 +189,49 @@ struct NativeLyricsFollowing: Equatable {
         }
     }
 
-    @ViewBuilder private func lyricViewport(_ lyrics: NativeLyrics, position: Double) -> some View {
-        let active = store.currentID == trackID ? lyrics.activeLine(at: position) : nil
+    @ViewBuilder private func lyricViewport(_ lyrics: NativeLyrics) -> some View {
         ScrollViewReader { proxy in
             VStack(spacing: 6) {
-                GeometryReader { geometry in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 22) {
-                            if lyrics.synced {
-                                ForEach(lyrics.lines.filter { !$0.isPause }) { line in
-                                    lyricLine(line, lyrics: lyrics, active: active)
-                                        .id(line.id).accessibilityFocused($focusedLine, equals: line.id)
-                                }
-                            } else {
-                                Text(lyrics.text.isEmpty ? lyrics.lines.map(\.text).joined(separator: "\n") : lyrics.text)
-                                    .font(.title2.weight(.semibold)).lineSpacing(12).textSelection(.enabled)
-                                    .foregroundStyle(.white.opacity(0.88)).accessibilityIdentifier("nativePlainLyrics")
-                            }
-                        }.frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, lyrics.synced ? max(24, geometry.size.height * 0.34) : 18)
-                    }.scrollIndicators(.hidden)
-                        .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { value in
-                            following.drag(horizontal: Double(value.translation.width), vertical: Double(value.translation.height))
-                        })
-                        .mask {
-                            LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.08),
-                                .init(color: .black, location: 0.88), .init(color: .clear, location: 1)],
-                                startPoint: .top, endPoint: .bottom)
-                        }.onChange(of: active) { _, id in
-                            guard following.enabled else { return }; scroll(proxy, to: id)
-                        }.onChange(of: following.enabled) { _, enabled in
-                            if enabled { scroll(proxy, to: active) }
-                        }.onChange(of: focusedLine) { _, id in
-                            if let id = id, id != active { following.pause() }
-                        }.onAppear { scroll(proxy, to: active, animated: false) }
-                }
+                ScrollView {
+                    NativeLyricLines(store: store, clock: store.playback, lyrics: lyrics, trackID: trackID,
+                        reduceMotion: reduceMotion, scenePhase: scenePhase, focus: $focusedLine, lyricHeight: lyricHeight) { id in
+                        if activeLine != id { activeLine = id }
+                    } onSeek: { time in
+                        store.run {
+                            guard store.currentID == trackID else { return }
+                            try await store.seek(time)
+                            if store.currentID == trackID { following.resume() }
+                        }
+                    } onUserPan: {
+                        if following.enabled { following.pause() }
+                    }
+                }.scrollIndicators(.hidden)
+                    .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { value in
+                        following.drag(horizontal: Double(value.translation.width), vertical: Double(value.translation.height))
+                    })
+                    .mask {
+                        LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.08),
+                            .init(color: .black, location: 0.88), .init(color: .clear, location: 1)],
+                            startPoint: .top, endPoint: .bottom)
+                    }
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: NativeLyricHeightKey.self, value: proxy.size.height)
+                        }
+                    }
+                    .onPreferenceChange(NativeLyricHeightKey.self) { value in
+                        if value > 1, abs(lyricHeight - value) > 0.5 { lyricHeight = value }
+                    }
+                    .onChange(of: activeLine) { _, id in
+                        guard following.enabled else { return }
+                        scroll(proxy, to: id)
+                    }
+                    .onChange(of: following.enabled) { _, enabled in
+                        if enabled { scroll(proxy, to: activeLine) }
+                    }
+                    .onChange(of: focusedLine) { _, id in
+                        if let id = id, id != activeLine { following.pause() }
+                    }
                 HStack(spacing: 12) {
                     if let sourceURL = lyrics.sourceURL { Link(lyrics.sourceLabel, destination: sourceURL) }
                     else { Text(lyrics.sourceLabel) }
@@ -237,7 +239,7 @@ struct NativeLyricsFollowing: Equatable {
                     if lyrics.synced {
                         Button {
                             if following.enabled { following.pause() }
-                            else { following.resume(); scroll(proxy, to: active) }
+                            else { following.resume(); scroll(proxy, to: activeLine) }
                         } label: {
                             Label(following.enabled ? "Следить" : "К текущей строке",
                                   systemImage: following.enabled ? "waveform" : "arrow.uturn.backward")
@@ -252,15 +254,64 @@ struct NativeLyricsFollowing: Equatable {
         }
     }
 
-    private func lyricLine(_ line: NativeLyrics.Line, lyrics: NativeLyrics, active: Int?) -> some View {
+    private func scroll(_ proxy: ScrollViewProxy, to id: Int?, animated: Bool = true) {
+        guard let id = id else { return }
+        if reduceMotion || !animated { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.38)) }
+        else { withAnimation(.easeInOut(duration: 0.42)) { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.38)) } }
+    }
+}
+
+private struct NativeLyricHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+@MainActor private struct NativeLyricLines: View {
+    @ObservedObject var store: NativeStore
+    @ObservedObject var clock: NativePlaybackClock
+    let lyrics: NativeLyrics
+    let trackID: Int
+    let reduceMotion: Bool
+    let scenePhase: ScenePhase
+    var focus: AccessibilityFocusState<Int?>.Binding
+    let lyricHeight: CGFloat
+    var onActive: (Int?) -> Void
+    var onSeek: (Double) -> Void
+    var onUserPan: () -> Void
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.1, paused: !store.playing || scenePhase != .active)) { context in
+            let position = NativeLyricsClock.position(clock.position, duration: clock.duration,
+                playing: store.playing && store.currentID == trackID,
+                sampledAt: clock.sampleAt, now: context.date,
+                projectionLimit: clock.projectionLimit)
+            let active = store.currentID == trackID ? lyrics.activeLine(at: position) : nil
+            LazyVStack(alignment: .leading, spacing: 22) {
+                if lyrics.synced {
+                    ForEach(lyrics.lines.filter { !$0.isPause }) { line in
+                        lyricLine(line, active: active).id(line.id).accessibilityFocused(focus, equals: line.id)
+                    }
+                } else {
+                    Text(lyrics.text.isEmpty ? lyrics.lines.map(\.text).joined(separator: "\n") : lyrics.text)
+                        .font(.title2.weight(.semibold)).lineSpacing(12).textSelection(.enabled)
+                        .foregroundStyle(.white.opacity(0.88)).accessibilityIdentifier("nativePlainLyrics")
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, lyrics.synced ? max(24, lyricHeight * 0.34) : 18)
+                .onChange(of: active) { _, id in onActive(id) }
+                .onAppear { onActive(active) }
+        }
+        .background(alignment: .topLeading) {
+            NativeLyricsScrollLock(onUserPan: onUserPan).frame(width: 1, height: 1).accessibilityHidden(true)
+        }
+    }
+
+    private func lyricLine(_ line: NativeLyrics.Line, active: Int?) -> some View {
         let highlighted = active.map { lyrics.lines[$0].time == line.time } ?? false
         return Button {
             guard let time = lyrics.seekTime(lineID: line.id, displayedTrackID: trackID, currentTrackID: store.currentID) else { return }
-            store.run {
-                guard store.currentID == trackID else { return }
-                try await store.seek(time)
-                if store.currentID == trackID { following.resume() }
-            }
+            onSeek(time)
         } label: {
             Text(line.text).font(.title.weight(.bold)).multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
@@ -273,10 +324,49 @@ struct NativeLyricsFollowing: Equatable {
             .accessibilityValue(highlighted ? "Текущая строка" : "")
             .accessibilityHint("Перейти к этой строке в песне")
     }
+}
 
-    private func scroll(_ proxy: ScrollViewProxy, to id: Int?, animated: Bool = true) {
-        guard let id = id else { return }
-        if reduceMotion || !animated { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.38)) }
-        else { withAnimation(.easeInOut(duration: 0.42)) { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.38)) } }
+/// A finger pan pauses lyric follow. Programmatic scrollTo does not trigger this recognizer.
+private struct NativeLyricsScrollLock: UIViewRepresentable {
+    var onUserPan: () -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(onUserPan: onUserPan) }
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
+    }
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.onUserPan = onUserPan
+        DispatchQueue.main.async { [weak view] in
+            guard let view = view else { return }
+            context.coordinator.attach(from: view)
+        }
+    }
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.detach() }
+
+    final class Coordinator: NSObject {
+        var onUserPan: () -> Void
+        weak var scroll: UIScrollView?
+        init(onUserPan: @escaping () -> Void) { self.onUserPan = onUserPan }
+        func attach(from view: UIView) {
+            var current: UIView? = view
+            var found: UIScrollView?
+            while let next = current?.superview {
+                if let candidate = next as? UIScrollView { found = candidate; break }
+                current = next
+            }
+            guard let found = found, scroll !== found else { return }
+            detach()
+            found.panGestureRecognizer.addTarget(self, action: #selector(panned(_:)))
+            scroll = found
+        }
+        func detach() {
+            scroll?.panGestureRecognizer.removeTarget(self, action: #selector(panned(_:)))
+            scroll = nil
+        }
+        @objc func panned(_ gesture: UIPanGestureRecognizer) {
+            if gesture.state == .began { onUserPan() }
+        }
     }
 }

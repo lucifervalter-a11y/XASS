@@ -316,6 +316,7 @@ class XassDesktop:
         self.history: list[str] = []
         self.current_view = "overview"
         self.nav_buttons: dict[str, NavButton] = {}
+        self._seen_reveal: int | None = None
 
         self.server_var = tk.StringVar(value=str(self.config.get("server_url") or "http://127.0.0.1:8001"))
         self.name_var = tk.StringVar(value=str(self.config.get("source_name") or socket.gethostname()))
@@ -1754,7 +1755,78 @@ class XassDesktop:
             self.agent_pid_var.set("—")
             self.latency_var.set("—")
             self._set_status("Остановлен" if self.config.get("api_key") else "Требуется подключение", AMBER)
+        try:
+            self._surface_cast_playback()
+        except Exception:
+            pass
         self.root.after(750, self._refresh_agent_status)
+
+    def _surface_cast_playback(self) -> None:
+        if getattr(self, "_closing", False) or getattr(self, "preview", False):
+            return
+        from music_bridge import read_playback
+        status = read_playback()
+        if not isinstance(status, dict) or "state" not in status:
+            return
+        try:
+            reveal = int(status.get("reveal") or 0)
+        except (TypeError, ValueError):
+            reveal = 0
+        state = str(status.get("state") or "")
+        track = status.get("track_id")
+        active = state in {"loading", "playing", "paused", "error"} and isinstance(track, int) and not isinstance(track, bool) and track > 0
+        seen = getattr(self, "_seen_reveal", None)
+        surface = False
+        if seen is None:
+            self._seen_reveal = reveal
+            surface = active
+        elif reveal > seen:
+            self._seen_reveal = reveal
+            surface = True
+        elif reveal < seen:
+            self._seen_reveal = reveal
+            surface = active
+        if not surface:
+            return
+        self._show_from_tray()
+        if getattr(self, "current_view", "") != "music":
+            self.show_view("music")
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.after(500, self._drop_topmost)
+        except tk.TclError:
+            pass
+        self._flash_window()
+
+    def _drop_topmost(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.root.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    def _flash_window(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            raw = int(self.root.winfo_id())
+            parent = int(ctypes.windll.user32.GetParent(raw) or 0)
+            hwnd = parent or raw
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = (
+                    ("cbSize", ctypes.c_uint),
+                    ("hwnd", ctypes.c_void_p),
+                    ("dwFlags", ctypes.c_uint),
+                    ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint),
+                )
+
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 3, 4, 0)
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            return
 
     def _refresh_update_status(self) -> None:
         if self._closing:

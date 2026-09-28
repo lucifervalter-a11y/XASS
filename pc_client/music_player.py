@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import ipaddress
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -75,6 +77,53 @@ def approved_media_url(server_url: str, value: Any, track_id: Any) -> tuple[str,
     except (TypeError, ValueError, OverflowError):
         raise MusicError("Ссылка должна вести на музыку привязанного сервера XASS") from None
     return raw, int(track_id)
+
+
+_LAN_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,64}\Z")
+_RFC1918 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _private_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    try:
+        value = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if not isinstance(value, ipaddress.IPv4Address):
+        return None
+    if not any(value in network for network in _RFC1918):
+        return None
+    return value
+
+
+def approved_lan_url(value: Any, track_id: Any) -> str:
+    """One private HTTP offer for this track. Anything else is refused before a request."""
+    identifier = str(track_id)
+    if isinstance(track_id, bool) or not identifier.isascii() or not identifier.isdigit() or len(identifier) > 19 or not 0 < int(identifier) < 2**63:
+        raise MusicError("Некорректный номер трека")
+    if not isinstance(value, str) or len(value) > 300 or any(ord(char) <= 32 or ord(char) == 127 for char in value) or "\\" in value:
+        raise MusicError("Локальная ссылка на трек отклонена")
+    try:
+        parts = urlsplit(value)
+        if parts.scheme != "http" or parts.username is not None or parts.password is not None or parts.fragment or parts.port is None:
+            raise ValueError("url")
+        if not 1024 <= parts.port <= 65535:
+            raise ValueError("port")
+        address = _private_ipv4(parts.hostname or "")
+        if address is None or parts.hostname != str(address):
+            raise ValueError("host")
+        if parts.path != f"/xass-lan/{int(identifier)}":
+            raise ValueError("path")
+        query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
+        token = query.get("token", [])
+        if set(query) != {"token"} or len(token) != 1 or _LAN_TOKEN.fullmatch(token[0]) is None:
+            raise ValueError("token")
+    except (TypeError, ValueError, OverflowError):
+        raise MusicError("Локальная ссылка на трек отклонена") from None
+    return f"http://{address}:{parts.port}/xass-lan/{int(identifier)}?token={token[0]}"
 
 
 LOCAL_SUFFIXES = {".mp3": ".mp3", ".wav": ".wav", ".flac": ".flac", ".ogg": ".ogg"}
@@ -192,6 +241,27 @@ class MusicPlayer:
         self._artist = ""
         self._downloaded_bytes = 0
         self._total_bytes = 0
+        self._reveal = 0
+        self._reveal_listener = None
+
+    def set_reveal_listener(self, listener) -> None:
+        """GUI wake-up only. The listener must not do work while the player lock is held."""
+        with self._lock:
+            self._reveal_listener = listener
+
+    def reveal_count(self) -> int:
+        with self._lock:
+            return self._reveal
+
+    def _notify_reveal(self) -> None:
+        with self._lock:
+            listener = self._reveal_listener
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception:
+            return
 
     def _engine(self):
         if self._audio is None:
@@ -312,98 +382,132 @@ class MusicPlayer:
             return self.snapshot()
 
     def command(self, command: str, payload: dict, config: dict) -> dict[str, Any]:
-        if "expires_at" in payload:
-            try:
-                expires = float(payload["expires_at"])
-                if not math.isfinite(expires) or expires <= time.time():
-                    raise ValueError("expired")
-            except (ValueError, TypeError):
-                raise MusicError("Команда устарела. Повторите действие") from None
-        with self._condition:
-            if self._closed:
-                raise MusicError("Музыкальный плеер завершает работу")
-            self.snapshot()
-            if command == "music_outputs":
-                rows, _ = self._engine().outputs()
-                return {**self.snapshot(), "outputs": rows, "default_output_id": "default"}
-            if command == "music_status":
-                return self.snapshot()
-            if command == "music_play":
-                server_url = str(config.get("server_url") or "")
-                media_path = payload.get("media_path")
-                # The server may have a public HTTPS origin while an older
-                # paired agent uses its private/IP endpoint. Relative library
-                # routes resolve ONLY against that agent's own configured base.
-                value = server_url.rstrip("/") + str(media_path) if media_path is not None else payload.get("url")
-                url, track_id = approved_media_url(server_url, value, payload.get("track_id"))
-                position = _number(payload.get("position_sec", 0), "Позиция", 0, 24 * 3600)
-                volume = _number(payload.get("volume", self._volume), "Громкость", 0, 100)
-                output_id = str(payload.get("output_id") or "default")
-                _, ids = self._engine().outputs()
-                if output_id not in ids:
-                    raise MusicError("Аудиовыход не найден. Обновите список устройств")
-                self._discard_track()
-                self._generation += 1
-                self._track_id, self._output_id, self._volume = track_id, output_id, volume
-                self._title, self._artist = str(payload.get("title") or "")[:256], str(payload.get("artist") or "")[:256]
-                self._state, self._error, self._duration = "loading", "", 0.0
-                self._downloaded_bytes, self._total_bytes = 0, 0
-                self._progress = {"position": position, "ended": False, "error": ""}
-                self._pending = (self._generation, url, dict(config), position)
-                if self._worker is None:
-                    self._worker = threading.Thread(target=self._download_loop, name="xass-music", daemon=True)
-                    self._worker.start()
-                self._condition.notify()
-            elif command == "music_stop":
-                self._generation += 1
-                self._pending = None
-                self._discard_track()
-                self._state, self._error = "stopped", ""
-                self._progress = {"position": 0.0, "ended": False, "error": ""}
-            elif command == "music_volume":
-                self._volume = _number(payload.get("volume"), "Громкость", 0, 100)
-            elif command in {"music_pause", "music_resume", "music_seek"}:
-                if command == "music_pause" and self._state == "loading":
-                    # A handoff must be able to silence a download too. Merely
-                    # returning an error leaves the worker free to start later.
+        reveal = False
+        try:
+            if "expires_at" in payload:
+                try:
+                    expires = float(payload["expires_at"])
+                    if not math.isfinite(expires) or expires <= time.time():
+                        raise ValueError("expired")
+                except (ValueError, TypeError):
+                    raise MusicError("Команда устарела. Повторите действие") from None
+            with self._condition:
+                if self._closed:
+                    raise MusicError("Музыкальный плеер завершает работу")
+                self.snapshot()
+                if command == "music_outputs":
+                    rows, _ = self._engine().outputs()
+                    return {**self.snapshot(), "outputs": rows, "default_output_id": "default"}
+                if command == "music_status":
+                    return self.snapshot()
+                if command == "music_play":
+                    server_url = str(config.get("server_url") or "")
+                    media_path = payload.get("media_path")
+                    # The server may have a public HTTPS origin while an older
+                    # paired agent uses its private/IP endpoint. Relative library
+                    # routes resolve ONLY against that agent's own configured base.
+                    value = server_url.rstrip("/") + str(media_path) if media_path is not None else payload.get("url")
+                    url, track_id = approved_media_url(server_url, value, payload.get("track_id"))
+                    raw_lan = payload.get("lan_url")
+                    lan_url = approved_lan_url(raw_lan, track_id) if raw_lan else None
+                    position = _number(payload.get("position_sec", 0), "Позиция", 0, 24 * 3600)
+                    volume = _number(payload.get("volume", self._volume), "Громкость", 0, 100)
+                    output_id = str(payload.get("output_id") or "default")
+                    _, ids = self._engine().outputs()
+                    if output_id not in ids:
+                        raise MusicError("Аудиовыход не найден. Обновите список устройств")
+                    self._discard_track()
+                    self._generation += 1
+                    self._track_id, self._output_id, self._volume = track_id, output_id, volume
+                    self._title, self._artist = str(payload.get("title") or "")[:256], str(payload.get("artist") or "")[:256]
+                    self._state, self._error, self._duration = "loading", "", 0.0
+                    self._downloaded_bytes, self._total_bytes = 0, 0
+                    self._progress = {"position": position, "ended": False, "error": ""}
+                    self._pending = (self._generation, url, dict(config), position, lan_url)
+                    self._reveal += 1
+                    reveal = True
+                    if self._worker is None:
+                        self._worker = threading.Thread(target=self._download_loop, name="xass-music", daemon=True)
+                        self._worker.start()
+                    self._condition.notify()
+                elif command == "music_stop":
                     self._generation += 1
                     self._pending = None
                     self._discard_track()
                     self._state, self._error = "stopped", ""
-                    return self.snapshot()
-                if self._path is None or self._state in {"idle", "loading", "stopped", "error"}:
-                    raise MusicError("Сначала запустите трек и дождитесь загрузки")
-                if command == "music_pause":
-                    if self._state == "playing":
-                        self._release_device()
-                        self._state = "paused"
-                elif command == "music_resume":
-                    if self._state != "playing":
-                        self._start_at(0 if self._state == "ended" else self._progress["position"])
-                else:
-                    position = _number(payload.get("position_sec"), "Позиция", 0, self._duration)
-                    if self._state == "paused":
-                        self._progress = {"position": position, "ended": False, "error": ""}
+                    self._progress = {"position": 0.0, "ended": False, "error": ""}
+                elif command == "music_volume":
+                    self._volume = _number(payload.get("volume"), "Громкость", 0, 100)
+                elif command in {"music_pause", "music_resume", "music_seek"}:
+                    if command == "music_pause" and self._state == "loading":
+                        # A handoff must be able to silence a download too. Merely
+                        # returning an error leaves the worker free to start later.
+                        self._generation += 1
+                        self._pending = None
+                        self._discard_track()
+                        self._state, self._error = "stopped", ""
+                        return self.snapshot()
+                    if self._path is None or self._state in {"idle", "loading", "stopped", "error"}:
+                        raise MusicError("Сначала запустите трек и дождитесь загрузки")
+                    if command == "music_pause":
+                        if self._state == "playing":
+                            self._release_device()
+                            self._state = "paused"
+                    elif command == "music_resume":
+                        if self._state != "playing":
+                            self._start_at(0 if self._state == "ended" else self._progress["position"])
                     else:
-                        self._start_at(position)
-            else:
-                raise MusicError("Неизвестная музыкальная команда")
-            return self.snapshot()
+                        position = _number(payload.get("position_sec"), "Позиция", 0, self._duration)
+                        if self._state == "paused":
+                            self._progress = {"position": position, "ended": False, "error": ""}
+                        else:
+                            self._start_at(position)
+                else:
+                    raise MusicError("Неизвестная музыкальная команда")
+                return self.snapshot()
+        finally:
+            if reveal:
+                self._notify_reveal()
 
     def _cancelled(self, generation):
         with self._lock:
             return self._closed or generation != self._generation
 
-    def _download(self, generation, url, config) -> Path | None:
+    def _download(self, generation, url, config, lan_url=None) -> Path | None:
+        if lan_url:
+            if self._cancelled(generation):
+                return None
+            try:
+                fetched = self._fetch(generation, lan_url, config, direct=True)
+            except Exception:
+                fetched = None
+                if self._cancelled(generation):
+                    return None
+            else:
+                return fetched
+            if self._cancelled(generation):
+                return None
+        return self._fetch(generation, url, config, direct=False)
+
+    def _fetch(self, generation, url, config, *, direct: bool) -> Path | None:
         if self._tempdir is None:
             self._tempdir = tempfile.TemporaryDirectory(prefix="xass-music-", dir=self._cache_parent)
         target = Path(self._tempdir.name) / f"track-{generation}.part"
         started, total = time.monotonic(), 0
+        with self._lock:
+            if self._cancelled(generation):
+                return None
+            self._downloaded_bytes = 0
+            self._total_bytes = 0
+        headers = {"Accept-Encoding": "identity"}
+        if not direct:
+            headers["X-Api-Key"] = str(config.get("api_key") or "")
+        timeout = httpx.Timeout(10, connect=2 if direct else 5)
+        trust_env = False if direct else bool(config.get("trust_env_proxy", False))
         try:
-            with self._client_factory(str(config["server_url"]), timeout=httpx.Timeout(10, connect=5),
-                                      trust_env=bool(config.get("trust_env_proxy", False)), follow_redirects=False) as client:
-                with client.stream("GET", url, headers={"X-Api-Key": str(config.get("api_key") or ""),
-                                                        "Accept-Encoding": "identity"}, follow_redirects=False) as response:
+            with self._client_factory(url if direct else str(config["server_url"]), timeout=timeout,
+                                      trust_env=trust_env, follow_redirects=False) as client:
+                with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
                     if response.status_code in {401, 403, 404, 410}:
                         raise MusicError("Ссылка на музыку истекла или доступ отозван. Запустите трек снова")
                     if response.status_code != 200:
@@ -448,11 +552,15 @@ class MusicPlayer:
                 self._condition.wait_for(lambda: self._pending is not None or self._closed)
                 if self._closed:
                     break
-                generation, url, config, position = self._pending
+                pending = self._pending
                 self._pending = None
+                if not pending:
+                    continue
+                generation, url, config, position = pending[:4]
+                lan_url = pending[4] if len(pending) > 4 else None
             path = None
             try:
-                path = self._download(generation, url, config)
+                path = self._download(generation, url, config, lan_url)
                 if path is None:
                     continue
                 # MP3 duration inspection can scan a large file. Never hold the

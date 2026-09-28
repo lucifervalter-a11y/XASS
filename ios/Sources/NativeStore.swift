@@ -2,9 +2,19 @@ import Foundation
 import Combine
 import UIKit
 
+/// Playback ticks stay off NativeStore. A half-second position update must not
+/// invalidate the library list or reset its scroll offset.
+@MainActor final class NativePlaybackClock: ObservableObject {
+    @Published var position: Double = 0
+    @Published var duration: Double = 0
+    @Published var sampleAt = Date.distantPast
+    @Published var projectionLimit: TimeInterval = 0
+}
+
 @MainActor final class NativeStore: ObservableObject {
     let api: OwnerService
     let audio: AudioController
+    private var lanOffer: NativeLanOffer?
     let authorization: NativeActionAuthorization
     let sessionKey: String
     let clientID: String
@@ -31,10 +41,23 @@ import UIKit
     private var canonicalDetail: String?
     @Published var outputID = "default"
     @Published var playbackState = "stopped"
-    @Published var position: Double = 0
-    @Published private(set) var playbackSampleAt = Date.distantPast
-    @Published private(set) var playbackProjectionLimit: TimeInterval = 0
-    @Published var duration: Double = 0
+    let playback = NativePlaybackClock()
+    var position: Double {
+        get { playback.position }
+        set { playback.position = newValue }
+    }
+    var duration: Double {
+        get { playback.duration }
+        set { playback.duration = newValue }
+    }
+    private(set) var playbackSampleAt: Date {
+        get { playback.sampleAt }
+        set { playback.sampleAt = newValue }
+    }
+    private(set) var playbackProjectionLimit: TimeInterval {
+        get { playback.projectionLimit }
+        set { playback.projectionLimit = newValue }
+    }
     @Published var volume: Double = 70
     @Published var shareSite = false
     @Published var shareSaving = false
@@ -334,37 +357,75 @@ import UIKit
         await acknowledgePendingHandoff(from: session)
         if ownsSession && !queueSaving, let ids = session["queue"] as? [Int], !ids.isEmpty {
             let mode = session["repeat_mode"] as? String ?? repeatMode
-            if ids != queue.map(\.id) || mode != repeatMode {
-                queue = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }; baseQueue = queue; repeatMode = mode
-                applyNativeQueue()
+            let next = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }
+            let queueChanged = next.map(\.id) != queue.map(\.id)
+            if queueChanged {
+                objectWillChange.send()
+                queue = next
+                baseQueue = queue
             }
+            let modeChanged = repeatMode != mode
+            if modeChanged { repeatMode = mode }
+            if queueChanged || modeChanged { applyNativeQueue() }
         }
         let result = try await api.request("/api/mini/music/players", method: "GET", body: nil)
-        players = (result["players"] as? [[String: Any]] ?? []).compactMap(RemotePlayer.init)
-        for index in devices.indices { if let player = players.first(where: { $0.id == devices[index].name }) { devices[index].online = player.online } }
+        adoptPlayers((result["players"] as? [[String: Any]] ?? []).compactMap(RemotePlayer.init))
         // /session reconciles queue-command ACKs with heartbeat freshness.
         // /players supplies discovery/capabilities only: its raw heartbeat can
         // still describe the previous track during server-owned auto-advance.
     }
     private func applySession(_ value: [String: Any]) {
-        currentID = value["track_id"] as? Int
-        canonicalClientID = value["client_id"] as? String ?? ""; canonicalSessionKey = value["session_key"] as? String ?? ""
+        publishIfChanged(\.currentID, value["track_id"] as? Int)
+        publishIfChanged(\.canonicalClientID, value["client_id"] as? String ?? "")
+        canonicalSessionKey = value["session_key"] as? String ?? ""
         canonicalDevice = value["device"] as? String ?? "local"
         canonicalRevision = value["revision"] as? Int ?? 0
-        canRecoverPlayback = value["recovery_available"] as? Bool == true && canonicalDevice == "local" && canonicalSessionKey != sessionKey
-        if userPickedRoute || transferPending { selectedDevice = value["device"] as? String ?? selectedDevice } else { selectedDevice = "local" }
-        playbackState = value["state"] as? String ?? "stopped"
+        let recoverable = value["recovery_available"] as? Bool == true && canonicalDevice == "local" && canonicalSessionKey != sessionKey
+        publishIfChanged(\.canRecoverPlayback, recoverable)
+        if userPickedRoute || transferPending { publishIfChanged(\.selectedDevice, value["device"] as? String ?? selectedDevice) }
+        else { publishIfChanged(\.selectedDevice, "local") }
+        publishIfChanged(\.playbackState, value["state"] as? String ?? "stopped")
         let detail = value["detail"] as? String
-        if let detail = detail { error = detail }
-        else if error == canonicalDetail { error = nil }
+        if let detail = detail { publishIfChanged(\.error, detail) }
+        else if error == canonicalDetail { publishIfChanged(\.error, nil) }
         canonicalDetail = detail
         position = NativeValue.number(value["position"]); duration = currentTrack?.duration ?? 0
-        outputID = value["output_id"] as? String ?? "default"; volume = NativeValue.number(value["volume"], fallback: volume)
-        if !shareSaving { shareSite = value["share_site"] as? Bool ?? shareSite }
-        if !queueSaving, let ids = value["queue"] as? [Int], !ids.isEmpty { queue = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }; if baseQueue.isEmpty { baseQueue = queue } }
-        if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { repeatMode = mode }
+        publishIfChanged(\.outputID, value["output_id"] as? String ?? "default")
+        publishIfChanged(\.volume, NativeValue.number(value["volume"], fallback: volume))
+        if !shareSaving { publishIfChanged(\.shareSite, value["share_site"] as? Bool ?? shareSite) }
+        if !queueSaving, let ids = value["queue"] as? [Int], !ids.isEmpty {
+            let next = ids.compactMap { id in tracks.first { $0.id == id } ?? knownTracks[id] ?? queue.first { $0.id == id } }
+            if next.map(\.id) != queue.map(\.id) {
+                objectWillChange.send()
+                queue = next
+            }
+            if baseQueue.isEmpty { baseQueue = queue }
+        }
+        if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { publishIfChanged(\.repeatMode, mode) }
         playbackSampleAt = Date()
         playbackProjectionLimit = NativeLyricsClock.projectionLimit(serverTime: value["server_time"] as? String, updatedAt: value["updated_at"] as? String)
+    }
+    /// Heartbeat position on a PC player is not shown in the library. Rewriting it
+    /// every poll used to publish the whole store and snap the track list upward.
+    private func adoptPlayers(_ next: [RemotePlayer]) {
+        let changed = next.count != players.count || zip(next, players).contains { lhs, rhs in
+            lhs.id != rhs.id || lhs.online != rhs.online || lhs.available != rhs.available
+                || lhs.trackID != rhs.trackID || lhs.state != rhs.state || lhs.outputID != rhs.outputID || lhs.error != rhs.error
+        }
+        if changed { players = next }
+        let source = changed ? next : players
+        var nextDevices = devices
+        var devicesChanged = false
+        for index in nextDevices.indices {
+            if let player = source.first(where: { $0.id == nextDevices[index].name }), nextDevices[index].online != player.online {
+                nextDevices[index].online = player.online
+                devicesChanged = true
+            }
+        }
+        if devicesChanged { devices = nextDevices }
+    }
+    private func publishIfChanged<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<NativeStore, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
     private func audioEvent(_ value: [String: Any]) {
         if value["action"] != nil { objectWillChange.send(); return }
@@ -382,12 +443,14 @@ import UIKit
                 target: .localPlayer, error: audioFailed ? .invalidState : .none)
         }
         lastAudioDiagnosticFailed = audioFailed
-        playbackState = nextState
+        publishIfChanged(\.playbackState, nextState)
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
         playbackSampleAt = Date()
         playbackProjectionLimit = NativeLyricsClock.maximumProjection
-        if let gain = value["playback_gain"] as? Double, gain.isFinite { volume = min(100, max(0, gain)) }
-        if let message = value["error"] as? String { error = message }
+        if let gain = value["playback_gain"] as? Double, gain.isFinite {
+            publishIfChanged(\.volume, min(100, max(0, gain)))
+        }
+        if let message = value["error"] as? String { publishIfChanged(\.error, message) }
     }
     func ticket(_ trackID: Int, purpose: String = "listen") async throws -> String {
         let result = try await api.request("/api/mini/music/tracks/\(trackID)/ticket", method: "POST", body: ["purpose": purpose])
@@ -521,8 +584,25 @@ import UIKit
             "queue": Array(queue.prefix(2000)).map(\.id), "repeat_mode": repeatMode]
         if let start = startPosition { body["position"] = start }
         else if ownedSource { body["position"] = actualPosition }
+        if device.hasPrefix("agent:") {
+            lanOffer?.stop()
+            lanOffer = nil
+            if let file = audio.analysisFile(chosenID) {
+                let offer = NativeLanOffer()
+                if let started = await offer.start(file: file, trackID: chosenID) {
+                    lanOffer = offer
+                    body["lan_host"] = started.host
+                    body["lan_port"] = started.port
+                    body["lan_token"] = started.token
+                }
+            }
+        }
         try Task.checkCancellation()
-        guard generation == nextGeneration, !transferCancelled else { throw CancellationError() }
+        guard generation == nextGeneration, !transferCancelled else {
+            lanOffer?.stop()
+            lanOffer = nil
+            throw CancellationError()
+        }
         let started = try await api.request("/api/mini/music/transfers", method: "POST", body: body)
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
         activeTransferID = transferID

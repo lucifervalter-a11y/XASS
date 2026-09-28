@@ -204,12 +204,33 @@ enum XASSStyle {
                 Button { store.run { try await store.step(1) } } label: { Image(systemName: "forward.end.fill").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel("Следующий трек")
             }.foregroundStyle(.white).padding(.horizontal, 12).padding(.vertical, 7)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
-                .overlay(alignment: .bottomLeading) {
-                    GeometryReader { size in
-                        Capsule().fill(.white.opacity(0.36)).frame(width: size.size.width * min(1, max(0, store.position / max(1, store.duration))), height: 2)
-                    }.frame(height: 2).padding(.horizontal, 15).padding(.bottom, 2).accessibilityHidden(true)
-                }.padding(.horizontal, 10).padding(.vertical, 5).background(Color.black.opacity(0.84)).disabled(store.busy)
+                .overlay(alignment: .bottomLeading) { NativeMiniProgress(clock: store.playback) }
+                .padding(.horizontal, 10).padding(.vertical, 5).background(Color.black.opacity(0.84)).disabled(store.busy)
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: track.id)
+        }
+    }
+}
+
+@MainActor private struct NativeMiniProgress: View {
+    @ObservedObject var clock: NativePlaybackClock
+    var body: some View {
+        GeometryReader { size in
+            Capsule().fill(.white.opacity(0.36)).frame(width: size.size.width * min(1, max(0, clock.position / max(1, clock.duration))), height: 2)
+        }.frame(height: 2).padding(.horizontal, 15).padding(.bottom, 2).accessibilityHidden(true)
+    }
+}
+
+@MainActor private struct NativePlayerScrubber: View {
+    @ObservedObject var store: NativeStore
+    @ObservedObject var clock: NativePlaybackClock
+    @Binding var scrubbing: Double?
+    var body: some View {
+        VStack(spacing: 0) {
+            Slider(value: Binding(get: { scrubbing ?? min(clock.position, max(1, clock.duration)) }, set: { scrubbing = $0 }), in: 0...max(1, clock.duration), onEditingChanged: { editing in
+                if !editing, let value = scrubbing { scrubbing = nil; store.run { try await store.seek(value) } }
+            }).tint(.white.opacity(0.9)).disabled(clock.duration <= 0 || store.busy).accessibilityLabel("Позиция трека")
+            HStack { Text(NativeValue.time(scrubbing ?? clock.position)); Spacer(); Text("−" + NativeValue.time(max(0, clock.duration - (scrubbing ?? clock.position)))) }
+                .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.55))
         }
     }
 }
@@ -224,9 +245,8 @@ enum XASSStyle {
     @State private var selectedTrack: LibraryTrack?
     @State private var scrubbing: Double?
     var body: some View {
-        GeometryReader { geometry in
-            ScrollView {
-                VStack(spacing: 18) {
+        ScrollView {
+            VStack(spacing: 18) {
                     HStack {
                         Button { dismiss() } label: { Image(systemName: "chevron.down").font(.title3).frame(width: 44, height: 36) }.accessibilityLabel("Свернуть плеер")
                         Spacer()
@@ -241,22 +261,20 @@ enum XASSStyle {
                                 metadata(track)
                             }.frame(maxWidth: .infinity, alignment: .leading)
                             NativeLyricsContent(store: store, trackID: track.id)
-                                .frame(height: max(240, min(480, geometry.size.height - 430)))
+                                .frame(height: 420)
                                 .transition(.opacity)
                         } else {
-                            // Reserve native controls first; small screens and large type can scroll.
-                            let side = min(geometry.size.width - 56, max(190, min(400, geometry.size.height - 450)))
+                            // Fixed artwork keeps this ScrollView's identity stable while playback ticks.
+                            // Small screens and large type reach the controls by scrolling.
                             TrackArtwork(store: store, trackID: track.id, radius: 14, large: true)
-                                .frame(width: side, height: side).shadow(color: .black.opacity(0.24), radius: 22, y: 12)
+                                .frame(maxWidth: 400).aspectRatio(1, contentMode: .fit)
+                                .shadow(color: .black.opacity(0.24), radius: 22, y: 12)
                                 .scaleEffect(!store.playing && !reduceMotion ? 0.96 : 1)
                                 .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.85), value: store.playing)
                                 .padding(.vertical, 8).transition(.opacity)
                             metadata(track)
                         }
-                        VStack(spacing: 0) {
-                            Slider(value: Binding(get: { scrubbing ?? min(store.position, max(1, store.duration)) }, set: { scrubbing = $0 }), in: 0...max(1, store.duration), onEditingChanged: { editing in if !editing, let value = scrubbing { scrubbing = nil; store.run { try await store.seek(value) } } }).tint(.white.opacity(0.9)).disabled(store.duration <= 0 || store.busy).accessibilityLabel("Позиция трека")
-                            HStack { Text(NativeValue.time(scrubbing ?? store.position)); Spacer(); Text("−" + NativeValue.time(max(0, store.duration - (scrubbing ?? store.position)))) }.font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.55))
-                        }
+                        NativePlayerScrubber(store: store, clock: store.playback, scrubbing: $scrubbing)
                         if store.busy || store.playbackState == "loading" { HStack { ProgressView(); Text(store.transferStatus ?? (store.busy ? "Выполняю действие…" : "Загрузка трека…")).font(.caption) }.accessibilityIdentifier("nativePlayerLoading") }
                         HStack {
                             Button { store.run { try await store.step(-1) } } label: { Image(systemName: "backward.end.fill").font(.system(size: 26)).frame(width: 44, height: 48) }.accessibilityLabel("Предыдущий трек")
@@ -278,9 +296,9 @@ enum XASSStyle {
                     }
                     NativeMessage(store: store)
                 }.padding(.horizontal, 28).padding(.top, 10).padding(.bottom, 24).frame(maxWidth: 560).frame(maxWidth: .infinity)
-            }.scrollBounceBehavior(.basedOnSize)
-                .background { NativeMusicBackdrop(store: store, trackID: store.currentID) }
-        }.presentationDragIndicator(.visible).presentationDetents([.large]).tint(.white)
+        }.scrollBounceBehavior(.basedOnSize)
+            .background { NativeMusicBackdrop(store: store, trackID: store.currentID) }
+            .presentationDragIndicator(.visible).presentationDetents([.large]).tint(.white)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showLyrics)
             .sheet(isPresented: $showQueue) { NativeQueueView(store: store) }
             .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track) }

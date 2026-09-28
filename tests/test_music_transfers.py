@@ -420,6 +420,58 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             self.assertEqual((await session.get(MusicSession, 1)).session_key, self.old_key)
 
+    def test_lan_offer_accepts_only_a_private_canonical_url(self):
+        from app.music_playback import canonical_lan_url, lan_media_url
+        token = "a" * 43
+        good = lan_media_url("192.168.1.20", 8765, token, 7)
+        self.assertEqual(good, f"http://192.168.1.20:8765/xass-lan/7?token={token}")
+        self.assertEqual(canonical_lan_url(good, 7), good)
+        self.assertIsNone(canonical_lan_url(good, 8))
+        self.assertIsNone(canonical_lan_url(good.replace("http://", "https://"), 7))
+        for host, port, offered in (
+            ("8.8.8.8", 8765, token), ("127.0.0.1", 8765, token), ("169.254.1.1", 8765, token),
+            ("192.168.1.20", 80, token), ("192.168.1.20", 8765, "short"), ("10.1.2.3", 1024, token),
+        ):
+            with self.subTest(host=host, port=port):
+                if host == "10.1.2.3":
+                    self.assertEqual(lan_media_url(host, port, offered, 7), f"http://10.1.2.3:1024/xass-lan/7?token={token}")
+                else:
+                    self.assertIsNone(lan_media_url(host, port, offered, 7))
+
+    async def test_private_lan_offer_is_attached_to_the_single_play_command(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        token = "b" * 43
+        response = await self.transfer(track, device="agent:PC", lan_host="192.168.1.20", lan_port=8765, lan_token=token)
+        self.assertEqual(response.status_code, 200, response.text)
+        commands = await self.commands()
+        self.assertEqual([item.command for item in commands], ["music_play"])
+        payload = commands[0].payload or {}
+        self.assertEqual(payload["lan_url"], f"http://192.168.1.20:8765/xass-lan/{track}?token={token}")
+        self.assertIn("media_path", payload)
+        self.assertNotIn("lan_token", payload)
+        self.assertNotIn("lan_host", payload)
+        async with self.sessions() as session:
+            stored = (await session.get(MusicTransfer, response.json()["transfer_id"])).target
+        self.assertNotIn("lan_token", stored)
+        self.assertNotIn("lan_host", stored)
+        self.assertEqual(stored["lan_url"], payload["lan_url"])
+
+    async def test_public_lan_offer_is_ignored_and_playback_still_starts(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        response = await self.transfer(track, device="agent:PC", lan_host="8.8.8.8", lan_port=8765, lan_token="c" * 43)
+        self.assertEqual(response.status_code, 200, response.text)
+        commands = await self.commands()
+        self.assertEqual([item.command for item in commands], ["music_play"])
+        payload = commands[0].payload or {}
+        self.assertNotIn("lan_url", payload)
+        self.assertIn("media_path", payload)
+        async with self.sessions() as session:
+            stored = (await session.get(MusicTransfer, response.json()["transfer_id"])).target
+        self.assertNotIn("lan_url", stored)
+        self.assertNotIn("lan_token", stored)
+
 
 if __name__ == "__main__":
     unittest.main()

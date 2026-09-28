@@ -759,6 +759,12 @@ def run_agent(config: dict[str, Any]) -> str:
     source_type = str(config.get("source_type") or "PC_AGENT")
     trust_env_proxy = bool(config.get("trust_env_proxy", False))
     write_agent_status("connecting", detail=f"Подключение к {endpoint}")
+    try:
+        from music_bridge import start_music_bridge
+        if not start_music_bridge():
+            print("[pc-client] music bridge did not bind; playback continues", flush=True)
+    except Exception as exc:
+        print(f"[pc-client] music bridge unavailable: {exc}", flush=True)
     print(
         f"[pc-client] endpoint={endpoint} source_name={source_name} "
         f"source_type={source_type} trust_env_proxy={trust_env_proxy}",

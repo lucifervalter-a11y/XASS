@@ -36,6 +36,7 @@ class PcCommandLoopTests(unittest.TestCase):
         self.archive = self.context.enter_context(patch.object(client_agent, "_ArchiveSyncWorker"))
         self.archive.return_value.busy = False
         self.telemetry = self.context.enter_context(patch.object(client_agent, "build_payload", return_value={"metrics": {}}))
+        self.context.enter_context(patch("music_bridge.start_music_bridge", return_value=True))
         self.clock = 100.0
         self.sleeps: list[float] = []
         self.payloads: list[dict] = []

@@ -369,6 +369,63 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertIsNone(self.player._tempdir)
 
 
+    def test_private_lan_download_does_not_touch_the_server_or_send_the_api_key(self):
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.wait_state("playing")
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0].url.host, "192.168.1.20")
+        self.assertEqual(self.requests[0].url.path, "/xass-lan/7")
+        self.assertIsNone(self.requests[0].headers.get("X-Api-Key"))
+
+    def test_lan_failure_falls_back_to_the_paired_server(self):
+        def handler(request):
+            if request.url.host == "192.168.1.20":
+                return httpx.Response(503)
+            return httpx.Response(200, content=silent_wav())
+        self.handler = handler
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.wait_state("playing")
+        self.assertEqual([item.url.host for item in self.requests], ["192.168.1.20", "music.example"])
+        self.assertEqual(self.requests[1].headers.get("X-Api-Key"), CONFIG["api_key"])
+        self.assertIsNone(self.requests[0].headers.get("X-Api-Key"))
+
+    def test_cancelled_lan_download_does_not_fall_back(self):
+        entered = threading.Event()
+        def blocked(request):
+            entered.set()
+            self.release.wait(2)
+            return httpx.Response(200, content=silent_wav())
+        self.handler = blocked
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.assertTrue(entered.wait(1))
+        self.assertEqual(self.command("music_stop")["state"], "stopped")
+        self.release.set()
+        time.sleep(0.05)
+        self.assertEqual(self.player.snapshot()["state"], "stopped")
+        self.assertEqual({request.url.host for request in self.requests}, {"192.168.1.20"})
+        self.assertEqual(len(self.audio.devices), 0)
+
+    def test_public_and_rewritten_lan_urls_are_rejected_before_any_request(self):
+        lan = f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}"
+        bad = [
+            lan.replace("http://", "https://"),
+            lan.replace("192.168.1.20", "8.8.8.8"),
+            lan.replace("192.168.1.20", "127.0.0.1"),
+            lan.replace("192.168.1.20", "169.254.1.1"),
+            lan.replace(":8765", ":80"),
+            lan.replace("http://", "http://user@"),
+            lan.replace("/xass-lan/7", "/other/7"),
+            lan.replace("/xass-lan/7", "/xass-lan/8"),
+            lan + "&extra=1",
+            lan + "#fragment",
+            "http://192.168.1.20:8765/xass-lan/7",
+        ]
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(mp.MusicError):
+                self.play(lan_url=value)
+        self.assertEqual(self.requests, [])
+
+
 class NativeDecodeTests(unittest.TestCase):
     def test_native_windows_adapter_passes_exact_selected_endpoint_to_wasapi(self):
         try:

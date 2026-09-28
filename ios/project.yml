@@ -31,6 +31,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSFaceIDUsageDescription: "Защитить управление устройствами XASS и вашу библиотеку."
         NSSpeechRecognitionUsageDescription: "По вашему запросу расшифровать скачанную песню на iPhone. XASS требует локальное распознавание и не передаёт аудио в облако."
+        NSLocalNetworkUsageDescription: "Передать уже скачанный трек на ваш компьютер XASS в той же сети Wi-Fi. Другие устройства библиотеку не получают."
         UIBackgroundModes: [audio]
         UILaunchScreen: {}
         UIApplicationSceneManifest:

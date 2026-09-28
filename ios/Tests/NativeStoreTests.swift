@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import XASS
 
 @MainActor private final class NativeOwnerFixture: OwnerService {
@@ -18,6 +19,26 @@ import XCTest
 }
 
 final class NativeStoreTests: XCTestCase {
+    @MainActor func testPlaybackTicksDoNotRepublishTheLibrary() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        await store.refresh()
+        let clock = expectation(description: "playback clock moved")
+        let clockSubscription = store.playback.objectWillChange.sink { _ in clock.fulfill() }
+        let library = expectation(description: "library store published")
+        library.isInverted = true
+        let librarySubscription = store.objectWillChange.sink { _ in library.fulfill() }
+        store.position = 12
+        store.duration = 80
+        XCTAssertEqual(store.position, 12)
+        XCTAssertEqual(store.duration, 80)
+        try await store.refreshSession()
+        XCTAssertEqual(store.position, 37, "A session poll still records the reported position")
+        await fulfillment(of: [clock], timeout: 1)
+        await fulfillment(of: [library], timeout: 0.2)
+        clockSubscription.cancel()
+        librarySubscription.cancel()
+    }
     @MainActor func testTransientSessionFailureRecoversWithoutDiscardingLibraryOrOtherActionError() async throws {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
         defer { store.disconnect() }

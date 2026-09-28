@@ -64,7 +64,7 @@ struct PlayerOutput: Identifiable, Equatable {
     }
 }
 
-struct RemotePlayer: Identifiable {
+struct RemotePlayer: Identifiable, Equatable {
     let id: String
     let online: Bool
     let available: Bool

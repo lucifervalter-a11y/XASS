@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.db import get_session
 from app.models import AgentCommand, AgentCredential, AppConfig, HeartbeatSource
 from app.music_models import MusicEnrichment, MusicPlaylist, MusicSession, MusicTrack, MusicUpload, MusicUploadReceipt
-from app.music_playback import current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta, stale_local_recovery_available
+from app.music_playback import canonical_lan_url, current_session, expire_active_transfer, install_transfer_routes, pending_handoff, playback_meta, stale_local_recovery_available
 from app.music_playback_models import MusicRemoteCommand, MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
 from app.services.agent_lifecycle import ensure_agent_attached
@@ -77,6 +77,7 @@ class ControlBody(BaseModel):
     position_sec: float = Field(default=0, ge=0, le=86400, allow_inf_nan=False)
     volume: int = Field(default=70, ge=0, le=100)
     expires_at: int | None = Field(default=None, gt=0)
+    lan_url: str | None = Field(default=None, max_length=300)
 
 
 class RecoverSessionBody(BaseModel):
@@ -648,6 +649,9 @@ def build_router(settings, require_owner, public_origin):
             web_url = canonical_web_app_url(config.service_base_url if config else "", settings.profile_public_url, public_origin(request)[1])
             origin = web_url.split("/miniapp.php", 1)[0]
             details.update(track_id=track.id, title=track.title, artist=track.artist, url=origin + media_path, media_path=media_path)
+            offered = canonical_lan_url(payload.lan_url, track.id) if payload.lan_url else None
+            if offered:
+                details["lan_url"] = offered
         # Superseded transient controls must not burst into playback after reconnect.
         if payload.action in {"play", "seek", "volume"}:
             await session.execute(update(AgentCommand).where(AgentCommand.source_name == source.source_name,
