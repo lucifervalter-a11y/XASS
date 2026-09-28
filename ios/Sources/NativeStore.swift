@@ -120,6 +120,8 @@ import UIKit
     private var lastAudioDiagnosticFailed = false
     /// Toast shown when a chosen/current PC is gone and this iPhone plays instead.
     static let pcOfflineNotice = "ПК не в сети, играет на iPhone"
+    /// Server detail for a PC lease whose heartbeat is stale.
+    static let pcOfflineServerDetail = "Компьютер не в сети"
     /// A PC must answer the reachability check within this time, else the
     /// iPhone plays by itself. Tests may shorten it.
     var pcResponseDeadline: TimeInterval = 2
@@ -315,7 +317,11 @@ import UIKit
             do {
                 // Keep the source route until its player has been paused and acknowledged.
                 if device.hasPrefix("agent:"), let id = currentID {
-                    try await transferToPC(device, trackID: id, startPosition: position, output: output)
+                    // An offline PC always falls back to this iPhone. A failed
+                    // handoff to a live PC is reported, unless the iPhone was
+                    // audible: then it keeps playing here (never silence).
+                    let audibleHere = selectedDevice == "local" && ownsSession && playing
+                    try await transferToPC(device, trackID: id, startPosition: position, output: output, fallbackOnHandoffFailure: audibleHere)
                     // Offline PC: the iPhone kept playing, the route stays "iPhone".
                     if selectedDevice == device { userPickedRoute = true }
                 } else {
@@ -448,7 +454,8 @@ import UIKit
         let state = value["state"] as? String ?? "stopped"
         publishIfChanged(\.playbackState, state)
         // An offline PC is not an error: playback simply happens on the iPhone.
-        let detail = state == "unavailable" && canonicalDevice.hasPrefix("agent:") ? nil : value["detail"] as? String
+        let rawDetail = value["detail"] as? String
+        let detail = state == "unavailable" && canonicalDevice.hasPrefix("agent:") && rawDetail == Self.pcOfflineServerDetail ? nil : rawDetail
         if let detail = detail { publishIfChanged(\.error, detail) }
         else if error == canonicalDetail { publishIfChanged(\.error, nil) }
         canonicalDetail = detail
@@ -585,14 +592,13 @@ import UIKit
 
     /// Play on a chosen PC, or on this iPhone when that PC is gone. The PC is
     /// checked within `pcResponseDeadline`; a failed handoff never ends in silence.
-    private func transferToPC(_ device: String, trackID: Int, startPosition: Double?, output: String? = nil) async throws {
+    private func transferToPC(_ device: String, trackID: Int, startPosition: Double?, output: String? = nil, fallbackOnHandoffFailure: Bool = true) async throws {
         let resumeAt = startPosition ?? currentPlaybackPosition(trackID)
         guard pcIsLive(device), await pcReachable(device) else {
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return
         }
         do { try await transfer(to: device, trackID: trackID, startPosition: startPosition, output: output) }
-        catch where Self.isPCFailure(error) {
-            NativeDiagnostics.shared.record(operation: .musicTransfer, step: .failed, target: .pcPlayer, error: .targetUnavailable)
+        catch where fallbackOnHandoffFailure && Self.isPCFailure(error) {
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
         }
     }
