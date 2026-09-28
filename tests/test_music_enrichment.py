@@ -135,6 +135,22 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "candidate")
         self.assertEqual(result["reason"], "duration_mismatch")
         self.assertEqual(result["lyrics"]["lines"], [])
+        self.assertEqual(result["lyrics"]["text"], "")
+        # The length is unconfirmed, so timed lyrics stay off. The cover still
+        # belongs to this exact title and artist.
+        self.assertEqual(result["artwork"]["status"], "candidate")
+        self.assertEqual(result["artwork"]["release_id"], RELEASE)
+        self.assertIn("musicbrainz.org", {request.url.host for request in self.requests})
+
+    async def test_untagged_filename_duration_mismatch_still_loads_a_cover(self):
+        self.track.artist = self.track.album = ""
+        self.track.title = "Fixture Artist Fixture Song"
+        self.track.duration = 99
+        self.lyric["albumName"] = ""
+        result = await self.service().enrich(self.track)
+        self.assertEqual((result["status"], result["reason"]), ("candidate", "duration_mismatch"))
+        self.assertEqual(result["lyrics"]["text"], "")
+        self.assertEqual(result["artwork"]["release_id"], RELEASE)
 
     async def test_persisted_excerpt_hint_survives_cleaned_title_and_matching_duration(self):
         self.track.is_excerpt = True
@@ -156,6 +172,8 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["candidate"])
         self.assertEqual(len(result["candidates"]), 2)
         self.assertEqual(result["lyrics"]["text"], "")
+        self.assertEqual(result["artwork"]["status"], "not_found")
+        self.assertTrue(all(request.url.host == "lrclib.net" for request in self.requests))
 
     async def test_long_lrc_and_out_of_duration_lrc_never_become_synced(self):
         for synced in ("x" * (64 * 1024 + 1), "[05:00]Wrong timeline", "[00:01]" * 2001 + "amplified"):

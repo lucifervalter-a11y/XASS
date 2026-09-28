@@ -106,6 +106,12 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
             elif record.result.get("artwork_reason") in {"catalog_unavailable", "artwork_unavailable"}:
                 ttl = min(ttl, 60)
             same = record.fingerprint == fingerprint(track)
+            # Older lookups left a duration mismatch with no cover attempt.
+            # One new lookup fills the art; lyrics stay a suggestion.
+            needs_cover = (same and not record.dismissed and record.result.get("status") == "candidate"
+                and record.result.get("reason") == "duration_mismatch" and not record.artwork_data
+                and (record.result.get("artwork") or {}).get("status") != "candidate"
+                and not record.result.get("artwork_reason"))
             if same and not record.dismissed and record.result.get("status") == "matched":
                 previous_result, previous_artwork = deepcopy(record.result), record.artwork_data
             if same and not record.dismissed and record.result.get("status") == "confirmed":
@@ -116,7 +122,7 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
                 confirmed_candidate = deepcopy(record.result.get("candidate") or {})
                 previous_result = deepcopy(record.result)
                 previous_artwork = record.artwork_data
-            if record.dismissed and not refresh or same and record.result.get("status") and age < (60 if refresh else ttl):
+            if (record.dismissed and not refresh) or (same and record.result.get("status") and age < (60 if refresh else ttl) and not needs_cover):
                 return {"ok": True, "track": track_json(track), "enrichment": result_json(record)}
         before = identity(track)
         snapshot = SimpleNamespace(**{key: getattr(track, key) for key in

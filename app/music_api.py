@@ -540,23 +540,32 @@ def build_router(settings, require_owner, public_origin):
 
     @router.get("/api/mini/music/tracks/{track_id}/lyrics")
     async def lyrics(track_id: int, response: Response, user=Depends(require_owner), session=Depends(get_session)):
-        from app.services.music_lyrics import embedded_lyrics
+        from app.services.music_lyrics import embedded_lyrics, empty_lyrics
         track = await find_track(session, track_id)
         response.headers["Cache-Control"] = "private, no-store"
         record = await session.get(MusicEnrichment, track_id)
-        if record and record.owner_lyrics and not record.owner_lyrics.get("disabled", False):
-            return {"ok": True, "lyrics": record.owner_lyrics}
+        owner = record.owner_lyrics if record and isinstance(record.owner_lyrics, dict) else None
+        # The owner's saved transcript stays until they switch the source to
+        # the catalog. Unsynced file tags do not: they used to hide both the
+        # catalog text and a finished PC transcription.
+        if owner and not owner.get("disabled") and str(owner.get("text") or "").strip():
+            return {"ok": True, "lyrics": owner}
         embedded = await asyncio.to_thread(embedded_lyrics, root, track)
-        if embedded["text"]:
+        if embedded.get("synced") and embedded.get("text"):
             return {"ok": True, "lyrics": embedded}
         from app.music_enrichment_api import enrich_saved_track
         from app.services.transcription_queue import as_owner_lyrics, done_result
         transcription = await done_result(session, track_id)
         result = await enrich_saved_track(session, track_id)
-        value = dict(result["enrichment"].get("lyrics") or embedded)
+        raw = result["enrichment"].get("lyrics")
+        value = dict(raw) if isinstance(raw, dict) else {}
+        if "text" not in value:
+            value = {**empty_lyrics(), **value}
         if transcription and not value.get("synced"):
-            # Catalog first; the finished PC transcription only fills a gap.
+            # Synced catalog text stays. Anything else yields to the PC transcription.
             value = as_owner_lyrics(transcription)
+        elif not str(value.get("text") or "").strip() and embedded.get("text"):
+            value = embedded
         value.setdefault("status", result["enrichment"].get("lookup_status") or result["enrichment"].get("status", "not_found"))
         return {"ok": True, "lyrics": value, "track": result["track"]}
 

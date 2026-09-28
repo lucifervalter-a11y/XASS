@@ -127,9 +127,10 @@ def pick(rows: list, artist: str, title: str, duration: float) -> dict | None:
             continue
         got_t = _norm(row.get("trackName") or row.get("name") or "")
         got_a = _norm(row.get("artistName") or "")
-        if not got_t or not want_t or not (got_t == want_t or want_t in got_t or got_t in want_t):
+        # Substring titles attach a remix or a different song. Equality only.
+        if not got_t or got_t != want_t:
             continue
-        if want_a and got_a and not (want_a in got_a or got_a in want_a):
+        if not want_a or got_a != want_a:
             continue
         diff = abs(float(row.get("duration") or 0) - duration) if duration else 0
         if duration and diff > 12:
@@ -315,10 +316,14 @@ async def resolve(track, *, owner: dict | None, embedded: dict | None, enrichmen
             looked = await client.lookup(track.title, track.artist, getattr(track, "album", ""), duration,
                                          getattr(track, "filename", ""))
             cached = cache.put(track.id, print_, looked)
-    if cached.get("synced") or cached.get("status") == "instrumental":
+    if cached.get("synced"):
         return public(cached, track.id)
+    # A finished transcription is real vocal text. An "instrumental" catalog
+    # flag must not hide it, and neither must unsynced filler.
     if automatic:
         return public(automatic, track.id)
+    if cached.get("status") == "instrumental":
+        return public(cached, track.id)
     if plain:
         return public(plain, track.id)
     return public(cached, track.id)

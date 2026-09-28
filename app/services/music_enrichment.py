@@ -93,6 +93,23 @@ def _empty(status, reason="", **extra):
             "artwork": {"status": "not_found"}, "provenance": [], **extra}
 
 
+def _same_recording(signature, candidate, status) -> bool:
+    """Exact title and artist, with only the duration still unconfirmed.
+
+    Used for a cover lookup. It does not authorize lyrics. An untagged
+    "artist title" filename keeps both names in the title field.
+    """
+    if status != "duration_mismatch" or not isinstance(candidate, dict):
+        return False
+    title, artist = _norm(signature.get("title")), _norm(signature.get("artist"))
+    got_title, got_artist = _norm(candidate.get("title")), _norm(candidate.get("artist"))
+    if not title or not got_title or not got_artist:
+        return False
+    if artist:
+        return title == got_title and artist == got_artist
+    return title in {got_title, f"{got_artist} {got_title}", f"{got_title} {got_artist}"}
+
+
 def _candidate(title, artist, album, duration, source, identity):
     return {"title": title, "artist": artist, "album": album, "duration": duration,
             "source": source, "source_id": identity,
@@ -429,14 +446,15 @@ class MusicEnrichmentService:
         finally:
             self._lock.release()
 
-    async def _cover_for_named_recording(self, result, signature, deadline):
+    async def _cover_for_named_recording(self, result, signature, deadline, data=None):
         """Cover for the chosen title and artist when only the duration differs."""
         candidate = result["candidate"]
         quote = lambda value: str(value).replace("\\", "\\\\").replace('"', '\\"')
         query = f'recording:"{quote(candidate["title"])}" AND artist:"{quote(candidate["artist"])}"'
         try:
-            data = await self._json_before("https://musicbrainz.org/ws/2/recording/",
-                {"query": query, "fmt": "json", "limit": 20}, deadline, optional=True)
+            if data is None:
+                data = await self._json_before("https://musicbrainz.org/ws/2/recording/",
+                    {"query": query, "fmt": "json", "limit": 20}, deadline, optional=True)
             rows = _musicbrainz_rows({"recordings": []} if data is None else data, candidate.get("album") or signature["album"])
             covers = []
             for row, raw in rows:
@@ -496,8 +514,13 @@ class MusicEnrichmentService:
             elif status != "not_found":
                 # A plausible cut/full-recording match is only an explicit
                 # metadata suggestion; it must not gain synchronized lyrics.
-                return _empty("ambiguous" if status == "ambiguous" else "candidate", status,
+                # The cover still belongs to that title and artist when only
+                # the duration differs, so the player is not left without art.
+                result = _empty("ambiguous" if status == "ambiguous" else "candidate", status,
                     candidate=lrc_choice[0] if lrc_choice else None, candidates=suggestions)
+                if _same_recording(signature, result.get("candidate"), status):
+                    await self._cover_for_named_recording(result, signature, deadline)
+                return result
         except _ProviderFailure as exc:
             result = _empty(exc.status, retry_after=exc.retry_after) if exc.retry_after else _empty(exc.status)
         except (ValueError, TypeError):
@@ -528,6 +551,8 @@ class MusicEnrichmentService:
             elif result["status"] != "matched" and status != "not_found":
                 result = _empty("ambiguous" if status == "ambiguous" else "candidate", status,
                     candidate=choice[0] if choice else None, candidates=suggestions)
+                if _same_recording(signature, result.get("candidate"), status):
+                    await self._cover_for_named_recording(result, signature, deadline, data)
         except _ProviderFailure as exc:
             # Cover failure must not discard matched lyrics. When there was no
             # match at all, distinguish retryable catalog failure from absence.

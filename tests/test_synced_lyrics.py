@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +59,30 @@ class SyncedLyricsTests(unittest.IsolatedAsyncioTestCase):
         mock, _ = transport([(lambda r: r.url.path == "/api/get", None), (lambda r: r.url.path == "/api/search", rows)])
         result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 200)
         self.assertEqual(result["source_id"], 3)
+
+    async def test_search_rejects_substring_title_and_artist(self):
+        rows = [
+            {"id": 1, "trackName": "Song Remix", "artistName": "Artist", "duration": 200, "syncedLyrics": LRC},
+            {"id": 2, "trackName": "Song", "artistName": "Artist Project", "duration": 200, "syncedLyrics": LRC},
+            {"id": 3, "trackName": "My Song", "artistName": "Artist", "duration": 200, "syncedLyrics": LRC},
+        ]
+        mock, _ = transport([(lambda r: r.url.path == "/api/get", None), (lambda r: r.url.path == "/api/search", rows)])
+        result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 200)
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["lines"], [])
+
+    async def test_finished_transcription_beats_instrumental_catalog(self):
+        track = SimpleNamespace(id=9, title="Song", artist="Artist", album="", duration=200, filename="a.mp3", sha256="1" * 64)
+        instrumental = {"status": "instrumental", "synced": False, "lines": [], "text": "", "source": "lrclib"}
+        pc = {"lines": [{"start": 1.0, "end": 2.0, "text": "слова"}]}
+        client = SimpleNamespace(lookup=unittest.mock.AsyncMock(return_value=instrumental))
+        value = await sl.resolve(track, owner=None, embedded=None, enrichment=None, cache=sl.LyricsCache(None),
+                                  client=client, transcription=pc, refresh=True)
+        self.assertEqual(value["source"], "pc_transcription")
+        self.assertEqual(value["lines"][0]["text"], "слова")
+        plain = await sl.resolve(track, owner=None, embedded=None, enrichment=None, cache=sl.LyricsCache(None),
+                                  client=client, refresh=True)
+        self.assertEqual(plain["status"], "instrumental")
 
     async def test_network_failure_is_unavailable_not_crash(self):
         def boom(request):

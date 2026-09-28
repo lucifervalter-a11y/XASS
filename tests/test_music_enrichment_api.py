@@ -372,6 +372,28 @@ class MusicEnrichmentApiTests(MusicApiTests):
         await self.request("DELETE", route.replace("/enrichment", ""))
         self.assertEqual((await self.request("POST", route, json={})).status_code, 404)
 
+    async def test_stored_duration_mismatch_without_a_cover_is_fetched_once(self):
+        from app.music_enrichment_api import fingerprint
+        track, route = await self.prepared()
+        async with self.sessions() as session:
+            row = await session.get(MusicTrack, track["id"])
+            session.add(MusicEnrichment(track_id=row.id, fingerprint=fingerprint(row), revision=1, original={},
+                result={"status": "candidate", "reason": "duration_mismatch", "lyrics": empty_lyrics(),
+                    "artwork": {"status": "not_found"}, "candidate": {"title": row.title, "artist": row.artist}},
+                artwork_data=None, owner_lyrics={}, dismissed=False, checked_at=datetime.now(timezone.utc)))
+            await session.commit()
+        found = {"status": "candidate", "reason": "duration_mismatch", "lyrics": empty_lyrics(),
+            "artwork": {"status": "candidate", "source": "coverartarchive"}, "artwork_reason": "",
+            "candidate": {"title": "Fixture Song", "artist": "Fixture Artist"}}
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=found)) as lookup, \
+             patch("app.services.music_enrichment.fetch_artwork_thumbnail", AsyncMock(return_value=b"jpeg")):
+            first = await self.request("POST", route, json={})
+            second = await self.request("POST", route, json={})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(lookup.await_count, 1)
+        self.assertEqual(second.json()["enrichment"]["artwork"]["status"], "candidate")
+        self.assertEqual(lookup.await_count, 1)
+
     async def test_catalog_timeout_does_not_break_track_or_playback(self):
         _, route = await self.prepared()
         with patch("app.services.music_enrichment.enrich_track", AsyncMock(side_effect=TimeoutError)):
