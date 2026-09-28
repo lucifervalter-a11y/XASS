@@ -33,6 +33,7 @@ ACTIVE = ("assigned", "running")
 MESSAGES = {
     "none": "",
     "waiting_for_pc": "Расшифруем, когда включится компьютер",
+    "preparing_pc": "ПК готовится к расшифровке",
     "queued": "В очереди на расшифровку",
     "running": "Расшифровываем на компьютере",
     "done": "Текст распознан автоматически, может быть с ошибками",
@@ -91,6 +92,19 @@ async def online_workers(session, now: datetime) -> list[TranscriptionWorker]:
     return [item for item in rows if worker_online(item, now)]
 
 
+def worker_preparing(worker: TranscriptionWorker, now: datetime) -> bool:
+    """Enabled and online, but still installing Python/torch/models for the first time."""
+    return bool(worker.enabled and worker.state == "installing"
+                and aware(worker.last_seen_at) >= now - timedelta(seconds=WORKER_STALE_SEC))
+
+
+async def preparing_percent(session, now: datetime) -> int | None:
+    rows = await session.scalars(select(TranscriptionWorker).where(TranscriptionWorker.enabled.is_(True),
+                                                                   TranscriptionWorker.state == "installing"))
+    values = [int(_num((item.setup or {}).get("percent"))) for item in rows if worker_preparing(item, now)]
+    return max(0, min(100, max(values))) if values else None
+
+
 async def free_workers(session, now: datetime) -> list[TranscriptionWorker]:
     """Online, not over 70 % CPU/GPU and not already holding a job (max 1 per worker)."""
     busy = await _active_worker_ids(session)
@@ -105,6 +119,12 @@ def clean_capabilities(value: dict) -> dict:
             "cpu_threads": max(0, int(_num(value.get("cpu_threads")))), "ram_mb": max(0, int(_num(value.get("ram_mb"))))}
 
 
+def clean_setup(value: dict | None) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {"stage": str(value.get("stage") or "")[:32], "percent": int(min(100, max(0, _num(value.get("percent")))))}
+
+
 def clean_load(value: dict) -> dict:
     gpu = value.get("gpu_percent")
     return {"cpu_percent": round(min(100.0, max(0.0, _num(value.get("cpu_percent")))), 1),
@@ -113,7 +133,8 @@ def clean_load(value: dict) -> dict:
 
 
 async def upsert_worker(session, *, credential_id: int, source_name: str, enabled: bool, state: str,
-                        detail: str, capabilities: dict, load: dict, now: datetime) -> TranscriptionWorker:
+                        detail: str, capabilities: dict, load: dict, now: datetime,
+                        setup: dict | None = None) -> TranscriptionWorker:
     worker = await session.scalar(select(TranscriptionWorker).where(TranscriptionWorker.credential_id == credential_id))
     if worker is None:
         worker = TranscriptionWorker(credential_id=credential_id)
@@ -124,6 +145,7 @@ async def upsert_worker(session, *, credential_id: int, source_name: str, enable
     worker.detail = str(detail or "")[:300]
     worker.capabilities = clean_capabilities(capabilities or {})
     worker.load = clean_load(load or {})
+    worker.setup = clean_setup(setup) if worker.state == "installing" else {}
     worker.last_seen_at = now
     worker.updated_at = now
     await session.flush()
@@ -243,8 +265,14 @@ async def status_payload(session, track_id: int, now: datetime) -> dict:
     worker = await session.get(TranscriptionWorker, job.worker_id) if job.worker_id else None
     status = job.state
     estimate = None
+    setup_percent = None
     if status in {"queued", "assigned"}:
         status = "queued" if online else "waiting_for_pc"
+        if status == "waiting_for_pc":
+            # No ready PC, but one is installing its components: say so with a percentage.
+            setup_percent = await preparing_percent(session, now)
+            if setup_percent is not None:
+                status = "preparing_pc"
         if status == "queued":
             estimate = max(1, math.ceil(_estimate_seconds(job, (sorted(online, key=worker_score, reverse=True) or [None])[0], now) / 60))
     elif status == "running":
@@ -252,9 +280,11 @@ async def status_payload(session, track_id: int, now: datetime) -> dict:
     message = MESSAGES.get(status, "")
     if status == "running":
         message = f"{message} · ~{estimate} мин"
+    elif status == "preparing_pc":
+        message = f"{message}, {setup_percent}%"
     return {"ok": True, "status": status, "job_id": job.id, "language": job.language, "message": message,
             "estimate_minutes": estimate, "stage": (job.progress or {}).get("stage", "") if status == "running" else "",
-            "workers_online": len(online), "attempts": job.attempts,
+            "workers_online": len(online), "attempts": job.attempts, "setup_percent": setup_percent,
             "error": job.error if status == "failed" else "",
             "updated_at": aware(job.updated_at).isoformat() if job.updated_at else None,
             "line_count": len((job.result or {}).get("lines") or []) if status == "done" else 0}

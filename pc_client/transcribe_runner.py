@@ -168,14 +168,67 @@ def run(args) -> dict:
             "elapsed_sec": round(time.monotonic() - started, 1)}
 
 
+WHISPER_REPO = "Systran/faster-whisper-large-v3"
+WHISPER_FILES = ("config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.json", "vocabulary.txt")
+WHISPER_FALLBACK_BYTES = 3_090_000_000
+DEMUCS_SHARE = 0.03  # htdemucs is ~80 MB of the ~3.2 GB first download
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def whisper_total_bytes() -> int:
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(WHISPER_REPO, files_metadata=True)
+        total = sum(int(item.size or 0) for item in info.siblings or [] if item.rfilename in WHISPER_FILES)
+        return total or WHISPER_FALLBACK_BYTES
+    except Exception:
+        return WHISPER_FALLBACK_BYTES
+
+
+def watch_download(directory: Path, total: int, start: float, share: float, interval: float = 1.0):
+    """Report bytes on disk (including partial files) as "PROGRESS models f"."""
+    import threading
+    stop = threading.Event()
+    baseline = _tree_bytes(directory)
+
+    def loop():
+        while not stop.wait(interval):
+            done = max(0, _tree_bytes(directory) - baseline)
+            progress("models", min(0.99, start + share * min(1.0, done / max(1, total))))
+
+    thread = threading.Thread(target=loop, name="model-download-progress", daemon=True)
+    thread.start()
+    return stop
+
+
 def warmup(args) -> dict:
-    """Download/verify both models once so the first job does not hit its deadline."""
+    """Download both models once (with progress) so the first job does not hit its deadline."""
     models = Path(args.models)
     os.environ.setdefault("TORCH_HOME", str(models / "torch"))
     os.environ.setdefault("HF_HOME", str(models / "hf"))
+    progress("models", 0.0)
     from demucs.pretrained import get_model
     get_model(DEMUCS_MODEL)
-    load_whisper(args.device, args.threads, models)
+    progress("models", DEMUCS_SHARE)
+    target = models / "whisper"
+    target.mkdir(parents=True, exist_ok=True)
+    stop = watch_download(target, whisper_total_bytes(), DEMUCS_SHARE, 0.99 - DEMUCS_SHARE)
+    try:
+        from faster_whisper.utils import download_model
+        download_model(MODEL, cache_dir=str(target))
+    finally:
+        stop.set()
+    progress("models", 1.0)
     return {"ok": True, "model": MODEL, "device": args.device}
 
 

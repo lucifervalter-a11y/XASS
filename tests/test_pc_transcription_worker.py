@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -9,8 +10,10 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,6 +21,8 @@ import httpx
 
 from pc_client import transcribe_runner as runner
 from pc_client import transcription_worker as tw
+
+REAL_WATCH_DOWNLOAD = runner.watch_download
 
 GPU = {"gpu": True, "gpu_name": "RTX 4070", "vram_mb": 12282, "gpu_percent": 4.0}
 NO_GPU = {"gpu": False, "gpu_name": "", "vram_mb": 0, "gpu_percent": None}
@@ -56,9 +61,13 @@ class ReadyRuntime(tw.Runtime):
     def __init__(self, root: Path):
         super().__init__(root, root)
         self.env_ready = True
+        self.torch = "cu121"
 
     def ready(self):
         return self.env_ready
+
+    def variant(self):
+        return self.torch
 
 
 class HardwareTests(unittest.TestCase):
@@ -90,46 +99,170 @@ class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.src = self.root / "src"
+        self.src.mkdir()
+        archive = self.src / "python.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("python.exe", b"MZ")
+            bundle.writestr("python3.dll", b"dll")
+            bundle.writestr("python311._pth", "python311.zip\n.\n\n# Uncomment to run site.main() automatically\n#import site\n")
+        wheel = self.src / "pip.whl"
+        wheel.write_bytes(b"PK-pip-wheel")
+        self.blobs = {"python": archive.read_bytes(), "pip": wheel.read_bytes()}
+        self.fetched = []
+        patches = [patch.object(tw, "PYTHON_EMBED_SHA256", hashlib.sha256(self.blobs["python"]).hexdigest()),
+                   patch.object(tw, "PIP_WHEEL_SHA256", hashlib.sha256(self.blobs["pip"]).hexdigest()),
+                   patch.object(tw, "IS_WINDOWS", True)]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_install_plan_uses_cuda_wheels_only_with_gpu_and_warms_models(self):
+    def fetch(self, url, destination, on_progress):
+        self.fetched.append(url)
+        data = self.blobs["python" if url == tw.PYTHON_EMBED_URL else "pip"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data[: len(data) // 2])
+        on_progress(len(data) // 2, len(data))
+        destination.write_bytes(data)
+        on_progress(len(data), len(data))
+
+    @staticmethod
+    def popen_with_progress(calls):
+        def popen(command, **kwargs):
+            calls.append((command, kwargs))
+            if "--warmup" in command:
+                lines = ["PROGRESS models 0.400\n", "PROGRESS models 1.000\n"]
+            elif "torch==2.5.1" in command:
+                lines = ["Collecting torch==2.5.1\n", "Progress 1000000000 of 2500000000\n", "Progress 2500000000 of 2500000000\n",
+                         "Progress 1000000 of 7000000\n"]
+            else:
+                lines = ["Successfully installed\n"]
+            return FakeProcess(stdout=lines)
+        return popen
+
+    def test_torch_variant_uses_cuda_only_for_nvidia(self):
+        self.assertEqual(tw.torch_variant(GPU), "cu121")
+        self.assertEqual(tw.torch_variant(NO_GPU, ["NVIDIA GeForce GTX 1060 6GB"]), "cu121")
+        self.assertEqual(tw.torch_variant(NO_GPU, ["AMD Radeon RX 6600", "Intel(R) UHD Graphics 770"]), "cpu")
+        self.assertEqual(tw.torch_variant(NO_GPU, []), "cpu")
+        self.assertEqual(tw.torch_variant(None), "cpu")
+        self.assertEqual(tw.torch_index("cu121"), tw.TORCH_CUDA_INDEX)
+        self.assertEqual(tw.torch_index("cpu"), tw.TORCH_CPU_INDEX)
+
+    def test_wmi_gpu_names_parses_powershell_output(self):
+        seen = []
+        names = tw.wmi_gpu_names(run=lambda args: seen.append(args) or "NVIDIA GeForce RTX 3060\r\n\r\nMicrosoft Basic Display\r\n")
+        self.assertEqual(names, ["NVIDIA GeForce RTX 3060", "Microsoft Basic Display"])
+        self.assertIn("Win32_VideoController", seen[0][-1])
+
+    def test_pip_commands_pick_index_by_variant_and_warm_models(self):
         runtime = tw.Runtime(self.root, self.root)
-        gpu = runtime.install_commands(["py", "-3.11"], gpu=True)
-        cpu = runtime.install_commands(["py", "-3.11"], gpu=False)
-        self.assertEqual(gpu[0], ["py", "-3.11", "-m", "venv", str(runtime.env)])
-        self.assertIn(tw.TORCH_CUDA_INDEX, gpu[2])
-        self.assertIn(tw.TORCH_CPU_INDEX, cpu[2])
-        self.assertTrue(any("faster-whisper" in item for item in gpu[3]))
-        self.assertTrue(any("demucs" in item for item in gpu[3]))
-        self.assertIn("--warmup", gpu[4])
-        self.assertIn("cuda", gpu[4])
-        self.assertIn("cpu", cpu[4])
-        # Models live in the runtime cache, never in the repository.
+        cuda, cpu = runtime.pip_commands("cu121"), runtime.pip_commands("cpu")
+        self.assertIn(tw.TORCH_CUDA_INDEX, cuda["torch"][0])
+        self.assertNotIn(tw.TORCH_CPU_INDEX, cuda["torch"][0])
+        self.assertIn(tw.TORCH_CPU_INDEX, cpu["torch"][0])
+        self.assertIn("torchaudio==2.5.1", cpu["torch"][0])
+        self.assertTrue(all(cmd[0] == str(runtime.python) for cmds in cuda.values() for cmd in cmds))
+        self.assertIn("--no-build-isolation", cuda["deps"][1])
+        self.assertTrue(any("faster-whisper" in item for item in cuda["deps"][1]))
+        self.assertTrue(any("demucs" in item for item in cuda["deps"][1]))
+        self.assertIn("--warmup", cuda["models"][0])
+        self.assertEqual(cuda["models"][0][cuda["models"][0].index("--device") + 1], "cuda")
+        self.assertEqual(cpu["models"][0][cpu["models"][0].index("--device") + 1], "cpu")
+        # Private Python and models live under the per-user data root, never in the repository.
+        self.assertTrue(str(runtime.python).startswith(str(self.root / "transcription" / "python")))
         self.assertTrue(str(runtime.models).startswith(str(self.root)))
 
-    def test_install_runs_steps_at_low_priority_and_writes_marker(self):
-        runtime = tw.Runtime(self.root, self.root)
-        calls = []
-        with patch.object(runtime, "find_base_python", return_value=["python3.11"]):
-            runtime.install(False, popen=lambda cmd, **kw: calls.append((cmd, kw)) or FakeProcess())
-        self.assertEqual(len(calls), 5)
-        self.assertTrue(runtime.marker.is_file())
-        failing = tw.Runtime(self.root / "other", self.root)
-        with patch.object(failing, "find_base_python", return_value=["python3.11"]):
-            with self.assertRaises(tw.TranscriptionError) as ctx:
-                failing.install(False, popen=lambda cmd, **kw: FakeProcess(returncode=1))
-        self.assertEqual(ctx.exception.reason, "install_step_1_failed")
-        with patch.object(failing, "find_base_python", return_value=None):
-            with self.assertRaises(tw.TranscriptionError):
-                failing.install(False)
+    def test_install_plan_and_overall_percent(self):
+        cuda, cpu = tw.install_plan("cu121"), tw.install_plan("cpu")
+        self.assertEqual([stage for stage, _, _ in cuda], ["python", "pip", "torch", "deps", "models"])
+        self.assertIn("CUDA", dict((s, l) for s, l, _ in cuda)["torch"])
+        self.assertIn("CPU", dict((s, l) for s, l, _ in cpu)["torch"])
+        self.assertEqual(tw.overall_percent(cuda, "python", 0.0), 0)
+        self.assertEqual(tw.overall_percent(cuda, "models", 1.0), 100)
+        mid = tw.overall_percent(cuda, "torch", 0.5)
+        self.assertLess(tw.overall_percent(cuda, "torch", 0.1), mid)
+        self.assertLess(mid, tw.overall_percent(cuda, "deps", 0.0))
+        self.assertEqual(tw.overall_percent(cuda, "torch", 7.0), tw.overall_percent(cuda, "deps", 0.0))
 
-    def test_find_base_python_accepts_only_supported_versions(self):
-        runtime = tw.Runtime(self.root, self.root, {"transcription_python": "C:/Py/python.exe"})
-        versions = {"C:/Py/python.exe": "3.13", "python3.12": "3.12"}
-        found = runtime.find_base_python(run=lambda args: versions.get(args[0], ""))
-        self.assertEqual(found, ["python3.12"])
+    def test_install_private_python_reports_progress_and_writes_marker(self):
+        runtime = tw.Runtime(self.root / "data", self.root)
+        calls, reports = [], []
+        runtime.install("cpu", report=lambda stage, fraction: reports.append((stage, fraction)),
+                        popen=self.popen_with_progress(calls), fetch=self.fetch)
+        python_dir = runtime.python_dir
+        self.assertTrue((python_dir / "python.exe").is_file())
+        pth = (python_dir / "python311._pth").read_text(encoding="utf-8").splitlines()
+        self.assertIn("import site", pth)
+        self.assertIn("Lib\\site-packages", pth)
+        self.assertNotIn("#import site", pth)
+        self.assertEqual(self.fetched, [tw.PYTHON_EMBED_URL, tw.PIP_WHEEL_URL])
+        # pip bootstraps itself from the pinned wheel, offline.
+        bootstrap = calls[0][0]
+        self.assertEqual(bootstrap[0], str(runtime.python))
+        self.assertTrue(bootstrap[1].endswith("pip"))
+        self.assertIn("--no-index", bootstrap)
+        self.assertEqual(len(calls), 1 + 1 + 2 + 1)
+        self.assertTrue(all("creationflags" in kw for _, kw in calls))
+        self.assertEqual(json.loads(runtime.marker.read_text(encoding="utf-8"))["variant"], "cpu")
+        self.assertEqual(runtime.variant(), "cpu")
+        stages = [stage for stage, _ in reports]
+        self.assertEqual(sorted(set(stages), key=stages.index), ["python", "pip", "torch", "deps", "models"])
+        torch_fractions = [f for stage, f in reports if stage == "torch"]
+        self.assertTrue(any(0 < f < 1 for f in torch_fractions))
+        self.assertEqual(torch_fractions, sorted(torch_fractions))  # a new file does not move progress back
+        self.assertIn(("models", 0.4), reports)
+        self.assertIn(("python", 1.0), reports)
+        self.assertIn("Collecting torch", runtime.log_path.read_text(encoding="utf-8"))
+        # A retry reuses the verified downloads and the unpacked Python.
+        self.fetched.clear()
+        runtime.install("cpu", popen=self.popen_with_progress([]), fetch=self.fetch)
+        self.assertEqual(self.fetched, [])
+
+    def test_install_rejects_hash_mismatch_and_failed_steps(self):
+        runtime = tw.Runtime(self.root / "bad", self.root)
+        with patch.object(tw, "PYTHON_EMBED_SHA256", "0" * 64):
+            with self.assertRaises(tw.TranscriptionError) as ctx:
+                runtime.install("cpu", popen=self.popen_with_progress([]), fetch=self.fetch)
+        self.assertTrue(ctx.exception.reason.startswith("hash_mismatch"))
+        self.assertFalse(runtime.python.is_file())
+        self.assertFalse(any(runtime.downloads.iterdir()))
+        failing = tw.Runtime(self.root / "fail", self.root)
+        with self.assertRaises(tw.TranscriptionError) as ctx:
+            failing.install("cu121", popen=lambda cmd, **kw: FakeProcess(returncode=0 if "--no-index" in cmd else 1), fetch=self.fetch)
+        self.assertEqual(ctx.exception.reason, "install_torch_failed")
+        self.assertFalse(failing.ready())
+
+    def test_install_refuses_non_windows_real_run(self):
+        with patch.object(tw, "IS_WINDOWS", False):
+            with self.assertRaises(tw.TranscriptionError) as ctx:
+                tw.Runtime(self.root, self.root).install("cpu")
+        self.assertEqual(ctx.exception.reason, "windows_only")
+
+    def test_unsafe_archive_is_rejected(self):
+        archive = self.src / "evil.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("../evil.exe", b"x")
+        self.blobs["python"] = archive.read_bytes()
+        with patch.object(tw, "PYTHON_EMBED_SHA256", hashlib.sha256(self.blobs["python"]).hexdigest()):
+            with self.assertRaises(tw.TranscriptionError) as ctx:
+                tw.Runtime(self.root / "evil", self.root).install("cpu", popen=self.popen_with_progress([]), fetch=self.fetch)
+        self.assertEqual(ctx.exception.reason, "unsafe_python_archive")
+
+    def test_status_text_and_file(self):
+        self.assertEqual(tw.status_text({"state": "installing"}, False), "")
+        self.assertEqual(tw.status_text(None, True), "")
+        self.assertEqual(tw.status_text({"state": "installing", "stage_label": "PyTorch (CUDA)", "percent": 37}, True),
+                         "Подготовка к расшифровке: PyTorch (CUDA) — 37%")
+        self.assertIn("hash_mismatch", tw.status_text({"state": "error", "detail": "hash_mismatch x"}, True))
+        self.assertEqual(tw.status_text({"state": "idle"}, True), "Готов к расшифровке")
+        self.assertIsNone(tw.read_status_file(self.root))
+        (self.root / "transcription").mkdir()
+        (self.root / "transcription" / "status.json").write_text('{"state": "idle"}', encoding="utf-8")
+        self.assertEqual(tw.read_status_file(self.root), {"state": "idle"})
 
     def test_low_priority_and_thread_limits(self):
         runtime = tw.Runtime(self.root, self.root)
@@ -137,14 +270,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((env["OMP_NUM_THREADS"], env["MKL_NUM_THREADS"]), ("3", "3"))
         self.assertTrue(env["HF_HOME"].startswith(str(runtime.models)))
         idle_runtime = tw.Runtime(self.root, self.root, {"transcription_priority": "idle"})
-        with patch.object(tw.os, "name", "nt"):
-            flags = runtime.popen_kwargs()["creationflags"]
-            self.assertTrue(flags & tw.BELOW_NORMAL_PRIORITY_CLASS)
-            self.assertTrue(flags & tw.CREATE_NO_WINDOW)
-            idle = idle_runtime.popen_kwargs()["creationflags"]
-            self.assertTrue(idle & tw.IDLE_PRIORITY_CLASS)
-        if os.name != "nt":
-            self.assertIn("preexec_fn", runtime.popen_kwargs())
+        flags = runtime.popen_kwargs()["creationflags"]
+        self.assertTrue(flags & tw.BELOW_NORMAL_PRIORITY_CLASS)
+        self.assertTrue(flags & tw.CREATE_NO_WINDOW)
+        idle = idle_runtime.popen_kwargs()["creationflags"]
+        self.assertTrue(idle & tw.IDLE_PRIORITY_CLASS)
+        with patch.object(tw, "IS_WINDOWS", False):
+            if hasattr(os, "nice"):
+                self.assertIn("preexec_fn", runtime.popen_kwargs())
 
 
 class WorkerFlowTests(unittest.TestCase):
@@ -293,20 +426,64 @@ class WorkerFlowTests(unittest.TestCase):
         worker = self.worker(lambda *a, **k: FakeProcess())
         worker.runtime.env_ready = False
         started = threading.Event(); release = threading.Event()
+        seen = {}
 
-        def install(gpu, report):
-            report("шаг 1")
+        def install(variant, report, popen, fetch):
+            seen["variant"] = variant
+            report("torch", 0.5)
             started.set(); release.wait(5)
         with patch.object(worker.runtime, "install", side_effect=install), \
              patch.object(tw.psutil, "cpu_percent", return_value=1.0):
-            worker._gpu = GPU
             worker.ensure_runtime()
             started.wait(5)
             body = worker.poll_body()
             self.assertEqual(body["state"], "installing")
+            expected = tw.overall_percent(tw.install_plan("cu121"), "torch", 0.5)
+            self.assertEqual(body["setup"], {"stage": "torch", "percent": expected})
+            status = tw.read_status_file(self.root)
+            self.assertEqual((status["state"], status["stage"], status["percent"]), ("installing", "torch", expected))
+            self.assertIn(f"{expected}%", tw.status_text(status, True))
             release.set(); worker._install_thread.join(5)
+        self.assertEqual(seen["variant"], "cu121")
+        self.assertEqual(tw.read_status_file(self.root)["state"], "idle")
         worker.runtime.env_ready = True
         self.assertEqual(worker.runtime_state()[0], "ready")
+        self.assertNotIn("setup", worker.poll_body())
+
+    def test_ensure_runtime_selects_torch_variant_from_gpu_probes(self):
+        cases = [(GPU, ["AMD Radeon"], "cu121"), (NO_GPU, ["NVIDIA GeForce GTX 1650"], "cu121"),
+                 (NO_GPU, ["AMD Radeon RX 7600"], "cpu"), (NO_GPU, [], "cpu")]
+        for gpu, wmi, expected in cases:
+            with self.subTest(expected=expected, wmi=wmi):
+                worker = self.worker(lambda *a, **k: FakeProcess(), gpu=gpu)
+                worker.probe_wmi = lambda wmi=wmi: wmi
+                worker.runtime.env_ready = False
+                chosen = []
+                with patch.object(worker.runtime, "install", side_effect=lambda variant, **kw: chosen.append(variant)):
+                    worker.ensure_runtime()
+                    worker._install_thread.join(5)
+                self.assertEqual(chosen, [expected])
+
+    def test_install_failure_reports_error_state(self):
+        worker = self.worker(lambda *a, **k: FakeProcess())
+        worker.runtime.env_ready = False
+        with patch.object(worker.runtime, "install", side_effect=tw.TranscriptionError("hash_mismatch python.zip")), \
+             patch.object(tw.psutil, "cpu_percent", return_value=1.0):
+            worker.ensure_runtime()
+            worker._install_thread.join(5)
+            body = worker.poll_body()
+        self.assertEqual((body["state"], body["detail"]), ("error", "hash_mismatch python.zip"))
+        self.assertNotIn("setup", body)
+        self.assertEqual(tw.read_status_file(self.root)["state"], "error")
+
+    def test_runner_uses_cpu_when_cpu_torch_installed(self):
+        worker = self.worker(lambda *a, **k: FakeProcess())
+        worker._gpu = GPU
+        cmd = worker.runner_command(self.job, self.root / "in.mp3", self.root / "out.json", self.root, 2)
+        self.assertEqual(cmd[cmd.index("--device") + 1], "cuda")
+        worker.runtime.torch = "cpu"
+        cmd = worker.runner_command(self.job, self.root / "in.mp3", self.root / "out.json", self.root, 2)
+        self.assertEqual(cmd[cmd.index("--device") + 1], "cpu")
 
     def test_non_individual_key_or_missing_server_does_nothing(self):
         worker = tw.TranscriptionWorker({"server_url": "https://x", "api_key": "global", tw.CONFIG_KEY: True}, self.root, self.root,
@@ -367,6 +544,37 @@ class RunnerTests(unittest.TestCase):
                                 "--device", device, "--threads", "3", "--models", str(root / "m"), "--workdir", str(root / "w")])
             result = json.loads((root / "out.json").read_text("utf-8")) if code == 0 else None
         return code, result, calls
+
+    def test_warmup_downloads_models_with_progress(self):
+        calls = {}
+
+        def download_model(name, cache_dir):
+            calls["whisper"] = (name, cache_dir)
+            Path(cache_dir, "model.bin").write_bytes(b"x" * 2048)
+            time.sleep(0.25)
+
+        info = SimpleNamespace(siblings=[SimpleNamespace(rfilename="model.bin", size=2048), SimpleNamespace(rfilename="README.md", size=9)])
+        modules = {"demucs": types.ModuleType("demucs"),
+                   "demucs.pretrained": types.SimpleNamespace(get_model=lambda name: calls.setdefault("demucs", name)),
+                   "faster_whisper": types.ModuleType("faster_whisper"),
+                   "faster_whisper.utils": types.SimpleNamespace(download_model=download_model),
+                   "huggingface_hub": types.SimpleNamespace(HfApi=lambda: SimpleNamespace(model_info=lambda repo, files_metadata: info))}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, patch.dict(sys.modules, modules), \
+             patch.object(runner, "watch_download", wraps=lambda d, t, st, sh: REAL_WATCH_DOWNLOAD(d, t, st, sh, interval=0.05)) as watch, \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = runner.main(["--warmup", "--device", "cpu", "--models", temp])
+            whisper_dir = Path(temp) / "whisper"
+        self.assertEqual(code, 0)
+        self.assertEqual(calls["demucs"], "htdemucs")
+        self.assertEqual(calls["whisper"], ("large-v3", str(whisper_dir)))
+        self.assertEqual(watch.call_args[0][1], 2048)  # total from the HF file sizes of the model files only
+        fractions = [float(line.split()[2]) for line in out.getvalue().splitlines() if line.startswith("PROGRESS models")]
+        self.assertEqual(fractions[0], 0.0)
+        self.assertEqual(fractions[-1], 1.0)
+        self.assertIn(runner.DEMUCS_SHARE, fractions)
+        self.assertTrue(any(runner.DEMUCS_SHARE < f < 1.0 for f in fractions))
+        self.assertEqual(fractions, sorted(fractions))
 
     def test_runner_demucs_vocals_then_whisper_large_v3_float16_on_gpu(self):
         code, result, calls = self.run_main("cuda")

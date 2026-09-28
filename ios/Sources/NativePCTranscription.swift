@@ -5,18 +5,21 @@ import CoreFoundation
 /// (`/api/mini/music/tracks/{id}/transcription`). The iPhone only asks and
 /// shows the status; Demucs + Whisper run on a PC with the XASS client.
 struct PCTranscriptionStatus: Equatable {
-    /// none | waiting_for_pc | queued | running | done | failed | catalog_available
+    /// none | waiting_for_pc | preparing_pc | queued | running | done | failed | catalog_available
     let status: String
     let message: String
     let estimateMinutes: Int?
+    /// First-time setup progress of an installing PC (only with `preparing_pc`).
+    let setupPercent: Int?
 
-    static let known: Set<String> = ["none", "waiting_for_pc", "queued", "running", "done", "failed", "catalog_available"]
+    static let known: Set<String> = ["none", "waiting_for_pc", "preparing_pc", "queued", "running", "done", "failed", "catalog_available"]
     static let automaticLabel = "Автоматически, может быть с ошибками"
 
-    init(status: String, message: String = "", estimateMinutes: Int? = nil) {
+    init(status: String, message: String = "", estimateMinutes: Int? = nil, setupPercent: Int? = nil) {
         self.status = Self.known.contains(status) ? status : "none"
         self.message = message
         self.estimateMinutes = estimateMinutes
+        self.setupPercent = setupPercent
     }
 
     init(response: [String: Any]) {
@@ -26,11 +29,17 @@ struct PCTranscriptionStatus: Equatable {
            number.doubleValue.isFinite {
             minutes = max(1, min(600, number.intValue))
         }
-        self.init(status: raw, message: String((response["message"] as? String ?? "").prefix(200)), estimateMinutes: minutes)
+        var percent: Int?
+        if let number = response["setup_percent"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+           number.doubleValue.isFinite {
+            percent = max(0, min(100, number.intValue))
+        }
+        self.init(status: raw, message: String((response["message"] as? String ?? "").prefix(200)), estimateMinutes: minutes,
+                  setupPercent: percent)
     }
 
     /// Still worth polling: the result will arrive without another tap.
-    var isActive: Bool { ["waiting_for_pc", "queued", "running"].contains(status) }
+    var isActive: Bool { ["waiting_for_pc", "preparing_pc", "queued", "running"].contains(status) }
     /// The button stays while waiting for a PC: tapping again only joins the same job.
     var canRequest: Bool { ["none", "failed", "waiting_for_pc", "catalog_available"].contains(status) }
 
@@ -38,6 +47,7 @@ struct PCTranscriptionStatus: Equatable {
         if !message.isEmpty { return message }
         switch status {
         case "waiting_for_pc": return "Расшифруем, когда включится компьютер"
+        case "preparing_pc": return "ПК готовится к расшифровке, \(setupPercent ?? 0)%"
         case "queued": return "В очереди на расшифровку"
         case "running": return estimateMinutes.map { "Расшифровываем на компьютере · ~\($0) мин" } ?? "Расшифровываем на компьютере"
         case "done": return "Текст распознан. " + Self.automaticLabel
@@ -50,6 +60,7 @@ struct PCTranscriptionStatus: Equatable {
     var symbol: String {
         switch status {
         case "waiting_for_pc": return "desktopcomputer"
+        case "preparing_pc": return "arrow.down.circle"
         case "queued": return "clock"
         case "running": return "waveform"
         case "done": return "checkmark.circle"
@@ -58,8 +69,14 @@ struct PCTranscriptionStatus: Equatable {
         }
     }
 
-    /// Poll cadence: fast while a PC works, slow while no PC is online.
-    var pollInterval: Duration { status == "waiting_for_pc" ? .seconds(30) : .seconds(8) }
+    /// Poll cadence: fast while a PC works, slower while a PC installs, slow while no PC is online.
+    var pollInterval: Duration {
+        switch status {
+        case "waiting_for_pc": return .seconds(30)
+        case "preparing_pc": return .seconds(15)
+        default: return .seconds(8)
+        }
+    }
 }
 
 @MainActor final class PCTranscriptionModel: ObservableObject {

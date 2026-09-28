@@ -17,15 +17,18 @@ Setting «Использовать этот ПК для расшифровки �
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, Callable
+import zipfile
 
 import psutil
 
@@ -35,6 +38,7 @@ except ModuleNotFoundError:
     from pc_client.network_client import create_http_client
 
 CONFIG_KEY = "transcription_enabled"
+IS_WINDOWS = os.name == "nt"
 SETTING_LABEL = "Использовать этот ПК для расшифровки текста"
 POLL_SEC = 20
 DISABLED_POLL_SEC = 300
@@ -44,11 +48,18 @@ BUSY_PERCENT = 70.0
 # torch 2.5.1 cu121 bundles cuDNN 9 / cuBLAS 12, which CTranslate2 4.x
 # (faster-whisper) needs; wheels exist for Python 3.10-3.12. demucs 4.1 does
 # its audio I/O without torchaudio.
-TORCH_PACKAGES = ["torch==2.5.1"]
+TORCH_PACKAGES = ["torch==2.5.1", "torchaudio==2.5.1"]  # torchaudio pinned so demucs never pulls another torch
 TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 RUNTIME_PACKAGES = ["demucs==4.1.0", "faster-whisper==1.2.1"]
-SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12))
+# Official python.org Windows embeddable build; SHA-256 computed from the file
+# whose MD5 (6d9aa08531d48fcc261ba667e2df17c4) matches python.org's release page.
+PYTHON_VERSION = "3.11.9"
+PYTHON_EMBED_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+PYTHON_EMBED_SHA256 = "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b"
+PIP_WHEEL_URL = ("https://files.pythonhosted.org/packages/b7/3f/945ef7ab14dc4f9d7f40288d2df998d1837ee0888ec3659c813487572faa/"
+                 "pip-25.2-py3-none-any.whl")
+PIP_WHEEL_SHA256 = "6d67a2b4e7f14d8b31b8b52648866fa717f45a1eb70e83002f4331d07e953717"  # PyPI digest
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 IDLE_PRIORITY_CLASS = 0x00000040
 CREATE_NO_WINDOW = 0x08000000
@@ -79,9 +90,12 @@ def _run_quiet(args: list[str], timeout: float = 5.0) -> str:
 
 def gpu_info(run: Callable[[list[str]], str] = _run_quiet) -> dict:
     """NVIDIA GPU via nvidia-smi (ships with the driver); no torch needed."""
-    if run is _run_quiet and not shutil.which("nvidia-smi"):
-        return {"gpu": False, "gpu_name": "", "vram_mb": 0, "gpu_percent": None}
-    output = run(["nvidia-smi", "--query-gpu=name,memory.total,utilization.gpu", "--format=csv,noheader,nounits"])
+    binary = "nvidia-smi"
+    if run is _run_quiet:
+        binary = nvidia_smi_path() or ""
+        if not binary:
+            return {"gpu": False, "gpu_name": "", "vram_mb": 0, "gpu_percent": None}
+    output = run([binary, "--query-gpu=name,memory.total,utilization.gpu", "--format=csv,noheader,nounits"])
     best = None
     for row in output.splitlines():
         parts = [part.strip() for part in row.split(",")]
@@ -118,80 +132,256 @@ def thread_limit(caps: dict) -> int:
 
 # ------------------------------------------------------------------ runtime
 
+def torch_variant(gpu: dict | None, wmi_names: list[str] | None = None) -> str:
+    """CUDA wheels (~2.5 GB) only for an NVIDIA GPU; everything else gets the CPU wheel."""
+    if gpu and gpu.get("gpu"):
+        return "cu121"
+    if any("nvidia" in str(name).lower() for name in (wmi_names or [])):
+        return "cu121"
+    return "cpu"
+
+
+def torch_index(variant: str) -> str:
+    return TORCH_CUDA_INDEX if variant == "cu121" else TORCH_CPU_INDEX
+
+
+def install_plan(variant: str) -> list[tuple[str, str, float]]:
+    """(stage, Russian label, weight) — weights follow the approximate download size."""
+    cuda = variant == "cu121"
+    return [
+        ("python", "Python 3.11", 1.0),
+        ("pip", "Установщик пакетов", 0.5),
+        ("torch", "PyTorch (CUDA)" if cuda else "PyTorch (CPU)", 45.0 if cuda else 10.0),
+        ("deps", "Demucs и Whisper", 8.0),
+        ("models", "Модели htdemucs и Whisper large-v3", 45.0),
+    ]
+
+
+def overall_percent(plan: list[tuple[str, str, float]], stage: str, fraction: float) -> int:
+    total = sum(weight for _, _, weight in plan) or 1.0
+    done = 0.0
+    for name, _, weight in plan:
+        if name == stage:
+            done += weight * max(0.0, min(1.0, fraction))
+            break
+        done += weight
+    return max(0, min(100, int(done * 100 / total)))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def http_fetch(url: str, destination: Path, on_progress: Callable[[int, int], None]) -> None:
+    """Plain HTTPS download with progress; the caller verifies the pinned SHA-256."""
+    import httpx
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".part")
+    with httpx.stream("GET", url, follow_redirects=True, timeout=60) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length") or 0)
+        done = 0
+        with partial.open("wb") as stream:
+            for chunk in response.iter_bytes(chunk_size=256 * 1024):
+                stream.write(chunk)
+                done += len(chunk)
+                on_progress(done, total)
+    os.replace(partial, destination)
+
+
+_PIP_PROGRESS = re.compile(r"^Progress (\d+) of (\d+)")
+_RUNNER_PROGRESS = re.compile(r"^PROGRESS (\w+) ([0-9.]+)")
+
+
 class Runtime:
-    """Separate venv + model cache; installed on first enable, never bundled."""
+    """Private Python + packages + model cache under %LOCALAPPDATA%\\XASS\\transcription.
+
+    Nothing is required from the user: the official python.org embeddable
+    Python 3.11 (SHA-256 pinned) is unpacked per user without admin rights,
+    pip is bootstrapped from its pinned wheel, then torch (CUDA only with an
+    NVIDIA GPU), demucs, faster-whisper and both models are downloaded.
+    """
 
     def __init__(self, data_root: Path, resource_root: Path, config: dict | None = None):
         config = config or {}
         self.root = Path(data_root) / "transcription"
-        self.env = self.root / "env"
+        self.python_dir = self.root / "python"
+        self.downloads = self.root / "downloads"
         self.models = self.root / "models"
         self.jobs = self.root / "jobs"
         self.marker = self.root / "ready.json"
         self.log_path = self.root / "install.log"
         self.runner = Path(resource_root) / "transcribe_runner.py"
-        self.base_python = str(config.get("transcription_python") or "")
         self.priority = IDLE_PRIORITY_CLASS if config.get("transcription_priority") == "idle" else BELOW_NORMAL_PRIORITY_CLASS
 
     @property
     def python(self) -> Path:
-        return self.env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        return self.python_dir / ("python.exe" if IS_WINDOWS else "bin/python3")
 
     def ready(self) -> bool:
         return self.marker.is_file() and self.python.is_file() and self.runner.is_file()
+
+    def variant(self) -> str:
+        try:
+            return str(json.loads(self.marker.read_text(encoding="utf-8")).get("variant") or "cpu")
+        except (OSError, ValueError, AttributeError):
+            return "cpu"
 
     def environment(self, threads: int) -> dict:
         env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
         for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "CT2_INTER_THREADS"):
             env[key] = str(threads)
         env.update(TORCH_HOME=str(self.models / "torch"), HF_HOME=str(self.models / "hf"),
-                   HF_HUB_DISABLE_TELEMETRY="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+                   HF_HUB_DISABLE_TELEMETRY="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
+                   PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1")
         return env
 
     def popen_kwargs(self) -> dict:
-        if os.name == "nt":
+        if IS_WINDOWS:
             return {"creationflags": self.priority | CREATE_NO_WINDOW}
         return {"preexec_fn": lambda: os.nice(19 if self.priority == IDLE_PRIORITY_CLASS else 10)}
 
-    def find_base_python(self, run: Callable[[list[str]], str] = _run_quiet) -> list[str] | None:
-        candidates = []
-        if self.base_python:
-            candidates.append([self.base_python])
-        if os.name == "nt":
-            candidates += [["py", f"-{major}.{minor}"] for major, minor in reversed(SUPPORTED_PYTHON)]
-        candidates += [["python3.12"], ["python3.11"], ["python3.10"], ["python"], ["python3"]]
-        for command in candidates:
-            version = run(command + ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"]).strip()
-            if version and tuple(int(x) for x in version.split(".")[:2]) in SUPPORTED_PYTHON:
-                return command
-        return None
-
-    def install_commands(self, base: list[str], gpu: bool) -> list[list[str]]:
+    def pip_commands(self, variant: str) -> dict[str, list[list[str]]]:
         python = str(self.python)
-        index = TORCH_CUDA_INDEX if gpu else TORCH_CPU_INDEX
-        return [
-            base + ["-m", "venv", str(self.env)],
-            [python, "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip"],
-            [python, "-m", "pip", "install", "--disable-pip-version-check", *TORCH_PACKAGES, "--index-url", index],
-            [python, "-m", "pip", "install", "--disable-pip-version-check", *RUNTIME_PACKAGES],
-            [python, str(self.runner), "--warmup", "--device", "cuda" if gpu else "cpu", "--threads", "2", "--models", str(self.models)],
-        ]
+        pip = [python, "-m", "pip", "install", "--progress-bar", "raw", "--no-warn-script-location"]
+        return {
+            "torch": [pip + [*TORCH_PACKAGES, "--index-url", torch_index(variant)]],
+            # The embeddable Python ignores PYTHONPATH, so pip's isolated sdist builds cannot
+            # see their build deps: install setuptools first and build without isolation.
+            "deps": [pip + ["setuptools>=70", "wheel"], pip + ["--no-build-isolation", *RUNTIME_PACKAGES]],
+            "models": [[python, str(self.runner), "--warmup", "--device", "cuda" if variant == "cu121" else "cpu",
+                        "--threads", "2", "--models", str(self.models)]],
+        }
 
-    def install(self, gpu: bool, report: Callable[[str], None] = lambda _: None,
-                popen: Callable[..., Any] = subprocess.Popen) -> None:
+    def _download(self, url: str, sha256: str, name: str, fetch, report: Callable[[float], None]) -> Path:
+        target = self.downloads / name
+        if not (target.is_file() and sha256_file(target) == sha256):
+            fetch(url, target, lambda done, total: report(done / total if total else 0.0))
+        if sha256_file(target) != sha256:
+            target.unlink(missing_ok=True)
+            raise TranscriptionError(f"hash_mismatch {name}")
+        return target
+
+    def _install_python(self, fetch, report: Callable[[float], None]) -> None:
+        archive = self._download(PYTHON_EMBED_URL, PYTHON_EMBED_SHA256, Path(PYTHON_EMBED_URL).name, fetch,
+                                 lambda f: report(0.9 * f))
+        shutil.rmtree(self.python_dir, ignore_errors=True)
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.namelist():
+                if member.startswith(("/", "\\")) or ".." in Path(member).parts:
+                    raise TranscriptionError("unsafe_python_archive")
+            bundle.extractall(self.python_dir)
+        # The embeddable build ignores site-packages until `import site` is enabled.
+        for pth in self.python_dir.glob("python*._pth"):
+            lines = [line for line in pth.read_text(encoding="utf-8").splitlines() if line.strip() != "#import site"]
+            for extra in ("Lib\\site-packages", "import site"):
+                if extra not in lines:
+                    lines.append(extra)
+            pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report(1.0)
+
+    def _run(self, command: list[str], log, popen, on_line: Callable[[str], None]) -> int:
+        log.write(f"\n$ {' '.join(command)}\n"); log.flush()
+        process = popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                        errors="replace", env=self.environment(2), **self.popen_kwargs())
+        for line in process.stdout:
+            on_line(line.rstrip())
+            if not line.startswith(("Progress ", "PROGRESS ")):
+                log.write(line)
+        return process.wait()
+
+    def install(self, variant: str, report: Callable[[str, float], None] = lambda *_: None,
+                popen: Callable[..., Any] = subprocess.Popen, fetch: Callable[..., None] = http_fetch) -> None:
+        """Idempotent: already finished steps are skipped on a retry."""
+        if not IS_WINDOWS and popen is subprocess.Popen:
+            raise TranscriptionError("windows_only")
         self.root.mkdir(parents=True, exist_ok=True)
-        base = self.find_base_python()
-        if base is None:
-            raise TranscriptionError("python_3_10_to_3_12_not_found")
-        commands = self.install_commands(base, gpu)
+        expected = {"torch": 2600e6 if variant == "cu121" else 250e6, "deps": 350e6}
         with self.log_path.open("a", encoding="utf-8") as log:
-            for index, command in enumerate(commands, 1):
-                report(f"Установка компонентов расшифровки: шаг {index} из {len(commands)}")
-                log.write(f"\n$ {' '.join(command)}\n"); log.flush()
-                process = popen(command, stdout=log, stderr=subprocess.STDOUT, env=self.environment(2), **self.popen_kwargs())
-                if process.wait() != 0:
-                    raise TranscriptionError(f"install_step_{index}_failed")
-        self.marker.write_text(json.dumps({"installed_at": time.time(), "gpu": gpu, "packages": RUNTIME_PACKAGES}), encoding="utf-8")
+            report("python", 0.0)
+            if not self.python.is_file():
+                self._install_python(fetch, lambda f: report("python", f))
+            report("pip", 0.0)
+            wheel = self._download(PIP_WHEEL_URL, PIP_WHEEL_SHA256, Path(PIP_WHEEL_URL).name, fetch, lambda f: report("pip", 0.5 * f))
+            # pip runs straight from its wheel to install itself into the private Python.
+            if self._run([str(self.python), str(wheel / "pip"), "install", "--no-index", "--no-warn-script-location", str(wheel)],
+                         log, popen, lambda _line: None) != 0:
+                raise TranscriptionError("install_pip_failed")
+            report("pip", 1.0)
+            for stage, commands in self.pip_commands(variant).items():
+                state = {"done": 0, "current": 0}
+
+                def on_line(line: str, stage=stage, state=state) -> None:
+                    match = _PIP_PROGRESS.match(line)
+                    if match:
+                        current = int(match.group(1))
+                        if current < state["current"]:
+                            state["done"] += state["current"]  # a new file started
+                        state["current"] = current
+                        report(stage, min(0.99, (state["done"] + current) / expected.get(stage, 1e9)))
+                        return
+                    match = _RUNNER_PROGRESS.match(line)
+                    if match and match.group(1) == "models":
+                        report(stage, min(0.99, float(match.group(2))))
+
+                report(stage, 0.0)
+                for command in commands:
+                    if self._run(command, log, popen, on_line) != 0:
+                        raise TranscriptionError(f"install_{stage}_failed")
+                report(stage, 1.0)
+        self.marker.write_text(json.dumps({"installed_at": time.time(), "variant": variant, "python": PYTHON_VERSION,
+                                           "packages": TORCH_PACKAGES + RUNTIME_PACKAGES}), encoding="utf-8")
+
+
+def nvidia_smi_path() -> str | None:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    for candidate in (Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "nvidia-smi.exe",
+                      Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def wmi_gpu_names(run: Callable[[list[str]], str] = _run_quiet) -> list[str]:
+    """Display adapters via WMI (Win32_VideoController); works without the NVIDIA tools on PATH."""
+    if not IS_WINDOWS and run is _run_quiet:
+        return []
+    output = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                  "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"])
+    return [line.strip()[:120] for line in output.splitlines() if line.strip()][:8]
+
+
+def status_text(payload: dict | None, enabled: bool) -> str:
+    """One line under the desktop checkbox."""
+    if not enabled or not isinstance(payload, dict):
+        return ""
+    state = payload.get("state")
+    if state == "installing":
+        label = payload.get("stage_label") or "компоненты"
+        return f"Подготовка к расшифровке: {label} — {int(payload.get('percent') or 0)}%"
+    if state == "error":
+        return f"Не удалось подготовить расшифровку ({payload.get('detail') or 'ошибка'}). Проверьте интернет и место на диске (~6 ГБ)."
+    if state == "running":
+        return str(payload.get("detail") or "Идёт расшифровка")
+    if state in {"idle", "ready"}:
+        return "Готов к расшифровке"
+    if state == "retrying":
+        return "Нет связи с сервером расшифровки, повторим позже"
+    return "Запуск…"
+
+
+def read_status_file(data_root: Path) -> dict | None:
+    try:
+        value = json.loads((Path(data_root) / "transcription" / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 # ------------------------------------------------------------------ worker
@@ -199,7 +389,9 @@ class Runtime:
 class TranscriptionWorker:
     def __init__(self, config: dict, data_root: Path, resource_root: Path, *, client_factory: Callable[..., Any] | None = None,
                  runtime: Runtime | None = None, popen: Callable[..., Any] = subprocess.Popen,
-                 probe_gpu: Callable[[], dict] = gpu_info, sleep: Callable[[float], None] = time.sleep):
+                 probe_gpu: Callable[[], dict] = gpu_info, probe_wmi: Callable[[], list[str]] = wmi_gpu_names,
+                 sleep: Callable[[float], None] = time.sleep, fetch: Callable[..., None] = http_fetch,
+                 install_popen: Callable[..., Any] = subprocess.Popen):
         self.config = dict(config)
         self.enabled = bool(config.get(CONFIG_KEY, False))
         self.base = str(config.get("server_url") or "").rstrip("/")
@@ -208,7 +400,12 @@ class TranscriptionWorker:
             self.base, timeout=30, trust_env=bool(config.get("trust_env_proxy", False)), follow_redirects=False))
         self.popen = popen
         self.probe_gpu = probe_gpu
+        self.probe_wmi = probe_wmi
         self.sleep = sleep
+        self.fetch = fetch
+        self.install_popen = install_popen
+        self._setup: dict = {}
+        self._written: tuple = ()
         self.stop = threading.Event()
         self._guard = threading.Lock()
         self._status = {"state": "disabled" if not self.enabled else "starting", "detail": "", "job_id": None}
@@ -226,6 +423,23 @@ class TranscriptionWorker:
     def _set(self, **values) -> None:
         with self._guard:
             self._status.update(values)
+            status = dict(self._status)
+        self._write_status(status)
+
+    def _write_status(self, status: dict) -> None:
+        """status.json lets the desktop window show stage + percent under the checkbox."""
+        key = (status.get("state"), status.get("stage"), status.get("percent"), status.get("detail"))
+        if key == self._written:
+            return
+        self._written = key
+        try:
+            self.runtime.root.mkdir(parents=True, exist_ok=True)
+            target = self.runtime.root / "status.json"
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(json.dumps({**status, "enabled": self.enabled, "updated_at": time.time()}, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, target)
+        except OSError:
+            pass
 
     def runtime_state(self) -> tuple[str, str]:
         if self.runtime.ready():
@@ -240,14 +454,27 @@ class TranscriptionWorker:
         state, _ = self.runtime_state()
         if state != "missing":
             return
-        gpu = bool(self._gpu.get("gpu"))
+        self._gpu = self.probe_gpu()
+        variant = torch_variant(self._gpu, [] if self._gpu.get("gpu") else self.probe_wmi())
+        plan = install_plan(variant)
+        labels = {name: label for name, label, _ in plan}
+
+        def report(stage: str, fraction: float) -> None:
+            percent = overall_percent(plan, stage, fraction)
+            self._setup = {"stage": stage, "percent": percent, "variant": variant}
+            self._set(state="installing", stage=stage, stage_label=labels.get(stage, stage), percent=percent,
+                      detail=f"{labels.get(stage, stage)} — {percent}%")
 
         def install():
             try:
-                self.runtime.install(gpu, report=lambda text: self._set(state="installing", detail=text))
+                self.runtime.install(variant, report=report, popen=self.install_popen, fetch=self.fetch)
+                self._setup = {}
+                self._set(state="idle", stage="", stage_label="", percent=100, detail="")
             except Exception as exc:
                 self._install_error = getattr(exc, "reason", type(exc).__name__)
                 self._set(state="error", detail=self._install_error)
+
+        report("python", 0.0)
 
         self._install_thread = threading.Thread(target=install, name="xass-transcription-install", daemon=True)
         self._install_thread.start()
@@ -257,9 +484,12 @@ class TranscriptionWorker:
         state, detail = self.runtime_state() if self.enabled else ("ready", "")
         if state == "missing":
             state = "installing"
-        return {"enabled": self.enabled, "state": state, "detail": str(detail)[:300], "capabilities": capabilities(self._gpu),
+        body = {"enabled": self.enabled, "state": state, "detail": str(detail)[:300], "capabilities": capabilities(self._gpu),
                 "load": current_load(self._gpu, running=self._running_job is not None, interval=0.5),
                 "running_job_id": self._running_job}
+        if state == "installing":
+            body["setup"] = {"stage": str(self._setup.get("stage") or "python"), "percent": int(self._setup.get("percent") or 0)}
+        return body
 
     def poll_once(self, client) -> dict | None:
         response = client.post(self.base + "/agent/transcription/poll", json=self.poll_body())
@@ -281,7 +511,8 @@ class TranscriptionWorker:
                         self.ensure_runtime()
                     job = self.poll_once(client)
                     state, detail = self.runtime_state() if self.enabled else ("disabled", "")
-                    self._set(state="idle" if state == "ready" else state, detail=detail)
+                    if state != "installing":  # the installer thread reports its own stage + percent
+                        self._set(state="idle" if state == "ready" else state, detail=detail)
                     if job is not None and self.enabled:
                         self.process(client, job)
                         delay = 1
@@ -321,7 +552,8 @@ class TranscriptionWorker:
         return destination
 
     def runner_command(self, job: dict, source: Path, output: Path, workdir: Path, threads: int) -> list[str]:
-        device = "cuda" if self._gpu.get("gpu") else "cpu"
+        # CUDA only when an NVIDIA GPU is present *and* the CUDA torch wheel was installed.
+        device = "cuda" if self._gpu.get("gpu") and self.runtime.variant() == "cu121" else "cpu"
         language = str(job.get("language") or "ru")
         return [str(self.runtime.python), str(self.runtime.runner), "--input", str(source), "--output", str(output),
                 "--language", language, "--device", device, "--threads", str(threads),

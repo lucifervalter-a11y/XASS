@@ -87,6 +87,35 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["message"], "Расшифруем, когда включится компьютер")
             self.assertEqual((await tq.status_payload(session, 99, T0))["status"], "none")
 
+    async def test_preparing_pc_status_shows_setup_percent_of_installing_worker(self):
+        async with self.sessions() as session:
+            await tq.request_job(session, self.track(), language="ru", user_id=1, now=T0)
+            await tq.upsert_worker(session, credential_id=1, source_name="pc1", enabled=True, state="installing", detail="",
+                                   capabilities=GPU, load=IDLE, now=T0, setup={"stage": "torch", "percent": 12})
+            second = await tq.upsert_worker(session, credential_id=2, source_name="pc2", enabled=True, state="installing",
+                                            detail="", capabilities=BIG_CPU, load=IDLE, now=T0, setup={"stage": "models", "percent": 250})
+            self.assertEqual(second.setup, {"stage": "models", "percent": 100})
+            # A stale or disabled installer does not count.
+            await tq.upsert_worker(session, credential_id=3, source_name="pc3", enabled=False, state="installing", detail="",
+                                   capabilities=GPU, load=IDLE, now=T0, setup={"stage": "torch", "percent": 99})
+            await tq.upsert_worker(session, credential_id=2, source_name="pc2", enabled=True, state="installing", detail="",
+                                   capabilities=BIG_CPU, load=IDLE, now=T0 - timedelta(seconds=tq.WORKER_STALE_SEC + 1),
+                                   setup={"stage": "models", "percent": 90})
+            status = await tq.status_payload(session, 1, T0)
+            self.assertEqual((status["status"], status["setup_percent"]), ("preparing_pc", 12))
+            self.assertEqual(status["message"], "ПК готовится к расшифровке, 12%")
+            # Once it is ready the job is offered to it; setup progress is cleared.
+            ready = await self.worker(session, 1, GPU)
+            self.assertEqual(ready.setup, {})
+            await tq.schedule(session, T0)
+            status = await tq.status_payload(session, 1, T0)
+            self.assertEqual(status["status"], "queued")
+            self.assertIsNone(status["setup_percent"])
+            # No installer at all: back to waiting_for_pc.
+            await self.worker(session, 1, GPU, enabled=False)
+            status = await tq.status_payload(session, 1, T0)
+            self.assertEqual((status["status"], status["setup_percent"]), ("waiting_for_pc", None))
+
     async def test_dedupe_one_job_per_track_and_done_is_never_rerun(self):
         async with self.sessions() as session:
             gpu = await self.worker(session, 1, GPU)
@@ -315,6 +344,26 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         again = await self.request("POST", route, json={"force": True})
         self.assertEqual(again.json()["status"], "done")
         self.assertIsNone((await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())).json()["job"])
+
+    async def test_installing_pc_reports_setup_progress_to_owner_status(self):
+        track = await self.upload()
+        route = f"/api/mini/music/tracks/{track['id']}/transcription"
+        with await self.no_catalog():
+            await self.request("POST", route, json={})
+        polled = await self.request("POST", "/agent/transcription/poll", headers=self.agent,
+                                    json=self.poll_body(state="installing", setup={"stage": "torch", "percent": 37}))
+        self.assertEqual(polled.status_code, 200, polled.text)
+        self.assertIsNone(polled.json()["job"])
+        status = (await self.request("GET", route)).json()
+        self.assertEqual((status["status"], status["setup_percent"]), ("preparing_pc", 37))
+        self.assertEqual(status["message"], "ПК готовится к расшифровке, 37%")
+        for bad in ({"stage": "torch", "percent": 101}, {"stage": "rm -rf", "percent": 1}):
+            response = await self.request("POST", "/agent/transcription/poll", headers=self.agent,
+                                          json=self.poll_body(state="installing", setup=bad))
+            self.assertEqual(response.status_code, 422, bad)
+        job = (await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())).json()["job"]
+        self.assertEqual(job["track_id"], track["id"])
+        self.assertEqual((await self.request("GET", route)).json()["status"], "running")
 
     async def test_catalog_lyrics_prevent_job_unless_forced(self):
         track = await self.upload()

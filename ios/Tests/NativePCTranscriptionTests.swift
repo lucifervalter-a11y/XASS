@@ -30,6 +30,23 @@ final class NativePCTranscriptionTests: XCTestCase {
         XCTAssertTrue(PCTranscriptionStatus(response: ["status": "failed"]).canRequest)
     }
 
+    func testPreparingPCShowsSetupPercentAndKeepsPolling() {
+        let preparing = PCTranscriptionStatus(response: ["status": "preparing_pc", "setup_percent": 42])
+        XCTAssertEqual(preparing.status, "preparing_pc")
+        XCTAssertEqual(preparing.setupPercent, 42)
+        XCTAssertEqual(preparing.displayText, "ПК готовится к расшифровке, 42%")
+        XCTAssertTrue(preparing.isActive)
+        XCTAssertFalse(preparing.canRequest, "The job already waits for the installing PC")
+        XCTAssertEqual(preparing.symbol, "arrow.down.circle")
+        XCTAssertEqual(preparing.pollInterval, .seconds(15))
+        let fromServer = PCTranscriptionStatus(response: ["status": "preparing_pc", "setup_percent": 7,
+                                                          "message": "ПК готовится к расшифровке, 7%"])
+        XCTAssertEqual(fromServer.displayText, "ПК готовится к расшифровке, 7%")
+        XCTAssertEqual(PCTranscriptionStatus(response: ["status": "preparing_pc", "setup_percent": 250]).setupPercent, 100)
+        XCTAssertNil(PCTranscriptionStatus(response: ["status": "preparing_pc", "setup_percent": true]).setupPercent)
+        XCTAssertNil(PCTranscriptionStatus(response: ["status": "queued"]).setupPercent)
+    }
+
     func testTimedLyricsFromPCTranscriptionAreLabelledAndPendingIsParsed() {
         let value = SyncedLyrics(response: ["lyrics": ["status": "synced", "synced": true, "source": "pc_transcription",
             "automatic": true, "lines": [["start": 1.0, "end": 2.0, "text": "раз"]]]], trackID: 9)!

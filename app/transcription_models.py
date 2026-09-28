@@ -45,5 +45,7 @@ class TranscriptionWorker(Base):
     detail: Mapped[str] = mapped_column(String(300), default="")
     capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
     load: Mapped[dict] = mapped_column(JSON, default=dict)
+    # First-time setup progress while state == "installing": {stage, percent}.
+    setup: Mapped[dict] = mapped_column(JSON, default=dict)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

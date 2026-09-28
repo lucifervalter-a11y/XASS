@@ -40,16 +40,19 @@
   создать или присоединиться. Если в каталоге уже есть синхронизированный текст,
   вернёт `status: "catalog_available"` и задачу не создаст (`force: true` — создать всё равно).
 * `GET /api/mini/music/tracks/{id}/transcription` — статус:
-  `none | waiting_for_pc | queued | running | done | failed | catalog_available`,
-  `estimate_minutes`, `message` (готовая русская подпись, например
-  «Расшифруем, когда включится компьютер»).
+  `none | waiting_for_pc | preparing_pc | queued | running | done | failed | catalog_available`,
+  `estimate_minutes`, `setup_percent`, `message` (готовая русская подпись, например
+  «Расшифруем, когда включится компьютер»). `preparing_pc` — готовых ПК нет, но
+  включённый ПК ставит компоненты; `setup_percent` — его прогресс (максимум по
+  таким ПК), `message` = «ПК готовится к расшифровке, N%».
 * `GET /api/mini/music/tracks/{id}/timed-lyrics` — после `done` возвращает строки
   `[{start, end, text}]` с `source: "pc_transcription"`.
 
 ПК (заголовок `X-Api-Key` — персональный ключ агента, тот же, что для heartbeat):
 
 * `POST /agent/transcription/poll` — возможности (GPU, VRAM, ядра, RAM), загрузка,
-  `running_job_id`; в ответ — задача с короткоживущей ссылкой
+  `running_job_id`, при `state: "installing"` — `setup: {stage, percent}`
+  (`stage` ∈ `python | pip | torch | deps | models`); в ответ — задача с короткоживущей ссылкой
   `/agent/music/tracks/{id}/stream?ticket=…` (15 мин, привязана к ключу этого ПК).
 * `POST /agent/transcription/jobs/{id}/progress | complete | fail`.
   `409` означает, что аренда потеряна — ПК бросает задачу.
@@ -74,33 +77,22 @@
 
 ### Установка компонентов (при первом включении, автоматически)
 
-Модели и библиотеки в репозиторий и установщик **не входят**. При первом
-включении агент сам:
+Модели и библиотеки в репозиторий и установщик **не входят**, ручных шагов нет,
+права администратора не нужны. При первом включении агент сам, в
+`%LOCALAPPDATA%\XASS\transcription`:
 
-1. ищет Python 3.10–3.12 (`py -3.12/-3.11/-3.10`, либо путь из
-   `"transcription_python"` в `config.json`);
-2. создаёт venv `%LOCALAPPDATA%\XASS\transcription\env`;
-3. ставит `torch==2.5.1` (CUDA 12.1-сборку при наличии NVIDIA GPU, иначе CPU),
-   `demucs==4.1.0`, `faster-whisper==1.2.1`;
-4. заранее скачивает модели htdemucs (~80 МБ) и Whisper large-v3 (~3 ГБ) в
-   `%LOCALAPPDATA%\XASS\transcription\models`.
+1. **Python** — скачивает официальный embeddable Python 3.11.9 x64 с python.org,
+   сверяет закреплённый SHA-256 и распаковывает в `python\` (включает `site`);
+2. **pip** — ставит pip из закреплённого (SHA-256) wheel, офлайн;
+3. **PyTorch** — `torch==2.5.1` + `torchaudio==2.5.1`: сборка CUDA 12.1 (`cu121`)
+   только если найдена NVIDIA GPU (`nvidia-smi`, а если его нет — WMI
+   `Win32_VideoController`), иначе CPU-сборка;
+4. **Demucs и Whisper** — `demucs==4.1.0`, `faster-whisper==1.2.1`;
+5. **модели** — htdemucs (~80 МБ) и Whisper large-v3 (~3 ГБ) в `models\`.
 
-Всего ~5 ГБ (с CUDA) или ~2,5 ГБ (CPU). Журнал установки:
-`%LOCALAPPDATA%\XASS\transcription\install.log`. Пока идёт установка, ПК
-сообщает серверу `installing` и задач не получает.
-
-Ручная установка (если автоматическая не удалась), PowerShell:
-
-```powershell
-winget install -e --id Python.Python.3.11
-$R = "$env:LOCALAPPDATA\XASS\transcription"
-py -3.11 -m venv "$R\env"
-& "$R\env\Scripts\python.exe" -m pip install --upgrade pip
-# с NVIDIA GPU:
-& "$R\env\Scripts\python.exe" -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-# без GPU:  ... --index-url https://download.pytorch.org/whl/cpu
-& "$R\env\Scripts\python.exe" -m pip install demucs==4.1.0 faster-whisper==1.2.1
-'{"manual": true}' | Set-Content "$R\ready.json"
-```
-
-Затем перезапустить агент XASS. Модели скачаются при первой задаче.
+Всего ~6 ГБ с CUDA или ~3 ГБ на CPU. Ход установки (этап + общий процент)
+агент пишет в `status.json` — окно XASS показывает его под флажком — и отправляет
+серверу в `poll` (`setup`). iOS в это время показывает «ПК готовится к
+расшифровке, N%». Задач ПК не получает, пока установка не закончится.
+Журнал: `install.log`. При ошибке под флажком появляется кнопка «Повторить
+установку» (перезапуск агента; уже скачанное и проверенное не качается заново).

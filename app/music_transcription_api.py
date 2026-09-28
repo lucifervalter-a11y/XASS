@@ -47,6 +47,11 @@ class Load(BaseModel):
     busy: bool = False
 
 
+class SetupProgress(BaseModel):
+    stage: Literal["python", "pip", "torch", "deps", "models"] = "python"
+    percent: int = Field(default=0, ge=0, le=100)
+
+
 class PollBody(BaseModel):
     enabled: bool
     state: Literal["ready", "installing", "error"] = "ready"
@@ -54,6 +59,7 @@ class PollBody(BaseModel):
     capabilities: Capabilities = Field(default_factory=Capabilities)
     load: Load = Field(default_factory=Load)
     running_job_id: int | None = Field(default=None, gt=0)
+    setup: SetupProgress | None = None
 
 
 class ProgressBody(BaseModel):
@@ -141,7 +147,8 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
             now = tq.now_utc()
             worker = await tq.upsert_worker(session, credential_id=auth.credential_id, source_name=auth.source_name,
                 enabled=payload.enabled, state=payload.state, detail=payload.detail,
-                capabilities=payload.capabilities.model_dump(), load=payload.load.model_dump(), now=now)
+                capabilities=payload.capabilities.model_dump(), load=payload.load.model_dump(), now=now,
+                setup=payload.setup.model_dump() if payload.setup else None)
             await tq.release_worker_jobs(session, worker, now, running_job_id=payload.running_job_id)
             job = None
             if tq.worker_online(worker, now) and payload.running_job_id is None:
