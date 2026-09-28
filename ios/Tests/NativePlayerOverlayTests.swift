@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 @testable import XASS
 
 final class NativePlayerOverlayTests: XCTestCase {
@@ -18,6 +19,28 @@ final class NativePlayerOverlayTests: XCTestCase {
         // Enrollment (401 / account) outranks everything, including Now Playing.
         XCTAssertEqual(O.resolve(hasTrack: true, expanded: true, devicePicker: true, transferActive: true, accountSheet: true), .accountSheet)
         XCTAssertEqual(O.resolve(hasTrack: true, expanded: true, devicePicker: false, transferActive: false, accountSheet: true), .accountSheet)
+    }
+
+    func testNowPlayingCardCollapsesIntoTheMiniPlayerAndHasOneHeroSource() {
+        typealias G = NowPlayingCardGeometry
+        let size = CGSize(width: 390, height: 763), insets = EdgeInsets(top: 47, leading: 0, bottom: 34, trailing: 0)
+        let mini = CGRect(x: 10, y: 650, width: 370, height: 64)
+        let full = CGRect(x: 0, y: -47, width: 390, height: 844)
+        XCTAssertEqual(G.rect(expanded: true, reduceMotion: false, miniFrame: mini, size: size, insets: insets, dragOffset: 0), full)
+        XCTAssertEqual(G.rect(expanded: false, reduceMotion: false, miniFrame: mini, size: size, insets: insets, dragOffset: 0), mini,
+                       "Collapsed, the opaque card is clipped exactly to the mini player")
+        XCTAssertEqual(G.rect(expanded: true, reduceMotion: false, miniFrame: mini, size: size, insets: insets, dragOffset: 120).minY, 73,
+                       "The clip follows the swipe-down, so the collapse starts where the finger left it")
+        XCTAssertEqual(G.rect(expanded: false, reduceMotion: true, miniFrame: mini, size: size, insets: insets, dragOffset: 0), full,
+                       "Reduce Motion never morphs the frame, it only crossfades")
+        XCTAssertGreaterThanOrEqual(G.rect(expanded: false, reduceMotion: false, miniFrame: .zero, size: size, insets: insets, dragOffset: 0).minY,
+                                    size.height, "Without a mini player the card leaves below the screen")
+        XCTAssertEqual(G.cornerRadius(expanded: false, reduceMotion: false, dragOffset: 0), 16)
+        XCTAssertEqual(G.cornerRadius(expanded: true, reduceMotion: false, dragOffset: 0), 0)
+        for expanded in [false, true] {
+            let sources = G.heroSources(expanded: expanded)
+            XCTAssertNotEqual(sources.mini, sources.card, "Exactly one matchedGeometry source per id")
+        }
     }
 
     func testTimedLyricsIndexFollowsStartTimes() {

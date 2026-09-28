@@ -20,6 +20,15 @@ import UIKit
     @State private var fileArtwork: FileArtwork?
     @State private var hostBottom: CGFloat?
     @State private var clearance: CGFloat = 49
+    /// Now Playing is in the hierarchy (while open and for the whole collapse).
+    @State private var cardMounted = false
+    /// Animated hero state. true: the card is full screen and owns every hero id;
+    /// false: the card is clipped to the mini player's frame and the mini owns them.
+    @State private var expanded = false
+    @State private var dragOffset: CGFloat = 0
+    /// Mini player pill in host space, captured only while the mini player is the visible source.
+    @State private var miniFrame: CGRect = .zero
+    @State private var transitionID = 0
 
     struct FileArtwork { let trackID: String; let image: UIImage }
 
@@ -30,6 +39,13 @@ import UIKit
         return nil
     }
     private var lookKey: String { PlayerArtworkLook.cacheKey(trackID: player.track?.id ?? "none", image: artwork) }
+    private var wantsCard: Bool { overlay == .nowPlaying && player.track != nil }
+    /// The mini player stays laid out (hidden) under Now Playing, so it is the
+    /// hero source on expand and the target frame on collapse.
+    private var miniAvailable: Bool { player.track != nil && (overlay == .miniPlayer || overlay == .nowPlaying) }
+    /// Hidden instantly while the card is on screen: never crossfaded with it.
+    private var miniVisible: Bool { miniAvailable && !cardMounted }
+
     /// Distance from the host's safe bottom to the top of the tab bar. Keeps the
     /// last plausible value (keyboard or rotation mid-flight produce outliers).
     private func updateClearance() {
@@ -39,27 +55,44 @@ import UIKit
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            if overlay == .nowPlaying, let track = player.track {
-                NowPlayingView(player: player, track: track, artwork: artwork, look: look, namespace: namespace,
-                               showLyrics: $showLyrics, slots: slots, onCollapse: { collapse() })
-                    .transition(.opacity)
-                    .zIndex(2)
-            } else if overlay == .miniPlayer, let track = player.track {
-                MiniPlayerBar(player: player, track: track, artwork: artwork, namespace: namespace, onExpand: { expand() })
-                    .background {
-                        GeometryReader { proxy in
-                            Color.clear
-                                .onAppear { onMiniHeightChange(proxy.size.height) }
-                                .onChange(of: proxy.size.height) { _, height in onMiniHeightChange(height) }
+        GeometryReader { geometry in
+            let fullHeight = geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
+            let dragProgress = min(1, max(0, dragOffset / max(1, fullHeight)))
+            ZStack(alignment: .bottom) {
+                if miniAvailable, let track = player.track {
+                    MiniPlayerBar(player: player, track: track, artwork: artwork, namespace: namespace,
+                                  heroSource: !expanded, onExpand: { expand() },
+                                  onFrameChange: { frame in if !cardMounted { miniFrame = frame } })
+                        .background {
+                            GeometryReader { proxy in
+                                Color.clear
+                                    .onAppear { onMiniHeightChange(proxy.size.height) }
+                                    .onChange(of: proxy.size.height) { _, height in onMiniHeightChange(height) }
+                            }
                         }
-                    }
-                    .padding(.bottom, clearance)
-                    .transition(.opacity)
-                    .zIndex(1)
+                        .padding(.bottom, clearance)
+                        .opacity(miniVisible ? 1 : 0)
+                        .allowsHitTesting(miniVisible)
+                        .accessibilityHidden(!miniVisible)
+                        .zIndex(1)
+                }
+                if cardMounted {
+                    backdrop(insets: geometry.safeAreaInsets, dragProgress: dragProgress).zIndex(1.5)
+                }
+                if cardMounted, let track = player.track {
+                    NowPlayingView(player: player, track: track, artwork: artwork, look: look, namespace: namespace,
+                                   expanded: expanded, dragOffset: $dragOffset,
+                                   showLyrics: $showLyrics, slots: slots, onCollapse: { collapse() })
+                        // Always fully opaque; only under Reduce Motion the whole card crossfades.
+                        .opacity(reduceMotion && !expanded ? 0 : 1)
+                        .mask(alignment: .topLeading) { cardMask(size: geometry.size, insets: geometry.safeAreaInsets) }
+                        .allowsHitTesting(expanded)
+                        .zIndex(2)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .coordinateSpace(.named(PlayerHostSpace.name))
         .background {
             GeometryReader { proxy in
                 let bottom = proxy.frame(in: .global).maxY
@@ -70,16 +103,74 @@ import UIKit
         }
         .onChange(of: tabContentBottom) { _, _ in updateClearance() }
         .ignoresSafeArea(.keyboard)
-        .animation(PlayerMotion.expand(reduceMotion), value: overlay)
+        .onAppear { if wantsCard { cardMounted = true; expanded = true } }
+        .onChange(of: wantsCard) { _, want in
+            if want { presentCard() } else { dismissCard(animated: overlay == .miniPlayer || overlay == .transferBanner) }
+        }
         .task(id: lookKey) { await refreshLook() }
         .task(id: player.track?.id) { await loadFileArtwork() }
     }
 
-    private func expand() {
-        withAnimation(PlayerMotion.expand(reduceMotion)) { setExpanded(true) }
+    /// Dims the library behind the card and covers the tab bar at once (no crossfade).
+    private func backdrop(insets: EdgeInsets, dragProgress: CGFloat) -> some View {
+        ZStack(alignment: .bottom) {
+            Color.black.opacity(expanded ? 0.55 * Double(1 - dragProgress) : 0)
+            Color.black.frame(height: clearance + insets.bottom)
+        }
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .accessibilityHidden(true)
     }
-    private func collapse() {
-        withAnimation(PlayerMotion.expand(reduceMotion)) { setExpanded(false) }
+
+    private func cardMask(size: CGSize, insets: EdgeInsets) -> some View {
+        let rect = NowPlayingCardGeometry.rect(expanded: expanded, reduceMotion: reduceMotion, miniFrame: miniFrame,
+                                               size: size, insets: insets, dragOffset: dragOffset)
+        let radius = NowPlayingCardGeometry.cornerRadius(expanded: expanded, reduceMotion: reduceMotion, dragOffset: dragOffset)
+        return RoundedRectangle(cornerRadius: radius, style: .continuous)
+            .frame(width: rect.width, height: rect.height)
+            .offset(x: rect.minX, y: rect.minY)
+    }
+
+    private func expand() { setExpanded(true) }
+    private func collapse() { setExpanded(false) }
+
+    private func presentCard() {
+        transitionID += 1
+        let id = transitionID
+        if cardMounted {
+            // Re-opened mid-collapse: reverse with the same spring.
+            withAnimation(PlayerMotion.expand(reduceMotion)) { expanded = true; dragOffset = 0 }
+            return
+        }
+        var still = Transaction(); still.disablesAnimations = true
+        // First pass: the card is mounted clipped to the mini player, with the mini as
+        // hero source; the mini hides in the same pass, so nothing is ever doubled.
+        withTransaction(still) { dragOffset = 0; expanded = false; cardMounted = true }
+        DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                guard id == transitionID, cardMounted else { return }
+                withAnimation(PlayerMotion.expand(reduceMotion)) { expanded = true }
+            }
+        }
+    }
+
+    private func dismissCard(animated: Bool) {
+        transitionID += 1
+        let id = transitionID
+        guard cardMounted else { return }
+        guard animated else {
+            var still = Transaction(); still.disablesAnimations = true
+            withTransaction(still) { cardMounted = false; expanded = false; dragOffset = 0 }
+            return
+        }
+        // The card springs into the mini player's frame and is removed only once the
+        // animation has fully finished; the mini (same frame) then shows at once.
+        withAnimation(PlayerMotion.expand(reduceMotion), completionCriteria: .removed) {
+            expanded = false; dragOffset = 0
+        } completion: {
+            guard id == transitionID else { return }
+            cardMounted = false
+        }
     }
 
     private func refreshLook() async {
@@ -114,7 +205,11 @@ import UIKit
     let track: PlayerTrack
     let artwork: UIImage?
     let namespace: Namespace.ID
+    /// Owns the hero ids while Now Playing is collapsed (exactly one source per id).
+    var heroSource = true
     let onExpand: () -> Void
+    /// Pill frame in `PlayerHostSpace`: the collapse target of the Now Playing card.
+    var onFrameChange: (CGRect) -> Void = { _ in }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var dragX: CGFloat = 0
     @State private var horizontal: Bool?
@@ -132,8 +227,10 @@ import UIKit
                             .id(track.id)
                             .transition(.playerSlide(direction: slideDirection, distance: 56, reduceMotion: reduceMotion))
                     }
+                    // Hero inside the fixed frame: the flexible artwork takes the other
+                    // side's size, the bar's own layout never changes.
+                    .playerHero("artwork", in: namespace, enabled: hero, isSource: heroSource)
                     .frame(width: 48, height: 48)
-                    .playerHero("artwork", in: namespace, enabled: hero)
                     .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(track.title).font(.subheadline.weight(.semibold)).lineLimit(1)
@@ -142,7 +239,7 @@ import UIKit
                     .id(track.id)
                     .transition(.playerSlide(direction: slideDirection, distance: 90, reduceMotion: reduceMotion))
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .playerHero("title", in: namespace, enabled: hero, properties: .position)
+                    .playerHero("title", in: namespace, enabled: hero, isSource: heroSource, properties: .position)
                 }
                 .offset(x: dragX)
                 .contentShape(Rectangle())
@@ -162,7 +259,7 @@ import UIKit
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
-            .playerHero("playButton", in: namespace, enabled: hero)
+            .playerHero("playButton", in: namespace, enabled: hero, isSource: heroSource, properties: .position)
             .accessibilityLabel(player.isPlaying ? "Пауза" : "Слушать")
             .accessibilityIdentifier("miniPlayerPlayPause")
             .disabled(player.isBusy)
@@ -170,7 +267,7 @@ import UIKit
             Button { go(1) } label: {
                 Image(systemName: "forward.fill").font(.title3).frame(width: 40, height: 44).contentShape(Rectangle())
             }
-            .playerHero("nextButton", in: namespace, enabled: hero)
+            .playerHero("nextButton", in: namespace, enabled: hero, isSource: heroSource, properties: .position)
             .accessibilityLabel("Следующий трек")
             .accessibilityIdentifier("miniPlayerNext")
             .disabled(player.isBusy)
@@ -184,7 +281,14 @@ import UIKit
                 .fill(.ultraThinMaterial)
                 .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.black.opacity(0.25)))
                 .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.08)))
-                .playerHero("container", in: namespace, enabled: hero)
+                .background {
+                    GeometryReader { proxy in
+                        let frame = proxy.frame(in: .named(PlayerHostSpace.name))
+                        Color.clear
+                            .onAppear { onFrameChange(frame) }
+                            .onChange(of: frame) { _, value in onFrameChange(value) }
+                    }
+                }
         }
         .overlay(alignment: .bottom) { MiniPlayerProgress(progress: player.progress).padding(.horizontal, 16).padding(.bottom, 3) }
         .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
@@ -249,25 +353,37 @@ private struct NowPlayingHeaderZoneKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
-private struct NowPlayingBelowArtworkKey: PreferenceKey {
+/// Heights measured in artwork mode; they size the artwork so the screen fits without scrolling.
+private struct NowPlayingMetadataHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+private struct NowPlayingControlsHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 private enum PlayerDragMode { case undecided, active, ignored }
 
+/// One layout for artwork and lyrics mode: the SAME artwork, title and control
+/// views move and resize (AnyLayout + conditional frames), nothing is duplicated
+/// or crossfaded. Only the lyrics list / volume row are inserted.
 @MainActor struct NowPlayingView<Player: PlayerStateProviding>: View {
     @ObservedObject var player: Player
     let track: PlayerTrack
     let artwork: UIImage?
     let look: PlayerArtworkLook
     let namespace: Namespace.ID
+    /// Host hero state: true once the card is full screen (card owns the hero ids).
+    let expanded: Bool
+    /// Owned by the host so the card mask follows the finger and collapses from there.
+    @Binding var dragOffset: CGFloat
     @Binding var showLyrics: Bool
     let slots: NowPlayingSlots
     let onCollapse: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var dragOffset: CGFloat = 0
     @State private var dragMode = PlayerDragMode.undecided
     @GestureState private var dragging = false
     @State private var dismissing = false
@@ -279,33 +395,31 @@ private enum PlayerDragMode { case undecided, active, ignored }
     @State private var slideDirection: CGFloat = 1
     /// A scrubber/volume drag is in progress: never start a swipe-down meanwhile.
     @State private var sliderEditing = false
-    /// Measured height of title + controls; the artwork gets whatever is left.
-    @State private var belowArtworkHeight: CGFloat = 340
+    @State private var metadataHeight: CGFloat = 64
+    @State private var controlsHeight: CGFloat = 276
     @AccessibilityFocusState private var titleFocused: Bool
 
     private var hero: Bool { !reduceMotion }
+    /// Non-hero chrome (header, scrubber, volume, footer…) fades with the expand;
+    /// hero views (artwork, title, play, next) stay opaque and fly.
+    private var chromeOpacity: Double { reduceMotion || expanded ? 1 : 0 }
 
     var body: some View {
         GeometryReader { geometry in
             let height = geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
-            let progress = min(1, max(0, dragOffset / max(1, height)))
-            ZStack(alignment: .top) {
-                // What shows behind the card while it is dragged down.
-                Color.black.opacity(0.5 * (1 - progress)).ignoresSafeArea()
-                card(width: geometry.size.width, insets: geometry.safeAreaInsets, radius: min(38, dragOffset * 0.35))
-                    .offset(y: dragOffset)
-                    .scaleEffect(reduceMotion ? 1 : 1 - progress * 0.08, anchor: .top)
-            }
-            .simultaneousGesture(dismissGesture(height: height))
-            .onChange(of: dragging) { _, active in
-                guard !active else { return }
-                dragMode = .undecided
-                if !dismissing && dragOffset > 0 { springBack() }
-            }
+            card(insets: geometry.safeAreaInsets)
+                .offset(y: dragOffset)
+                .simultaneousGesture(dismissGesture(height: height))
+                .onChange(of: dragging) { _, active in
+                    guard !active else { return }
+                    dragMode = .undecided
+                    if !dismissing && dragOffset > 0 { springBack() }
+                }
         }
         .onPreferenceChange(NowPlayingHeaderZoneKey.self) { value in
             if value > 0, dragOffset == 0 { headerZone = value }
         }
+        .onChange(of: expanded) { _, value in if value { dismissing = false } }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { onCollapse() }
@@ -316,24 +430,24 @@ private enum PlayerDragMode { case undecided, active, ignored }
         }
     }
 
-    private func card(width: CGFloat, insets: EdgeInsets, radius: CGFloat) -> some View {
+    private func card(insets: EdgeInsets) -> some View {
         VStack(spacing: 0) {
-            header
-            if showLyrics { lyricsLayout } else { artworkLayout }
+            header.opacity(chromeOpacity)
+            content
         }
         .foregroundStyle(.white)
         .tint(.white)
         .background {
             GeometryReader { proxy in
-                // The hero frame IS the full-screen frame (safe area included), so the
-                // expand animation ends exactly where the background stays: no jump
-                // when a trailing ignoresSafeArea would otherwise resize it.
-                NowPlayingBackground(look: look, reduceMotion: reduceMotion)
-                    .frame(width: proxy.size.width + insets.leading + insets.trailing,
-                           height: proxy.size.height + insets.top + insets.bottom)
-                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-                    .playerHero("container", in: namespace, enabled: hero)
-                    .padding(EdgeInsets(top: -insets.top, leading: -insets.leading, bottom: -insets.bottom, trailing: -insets.trailing))
+                // Solid base under the blurred artwork: the card is never see-through.
+                // The host clips it (mini frame -> full screen), so no clip here.
+                ZStack {
+                    Color.black
+                    NowPlayingBackground(look: look, reduceMotion: reduceMotion)
+                }
+                .frame(width: proxy.size.width + insets.leading + insets.trailing,
+                       height: proxy.size.height + insets.top + insets.bottom)
+                .padding(EdgeInsets(top: -insets.top, leading: -insets.leading, bottom: -insets.bottom, trailing: -insets.trailing))
             }
         }
     }
@@ -372,61 +486,95 @@ private enum PlayerDragMode { case undecided, active, ignored }
         }
     }
 
-    // MARK: Artwork mode
+    // MARK: Single layout
 
-    /// Fits the screen without scrolling at default Dynamic Type: the artwork
-    /// shrinks to the height left after title + controls. Only when even a
+    /// Artwork mode fits the screen without scrolling at default Dynamic Type:
+    /// the artwork gets the height left after title + controls; only when even a
     /// minimum artwork does not fit (large text, landscape) does it scroll.
-    private var artworkLayout: some View {
+    /// Lyrics mode pins the same views to one screen with the lyrics in between.
+    private var content: some View {
         GeometryReader { box in
-            let horizontal: CGFloat = 28
-            let topPadding: CGFloat = 10, gap: CGFloat = 22, bottomPadding: CGFloat = 16
-            let widthLimit = min(box.size.width - horizontal * 2, 420)
-            let heightLimit = box.size.height - belowArtworkHeight - topPadding - gap - bottomPadding
+            let topPadding: CGFloat = showLyrics ? 6 : 10
+            let gap: CGFloat = 22, bottomPadding: CGFloat = showLyrics ? 10 : 16
+            let widthLimit = min(box.size.width - 56, 420)
+            let heightLimit = box.size.height - metadataHeight - controlsHeight - topPadding - gap - 22 - bottomPadding
             let side = max(120, min(widthLimit, heightLimit))
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 0) {
-                    bigArtwork(side: side)
+                    topGroup(side: side, gap: gap)
+                        .padding(.horizontal, showLyrics ? 24 : 28)
                         .padding(.top, topPadding)
-                    Spacer(minLength: gap)
-                    VStack(spacing: 22) {
-                        metadata(large: true)
-                        controls(compact: false)
+                        .padding(.bottom, showLyrics ? 4 : 0)
+                        .frame(maxWidth: showLyrics ? 640 : 560)
+                    if showLyrics {
+                        lyricsRegion.transition(.opacity)
+                    } else {
+                        Spacer(minLength: 22)
                     }
-                    .background {
-                        GeometryReader { proxy in
-                            Color.clear.preference(key: NowPlayingBelowArtworkKey.self, value: proxy.size.height)
-                        }
-                    }
+                    controls(compact: showLyrics)
+                        .padding(.horizontal, 28)
+                        .frame(maxWidth: 560)
                 }
-                .padding(.horizontal, horizontal).padding(.bottom, bottomPadding)
-                .frame(maxWidth: 560)
-                .frame(maxWidth: .infinity, minHeight: box.size.height, alignment: .top)
+                .padding(.bottom, bottomPadding)
+                .frame(maxWidth: .infinity)
+                // Lyrics: exactly one screen (the lyrics list scrolls itself).
+                .frame(height: showLyrics ? box.size.height : nil)
+                .frame(minHeight: box.size.height, alignment: .top)
                 .background(alignment: .topLeading) {
                     PlayerScrollViewTuner { atTop in scrollAtTop = atTop }
                         .frame(width: 1, height: 1).accessibilityHidden(true)
                 }
             }
             .scrollBounceBehavior(.basedOnSize)
+            // While the card is dragged the content never scrolls: it moves only once.
+            .scrollDisabled(showLyrics || dragMode == .active)
             .accessibilityIdentifier("nowPlayingScroll")
         }
-        .onPreferenceChange(NowPlayingBelowArtworkKey.self) { value in
-            if value > 0, abs(value - belowArtworkHeight) > 0.5 { belowArtworkHeight = value }
+        .onPreferenceChange(NowPlayingMetadataHeightKey.self) { value in
+            if value > 0, abs(value - metadataHeight) > 0.5 { metadataHeight = value }
         }
-        .transition(.opacity)
+        .onPreferenceChange(NowPlayingControlsHeightKey.self) { value in
+            if value > 0, abs(value - controlsHeight) > 0.5 { controlsHeight = value }
+        }
     }
 
-    private func bigArtwork(side: CGFloat) -> some View {
+    /// Artwork + title: vertical in artwork mode, one row in lyrics mode. Same views.
+    private func topGroup(side: CGFloat, gap: CGFloat) -> some View {
+        let layout = showLyrics ? AnyLayout(HStackLayout(alignment: .center, spacing: 14))
+                                : AnyLayout(VStackLayout(alignment: .center, spacing: gap))
+        return layout {
+            artworkView(side: showLyrics ? 60 : side)
+            metadata(large: !showLyrics)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: NowPlayingMetadataHeightKey.self, value: showLyrics ? 0 : proxy.size.height)
+                    }
+                }
+        }
+        .contentShape(Rectangle())
+        // Lyrics scroll on their own: there the artwork/title row also starts a dismiss.
+        .background { if showLyrics { zoneReporter } }
+    }
+
+    private func artworkView(side: CGFloat) -> some View {
         let playing = player.isPlaying
+        let small = showLyrics
+        let shadowOpacity: Double = small ? 0.3 : (playing ? 0.4 : 0.22)
+        let shadowRadius: CGFloat = small ? 8 : (playing ? 28 : 12)
+        let shadowY: CGFloat = small ? 4 : (playing ? 16 : 6)
+        let cornerRadius: CGFloat = small ? 8 : 12
+        let scale: CGFloat = reduceMotion || playing || small || !expanded ? 1 : 0.85
         return ZStack {
-            PlayerArtworkImage(image: artwork, cornerRadius: 12)
+            PlayerArtworkImage(image: artwork, cornerRadius: cornerRadius)
                 .id(track.id)
                 .transition(.playerSlide(direction: slideDirection, distance: side * 0.7, reduceMotion: reduceMotion))
         }
+        // Hero INSIDE the fixed frame: the flexible artwork takes the mini player's
+        // size while collapsed and grows to `side`, the layout itself stays put.
+        .playerHero("artwork", in: namespace, enabled: hero, isSource: expanded)
         .frame(width: side, height: side)
-        .playerHero("artwork", in: namespace, enabled: hero)
-        .scaleEffect(reduceMotion || playing ? 1 : 0.85)
-        .shadow(color: .black.opacity(playing ? 0.4 : 0.22), radius: playing ? 28 : 12, y: playing ? 16 : 6)
+        .scaleEffect(scale)
+        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, y: shadowY)
         .offset(x: artworkDragX)
         .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.72), value: playing)
         .animation(reduceMotion ? PlayerMotion.fade : PlayerMotion.trackChange, value: track.id)
@@ -464,37 +612,20 @@ private enum PlayerDragMode { case undecided, active, ignored }
             }
     }
 
-    // MARK: Lyrics mode
-
-    private var lyricsLayout: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                PlayerArtworkImage(image: artwork, cornerRadius: 8)
-                    .frame(width: 60, height: 60)
-                    .playerHero("artwork", in: namespace, enabled: hero)
-                    .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
-                metadata(large: false)
+    private var lyricsRegion: some View {
+        Group {
+            if player.lyrics == nil, let custom = slots.lyrics {
+                // Legacy lyrics view (no synced lines for this song): keep its first line clear of the header row.
+                custom().padding(.horizontal, 20).padding(.top, 10)
+                    .mask {
+                        LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.06),
+                                               .init(color: .black, location: 1)], startPoint: .top, endPoint: .bottom)
+                    }
             }
-            .padding(.horizontal, 24).padding(.top, 6).padding(.bottom, 4)
-            .contentShape(Rectangle())
-            .background { zoneReporter }
-            Group {
-                if player.lyrics == nil, let custom = slots.lyrics {
-                    // Legacy lyrics view (no synced lines for this song): keep its first line clear of the header row.
-                    custom().padding(.horizontal, 20).padding(.top, 10)
-                        .mask {
-                            LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.06),
-                                                   .init(color: .black, location: 1)], startPoint: .top, endPoint: .bottom)
-                        }
-                }
-                else { TimedLyricsView(player: player, reduceMotion: reduceMotion) }
-            }
-            .frame(maxWidth: 640, maxHeight: .infinity)
-            .transition(.opacity)
-            controls(compact: true)
-                .padding(.horizontal, 28).padding(.bottom, 10)
-                .frame(maxWidth: 560)
+            else { TimedLyricsView(player: player, reduceMotion: reduceMotion) }
         }
+        .frame(maxWidth: 640, maxHeight: .infinity)
+        .opacity(chromeOpacity)
     }
 
     // MARK: Shared pieces
@@ -510,21 +641,28 @@ private enum PlayerDragMode { case undecided, active, ignored }
             .id(track.id)
             .transition(.opacity)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .playerHero("title", in: namespace, enabled: hero, properties: .position)
-            if let accessory = slots.titleAccessory { accessory() }
+            .playerHero("title", in: namespace, enabled: hero, isSource: expanded, properties: .position)
+            if let accessory = slots.titleAccessory { accessory().opacity(chromeOpacity) }
         }
         .animation(reduceMotion ? PlayerMotion.fade : PlayerMotion.trackChange, value: track.id)
     }
 
+    /// One control stack for both modes; compact only changes sizes and hides the volume row.
     private func controls(compact: Bool) -> some View {
         VStack(spacing: compact ? 12 : 20) {
             PlayerScrubber(trackID: track.id, position: player.position, duration: player.duration, disabled: player.isBusy,
                            reduceMotion: reduceMotion, onEditingChanged: { sliderEditing = $0 },
                            onSeek: { value in player.seek(to: value) })
+                .opacity(chromeOpacity)
             transport(compact: compact)
-            if let status = slots.status { status() }
-            if !compact { volume }
-            footer
+            if let status = slots.status { status().opacity(chromeOpacity) }
+            if !compact { volume.opacity(chromeOpacity).transition(.opacity) }
+            footer.opacity(chromeOpacity)
+        }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: NowPlayingControlsHeightKey.self, value: compact ? 0 : proxy.size.height)
+            }
         }
     }
 
@@ -535,6 +673,7 @@ private enum PlayerDragMode { case undecided, active, ignored }
                 Image(systemName: "backward.fill").font(.system(size: compact ? 28 : 34)).frame(width: 64, height: 56).contentShape(Rectangle())
             }
             .accessibilityLabel("Предыдущий трек").accessibilityIdentifier("nowPlayingPrevious")
+            .opacity(chromeOpacity)
             Spacer(minLength: 0)
             Button {
                 PlayerHaptics.tap()
@@ -545,13 +684,16 @@ private enum PlayerDragMode { case undecided, active, ignored }
                     .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
                     .frame(width: 76, height: 76).contentShape(Rectangle())
             }
-            .playerHero("playButton", in: namespace, enabled: hero)
+            // While collapsed the big glyph sits exactly on the mini one at its size.
+            .scaleEffect(reduceMotion || expanded ? 1 : 0.5)
+            .playerHero("playButton", in: namespace, enabled: hero, isSource: expanded, properties: .position)
             .accessibilityLabel(player.isPlaying ? "Пауза" : "Слушать").accessibilityIdentifier("nativePlayerToggle")
             Spacer(minLength: 0)
             Button { go(1) } label: {
                 Image(systemName: "forward.fill").font(.system(size: compact ? 28 : 34)).frame(width: 64, height: 56).contentShape(Rectangle())
             }
-            .playerHero("nextButton", in: namespace, enabled: hero)
+            .scaleEffect(reduceMotion || expanded ? 1 : 0.6)
+            .playerHero("nextButton", in: namespace, enabled: hero, isSource: expanded, properties: .position)
             .accessibilityLabel("Следующий трек").accessibilityIdentifier("nowPlayingNext")
             Spacer(minLength: 0)
         }
@@ -624,10 +766,11 @@ private enum PlayerDragMode { case undecided, active, ignored }
                 if dragMode == .undecided {
                     let downward = value.translation.height > 0 && value.translation.height > abs(value.translation.width) * 1.2
                     // Lyrics scroll on their own: there only the header/artwork row starts a dismiss.
+                    // Artwork mode: only when the content is exactly at its top (or from the header).
                     let inHeader = value.startLocation.y <= headerZone
                     let allowed = showLyrics ? inHeader : (scrollAtTop || inHeader)
                     // A scrubber/volume drag that drifts downward seeks; it never dismisses.
-                    dragMode = downward && allowed && !dismissing && !sliderEditing ? .active : .ignored
+                    dragMode = downward && allowed && expanded && !dismissing && !sliderEditing ? .active : .ignored
                 }
                 guard dragMode == .active else { return }
                 dragOffset = max(0, value.translation.height)

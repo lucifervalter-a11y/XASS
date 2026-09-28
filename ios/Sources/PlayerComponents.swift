@@ -46,11 +46,40 @@ struct NowPlayingSlots {
 }
 
 extension View {
-    /// matchedGeometryEffect that switches off under Reduce Motion.
-    @ViewBuilder func playerHero(_ id: String, in namespace: Namespace.ID, enabled: Bool,
+    /// matchedGeometryEffect that switches off under Reduce Motion. Mini player and
+    /// Now Playing are both mounted during a transition, so every id must have
+    /// exactly one source: mini `isSource: !expanded`, card `isSource: expanded`.
+    @ViewBuilder func playerHero(_ id: String, in namespace: Namespace.ID, enabled: Bool, isSource: Bool = true,
                                  properties: MatchedGeometryProperties = .frame) -> some View {
-        if enabled { matchedGeometryEffect(id: id, in: namespace, properties: properties) } else { self }
+        if enabled { matchedGeometryEffect(id: id, in: namespace, properties: properties, isSource: isSource) } else { self }
     }
+}
+
+/// Coordinate space of the root player layer (mini player frame -> card mask).
+enum PlayerHostSpace { static let name = "xass.playerHost" }
+
+/// Where the Now Playing card is clipped to, in the player host's coordinates.
+/// Collapsed: exactly the mini player's pill; expanded: the full screen (safe
+/// areas included) following the swipe-down. Reduce Motion never morphs.
+enum NowPlayingCardGeometry {
+    static func rect(expanded: Bool, reduceMotion: Bool, miniFrame: CGRect, size: CGSize, insets: EdgeInsets,
+                     dragOffset: CGFloat) -> CGRect {
+        let full = CGRect(x: -insets.leading, y: -insets.top + max(0, dragOffset),
+                          width: size.width + insets.leading + insets.trailing,
+                          height: size.height + insets.top + insets.bottom)
+        if expanded || reduceMotion { return full }
+        if miniFrame.width > 1, miniFrame.height > 1, miniFrame.minX.isFinite, miniFrame.minY.isFinite { return miniFrame }
+        // No mini player to land on (e.g. a transfer banner): slide below the screen.
+        return full.offsetBy(dx: 0, dy: full.height + insets.bottom - max(0, dragOffset))
+    }
+
+    static func cornerRadius(expanded: Bool, reduceMotion: Bool, dragOffset: CGFloat) -> CGFloat {
+        if expanded || reduceMotion { return min(38, max(0, dragOffset) * 0.35) }
+        return 16
+    }
+
+    /// Exactly one side owns each hero id at any time.
+    static func heroSources(expanded: Bool) -> (mini: Bool, card: Bool) { (!expanded, expanded) }
 }
 
 extension AnyTransition {
@@ -300,6 +329,9 @@ struct PlayerScrollViewTuner: UIViewRepresentable {
             found.bounces = false
             found.alwaysBounceVertical = false
             observation = found.observe(\.contentOffset, options: [.initial, .new]) { [weak self] scroll, _ in
+                // SwiftUI may re-apply its own bounce settings on update: keep them off.
+                if scroll.bounces { scroll.bounces = false }
+                if scroll.alwaysBounceVertical { scroll.alwaysBounceVertical = false }
                 let top = scroll.contentOffset.y <= -scroll.adjustedContentInset.top + 0.5
                 DispatchQueue.main.async { self?.report(top) }
             }

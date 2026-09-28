@@ -41,7 +41,7 @@ import UIKit
 
     /// Pure mapping (unit-tested): only synced lines of the track that is
     /// playing now become `TimedLyrics`; anything else is nil.
-    static func timedLyrics(from value: SyncedLyrics?, currentID: Int?) -> TimedLyrics? {
+    nonisolated static func timedLyrics(from value: SyncedLyrics?, currentID: Int?) -> TimedLyrics? {
         guard let value = value, let currentID = currentID, value.trackID == currentID,
               value.synced, !value.lines.isEmpty else { return nil }
         return TimedLyrics(lines: value.lines.map { TimedLyricLine(start: $0.start, end: $0.end, text: $0.text) })

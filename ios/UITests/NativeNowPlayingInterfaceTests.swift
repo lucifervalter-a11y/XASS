@@ -16,6 +16,7 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 5))
         waitForDisappearance(app.buttons["nativeMiniPlayer"])
         XCTAssertTrue(app.buttons["nowPlayingCollapse"].exists)
+        XCTAssertFalse(app.buttons["miniPlayerPlayPause"].exists, "Mini controls are hidden at once, never shown with the card's")
         capture(app, "NowPlaying-Expanded")
 
         let lyrics = app.buttons["nativePlayerLyrics"]
@@ -23,6 +24,10 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         lyrics.tap()
         XCTAssertTrue(app.buttons["lyric-line-2"].waitForExistence(timeout: 5), "Fixture lyrics must render as tappable lines")
         XCTAssertTrue(app.buttons["nativePlayerToggle"].exists, "Transport stays available in lyrics mode")
+        XCTAssertEqual(app.buttons.matching(identifier: "nativePlayerToggle").count, 1, "One transport, moved, not a crossfaded copy")
+        XCTAssertEqual(app.buttons.matching(identifier: "nativePlayerLyrics").count, 1)
+        XCTAssertEqual(app.descendants(matching: .any).matching(identifier: "nowPlayingArtwork").count, 1,
+                       "The same artwork shrinks into the lyrics header")
         capture(app, "NowPlaying-Lyrics")
 
         app.buttons["nowPlayingCollapse"].tap()
