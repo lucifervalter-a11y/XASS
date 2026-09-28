@@ -324,6 +324,7 @@ class XassDesktop:
         self.pair_var = tk.StringVar()
         self.interval_var = tk.StringVar(value=str(self.config.get("interval_sec") or 30))
         self.auto_update_var = tk.BooleanVar(value=bool(self.config.get("auto_update", True)))
+        self.transcription_var = tk.BooleanVar(value=bool(self.config.get("transcription_enabled", False)))
         self.archive_folder_var = tk.StringVar(value=str(self.config.get("archive_folder") or archive_root(self.config)))
         self.archive_max_gb_var = tk.StringVar(value=str(self.config.get("archive_max_gb") or ""))
         self.archive_retention_days_var = tk.StringVar(value=str(self.config.get("archive_retention_days") or ""))
@@ -1138,7 +1139,10 @@ class XassDesktop:
         tk.Label(runtime, text="Фоновая работа", bg=CARD, fg=TEXT, font=("Segoe UI", 20)).pack(anchor="w", pady=(11, 4))
         tk.Label(runtime, text="Окно можно свернуть — связь с сервером и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 18))
         check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
-        check.pack(anchor="w", pady=(6, 14))
+        check.pack(anchor="w", pady=(6, 4))
+        transcription = tk.Checkbutton(runtime, text="Использовать этот ПК для расшифровки текста", variable=self.transcription_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
+        transcription.pack(anchor="w", pady=(4, 2))
+        tk.Label(runtime, text="Песни без текста в каталоге распознаются на этом компьютере (Demucs + Whisper) с низким приоритетом. При первом включении скачается ~5 ГБ компонентов и моделей.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 14))
         self._field(runtime, "Имя с визитки", self.owner_var)
         self._field(runtime, "Интервал обновления показателей, секунд", self.interval_var)
         self._field(runtime, "Папка локального архива", self.archive_folder_var)
@@ -1504,6 +1508,7 @@ class XassDesktop:
                 "source_type": "PC_AGENT",
                 "interval_sec": interval,
                 "auto_update": self.auto_update_var.get(),
+                "transcription_enabled": bool(self.transcription_var.get()),
                 "archive_folder": self.archive_folder_var.get().strip(),
                 "archive_max_gb": max_gb,
                 "archive_retention_days": retention_days,

@@ -96,6 +96,7 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --icon (Join-Path $ClientRoot "assets\xass.ico") `
     --version-file $VersionInfo `
     --add-data "$(Join-Path $ClientRoot 'version.json');." `
+    --add-data "$(Join-Path $ClientRoot 'transcribe_runner.py');." `
     --add-data "$BuildInfo;." `
     --add-data "$(Join-Path $ClientRoot 'assets\xass.ico');assets" `
     --add-data "$(Join-Path $ClientRoot 'assets\xass-icon.png');assets" `
