@@ -86,7 +86,9 @@
 2. **pip** — ставит pip из закреплённого (SHA-256) wheel, офлайн;
 3. **PyTorch** — `torch==2.5.1` + `torchaudio==2.5.1`: сборка CUDA 12.1 (`cu121`)
    только если найдена NVIDIA GPU (`nvidia-smi`, а если его нет — WMI
-   `Win32_VideoController`), иначе CPU-сборка;
+   `Win32_VideoController`) и на томе папки `transcription` свободно не меньше 14 ГБ.
+   Иначе CPU-сборка: распаковка CUDA вместе с кэшем колеса не помещается в 9 ГБ.
+   Кэш pip и временная распаковка лежат внутри `transcription`, а не в общем кэше пользователя;
 4. **Demucs и Whisper** — `demucs==4.1.0`, `faster-whisper==1.2.1`;
 5. **модели** — htdemucs (~80 МБ) и Whisper large-v3 (~3 ГБ) в `models\`.
 

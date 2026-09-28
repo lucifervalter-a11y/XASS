@@ -132,6 +132,11 @@ def thread_limit(caps: dict) -> int:
 
 # ------------------------------------------------------------------ runtime
 
+# Peak use, not the final size: the cu121 wheel stays in the pip cache while it is
+# unpacked, and the models download after that. A real install failed at 9 GB free.
+CUDA_INSTALL_FREE_BYTES = 14 * 1024 ** 3
+
+
 def torch_variant(gpu: dict | None, wmi_names: list[str] | None = None) -> str:
     """CUDA wheels (~2.5 GB) only for an NVIDIA GPU; everything else gets the CPU wheel."""
     if gpu and gpu.get("gpu"):
@@ -139,6 +144,21 @@ def torch_variant(gpu: dict | None, wmi_names: list[str] | None = None) -> str:
     if any("nvidia" in str(name).lower() for name in (wmi_names or [])):
         return "cu121"
     return "cpu"
+
+
+def free_bytes(path: Path) -> int:
+    try:
+        return int(shutil.disk_usage(path).free)
+    except OSError:
+        return 0
+
+
+def select_variant(gpu: dict | None, wmi_names: list[str] | None, free: int) -> str:
+    """Keep the CPU wheel when the CUDA download and unpack do not fit."""
+    variant = torch_variant(gpu, wmi_names)
+    if variant == "cu121" and free < CUDA_INSTALL_FREE_BYTES:
+        return "cpu"
+    return variant
 
 
 def torch_index(variant: str) -> str:
@@ -240,6 +260,18 @@ class Runtime:
                    PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1")
         return env
 
+    def install_environment(self, threads: int) -> dict:
+        """Keep the wheel cache and unpack directory on the same volume as the runtime."""
+        env = self.environment(threads)
+        cache = self.root / "pip-cache"
+        tmp = self.root / "tmp"
+        cache.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        env["PIP_CACHE_DIR"] = str(cache)
+        env["TEMP"] = str(tmp)
+        env["TMP"] = str(tmp)
+        return env
+
     def popen_kwargs(self) -> dict:
         if IS_WINDOWS:
             return {"creationflags": self.priority | CREATE_NO_WINDOW}
@@ -297,7 +329,7 @@ class Runtime:
     def _run(self, command: list[str], log, popen, on_line: Callable[[str], None]) -> int:
         log.write(f"\n$ {' '.join(command)}\n"); log.flush()
         process = popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                        errors="replace", env=self.environment(2), **self.popen_kwargs())
+                        errors="replace", env=self.install_environment(2), **self.popen_kwargs())
         for line in process.stdout:
             on_line(line.rstrip())
             if not line.startswith(("Progress ", "PROGRESS ")):
@@ -322,6 +354,11 @@ class Runtime:
             if self._run(self.pip_bootstrap(wheel), log, popen, lambda _line: None) != 0:
                 raise TranscriptionError("install_pip_failed")
             report("pip", 1.0)
+            if variant == "cu121" and free_bytes(self.root) < CUDA_INSTALL_FREE_BYTES:
+                free = free_bytes(self.root)
+                log.write(f"\n# cu121 needs {CUDA_INSTALL_FREE_BYTES} free bytes, have {free}; using cpu\n")
+                log.flush()
+                variant = "cpu"
             for stage, commands in self.pip_commands(variant).items():
                 state = {"done": 0, "current": 0}
 
@@ -467,7 +504,7 @@ class TranscriptionWorker:
         if state != "missing":
             return
         self._gpu = self.probe_gpu()
-        variant = torch_variant(self._gpu, [] if self._gpu.get("gpu") else self.probe_wmi())
+        variant = select_variant(self._gpu, [] if self._gpu.get("gpu") else self.probe_wmi(), free_bytes(self.runtime.root))
         plan = install_plan(variant)
         labels = {name: label for name, label, _ in plan}
 

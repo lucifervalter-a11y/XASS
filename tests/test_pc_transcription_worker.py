@@ -151,6 +151,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(tw.torch_variant(None), "cpu")
         self.assertEqual(tw.torch_index("cu121"), tw.TORCH_CUDA_INDEX)
         self.assertEqual(tw.torch_index("cpu"), tw.TORCH_CPU_INDEX)
+        self.assertEqual(tw.select_variant(GPU, [], tw.CUDA_INSTALL_FREE_BYTES), "cu121")
+        self.assertEqual(tw.select_variant(GPU, [], tw.CUDA_INSTALL_FREE_BYTES - 1), "cpu")
+        self.assertEqual(tw.select_variant(NO_GPU, ["NVIDIA GeForce GTX 1060 6GB"], tw.CUDA_INSTALL_FREE_BYTES - 1), "cpu")
+        self.assertEqual(tw.select_variant(NO_GPU, [], 0), "cpu")
+        self.assertEqual(tw.free_bytes(Path("Z:\\missing-xass-volume")), 0)
 
     def test_wmi_gpu_names_parses_powershell_output(self):
         seen = []
@@ -212,6 +217,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(all("creationflags" in kw for _, kw in calls))
         self.assertEqual(json.loads(runtime.marker.read_text(encoding="utf-8"))["variant"], "cpu")
         self.assertEqual(runtime.variant(), "cpu")
+        self.assertTrue(str(calls[0][1]["env"]["PIP_CACHE_DIR"]).startswith(str(runtime.root)))
+        self.assertEqual(calls[0][1]["env"]["TEMP"], str(runtime.root / "tmp"))
         stages = [stage for stage, _ in reports]
         self.assertEqual(sorted(set(stages), key=stages.index), ["python", "pip", "torch", "deps", "models"])
         torch_fractions = [f for stage, f in reports if stage == "torch"]
@@ -239,6 +246,26 @@ class RuntimeTests(unittest.TestCase):
                 returncode=0 if "-c" in cmd and "pip._internal.cli.main" in " ".join(cmd) else 1), fetch=self.fetch)
         self.assertEqual(ctx.exception.reason, "install_torch_failed")
         self.assertFalse(failing.ready())
+
+    def test_install_uses_cpu_wheel_when_cuda_does_not_fit(self):
+        runtime = tw.Runtime(self.root / "tight", self.root)
+        calls = []
+        with patch.object(tw, "free_bytes", return_value=tw.CUDA_INSTALL_FREE_BYTES - 1):
+            runtime.install("cu121", popen=self.popen_with_progress(calls), fetch=self.fetch)
+        torch_cmd = next(cmd for cmd, _ in calls if "torch==2.5.1" in cmd)
+        self.assertIn(tw.TORCH_CPU_INDEX, torch_cmd)
+        self.assertNotIn(tw.TORCH_CUDA_INDEX, torch_cmd)
+        self.assertEqual(json.loads(runtime.marker.read_text(encoding="utf-8"))["variant"], "cpu")
+        self.assertIn("using cpu", runtime.log_path.read_text(encoding="utf-8"))
+
+    def test_install_keeps_cuda_wheel_when_the_disk_has_room(self):
+        runtime = tw.Runtime(self.root / "roomy", self.root)
+        calls = []
+        with patch.object(tw, "free_bytes", return_value=tw.CUDA_INSTALL_FREE_BYTES):
+            runtime.install("cu121", popen=self.popen_with_progress(calls), fetch=self.fetch)
+        torch_cmd = next(cmd for cmd, _ in calls if "torch==2.5.1" in cmd)
+        self.assertIn(tw.TORCH_CUDA_INDEX, torch_cmd)
+        self.assertEqual(json.loads(runtime.marker.read_text(encoding="utf-8"))["variant"], "cu121")
 
     def test_install_refuses_non_windows_real_run(self):
         with patch.object(tw, "IS_WINDOWS", False):
@@ -439,6 +466,7 @@ class WorkerFlowTests(unittest.TestCase):
             report("torch", 0.5)
             started.set(); release.wait(5)
         with patch.object(worker.runtime, "install", side_effect=install), \
+             patch.object(tw, "free_bytes", return_value=tw.CUDA_INSTALL_FREE_BYTES), \
              patch.object(tw.psutil, "cpu_percent", return_value=1.0):
             worker.ensure_runtime()
             started.wait(5)
@@ -465,10 +493,21 @@ class WorkerFlowTests(unittest.TestCase):
                 worker.probe_wmi = lambda wmi=wmi: wmi
                 worker.runtime.env_ready = False
                 chosen = []
-                with patch.object(worker.runtime, "install", side_effect=lambda variant, **kw: chosen.append(variant)):
+                with patch.object(worker.runtime, "install", side_effect=lambda variant, **kw: chosen.append(variant)), \
+                     patch.object(tw, "free_bytes", return_value=tw.CUDA_INSTALL_FREE_BYTES):
                     worker.ensure_runtime()
                     worker._install_thread.join(5)
                 self.assertEqual(chosen, [expected])
+
+    def test_ensure_runtime_uses_cpu_when_the_disk_is_short(self):
+        worker = self.worker(lambda *a, **k: FakeProcess(), gpu=GPU)
+        worker.runtime.env_ready = False
+        chosen = []
+        with patch.object(worker.runtime, "install", side_effect=lambda variant, **kw: chosen.append(variant)), \
+             patch.object(tw, "free_bytes", return_value=tw.CUDA_INSTALL_FREE_BYTES - 1):
+            worker.ensure_runtime()
+            worker._install_thread.join(5)
+        self.assertEqual(chosen, ["cpu"])
 
     def test_install_failure_reports_error_state(self):
         worker = self.worker(lambda *a, **k: FakeProcess())
