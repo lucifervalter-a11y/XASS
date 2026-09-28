@@ -245,6 +245,16 @@ class Runtime:
             return {"creationflags": self.priority | CREATE_NO_WINDOW}
         return {"preexec_fn": lambda: os.nice(19 if self.priority == IDLE_PRIORITY_CLASS else 10)}
 
+    def pip_bootstrap(self, wheel: Path) -> list[str]:
+        """Offline self-install. argv[0] must not be named pip, or Windows pip exits."""
+        code = (
+            "import sys; "
+            "sys.path.insert(0, sys.argv[1]); "
+            "from pip._internal.cli.main import main; "
+            "sys.exit(main(['install', '--no-index', '--no-warn-script-location', sys.argv[1]]))"
+        )
+        return [str(self.python), "-c", code, str(wheel)]
+
     def pip_commands(self, variant: str) -> dict[str, list[list[str]]]:
         python = str(self.python)
         pip = [python, "-m", "pip", "install", "--progress-bar", "raw", "--no-warn-script-location"]
@@ -307,9 +317,9 @@ class Runtime:
                 self._install_python(fetch, lambda f: report("python", f))
             report("pip", 0.0)
             wheel = self._download(PIP_WHEEL_URL, PIP_WHEEL_SHA256, Path(PIP_WHEEL_URL).name, fetch, lambda f: report("pip", 0.5 * f))
-            # pip runs straight from its wheel to install itself into the private Python.
-            if self._run([str(self.python), str(wheel / "pip"), "install", "--no-index", "--no-warn-script-location", str(wheel)],
-                         log, popen, lambda _line: None) != 0:
+            # `python <wheel>/pip` makes argv[0] end in "pip". Pip 25 then refuses
+            # to modify itself on Windows. Import the wheel and call main() instead.
+            if self._run(self.pip_bootstrap(wheel), log, popen, lambda _line: None) != 0:
                 raise TranscriptionError("install_pip_failed")
             report("pip", 1.0)
             for stage, commands in self.pip_commands(variant).items():
@@ -366,6 +376,8 @@ def status_text(payload: dict | None, enabled: bool) -> str:
         label = payload.get("stage_label") or "компоненты"
         return f"Подготовка к расшифровке: {label} — {int(payload.get('percent') or 0)}%"
     if state == "error":
+        if payload.get("detail") == "install_pip_failed":
+            return "Не удалось установить компоненты, мы уже чиним"
         return f"Не удалось подготовить расшифровку ({payload.get('detail') or 'ошибка'}). Проверьте интернет и место на диске (~6 ГБ)."
     if state == "running":
         return str(payload.get("detail") or "Идёт расшифровка")

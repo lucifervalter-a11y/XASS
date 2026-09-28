@@ -200,11 +200,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("Lib\\site-packages", pth)
         self.assertNotIn("#import site", pth)
         self.assertEqual(self.fetched, [tw.PYTHON_EMBED_URL, tw.PIP_WHEEL_URL])
-        # pip bootstraps itself from the pinned wheel, offline.
+        # pip bootstraps itself from the pinned wheel, offline, without argv[0] named pip.
         bootstrap = calls[0][0]
-        self.assertEqual(bootstrap[0], str(runtime.python))
-        self.assertTrue(bootstrap[1].endswith("pip"))
-        self.assertIn("--no-index", bootstrap)
+        self.assertEqual(bootstrap[:2], [str(runtime.python), "-c"])
+        self.assertIn("sys.path.insert(0, sys.argv[1])", bootstrap[2])
+        self.assertIn("from pip._internal.cli.main import main", bootstrap[2])
+        self.assertIn("--no-index", bootstrap[2])
+        self.assertEqual(bootstrap[3], str((runtime.downloads / "pip-25.2-py3-none-any.whl")))
+        self.assertFalse(any(str(part).endswith("pip") and part != bootstrap[0] for part in bootstrap))
         self.assertEqual(len(calls), 1 + 1 + 2 + 1)
         self.assertTrue(all("creationflags" in kw for _, kw in calls))
         self.assertEqual(json.loads(runtime.marker.read_text(encoding="utf-8"))["variant"], "cpu")
@@ -232,7 +235,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(any(runtime.downloads.iterdir()))
         failing = tw.Runtime(self.root / "fail", self.root)
         with self.assertRaises(tw.TranscriptionError) as ctx:
-            failing.install("cu121", popen=lambda cmd, **kw: FakeProcess(returncode=0 if "--no-index" in cmd else 1), fetch=self.fetch)
+            failing.install("cu121", popen=lambda cmd, **kw: FakeProcess(
+                returncode=0 if "-c" in cmd and "pip._internal.cli.main" in " ".join(cmd) else 1), fetch=self.fetch)
         self.assertEqual(ctx.exception.reason, "install_torch_failed")
         self.assertFalse(failing.ready())
 
@@ -258,6 +262,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(tw.status_text({"state": "installing", "stage_label": "PyTorch (CUDA)", "percent": 37}, True),
                          "Подготовка к расшифровке: PyTorch (CUDA) — 37%")
         self.assertIn("hash_mismatch", tw.status_text({"state": "error", "detail": "hash_mismatch x"}, True))
+        self.assertEqual(tw.status_text({"state": "error", "detail": "install_pip_failed"}, True),
+                         "Не удалось установить компоненты, мы уже чиним")
         self.assertEqual(tw.status_text({"state": "idle"}, True), "Готов к расшифровке")
         self.assertIsNone(tw.read_status_file(self.root))
         (self.root / "transcription").mkdir()
