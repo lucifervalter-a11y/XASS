@@ -10,6 +10,9 @@ import UIKit
         guard let index = args.firstIndex(of: "--native-ui-screen"), args.indices.contains(index + 1) else { return "library" }
         return args[index + 1]
     }
+    /// Screens rendered by the timer-driven FixturePlayerState instead of NativeStore.
+    static let playerScreens: Set<String> = ["nowplaying", "lyrics", "miniplayer"]
+    static var usesFixturePlayer: Bool { enabled && playerScreens.contains(screen) }
     let origin: ServerOrigin
     init(origin: ServerOrigin) { self.origin = origin }
     func artwork(trackID: Int) async throws -> Data? {
