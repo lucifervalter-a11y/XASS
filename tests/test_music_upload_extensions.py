@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 import zipfile
 
+from unittest.mock import AsyncMock, patch
+
 from mutagen.id3 import APIC
 from mutagen.wave import WAVE
 from PIL import Image
@@ -92,3 +94,18 @@ class MusicUploadExtensionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(thumb.size, (512, 512))
         await self.request("DELETE", f"/api/mini/music/tracks/{track['id']}")
         self.assertEqual((await self.request("GET", path)).status_code, 404)
+
+    async def test_track_without_embedded_art_gets_one_exact_name_cover(self):
+        track = await self.upload()
+        path = track["artwork_path"]
+        image = io.BytesIO()
+        Image.new("RGB", (40, 40), "red").save(image, format="JPEG")
+        jpeg = image.getvalue()
+        with patch("app.services.music_covers.display_cover", AsyncMock(return_value=jpeg)) as lookup:
+            first = await self.request("GET", path)
+            second = await self.request("GET", path)
+        self.assertEqual(first.status_code, 200, first.text[:80])
+        self.assertEqual(first.headers["content-type"], "image/jpeg")
+        self.assertEqual(first.content, jpeg)
+        self.assertEqual(second.content, jpeg)
+        self.assertEqual(lookup.await_count, 1)

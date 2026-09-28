@@ -183,6 +183,12 @@ if ($binaryMode) {
         header('X-Content-Type-Options: nosniff');
         header('Referrer-Policy: no-referrer');
     }
+    // Covers are not installers. The phone accepts only an image/jpeg response
+    // and ignores a body served as the Windows setup file.
+    if (!$mediaMode && strncasecmp($contentType, 'image/jpeg', 10) === 0) {
+        $contentType = 'image/jpeg';
+        $contentDisposition = 'inline';
+    }
     header('Content-Type: ' . $contentType);
     header('Content-Disposition: ' . $contentDisposition);
     if ($contentLength !== '') {

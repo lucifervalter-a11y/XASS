@@ -623,14 +623,29 @@ def build_router(settings, require_owner, public_origin):
         from app.services.music_artwork import artwork_thumbnail
         track = await find_track(session, track_id)
         path = await asyncio.to_thread(artwork_thumbnail, root, track)
-        if path is None:
-            cached = await session.get(MusicEnrichment, track_id)
-            if cached and not cached.dismissed and cached.artwork_data:
-                return Response(cached.artwork_data, media_type="image/jpeg", headers={"Cache-Control": "private, no-store",
-                    "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+        if path is not None:
+            return FileResponse(path, media_type="image/jpeg", headers=headers)
+        cached = await session.get(MusicEnrichment, track_id)
+        if cached and not cached.dismissed and cached.artwork_data:
+            return Response(cached.artwork_data, media_type="image/jpeg", headers=headers)
+        # The library asks for a cover directly. A file without a picture, and a
+        # catalog row MusicBrainz could not illustrate, still get an exact-name cover.
+        title, artist, album = track.title, track.artist, track.album
+        sha, storage = track.sha256, track.storage_name
+        await session.rollback()
+        from app.services.music_artwork import store_external_thumbnail
+        from app.services.music_covers import display_cover
+        try:
+            jpeg = await display_cover(title, artist, album)
+        except (OSError, ValueError, TypeError):
+            jpeg = None
+        if not jpeg:
             raise HTTPException(404, "Обложка пока не найдена")
-        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store",
-            "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
+        saved = await asyncio.to_thread(store_external_thumbnail, root, sha, storage, jpeg)
+        if saved is not None:
+            return FileResponse(saved, media_type="image/jpeg", headers=headers)
+        return Response(jpeg, media_type="image/jpeg", headers=headers)
 
     @router.post("/api/mini/music/tracks/{track_id}/ticket")
     async def ticket(track_id: int, payload: MediaTicketBody, user=Depends(require_owner), session=Depends(get_session)):

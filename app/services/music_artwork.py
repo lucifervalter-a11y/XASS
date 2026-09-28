@@ -178,6 +178,29 @@ def _cached_artwork(path: Path) -> bool:
         return stream.read(3) == b"\xff\xd8\xff"
 
 
+def store_external_thumbnail(root: Path, sha256: str, storage_name: str, data: bytes) -> Path | None:
+    """Remember a sanitized JPEG next to the embedded-art cache."""
+    try:
+        if not re.fullmatch(r"[a-f0-9]{64}", str(sha256)) or not data.startswith(b"\xff\xd8\xff") or len(data) > MAX_OUTPUT_BYTES:
+            return None
+        if not re.fullmatch(r"[a-f0-9]{32}\.(mp3|wav|flac|ogg|m4a)", str(storage_name)):
+            return None
+        root = Path(root).absolute()
+        for part in [root, *root.parents]:
+            _no_link(part)
+        _no_link(root / storage_name)
+        cache = root / ".artwork"
+        _no_link(cache)
+        cache.mkdir(mode=0o700, exist_ok=True)
+        if os.name != "nt":
+            cache.chmod(0o700)
+        image = cache / f"{sha256}-{CACHE_VERSION}.jpg"
+        _write_cache(image, data)
+        return image if _cached_artwork(image) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def artwork_thumbnail(root: Path, track) -> Path | None:
     """Blocking helper: call in a worker thread, return JPEG path or no artwork.
 
