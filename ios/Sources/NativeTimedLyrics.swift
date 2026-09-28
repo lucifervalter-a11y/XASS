@@ -86,7 +86,7 @@ struct TimedLyrics: Equatable, Codable {
     @Published private(set) var error: String?
     /// Index into `current.lines`; updated from AVPlayer's periodic observer
     /// (local) or the PC session position (remote).
-    @Published private(set) var activeLineIndex: Int?
+    @Published private(set) var currentLyricIndex: Int?
 
     static let foundTTL: TimeInterval = 14 * 86_400
     static let missTTL: TimeInterval = 6 * 3_600
@@ -111,7 +111,7 @@ struct TimedLyrics: Equatable, Codable {
     /// refreshes in the background, and warms the next track.
     func trackChanged(to id: Int?, next: Int?) {
         guard id != currentTrackID else { return }
-        currentTrackID = id; activeLineIndex = nil; error = nil
+        currentTrackID = id; currentLyricIndex = nil; error = nil
         current = id.flatMap { cached($0) }
         guard let id = id, autoFetch else { loading = false; return }
         loading = current == nil
@@ -151,11 +151,11 @@ struct TimedLyrics: Equatable, Codable {
 
     func tick(position: Double, trackID: Int?) {
         guard let lyrics = current, lyrics.trackID == trackID else {
-            if activeLineIndex != nil { activeLineIndex = nil }
+            if currentLyricIndex != nil { currentLyricIndex = nil }
             return
         }
         let index = lyrics.lineIndex(at: position)
-        if index != activeLineIndex { activeLineIndex = index }
+        if index != currentLyricIndex { currentLyricIndex = index }
     }
 
     func cached(_ id: Int) -> TimedLyrics? {
@@ -240,7 +240,7 @@ struct TimedLyrics: Equatable, Codable {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 20) {
                     ForEach(value.lines) { line in
-                        let active = lyrics.activeLineIndex == line.id
+                        let active = lyrics.currentLyricIndex == line.id
                         Button {
                             following = true
                             store.run { try await store.seek(line.start) }
@@ -257,16 +257,16 @@ struct TimedLyrics: Equatable, Codable {
                 }.padding(.vertical, 140).padding(.horizontal, 8)
             }.scrollIndicators(.hidden)
                 .simultaneousGesture(DragGesture(minimumDistance: 14).onChanged { _ in following = false })
-                .onChange(of: lyrics.activeLineIndex) { _, index in
+                .onChange(of: lyrics.currentLyricIndex) { _, index in
                     guard following, let index = index else { return }
                     withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) }
                 }
-                .onAppear { if let index = lyrics.activeLineIndex { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) } }
+                .onAppear { if let index = lyrics.currentLyricIndex { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) } }
                 .overlay(alignment: .bottomTrailing) {
                     if !following {
                         Button {
                             following = true
-                            if let index = lyrics.activeLineIndex { withAnimation { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) } }
+                            if let index = lyrics.currentLyricIndex { withAnimation { proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.35)) } }
                         } label: { Label("К текущей строке", systemImage: "arrow.uturn.backward").font(.caption.weight(.semibold)).padding(8).background(.white.opacity(0.16), in: Capsule()) }
                             .buttonStyle(.plain).padding(8)
                     }
