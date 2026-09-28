@@ -594,6 +594,72 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertNil(store.notice)
     }
 
+    @MainActor private func waitUntil(_ condition: @MainActor () -> Bool) async {
+        for _ in 0..<80 where !condition() { try? await Task.sleep(nanoseconds: 50_000_000) }
+    }
+
+    @MainActor func testWaitingForPCResumeOffersPlayOnIPhoneFromCurrentPosition() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        api.session["device"] = "agent:Studio"; api.session["state"] = "paused"; api.session["position"] = 40
+        Self.phoneHandler(api, store) { [Self.studio(live: true, state: "paused")] }
+        let base = api.handler
+        var pcActions: [String] = []
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/control", method == "POST" {
+                pcActions.append(body?["action"] as? String ?? "")
+                return ["ok": true, "command_id": 7, "status": "pending"]
+            }
+            if path == "/api/mini/music/control/7" { return ["ok": true, "status": "pending"] }
+            return try await base?(path, method, body)
+        }
+        await store.refresh()
+        XCTAssertEqual(store.pcRemoteSource, "agent:Studio")
+        let resume = Task { try await store.toggle() }
+        await waitUntil { store.pcConnecting != nil }
+        XCTAssertEqual(store.pcConnecting, "Studio")
+        XCTAssertEqual(store.transferStatus, NativeStore.pcConnectingText, "Mini player shows «Подключаемся к ПК…»")
+        XCTAssertFalse(audio.hasPlayableItem)
+        let tapped = Date()
+        store.playHereInsteadOfPC()
+        try await resume.value
+        XCTAssertLessThan(Date().timeIntervalSince(tapped), 2)
+        XCTAssertTrue(audio.hasPlayableItem, "«Играть на iPhone» switches immediately")
+        let claim = api.requests.last { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
+        XCTAssertEqual(claim?.2?["position"] as? Double, 40, "From the current position")
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertNil(store.pcConnecting)
+        XCTAssertNil(store.transferStatus)
+        XCTAssertEqual(store.notice, NativeStore.playingHereNotice)
+        await waitUntil { pcActions.contains("pause") }
+        XCTAssertEqual(pcActions, ["resume", "pause"], "A late PC resume is paused again")
+    }
+
+    @MainActor func testWaitingForPCHandoffOffersPlayOnIPhone() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        Self.phoneHandler(api, store) { [Self.studio(live: true, state: "stopped")] }
+        let base = api.handler
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/transfers" { return ["ok": true, "transfer_id": "to-pc", "status": "waiting"] }
+            if path == "/api/mini/music/transfers/to-pc" { return ["ok": true, "transfer_id": "to-pc", "status": "waiting"] }
+            if path == "/api/mini/music/transfers/to-pc/cancel" { return ["ok": true, "transfer_id": "to-pc", "status": "failed"] }
+            return try await base?(path, method, body)
+        }
+        await store.refresh()
+        store.selectedDevice = "agent:Studio"
+        let play = Task { try await store.play(store.tracks[0]) }
+        await waitUntil { store.transferStatus == NativeStore.pcConnectingText }
+        XCTAssertEqual(store.pcConnecting, "Studio")
+        store.playHereInsteadOfPC()
+        try await play.value
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers/to-pc/cancel" }, "The PC handoff is cancelled on the server")
+        XCTAssertTrue(audio.hasPlayableItem)
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertNil(store.pcConnecting)
+        XCTAssertEqual(store.notice, NativeStore.playingHereNotice)
+    }
+
     @MainActor func testFavoriteUpdatesHiddenCurrentTrackAndDeletePrunesPlaylists() async throws {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
         defer { store.disconnect() }

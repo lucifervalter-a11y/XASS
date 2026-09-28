@@ -452,15 +452,24 @@ struct NativeTransferWait: View {
                 ProgressView().tint(.white)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(store.transferStatus ?? "Переключаю…").font(.subheadline.weight(.semibold)).foregroundStyle(.white)
-                    Text("Можно отменить и остаться на текущем устройстве").font(.caption2).foregroundStyle(.white.opacity(0.7))
+                    Text(store.pcConnecting != nil ? "Ждём ответ ПК. Можно сразу слушать на iPhone"
+                         : "Можно отменить и остаться на текущем устройстве").font(.caption2).foregroundStyle(.white.opacity(0.7))
                 }
                 Spacer(minLength: 0)
-                Button("Отмена") { store.cancelTransfer() }
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(Color.white.opacity(0.15), in: Capsule())
-                    .foregroundStyle(.white)
-                    .accessibilityIdentifier("nativeTransferCancel")
+                if store.pcConnecting != nil {
+                    NativePlayHereButton(store: store)
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(Color.white.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.white)
+                } else {
+                    Button("Отмена") { store.cancelTransfer() }
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(Color.white.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.white)
+                        .accessibilityIdentifier("nativeTransferCancel")
+                }
             }
             ProgressView(value: min(max(store.transferProgress, 0), 1))
                 .tint(XASSStyle.accent)
@@ -494,6 +503,7 @@ struct NativeTransferWait: View {
                             ProgressView(value: min(max(store.transferProgress, 0), 1))
                                 .tint(XASSStyle.accent)
                                 .accessibilityIdentifier("nativeTransferProgress")
+                            if store.pcConnecting != nil { NativePlayHereButton(store: store) }
                             Button("Отмена") { store.cancelTransfer() }
                                 .accessibilityIdentifier("nativeTransferCancel")
                         }

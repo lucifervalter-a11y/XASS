@@ -120,6 +120,12 @@ import UIKit
     private var lastAudioDiagnosticFailed = false
     /// Toast shown when a chosen/current PC is gone and this iPhone plays instead.
     static let pcOfflineNotice = "ПК не в сети, играет на iPhone"
+    /// Shown while a live PC has not yet confirmed play/resume.
+    static let pcConnectingText = "Подключаемся к ПК…"
+    static let playingHereNotice = "Играет на iPhone"
+    /// Name of the PC we are waiting for; the UI then offers «Играть на iPhone».
+    @Published private(set) var pcConnecting: String?
+    private var pcWaitAbandoned = false
     /// Server detail for a PC lease whose heartbeat is stale.
     static let pcOfflineServerDetail = "Компьютер не в сети"
     /// A PC must answer the reachability check within this time, else the
@@ -597,8 +603,16 @@ import UIKit
         guard pcIsLive(device), await pcReachable(device) else {
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return
         }
+        pcWaitAbandoned = false; pcConnecting = String(device.dropFirst(6))
+        defer { pcConnecting = nil }
         do { try await transfer(to: device, trackID: trackID, startPosition: startPosition, output: output) }
+        catch where pcWaitAbandoned {
+            // «Играть на iPhone» while waiting: the handoff was cancelled on the server.
+            pcConnecting = nil
+            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt, notice: Self.playingHereNotice)
+        }
         catch where fallbackOnHandoffFailure && Self.isPCFailure(error) {
+            pcConnecting = nil
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
         }
     }
@@ -607,18 +621,37 @@ import UIKit
     private func resumeOnPC(_ device: String, trackID: Int) async throws {
         let resumeAt = pcResumePosition(trackID)
         guard await pcReachable(device) else { try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return }
+        let name = String(device.dropFirst(6))
+        pcWaitAbandoned = false; pcConnecting = name; transferStatus = Self.pcConnectingText; transferProgress = 0.1
+        defer { pcConnecting = nil; if transferStatus == Self.pcConnectingText { transferStatus = nil; transferProgress = 0 } }
         do {
             let expires = Int(Date().timeIntervalSince1970 + pcStartAckDeadline + 1)
-            _ = try await control("resume", extra: ["expires_at": expires], source: String(device.dropFirst(6)), ackDeadline: pcStartAckDeadline)
+            _ = try await control("resume", extra: ["expires_at": expires], source: name, ackDeadline: pcStartAckDeadline, abandonable: true)
+            pcConnecting = nil; transferStatus = nil; transferProgress = 0
             try await refreshSession()
+        } catch where pcWaitAbandoned {
+            pcConnecting = nil; transferStatus = nil; transferProgress = 0
+            // A late resume must not make the PC audible next to the iPhone.
+            let api = self.api
+            Task { _ = try? await api.request("/api/mini/music/control", method: "POST", body: [
+                "source_name": name, "action": "pause", "expires_at": Int(Date().timeIntervalSince1970) + 30]) }
+            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt, notice: Self.playingHereNotice)
         } catch where Self.isPCFailure(error) {
+            pcConnecting = nil; transferStatus = nil; transferProgress = 0
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
         }
     }
 
     /// The iPhone is the default output: a gone PC falls back here silently,
     /// with a toast instead of an error.
-    private func playOnPhoneAfterPCLoss(trackID: Int, position start: Double) async throws {
+    /// «Играть на iPhone» while a PC has not confirmed play/resume yet.
+    func playHereInsteadOfPC() {
+        guard pcConnecting != nil, !pcWaitAbandoned else { return }
+        pcWaitAbandoned = true
+        if activeTransferKind == .handoff { cancelTransfer() }
+    }
+
+    private func playOnPhoneAfterPCLoss(trackID: Int, position start: Double, notice message: String = NativeStore.pcOfflineNotice) async throws {
         guard let track = knownTracks[trackID] ?? tracks.first(where: { $0.id == trackID }) ?? queue.first(where: { $0.id == trackID })
                 ?? (currentID == trackID ? currentTrack : nil) else {
             throw OwnerAPIError(status: 404, message: "Трек недоступен")
@@ -634,10 +667,10 @@ import UIKit
             try await playLocal(track, startPosition: start)
         }
         if ownsSession && selectedDevice == "local" {
-            error = nil; notice = NativeStore.pcOfflineNotice
+            error = nil; notice = message
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
-                if self?.notice == NativeStore.pcOfflineNotice { self?.notice = nil }
+                if self?.notice == message { self?.notice = nil }
             }
         }
     }
@@ -795,7 +828,7 @@ import UIKit
             await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
             throw CancellationError()
         }
-        transferStatus = "Подключаю устройство…"; transferProgress = 0.08
+        transferStatus = device.hasPrefix("agent:") ? Self.pcConnectingText : "Подключаю устройство…"; transferProgress = 0.08
         let deadline = Date().addingTimeInterval(30)
         let startedAt = Date()
         var response = started
@@ -823,7 +856,8 @@ import UIKit
             }
             let elapsed = Date().timeIntervalSince(startedAt)
             transferProgress = min(0.92, 0.08 + elapsed / 30)
-            transferStatus = elapsed < 8 ? "Жду остановку на текущем устройстве…" : (elapsed < 18 ? "Передаю воспроизведение…" : "Почти готово…")
+            transferStatus = device.hasPrefix("agent:") ? Self.pcConnectingText
+                : (elapsed < 8 ? "Жду остановку на текущем устройстве…" : (elapsed < 18 ? "Передаю воспроизведение…" : "Почти готово…"))
             do {
                 try await Task.sleep(for: .milliseconds(650)); try Task.checkCancellation()
                 response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID), method: "GET", body: nil)
@@ -1155,7 +1189,7 @@ import UIKit
         _ = try await writeSession(body, explicit: true); shareSite = desired
         if ownsSession && selectedDevice == "local" { audio.handle(try NativeAudioCommand(["action": "session", "session": snapshot()])) }
     }
-    func control(_ action: String, extra: [String: Any] = [:], source: String? = nil, ackDeadline: TimeInterval = 25) async throws -> [String: Any] {
+    func control(_ action: String, extra: [String: Any] = [:], source: String? = nil, ackDeadline: TimeInterval = 25, abandonable: Bool = false) async throws -> [String: Any] {
         let name = source ?? (selectedDevice.hasPrefix("agent:") ? String(selectedDevice.dropFirst(6)) : "")
         guard !name.isEmpty else { throw OwnerAPIError(status: 400, message: "Выберите компьютер") }
         var body: [String: Any] = ["source_name": name, "action": action, "output_id": outputID, "position_sec": position, "volume": Int(volume)]
@@ -1164,6 +1198,7 @@ import UIKit
         guard let id = started["command_id"] as? Int else { throw OwnerAPIError.invalidResponse }
         let deadline = Date().addingTimeInterval(ackDeadline)
         while Date() < deadline {
+            if abandonable && pcWaitAbandoned { throw CancellationError() }
             let status = try await api.request("/api/mini/music/control/\(id)", method: "GET", body: nil)
             let result = status["result"] as? [String: Any] ?? [:]
             if status["status"] as? String == "completed" {
@@ -1172,6 +1207,7 @@ import UIKit
             }
             if ["failed", "cancelled"].contains(status["status"] as? String ?? "") { throw OwnerAPIError(status: 409, message: result["message"] as? String ?? "Команда не выполнена") }
             try await Task.sleep(for: .milliseconds(700)); try Task.checkCancellation()
+            if abandonable && pcWaitAbandoned { throw CancellationError() }
         }
         throw OwnerAPIError(status: 408, message: "ПК не ответил вовремя. Проверьте агент.")
     }
