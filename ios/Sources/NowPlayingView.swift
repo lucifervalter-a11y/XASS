@@ -479,8 +479,8 @@ private enum PlayerDragMode { case undecided, active, ignored }
             .contentShape(Rectangle())
             .background { zoneReporter }
             Group {
-                if let custom = slots.lyrics {
-                    // Legacy lyrics view: keep its first line clear of the header row.
+                if player.lyrics == nil, let custom = slots.lyrics {
+                    // Legacy lyrics view (no synced lines for this song): keep its first line clear of the header row.
                     custom().padding(.horizontal, 20).padding(.top, 10)
                         .mask {
                             LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.06),
