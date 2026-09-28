@@ -435,6 +435,165 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/control" })
     }
 
+    // MARK: P0 — the iPhone plays by itself when no PC is online.
+
+    private static func studio(live: Bool, state: String = "playing", position: Double = 40) -> [String: Any] {
+        ["source_name": "Studio", "online": true, "live": live, "available": live,
+         "music_player": ["track_id": 1, "state": state, "position_sec": position, "volume": 50]]
+    }
+
+    /// Local claim handler: ticket + accepted local session, no PC handoff allowed.
+    @MainActor private static func phoneHandler(_ api: NativeOwnerFixture, _ store: NativeStore, players: @escaping () -> [[String: Any]]) {
+        api.handler = { path, method, body in
+            if path.hasSuffix("/ticket") { return ["ok": true, "path": "/api/music/tracks/1/stream?ticket=fixture"] }
+            if path == "/api/mini/music/session", method == "POST" {
+                return ["ok": true, "session": ["track_id": 1, "device": "local", "state": "loading",
+                    "position": body?["position"] ?? 0, "session_key": store.sessionKey, "client_id": store.clientID]]
+            }
+            if path == "/api/mini/music/players" { return ["ok": true, "players": players()] }
+            if path.hasPrefix("/api/mini/music/transfers") || path.hasPrefix("/api/mini/music/control") {
+                XCTFail("An offline PC must not be asked to play: \(path)"); throw OwnerAPIError(status: 409, message: "offline")
+            }
+            return nil
+        }
+    }
+
+    @MainActor func testAllPCsOfflinePlayStartsOnIPhoneByDefault() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        Self.phoneHandler(api, store) { [Self.studio(live: false)] }
+        await store.refresh()
+        XCTAssertEqual(store.selectedDevice, "local", "The iPhone is the default output")
+        XCTAssertFalse(store.pcIsLive("agent:Studio"))
+        let started = Date()
+        try await store.play(store.tracks[0])
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        XCTAssertTrue(audio.hasPlayableItem)
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertNil(store.error)
+    }
+
+    @MainActor func testChosenOfflinePCFallsBackToIPhoneWithToast() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        Self.phoneHandler(api, store) { [Self.studio(live: false)] }
+        await store.refresh()
+        store.selectedDevice = "agent:Studio"
+        try await store.play(store.tracks[0])
+        XCTAssertTrue(audio.hasPlayableItem, "No silence: the iPhone plays")
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
+        XCTAssertNil(store.error, "An offline PC is not an error")
+    }
+
+    @MainActor func testSilentPCIsAbandonedWithinTwoSeconds() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        var hang = false
+        Self.phoneHandler(api, store) { [Self.studio(live: true)] }
+        let base = api.handler
+        api.handler = { path, method, body in
+            if hang, path == "/api/mini/music/players" { try await Task.sleep(nanoseconds: 5_000_000_000); return ["ok": true, "players": []] }
+            return try await base?(path, method, body)
+        }
+        await store.refresh()
+        store.selectedDevice = "agent:Studio"
+        store.pcResponseDeadline = 0.4
+        hang = true
+        let started = Date()
+        try await store.play(store.tracks[0])
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "Fallback must happen within 2 s")
+        XCTAssertTrue(audio.hasPlayableItem)
+        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
+    }
+
+    @MainActor func testFailedPCHandoffFallsBackToIPhone() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        Self.phoneHandler(api, store) { [Self.studio(live: true)] }
+        let base = api.handler
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/transfers" { throw OwnerAPIError(status: 409, message: "ПК недоступен для музыки. Проверьте подключение и версию агента") }
+            return try await base?(path, method, body)
+        }
+        await store.refresh()
+        store.selectedDevice = "agent:Studio"
+        try await store.play(store.tracks[0])
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" })
+        XCTAssertTrue(audio.hasPlayableItem)
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
+        XCTAssertNil(store.error)
+    }
+
+    @MainActor func testPCOfflineMidTrackContinuesOnIPhoneFromCurrentPosition() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        var live = true
+        api.session["device"] = "agent:Studio"; api.session["state"] = "playing"; api.session["position"] = 40
+        api.session["session_key"] = store.sessionKey; api.session["client_id"] = store.clientID
+        Self.phoneHandler(api, store) { [Self.studio(live: live)] }
+        await store.refresh()
+        XCTAssertEqual(store.pcRemoteSource, "agent:Studio", "Online PC stays a remote output")
+        // PC switched off: server lease keeps the stale start position.
+        live = false
+        api.session["state"] = "unavailable"; api.session["position"] = 0; api.session["detail"] = "Компьютер не в сети"
+        try await store.refreshSession()
+        let claim = api.requests.last { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
+        let resumed = claim?.2?["position"] as? Double ?? -1
+        XCTAssertGreaterThanOrEqual(resumed, 40, "Continue from where the PC was, not from 0")
+        XCTAssertLessThan(resumed, 75)
+        XCTAssertEqual(claim?.2?["device"] as? String, "local")
+        XCTAssertTrue(audio.hasPlayableItem)
+        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
+        XCTAssertNil(store.error)
+    }
+
+    @MainActor func testPausedPCGoingOfflineDoesNotStartAudio() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        var live = true
+        api.session["device"] = "agent:Studio"; api.session["state"] = "paused"; api.session["position"] = 40
+        Self.phoneHandler(api, store) { [Self.studio(live: live, state: "paused")] }
+        await store.refresh()
+        live = false; api.session["state"] = "unavailable"; api.session["detail"] = "Компьютер не в сети"
+        try await store.refreshSession()
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertNil(store.error, "Offline PC is shown without an error")
+        XCTAssertNil(store.pcRemoteSource)
+        // Pressing play now starts the iPhone from the PC position.
+        try await store.toggle()
+        XCTAssertTrue(audio.hasPlayableItem)
+        let claim = api.requests.last { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
+        XCTAssertEqual(claim?.2?["position"] as? Double, 40)
+        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
+    }
+
+    @MainActor func testOnlinePCResumeStaysRemote() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        api.session["device"] = "agent:Studio"; api.session["state"] = "paused"
+        await store.refresh()
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/players" { return ["ok": true, "players": [Self.studio(live: true, state: "paused")]] }
+            if path == "/api/mini/music/control", method == "POST" {
+                XCTAssertEqual(body?["action"] as? String, "resume")
+                XCTAssertNotNil(body?["expires_at"], "A late resume must expire on the PC")
+                return ["ok": true, "command_id": 7, "status": "pending"]
+            }
+            if path == "/api/mini/music/control/7" { return ["ok": true, "status": "completed", "result": ["ok": true, "details": ["state": "playing"]]] }
+            if path == "/api/mini/music/session", method == "POST" { XCTFail("Online PC must not be pulled to the phone") }
+            return nil
+        }
+        try await store.refreshSession()
+        XCTAssertEqual(store.pcRemoteSource, "agent:Studio")
+        try await store.toggle()
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/control" })
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertNil(store.notice)
+    }
+
     @MainActor func testFavoriteUpdatesHiddenCurrentTrackAndDeletePrunesPlaylists() async throws {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
         defer { store.disconnect() }

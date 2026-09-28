@@ -77,7 +77,9 @@ struct RemotePlayer: Identifiable, Equatable {
     let error: String?
     init?(_ value: [String: Any]) {
         guard let name = value["source_name"] as? String else { return nil }
-        id = name; online = value["online"] as? Bool ?? false; available = value["available"] as? Bool ?? false
+        // "live" = fresh music heartbeat (<= 15 s). Older servers only send
+        // the 2-minute dashboard "online" flag.
+        id = name; online = value["live"] as? Bool ?? value["online"] as? Bool ?? false; available = value["available"] as? Bool ?? false
         let info = value["music_player"] as? [String: Any] ?? [:]
         trackID = info["track_id"] as? Int; state = info["state"] as? String ?? "stopped"
         position = NativeValue.number(info["position_sec"]); duration = NativeValue.number(info["duration_sec"])

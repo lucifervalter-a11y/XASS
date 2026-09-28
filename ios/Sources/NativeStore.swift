@@ -118,6 +118,17 @@ import UIKit
     var musicImportArchiveLimit: Int { maxArchiveUpload }
     var isMusicImporting: Bool { musicImport != nil || standaloneUpload }
     private var lastAudioDiagnosticFailed = false
+    /// Toast shown when a chosen/current PC is gone and this iPhone plays instead.
+    static let pcOfflineNotice = "ПК не в сети, играет на iPhone"
+    /// A PC must answer the reachability check within this time, else the
+    /// iPhone plays by itself. Tests may shorten it.
+    var pcResponseDeadline: TimeInterval = 2
+    /// Resume on a PC must be ACKed by its agent (5 s command poll) in time,
+    /// otherwise the iPhone continues. The PC drops the expired command.
+    var pcStartAckDeadline: TimeInterval = 12
+    /// Last live PC playback sample: the server keeps the stale lease position
+    /// once the PC disappears, so the phone resumes from what it last saw.
+    private var pcLastSample: (device: String, trackID: Int, position: Double, at: Date, playing: Bool)?
 
     init(api: OwnerService, audio: AudioController) {
         self.api = api; self.audio = audio; authorization = NativeActionAuthorization(api: api)
@@ -163,8 +174,17 @@ import UIKit
     /// instead of pulling the music onto the phone.
     var pcRemoteSource: String? {
         guard canonicalDevice.hasPrefix("agent:"), !ownsSession, !offlinePlayback, !transferPending,
-              currentID != nil, playbackState != "unavailable" else { return nil }
+              currentID != nil, playbackState != "unavailable", pcIsLive(canonicalDevice) else { return nil }
         return canonicalDevice
+    }
+    /// A PC is only an output (like AirPlay). It counts as present only while
+    /// its music heartbeat is fresh. Unknown PCs are left to the server, which
+    /// answers at once when the PC is gone.
+    func pcIsLive(_ device: String) -> Bool {
+        guard device.hasPrefix("agent:") else { return false }
+        let name = String(device.dropFirst(6))
+        if let player = players.first(where: { $0.id == name }) { return player.online }
+        return true
     }
     /// Device that is audible right now: "local", "agent:<name>" or "other_local".
     var playingDevice: String { pcRemoteSource ?? (otherLocal ? "other_local" : selectedDevice) }
@@ -294,8 +314,15 @@ import UIKit
             showRoutePicker = true; showPlayer = false
             do {
                 // Keep the source route until its player has been paused and acknowledged.
-                try await transfer(to: device, trackID: currentID, startPosition: position, output: output)
-                userPickedRoute = true; showRoutePicker = false
+                if device.hasPrefix("agent:"), let id = currentID {
+                    try await transferToPC(device, trackID: id, startPosition: position, output: output)
+                    // Offline PC: the iPhone kept playing, the route stays "iPhone".
+                    if selectedDevice == device { userPickedRoute = true }
+                } else {
+                    try await transfer(to: device, trackID: currentID, startPosition: position, output: output)
+                    userPickedRoute = true
+                }
+                showRoutePicker = false
             } catch {
                 showRoutePicker = true
                 throw error
@@ -370,6 +397,9 @@ import UIKit
         }
     }
     private func loadSession() async throws {
+        let pcBefore = pcRemoteSource
+        let pcWasAudible = pcBefore != nil && ["playing", "loading"].contains(playbackState)
+        let trackBefore = currentID
         let response = try await api.request("/api/mini/music/session", method: "GET", body: nil)
         let session = response["session"] as? [String: Any] ?? [:]
         let serverKey = session["session_key"] as? String
@@ -396,6 +426,14 @@ import UIKit
         // /session reconciles queue-command ACKs with heartbeat freshness.
         // /players supplies discovery/capabilities only: its raw heartbeat can
         // still describe the previous track during server-owned auto-advance.
+        // PC switched off mid-track: continue on this iPhone from the current
+        // position instead of leaving silence. A paused PC is not resumed.
+        if let pc = pcBefore, pcWasAudible, let id = trackBefore, !busy, !ownsSession, !offlinePlayback, !transferPending,
+           canonicalDevice == pc, currentID == id, playbackState == "unavailable" || !pcIsLive(pc) {
+            do { try await playOnPhoneAfterPCLoss(trackID: id, position: pcResumePosition(id)) }
+            catch is CancellationError {}
+            catch { handle(error) }
+        }
     }
     private func applySession(_ value: [String: Any]) {
         publishIfChanged(\.currentID, value["track_id"] as? Int)
@@ -407,12 +445,17 @@ import UIKit
         publishIfChanged(\.canRecoverPlayback, recoverable)
         if userPickedRoute || transferPending { publishIfChanged(\.selectedDevice, value["device"] as? String ?? selectedDevice) }
         else { publishIfChanged(\.selectedDevice, "local") }
-        publishIfChanged(\.playbackState, value["state"] as? String ?? "stopped")
-        let detail = value["detail"] as? String
+        let state = value["state"] as? String ?? "stopped"
+        publishIfChanged(\.playbackState, state)
+        // An offline PC is not an error: playback simply happens on the iPhone.
+        let detail = state == "unavailable" && canonicalDevice.hasPrefix("agent:") ? nil : value["detail"] as? String
         if let detail = detail { publishIfChanged(\.error, detail) }
         else if error == canonicalDetail { publishIfChanged(\.error, nil) }
         canonicalDetail = detail
         position = NativeValue.number(value["position"]); duration = currentTrack?.duration ?? 0
+        if canonicalDevice.hasPrefix("agent:"), state != "unavailable", let id = currentID {
+            pcLastSample = (canonicalDevice, id, position, Date(), ["playing", "loading"].contains(state))
+        }
         publishIfChanged(\.outputID, value["output_id"] as? String ?? "default")
         publishIfChanged(\.volume, NativeValue.number(value["volume"], fallback: volume))
         if !shareSaving { publishIfChanged(\.shareSite, value["share_site"] as? Bool ?? shareSite) }
@@ -533,11 +576,111 @@ import UIKit
         if queue.isEmpty { baseQueue = tracks; queue = shuffle ? tracks.shuffled() : tracks }
         if !queue.contains(where: { $0.id == track.id }) { queue.insert(track, at: 0) }
         // An already idle source starts locally; active foreign sources use a handoff.
-        if selectedDevice == "local" || selectedDevice.isEmpty {
+        if selectedDevice == "local" || selectedDevice.isEmpty || !selectedDevice.hasPrefix("agent:") {
             try await playLocal(track, startPosition: 0)
         } else {
-            try await transfer(to: selectedDevice, trackID: track.id, startPosition: 0)
+            try await transferToPC(selectedDevice, trackID: track.id, startPosition: 0)
         }
+    }
+
+    /// Play on a chosen PC, or on this iPhone when that PC is gone. The PC is
+    /// checked within `pcResponseDeadline`; a failed handoff never ends in silence.
+    private func transferToPC(_ device: String, trackID: Int, startPosition: Double?, output: String? = nil) async throws {
+        let resumeAt = startPosition ?? currentPlaybackPosition(trackID)
+        guard pcIsLive(device), await pcReachable(device) else {
+            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return
+        }
+        do { try await transfer(to: device, trackID: trackID, startPosition: startPosition, output: output) }
+        catch where Self.isPCFailure(error) {
+            NativeDiagnostics.shared.record(operation: .musicTransfer, step: .failed, target: .pcPlayer, error: .targetUnavailable)
+            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
+        }
+    }
+
+    /// Resume the current PC; if it does not confirm in time, play here.
+    private func resumeOnPC(_ device: String, trackID: Int) async throws {
+        let resumeAt = pcResumePosition(trackID)
+        guard await pcReachable(device) else { try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return }
+        do {
+            let expires = Int(Date().timeIntervalSince1970 + pcStartAckDeadline + 1)
+            _ = try await control("resume", extra: ["expires_at": expires], source: String(device.dropFirst(6)), ackDeadline: pcStartAckDeadline)
+            try await refreshSession()
+        } catch where Self.isPCFailure(error) {
+            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
+        }
+    }
+
+    /// The iPhone is the default output: a gone PC falls back here silently,
+    /// with a toast instead of an error.
+    private func playOnPhoneAfterPCLoss(trackID: Int, position start: Double) async throws {
+        guard let track = knownTracks[trackID] ?? tracks.first(where: { $0.id == trackID }) ?? queue.first(where: { $0.id == trackID })
+                ?? (currentID == trackID ? currentTrack : nil) else {
+            throw OwnerAPIError(status: 404, message: "Трек недоступен")
+        }
+        userPickedRoute = false
+        let alreadyHere = selectedDevice == "local" && ownsSession && currentID == trackID && audio.hasPlayableItem
+        selectedDevice = "local"
+        if alreadyHere {
+            // The iPhone is already audible (e.g. PC picked while playing here).
+            if !playing { audio.resume() }
+        } else {
+            outputID = "default"
+            try await playLocal(track, startPosition: start)
+        }
+        if ownsSession && selectedDevice == "local" {
+            error = nil; notice = NativeStore.pcOfflineNotice
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if self?.notice == NativeStore.pcOfflineNotice { self?.notice = nil }
+            }
+        }
+    }
+
+    /// Fresh reachability probe bounded by `pcResponseDeadline`.
+    private func pcReachable(_ device: String) async -> Bool {
+        guard device.hasPrefix("agent:") else { return false }
+        do {
+            let result = try await withinPCDeadline { [api] in try await api.request("/api/mini/music/players", method: "GET", body: nil) }
+            adoptPlayers((result["players"] as? [[String: Any]] ?? []).compactMap(RemotePlayer.init))
+        } catch { return false }
+        return pcIsLive(device)
+    }
+
+    func withinPCDeadline(_ operation: @escaping @MainActor () async throws -> [String: Any]) async throws -> [String: Any] {
+        let seconds = max(0.05, pcResponseDeadline)
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String: Any], Error>) in
+            let gate = NativeDeadlineGate()
+            let work = Task { @MainActor in
+                do { let value = try await operation(); if gate.claim() { continuation.resume(returning: value) } }
+                catch { if gate.claim() { continuation.resume(throwing: error) } }
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                if gate.claim() { work.cancel(); continuation.resume(throwing: NativePCUnreachable()) }
+            }
+        }
+    }
+
+    static func isPCFailure(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        if let failure = error as? OwnerAPIError { return ![400, 401, 403, 404, 415].contains(failure.status) }
+        return true
+    }
+
+    private func currentPlaybackPosition(_ trackID: Int) -> Double {
+        if selectedDevice == "local", ownsSession || offlinePlayback, audio.hasPlayableItem { return audio.exactPosition() }
+        return pcResumePosition(trackID)
+    }
+
+    /// Where the PC was when last seen alive, projected while it was playing.
+    func pcResumePosition(_ trackID: Int) -> Double {
+        var value = position
+        if let sample = pcLastSample, sample.trackID == trackID {
+            let elapsed = sample.playing ? min(30, max(0, Date().timeIntervalSince(sample.at))) : 0
+            value = sample.position + elapsed
+        }
+        let limit = duration > 0 ? duration : (currentTrack?.duration ?? 0)
+        return max(0, limit > 0 ? min(value, limit) : value)
     }
 
     /// Reserve the canonical session before starting AVPlayer, so a rejected
@@ -780,15 +923,23 @@ import UIKit
         NativeDiagnostics.shared.record(operation: .musicControl, step: .completed, target: .localPlayer)
     }
     func toggle() async throws {
-        guard currentID != nil, !busy else { return }
+        guard let id = currentID, !busy else { return }
         if let pc = pcRemoteSource {
-            _ = try await control(playing ? "pause" : "resume", source: String(pc.dropFirst(6))); try await refreshSession(); return
+            if playing { _ = try await control("pause", source: String(pc.dropFirst(6))); try await refreshSession() }
+            else { try await resumeOnPC(pc, trackID: id) }
+            return
         }
         if otherLocal { try await remoteControl(playing ? "pause" : "resume"); return }
         if selectedDevice == "local" {
             if ownsSession || offlinePlayback { playing ? audio.pause() : audio.resume() }
+            else if canonicalDevice.hasPrefix("agent:") && !transferPending {
+                // The last output was a PC that is gone now: play here at once,
+                // no handoff (an offline PC can never acknowledge it).
+                try await playOnPhoneAfterPCLoss(trackID: id, position: pcResumePosition(id))
+            }
             else { try await transfer(to: "local") }
-        } else { _ = try await control(playing ? "pause" : "resume"); try await refreshSession() }
+        } else if playing { _ = try await control("pause"); try await refreshSession() }
+        else { try await resumeOnPC(selectedDevice, trackID: id) }
     }
     func seek(_ value: Double) async throws {
         if let pc = pcRemoteSource {
@@ -825,7 +976,7 @@ import UIKit
             var next: LibraryTrack?
             if list.indices.contains(index + direction) { next = list[index + direction] }
             else if repeatMode == "all" { next = direction < 0 ? list.last : list.first }
-            if let next = next { try await transfer(to: pc, trackID: next.id, startPosition: 0) }
+            if let next = next { try await transferToPC(pc, trackID: next.id, startPosition: 0) }
             return
         }
         if otherLocal { try await remoteControl(direction < 0 ? "previous" : "next"); return }
@@ -998,14 +1149,14 @@ import UIKit
         _ = try await writeSession(body, explicit: true); shareSite = desired
         if ownsSession && selectedDevice == "local" { audio.handle(try NativeAudioCommand(["action": "session", "session": snapshot()])) }
     }
-    func control(_ action: String, extra: [String: Any] = [:], source: String? = nil) async throws -> [String: Any] {
+    func control(_ action: String, extra: [String: Any] = [:], source: String? = nil, ackDeadline: TimeInterval = 25) async throws -> [String: Any] {
         let name = source ?? (selectedDevice.hasPrefix("agent:") ? String(selectedDevice.dropFirst(6)) : "")
         guard !name.isEmpty else { throw OwnerAPIError(status: 400, message: "Выберите компьютер") }
         var body: [String: Any] = ["source_name": name, "action": action, "output_id": outputID, "position_sec": position, "volume": Int(volume)]
         body.merge(extra) { _, new in new }
         let started = try await api.request("/api/mini/music/control", method: "POST", body: body)
         guard let id = started["command_id"] as? Int else { throw OwnerAPIError.invalidResponse }
-        let deadline = Date().addingTimeInterval(25)
+        let deadline = Date().addingTimeInterval(ackDeadline)
         while Date() < deadline {
             let status = try await api.request("/api/mini/music/control/\(id)", method: "GET", body: nil)
             let result = status["result"] as? [String: Any] ?? [:]
@@ -1231,4 +1382,14 @@ import UIKit
         _ = try await api.request("/api/mini/music/storage/\(trackID)/free-server-copy", method: "POST", body: ["source_name": source, "sha256": sha256, "confirm": "FREE SERVER COPY", "action_proof": proof])
         notice = "Серверная копия освобождена. Проверенная музыка хранится на выбранном ПК."
     }
+}
+
+/// One-shot resume guard for `withinPCDeadline` (main-actor only).
+private final class NativeDeadlineGate {
+    private var done = false
+    func claim() -> Bool { if done { return false }; done = true; return true }
+}
+
+struct NativePCUnreachable: LocalizedError {
+    var errorDescription: String? { "ПК не ответил вовремя" }
 }

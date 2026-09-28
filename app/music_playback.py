@@ -101,6 +101,22 @@ def pc_heartbeat_proves_silence(item, source, *, now=None) -> bool:
     return (aware(source.last_seen_at) - aware(item.updated_at)).total_seconds() >= PC_SILENCE_GRACE_SECONDS
 
 
+# A PC agent heartbeats at least every 5 s (COMMAND_POLL_INTERVAL_SEC). The
+# generic dashboard "online" window is 2 minutes, which is far too long for
+# music: a PC that was switched off kept looking "playing" for two minutes and
+# every phone tap was sent to a dead machine (silence). Three missed beats is
+# enough to call the PC gone for playback purposes.
+MUSIC_PC_LIVE_SECONDS = 15
+
+
+def music_source_live(source, *, now=None) -> bool:
+    """True only while a PC agent's heartbeat is fresh enough to play music."""
+    if source is None or source.last_seen_at is None or not source_is_online(source, 2, now=now):
+        return False
+    age = ((now or datetime.now(timezone.utc)) - aware(source.last_seen_at)).total_seconds()
+    return age <= MUSIC_PC_LIVE_SECONDS
+
+
 async def pc_source_released(session, item, *, now=None) -> bool:
     """True when a PC lease cannot be audible: offline PC or a quiet fresh heartbeat.
 
@@ -111,7 +127,7 @@ async def pc_source_released(session, item, *, now=None) -> bool:
     if not item or not item.device.startswith("agent:"):
         return False
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == item.device[6:]))
-    if source is None or not source_is_online(source, 2, now=now):
+    if not music_source_live(source, now=now):
         return True
     return pc_heartbeat_proves_silence(item, source, now=now)
 
@@ -143,7 +159,7 @@ async def current_session(session):
         result["detail"] = (queue_command.result or {}).get("message") or "Ожидаем подтверждение ПК"
     if item.device.startswith("agent:"):
         source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == item.device[6:]))
-        if source and source_is_online(source, 2):
+        if music_source_live(source, now=now):
             player = (source.last_payload or {}).get("music_player") or {}
             # A paused heartbeat from before a new play command cannot prove
             # silence if the command was delivered and its ACK was lost.
@@ -396,7 +412,7 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                 raise HTTPException(404, "Выберите доступный трек")
             if payload.device.startswith("agent:"):
                 source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == payload.device[6:]))
-                if not source or not source_is_online(source, 2) or not isinstance((source.last_payload or {}).get("music_player"), dict):
+                if not music_source_live(source) or not isinstance((source.last_payload or {}).get("music_player"), dict):
                     raise HTTPException(409, "ПК недоступен для музыки. Проверьте подключение и версию агента")
                 credential = await session.scalar(select(AgentCredential).where(
                     AgentCredential.source_name == source.source_name, AgentCredential.is_active.is_(True)))
