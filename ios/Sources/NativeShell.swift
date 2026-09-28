@@ -51,6 +51,7 @@ private enum NativeMainSheet: String, Identifiable {
             .sheet(isPresented: $fixtureStorage) { NavigationStack { NativeStorageView(store: store) } }
             .sheet(isPresented: $fixtureAlbums) { NavigationStack { NativeCollectionLibrary(store: store, kind: .album) } }
             .sheet(isPresented: $fixtureMusicImport) { NativeMusicImportView(store: store) }
+            .deviceUIFixtureSheets() // Debug Simulator fixture screens: devicepicker, remote
             .onAppear {
                 #if DEBUG && targetEnvironment(simulator)
                 if NativeFixture.enabled {
