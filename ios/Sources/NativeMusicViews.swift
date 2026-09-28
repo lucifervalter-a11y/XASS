@@ -242,6 +242,7 @@ enum XASSStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showQueue = false
     @State private var showLyrics = false
+    @State private var showLyricsTools = false
     @State private var selectedTrack: LibraryTrack?
     @State private var scrubbing: Double?
     var body: some View {
@@ -260,7 +261,7 @@ enum XASSStyle {
                                 TrackArtwork(store: store, trackID: track.id).frame(width: 48, height: 48)
                                 metadata(track)
                             }.frame(maxWidth: .infinity, alignment: .leading)
-                            NativeLyricsContent(store: store, trackID: track.id)
+                            NativeTimedLyricsView(store: store, lyrics: store.lyrics, onMore: { showLyricsTools = true })
                                 .frame(height: 420)
                                 .transition(.opacity)
                         } else {
@@ -298,6 +299,15 @@ enum XASSStyle {
                 }.padding(.horizontal, 28).padding(.top, 10).padding(.bottom, 24).frame(maxWidth: 560).frame(maxWidth: .infinity)
         }.scrollBounceBehavior(.basedOnSize)
             .background { NativeMusicBackdrop(store: store, trackID: store.currentID) }
+            .sheet(isPresented: $showLyricsTools, onDismiss: { store.lyrics.retry() }) {
+                if let id = store.currentID {
+                    NavigationStack {
+                        NativeEnrichmentView(store: store, trackID: id).toolbar {
+                            ToolbarItem(placement: .confirmationAction) { Button("Готово") { showLyricsTools = false } }
+                        }
+                    }
+                }
+            }
             .presentationDragIndicator(.visible).presentationDetents([.large]).tint(.white)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showLyrics)
             .sheet(isPresented: $showQueue) { NativeQueueView(store: store) }

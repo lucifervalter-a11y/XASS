@@ -85,6 +85,37 @@ async def expire_active_transfer(session):
         await fail_transfer(session, transfer, "Время переключения истекло. Повторите действие")
 
 
+QUIET_STATES = frozenset({"paused", "stopped", "ended", "idle", "error"})
+# A heartbeat must postdate the lease by this much before it can prove that a
+# just-started PC command is not still downloading/starting.
+PC_SILENCE_GRACE_SECONDS = 15
+
+
+def pc_heartbeat_proves_silence(item, source, *, now=None) -> bool:
+    """A live PC heartbeat, newer than the lease, that reports a quiet player."""
+    if not item or not item.device.startswith("agent:") or source is None or source.last_seen_at is None:
+        return False
+    player = (source.last_payload or {}).get("music_player")
+    if not isinstance(player, dict) or player.get("state") not in QUIET_STATES:
+        return False
+    return (aware(source.last_seen_at) - aware(item.updated_at)).total_seconds() >= PC_SILENCE_GRACE_SECONDS
+
+
+async def pc_source_released(session, item, *, now=None) -> bool:
+    """True when a PC lease cannot be audible: offline PC or a quiet fresh heartbeat.
+
+    An offline PC cannot acknowledge anything, so waiting for it only leaves
+    the phone unable to play (HTTP 409 forever). The owner explicitly asked to
+    play here; the PC receives a stop command when it is reachable.
+    """
+    if not item or not item.device.startswith("agent:"):
+        return False
+    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == item.device[6:]))
+    if source is None or not source_is_online(source, 2, now=now):
+        return True
+    return pc_heartbeat_proves_silence(item, source, now=now)
+
+
 def stale_local_recovery_available(item, meta, transfer, *, now=None):
     """Staleness permits an explicit owner-confirmed pause, never automatic play."""
     active_handoff = bool(meta and meta.transfer_id and (
@@ -122,6 +153,13 @@ async def current_session(session):
                     volume=max(0, min(100, number(player.get("volume"), result["volume"]))),
                     output_id=player.get("output_id") or result["output_id"])
                 timestamp = aware(source.last_seen_at)
+            elif (item.state in {"playing", "loading"} and not queue_pending
+                    and pc_heartbeat_proves_silence(item, source, now=now)):
+                # The lease still says "loading" but the PC has reported a
+                # quiet, different player well after it. Without this the
+                # phone kept receiving transfer_required and waited for a PC
+                # that had nothing to pause.
+                result.update(state=str(player.get("state") or "stopped") if player.get("state") in QUIET_STATES else "stopped")
         else:
             result.update(state="unavailable", detail="Компьютер не в сети")
     if result["state"] == "playing":
@@ -349,8 +387,9 @@ def install_transfer_routes(router, settings, require_owner, control, control_bo
                     await fail(session, previous, "Время переключения истекло")
             state = await current_session(session)
             item = await session.get(MusicSession, 1)
-            if state.get("state") == "unavailable" and item and item.state in {"playing", "loading"}:
-                raise HTTPException(409, "Предыдущий ПК не в сети: невозможно подтвердить остановку звука. Подключите или остановите его перед переключением")
+            # An offline PC reports state "unavailable": it is not audible from
+            # the server's point of view and cannot ACK a pause. Moving playback
+            # away from it must not be blocked forever (was HTTP 409).
             track_id = payload.track_id or state.get("track_id")
             track = await session.get(MusicTrack, track_id) if track_id else None
             if track is None or track.deleted:

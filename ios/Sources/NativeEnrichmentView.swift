@@ -56,6 +56,7 @@ enum NativeEnrichmentPresentation {
     @State private var working = false
     @State private var message: String?
     @State private var transcript = ""
+    @AppStorage("xass.transcription.allowNetwork") private var allowNetworkRecognition = false
     @State private var language = "ru-RU"
     @State private var job: Task<Void, Never>?
     private var candidates: [[String: Any]] { info["candidates"] as? [[String: Any]] ?? [] }
@@ -137,11 +138,13 @@ enum NativeEnrichmentPresentation {
     private var transcriptionSection: some View {
         Section("Если готового текста нет") {
             Text("Расшифровать скачанную песню на iPhone").font(.headline)
-            Text("Аудио остаётся на iPhone; проверенный текст сохраняется на вашем сервере. Без микрофона и облачного распознавания. Нужна локальная модель языка в iOS. Пение может распознаться с ошибками — проверьте результат.")
+            Text("Без микрофона. По умолчанию аудио остаётся на iPhone (нужна локальная модель языка iOS); облачное распознавание Apple используется только если вы включите его ниже. Проверенный текст сохраняется на вашем сервере. Пение может распознаться с ошибками — проверьте результат.")
                 .font(.footnote).foregroundStyle(.secondary)
             Picker("Язык песни", selection: $language) {
                 Text("Русский").tag("ru-RU"); Text("English").tag("en-US")
             }.disabled(transcriber.running)
+            Toggle("Разрешить распознавание Apple через интернет, если локальной модели нет", isOn: $allowNetworkRecognition)
+                .font(.footnote).disabled(transcriber.running).accessibilityIdentifier("transcriptAllowNetwork")
             if transcriber.running {
                 ProgressView(value: transcriber.progress)
                 Button("Отменить расшифровку", role: .cancel) { job?.cancel() }
@@ -191,7 +194,7 @@ enum NativeEnrichmentPresentation {
         message = nil
         job = Task {
             do {
-                let result = try await transcriber.transcribe(file: file, language: language)
+                let result = try await transcriber.transcribe(file: file, language: language, allowNetwork: allowNetworkRecognition)
                 try Task.checkCancellation(); transcript = result
             }
             catch { if !Task.isCancelled { message = error.localizedDescription } }

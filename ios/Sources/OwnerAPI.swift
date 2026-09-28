@@ -104,7 +104,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     }
     static func jsonRequestTimeout(path: String, method: String) -> TimeInterval {
         let pattern = method == "POST" ? #"\A/api/mini/music/tracks/[1-9][0-9]*/enrichment(?:/confirm)?\z"# :
-            method == "GET" ? #"\A/api/mini/music/tracks/[1-9][0-9]*/lyrics\z"# : #"(?!)"#
+            method == "GET" ? #"\A/api/mini/music/tracks/[1-9][0-9]*/(?:timed-)?lyrics\z"# : #"(?!)"#
         return path.range(of: pattern, options: .regularExpression) != nil ? 25 : 12
     }
     @MainActor func artwork(trackID: Int) async throws -> Data? {
@@ -278,7 +278,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         if route == "/api/mini/music/players" { return .musicPlayers }
         if route == "/api/mini/music/library" { return .musicLibrary }
         if route.hasPrefix("/api/mini/music/tracks/") && route.hasSuffix("/ticket") { return .musicTicket }
-        if route.hasSuffix("/lyrics") { return .musicLyrics }
+        if route.hasSuffix("/lyrics") || route.hasSuffix("/timed-lyrics") { return .musicLyrics }
         if route.contains("/enrichment") { return .musicEnrichment }
         if route.hasSuffix("/files/upload") { return .upload }
         if route.hasPrefix("/api/native/") { return .authentication }

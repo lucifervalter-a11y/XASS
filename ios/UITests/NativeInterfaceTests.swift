@@ -120,7 +120,7 @@ final class NativeInterfaceTests: XCTestCase {
         XCTAssertTrue(lyrics.waitForExistence(timeout: 10))
         if !lyrics.isHittable { app.scrollViews.firstMatch.swipeUp() }
         lyrics.tap()
-        XCTAssertTrue(app.buttons["lyric-line-2"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.buttons["timed-lyric-2"].waitForExistence(timeout: 8))
         XCTAssertTrue(app.buttons["nativePlayerToggle"].exists)
         capture(app, "Native-Lyrics")
         app.buttons["nativePlayerQueue"].tap()

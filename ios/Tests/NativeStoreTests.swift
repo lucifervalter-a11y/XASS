@@ -385,9 +385,54 @@ final class NativeStoreTests: XCTestCase {
         }
         do { try await store.play(store.tracks[0]); XCTFail("Fixture cancels the handoff") }
         catch is CancellationError {} catch { XCTFail("Unexpected failure: \(error)") }
-        XCTAssertEqual(api.requests.filter { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }.count, 1)
-        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" })
+        let claims = api.requests.filter { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
+        XCTAssertEqual(claims.count, 2, "A local pick first retries as an explicit forced claim")
+        XCTAssertEqual(claims.last?.2?["force"] as? Bool, true)
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" }, "Servers without force support still use the handoff")
         XCTAssertFalse(audio.hasPlayableItem)
+    }
+
+    @MainActor func testPhonePickOverStalePCLeaseTakesOverWithoutWaitingForHandoff() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        api.session["device"] = "agent:Studio"; api.session["state"] = "loading"
+        await store.refresh()
+        api.handler = { path, method, body in
+            if path.hasSuffix("/ticket") { return ["ok": true, "path": "/api/music/tracks/1/stream?ticket=fixture"] }
+            if path == "/api/mini/music/session", method == "POST" {
+                guard body?["force"] as? Bool == true else {
+                    throw OwnerAPIError(status: 409, message: "Handoff required", detail: ["code": "transfer_required"])
+                }
+                return ["ok": true, "session": ["track_id": 1, "device": "local", "state": "loading", "session_key": store.sessionKey, "client_id": store.clientID]]
+            }
+            if path.hasPrefix("/api/mini/music/transfers") { XCTFail("A forced local claim must not wait for the PC"); return ["ok": true] }
+            return nil
+        }
+        try await store.play(store.tracks[0])
+        XCTAssertTrue(audio.hasPlayableItem)
+        XCTAssertEqual(store.selectedDevice, "local")
+        XCTAssertNil(store.pcRemoteSource)
+    }
+
+    @MainActor func testPCOwnedSessionIsControlledRemotelyNotPulledToPhone() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        api.session["device"] = "agent:Studio"; api.session["state"] = "playing"
+        await store.refresh()
+        XCTAssertEqual(store.pcRemoteSource, "agent:Studio")
+        XCTAssertEqual(store.playingDeviceName, "Studio")
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/control", method == "POST" {
+                XCTAssertEqual(body?["source_name"] as? String, "Studio")
+                XCTAssertEqual(body?["action"] as? String, "pause")
+                return ["ok": true, "command_id": 5, "status": "pending"]
+            }
+            if path == "/api/mini/music/control/5" { return ["ok": true, "status": "completed", "result": ["ok": true, "details": ["state": "paused"]]] }
+            return nil
+        }
+        try await store.toggle()
+        XCTAssertFalse(api.requests.contains { $0.0.hasPrefix("/api/mini/music/transfers") })
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/control" })
     }
 
     @MainActor func testFavoriteUpdatesHiddenCurrentTrackAndDeletePrunesPlaylists() async throws {

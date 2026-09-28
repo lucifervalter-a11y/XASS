@@ -91,6 +91,9 @@ class RecoverSessionBody(BaseModel):
 class SessionBody(BaseModel):
     session_key: str = Field(min_length=16, max_length=64)
     takeover: bool = False
+    # Explicit "play on this device" from the owner. Other local players see the
+    # new session key and pause; a PC gets a best-effort stop command.
+    force: bool = False
     track_id: int | None = Field(default=None, gt=0)
     device: str = Field(default="local", max_length=134)
     state: Literal["playing", "paused", "stopped", "ended", "loading", "error"] = "paused"
@@ -552,6 +555,30 @@ def build_router(settings, require_owner, public_origin):
         value.setdefault("status", result["enrichment"].get("lookup_status") or result["enrichment"].get("status", "not_found"))
         return {"ok": True, "lyrics": value, "track": result["track"]}
 
+    from app.services.synced_lyrics import LrclibClient, LyricsCache, resolve as resolve_synced_lyrics
+    lyrics_cache = LyricsCache(root.parent / "music-lyrics-cache")
+    lyrics_client = LrclibClient()
+
+    @router.get("/api/mini/music/tracks/{track_id}/timed-lyrics")
+    async def timed_lyrics(track_id: int, response: Response, refresh: bool = False,
+                           user=Depends(require_owner), session=Depends(get_session)):
+        """Apple-Music-style lines [{start, end, text}] for local playback and prefetch."""
+        from app.services.music_lyrics import embedded_lyrics
+        track = await find_track(session, track_id)
+        response.headers["Cache-Control"] = "private, no-store"
+        record = await session.get(MusicEnrichment, track_id)
+        owner = record.owner_lyrics if record and record.owner_lyrics else None
+        enrichment = (record.result or {}).get("lyrics") if record and not record.dismissed and isinstance(record.result, dict) else None
+        embedded = await asyncio.to_thread(embedded_lyrics, root, track)
+        from types import SimpleNamespace
+        snapshot = SimpleNamespace(**{key: getattr(track, key) for key in
+            ("id", "title", "artist", "album", "duration", "filename", "sha256")})
+        # Release the DB connection while the provider is contacted.
+        await session.rollback()
+        value = await resolve_synced_lyrics(snapshot, owner=owner, embedded=embedded, enrichment=enrichment,
+                                            cache=lyrics_cache, client=lyrics_client, refresh=refresh)
+        return {"ok": True, "lyrics": value}
+
     @router.get("/api/mini/music/tracks/{track_id}/artwork")
     async def artwork(track_id: int, user=Depends(require_owner), session=Depends(get_session)):
         from app.services.music_artwork import artwork_thumbnail
@@ -673,7 +700,7 @@ def build_router(settings, require_owner, public_origin):
         return {"ok": True, "session": await current_session(session)}
 
     @router.post("/api/mini/music/session")
-    async def publish(payload: SessionBody, user=Depends(require_owner), session=Depends(get_session)):
+    async def publish(payload: SessionBody, request: Request, user=Depends(require_owner), session=Depends(get_session)):
         await expire_active_transfer(session)
         meta = await playback_meta(session)
         transfer = await pending_handoff(session, payload.session_key)
@@ -696,8 +723,15 @@ def build_router(settings, require_owner, public_origin):
         item = await session.scalar(select(MusicSession).where(MusicSession.id == 1).with_for_update())
         changed_player = bool(item.session_key and (item.session_key != payload.session_key or
             ("device" in payload.model_fields_set and item.device != payload.device)))
+        stop_pc = ""
         if changed_player and item.state in {"playing", "loading"}:
-            raise HTTPException(409, {"code": "transfer_required", "message": "Переключите устройство через «Где слушать», чтобы сохранить позицию и остановить старый плеер"})
+            from app.music_playback import pc_source_released
+            released = item.device.startswith("agent:") and await pc_source_released(session, item)
+            if not (payload.takeover and (payload.force or released)):
+                raise HTTPException(409, {"code": "transfer_required", "source_device": item.device,
+                    "message": "Переключите устройство через «Где слушать», чтобы сохранить позицию и остановить старый плеер"})
+            if item.device.startswith("agent:") and item.device != payload.device:
+                stop_pc = item.device[6:]
         if item.session_key and item.session_key != payload.session_key and not payload.takeover:
             raise HTTPException(409, "Воспроизведение уже изменено на другом устройстве")
         queue_command = await session.get(AgentCommand, meta.queue_command_id) if meta.queue_command_id else None
@@ -718,7 +752,7 @@ def build_router(settings, require_owner, public_origin):
             if previous != "xass_music":
                 item.previous_source = previous
         meta_fields = {"client_id", "output_id", "volume", "queue", "repeat_mode"}
-        for key, value in payload.model_dump(exclude={"takeover"} | meta_fields, exclude_unset=True).items():
+        for key, value in payload.model_dump(exclude={"takeover", "force"} | meta_fields, exclude_unset=True).items():
             setattr(item, key, value)
         for key in meta_fields:
             if key in payload.model_fields_set and getattr(payload, key) is not None:
@@ -727,6 +761,12 @@ def build_router(settings, require_owner, public_origin):
         if not agent_queue_owned:
             item.updated_at = datetime.now(timezone.utc)
         await session.commit()
+        if stop_pc:
+            try:
+                await control(ControlBody(source_name=stop_pc, action="stop",
+                    expires_at=int(time.time()) + 60), request, user, session)
+            except HTTPException:
+                pass  # Offline PC: nothing is audible there that the server could stop.
         from app.services.music_broadcast import sync_music_profile
         await sync_music_profile(session, settings)
         return {"ok": True, "session": await current_session(session)}

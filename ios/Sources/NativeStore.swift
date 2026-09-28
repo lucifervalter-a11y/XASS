@@ -31,7 +31,9 @@ import UIKit
     @Published var showLogin = false
     @Published var showEnrollment = false
     @Published var showPlayer = false
-    @Published var currentID: Int?
+    @Published var currentID: Int? { didSet { if oldValue != currentID { lyricsTrackChanged() } } }
+    /// Synced lyrics for the current track (prefetches the next one).
+    let lyrics: TimedLyricsStore
     @Published var selectedDevice = "local"
     @Published private(set) var canonicalClientID = ""
     @Published private(set) var canRecoverPlayback = false
@@ -119,6 +121,8 @@ import UIKit
 
     init(api: OwnerService, audio: AudioController) {
         self.api = api; self.audio = audio; authorization = NativeActionAuthorization(api: api)
+        lyrics = TimedLyricsStore(namespace: api.origin.namespace)
+        lyrics.attach(api)
         sessionKey = Self.persistedID("native-player-", origin: api.origin)
         clientID = Self.persistedID("native-client-", origin: api.origin)
         imageCache.countLimit = 80; imageCache.totalCostLimit = 16 * 1024 * 1024
@@ -154,6 +158,25 @@ import UIKit
     var otherLocal: Bool { selectedDevice == "local" && canonicalDevice == "local" && !canonicalSessionKey.isEmpty && (canonicalSessionKey != sessionKey || (!canonicalClientID.isEmpty && canonicalClientID != clientID)) }
     var deviceLabel: String { selectedDevice == "local" ? (otherLocal ? "Другое устройство" : "Этот iPhone") : String(selectedDevice.dropFirst(6)) }
     var playing: Bool { playbackState == "playing" }
+    /// The PC ("agent:<name>") that owns the server session while this iPhone
+    /// is not playing itself. Transport controls then drive that PC remotely
+    /// instead of pulling the music onto the phone.
+    var pcRemoteSource: String? {
+        guard canonicalDevice.hasPrefix("agent:"), !ownsSession, !offlinePlayback, !transferPending,
+              currentID != nil, playbackState != "unavailable" else { return nil }
+        return canonicalDevice
+    }
+    /// Device that is audible right now: "local", "agent:<name>" or "other_local".
+    var playingDevice: String { pcRemoteSource ?? (otherLocal ? "other_local" : selectedDevice) }
+    var playingDeviceName: String {
+        if let pc = pcRemoteSource { return String(pc.dropFirst(6)) }
+        return deviceLabel
+    }
+    private func lyricsTrackChanged() {
+        let list = queue.isEmpty ? tracks : queue
+        let next = currentID.flatMap { id in list.firstIndex { $0.id == id } }.flatMap { list.indices.contains($0 + 1) ? list[$0 + 1].id : nil }
+        lyrics.trackChanged(to: currentID, next: next)
+    }
     var canEditQueue: Bool { !queueSaving && !busy && (authorized || offlinePlayback) }
     var enrolled: Bool { authorization.identity.enrolled }
     func rows(filter: String, query: String, playlist: LibraryPlaylist? = nil) -> [LibraryTrack] {
@@ -404,6 +427,7 @@ import UIKit
         if let mode = value["repeat_mode"] as? String, ["off", "one", "all"].contains(mode) { publishIfChanged(\.repeatMode, mode) }
         playbackSampleAt = Date()
         playbackProjectionLimit = NativeLyricsClock.projectionLimit(serverTime: value["server_time"] as? String, updatedAt: value["updated_at"] as? String)
+        lyrics.tick(position: position, trackID: currentID)
     }
     /// Heartbeat position on a PC player is not shown in the library. Rewriting it
     /// every poll used to publish the whole store and snap the track list upward.
@@ -447,6 +471,7 @@ import UIKit
         position = NativeValue.number(value["position"]); duration = NativeValue.number(value["duration"], fallback: duration)
         playbackSampleAt = Date()
         playbackProjectionLimit = NativeLyricsClock.maximumProjection
+        lyrics.tick(position: position, trackID: currentID)
         if let gain = value["playback_gain"] as? Double, gain.isFinite {
             publishIfChanged(\.volume, min(100, max(0, gain)))
         }
@@ -537,9 +562,19 @@ import UIKit
         suppressReports = true; pendingReport = nil
         do { response = try await writeSession(claim, explicit: true) }
         catch let failure as OwnerAPIError where failure.status == 409 && failure.detail?["code"] as? String == "transfer_required" {
-            suppressReports = false; busy = false
-            try await transfer(to: "local", trackID: track.id, startPosition: startPosition)
-            return
+            // Choosing a song on this iPhone is an explicit "play here". Take
+            // the lease directly (the server stops the PC / the other phone
+            // pauses on its next poll) instead of waiting for a handoff that a
+            // silent or offline PC can never acknowledge.
+            NativeDiagnostics.shared.record(operation: .musicSession, step: .requested, target: .localPlayer, error: .conflict)
+            var forced = claim; forced["force"] = true
+            do { response = try await writeSession(forced, explicit: true) }
+            catch let again as OwnerAPIError where again.status == 409 && again.detail?["code"] as? String == "transfer_required" {
+                // Server without `force` support: fall back to the handoff.
+                suppressReports = false; busy = false
+                try await transfer(to: "local", trackID: track.id, startPosition: startPosition)
+                return
+            } catch { suppressReports = false; throw error }
         } catch { suppressReports = false; throw error }
         suppressReports = false
         if Task.isCancelled || generation != nextGeneration || transferCancelled {
@@ -746,6 +781,9 @@ import UIKit
     }
     func toggle() async throws {
         guard currentID != nil, !busy else { return }
+        if let pc = pcRemoteSource {
+            _ = try await control(playing ? "pause" : "resume", source: String(pc.dropFirst(6))); try await refreshSession(); return
+        }
         if otherLocal { try await remoteControl(playing ? "pause" : "resume"); return }
         if selectedDevice == "local" {
             if ownsSession || offlinePlayback { playing ? audio.pause() : audio.resume() }
@@ -753,6 +791,11 @@ import UIKit
         } else { _ = try await control(playing ? "pause" : "resume"); try await refreshSession() }
     }
     func seek(_ value: Double) async throws {
+        if let pc = pcRemoteSource {
+            _ = try await control("seek", extra: ["position_sec": value], source: String(pc.dropFirst(6)))
+            position = value; playbackSampleAt = Date(); playbackProjectionLimit = NativeLyricsClock.maximumProjection
+            lyrics.tick(position: value, trackID: currentID); return
+        }
         if otherLocal { try await remoteControl("seek", extra: ["position": value]); return }
         if selectedDevice == "local" {
             if !ownsSession && !offlinePlayback { try await transfer(to: "local", startPosition: value) }
@@ -762,6 +805,7 @@ import UIKit
     func setVolume(_ value: Double) async throws {
         guard value.isFinite else { throw XASSErr.invalidCommand }
         let bounded = min(100, max(0, value))
+        if let pc = pcRemoteSource { _ = try await control("volume", extra: ["volume": Int(bounded)], source: String(pc.dropFirst(6))); volume = bounded; return }
         if otherLocal { try await remoteControl("volume", extra: ["volume": Int(bounded)]); return }
         // For another iPhone this command changes XASS gain, never hardware
         // volume. Local UI uses MPVolumeView, except the explicit gain reset.
@@ -774,6 +818,16 @@ import UIKit
         audio.resetPlaybackGain(); volume = audio.playbackGain
     }
     func step(_ direction: Int) async throws {
+        if let pc = pcRemoteSource {
+            if direction < 0 && position > 3 { try await seek(0); return }
+            let list = queue.isEmpty ? tracks : queue
+            let index = list.firstIndex { $0.id == currentID } ?? -1
+            var next: LibraryTrack?
+            if list.indices.contains(index + direction) { next = list[index + direction] }
+            else if repeatMode == "all" { next = direction < 0 ? list.last : list.first }
+            if let next = next { try await transfer(to: pc, trackID: next.id, startPosition: 0) }
+            return
+        }
         if otherLocal { try await remoteControl(direction < 0 ? "previous" : "next"); return }
         if selectedDevice == "local" && (ownsSession || offlinePlayback) { audio.handle(try NativeAudioCommand(["action": direction < 0 ? "previous" : "next"])); return }
         if direction < 0 && position > 3 { try await seek(0); return }

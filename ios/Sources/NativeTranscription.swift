@@ -34,9 +34,9 @@ enum NativeTranscriptPolicy {
         return true
     }
 
-    static func recognitionRequest(file: URL) -> SFSpeechURLRecognitionRequest {
+    static func recognitionRequest(file: URL, onDevice: Bool = true) -> SFSpeechURLRecognitionRequest {
         let request = SFSpeechURLRecognitionRequest(url: file)
-        request.requiresOnDeviceRecognition = true
+        request.requiresOnDeviceRecognition = onDevice
         request.shouldReportPartialResults = false
         request.taskHint = .dictation
         return request
@@ -139,13 +139,22 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
     private let completion = NativeTranscriptCompletion<[NativeTranscriptWord]>()
     private var timeout: Task<Void, Never>?
 
-    func transcribe(file: URL, language: String) async throws -> String {
+    /// `allowNetwork`: the owner explicitly allowed Apple's server recognition
+    /// when this iPhone has no on-device model for the language.
+    func transcribe(file: URL, language: String, allowNetwork: Bool = false) async throws -> String {
         guard !running, NativeTranscriptPolicy.localFile(file) else { throw XASSErr.invalidMedia }
         try Task.checkCancellation()
         running = true; progress = 0
         defer { running = false }
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: language)), recognizer.supportsOnDeviceRecognition else {
-            throw OwnerAPIError(status: 422, message: "На этом iPhone нет локального распознавания выбранного языка. Аудио не отправлялось в облако.")
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: language)) else {
+            throw OwnerAPIError(status: 422, message: "iOS не поддерживает распознавание выбранного языка.")
+        }
+        let onDevice = recognizer.supportsOnDeviceRecognition
+        guard onDevice || allowNetwork else {
+            throw OwnerAPIError(status: 422, message: "На этом iPhone нет локальной модели распознавания выбранного языка. Включите «Разрешить распознавание Apple через интернет» или скачайте язык диктовки в настройках iOS. Аудио не отправлялось.")
+        }
+        guard recognizer.isAvailable else {
+            throw OwnerAPIError(status: 503, message: "Распознавание речи сейчас недоступно. Проверьте сеть или повторите позже.")
         }
         let permission = try await authorization()
         try Task.checkCancellation()
@@ -160,6 +169,7 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.protectionKey: FileProtectionType.complete])
         defer { try? FileManager.default.removeItem(at: folder) } // Only this operation's UUID temporary directory.
         var words: [NativeTranscriptWord] = []
+        var failedChunks = 0
         for segment in clips {
             try Task.checkCancellation()
             guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else { throw XASSErr.invalidMedia }
@@ -176,7 +186,12 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
             }, onCancel: { exportGate.cancel { exporter.cancelExport() } })
             try Task.checkCancellation()
             guard exporter.status == .completed else { throw OwnerAPIError(status: 422, message: "Не удалось прочитать аудиофайл для расшифровки.") }
-            let chunk = try await recognize(clip, recognizer: recognizer)
+            // A 45 s intro/solo without vocals makes Speech report "no speech
+            // detected". That used to abort the whole song; skip that clip.
+            let chunk: [NativeTranscriptWord]
+            do { chunk = try await recognize(clip, recognizer: recognizer, onDevice: onDevice) }
+            catch is CancellationError { throw CancellationError() }
+            catch { failedChunks += 1; chunk = [] }
             let boundedChunk = chunk.filter { $0.time >= 0 && $0.time < segment.duration }
             guard words.count + boundedChunk.count <= 8000 else {
                 throw OwnerAPIError(status: 422, message: "Результат распознавания слишком большой. Текст не был сохранён.")
@@ -188,6 +203,9 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
             progress = min(1, (segment.start + segment.duration) / length)
         }
         try Task.checkCancellation()
+        if words.isEmpty && failedChunks == clips.count {
+            throw OwnerAPIError(status: 422, message: "Распознавание не вернуло ни одного фрагмента. Проверьте, что язык диктовки установлен в iOS, и повторите.")
+        }
         let value = NativeTranscriptFormat.lrc(words)
         guard !value.isEmpty, value.utf8.count <= 64_000 else { throw OwnerAPIError(status: 422, message: "Не удалось уверенно распознать слова. Инструментальная музыка и пение распознаются не всегда.") }
         return value
@@ -206,14 +224,14 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
         }, onCancel: { Task { @MainActor in gate.resolve(.failure(CancellationError()), token: token) } })
     }
 
-    private func recognize(_ file: URL, recognizer: SFSpeechRecognizer) async throws -> [NativeTranscriptWord] {
+    private func recognize(_ file: URL, recognizer: SFSpeechRecognizer, onDevice: Bool) async throws -> [NativeTranscriptWord] {
         try Task.checkCancellation()
         let token = UUID()
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { done in
                 if Task.isCancelled { done.resume(throwing: CancellationError()); return }
                 guard completion.install(done, token: token) else { return }
-                let request = NativeTranscriptPolicy.recognitionRequest(file: file)
+                let request = NativeTranscriptPolicy.recognitionRequest(file: file, onDevice: onDevice)
                 recognition = recognizer.recognitionTask(with: request) { [weak self] result, error in
                     Task { @MainActor in
                         if let result = result, result.isFinal {
