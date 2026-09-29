@@ -63,10 +63,9 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             job4, _ = await tq.request_job(session, self.track(4), language="ru", user_id=1, now=T0)
             self.assertEqual((job4.state, job4.worker_id), ("queued", None))
 
-    async def test_cpu_or_gpu_over_95_blocks_and_the_client_busy_flag_does_not(self):
+    async def test_gpu_over_95_blocks_and_cpu_or_the_busy_flag_does_not(self):
         async with self.sessions() as session:
-            await self.worker(session, 1, GPU, load={"cpu_percent": 20, "gpu_percent": 96})
-            await self.worker(session, 2, BIG_CPU, load={"cpu_percent": 96})
+            await self.worker(session, 1, GPU, load={"cpu_percent": 10, "gpu_percent": 96})
             await self.worker(session, 4, GPU, now=T0 - timedelta(seconds=tq.WORKER_STALE_SEC + 1))
             await self.worker(session, 5, GPU, enabled=False)
             await self.worker(session, 6, GPU, state="installing")
@@ -74,11 +73,10 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job.state, "queued")
             status = await tq.status_payload(session, 1, T0)
             self.assertEqual(status["status"], "queued")
-            desktop = await self.worker(session, 3, SMALL_CPU,
-                                        load={"cpu_percent": 82, "gpu_percent": 58, "busy": True})
+            desktop = await self.worker(session, 3, GPU, load={"cpu_percent": 99, "gpu_percent": 58, "busy": True})
             await tq.schedule(session, T0)
             self.assertEqual(job.worker_id, desktop.id)
-            edge = await self.worker(session, 7, GPU, load={"cpu_percent": 95, "gpu_percent": None, "busy": True})
+            edge = await self.worker(session, 7, SMALL_CPU, load={"cpu_percent": 100, "gpu_percent": 95, "busy": True})
             job2, _ = await tq.request_job(session, self.track(2), language="ru", user_id=1, now=T0)
             self.assertEqual(job2.worker_id, edge.id)
 
@@ -141,7 +139,7 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             gpu = await self.worker(session, 1, GPU)
             cpu = await self.worker(session, 2, BIG_CPU)
-            await self.worker(session, 3, BIG_CPU, load={"cpu_percent": 96})
+            await self.worker(session, 3, BIG_CPU, load={"gpu_percent": 96})
             job, _ = await tq.request_job(session, self.track(), language="ru", user_id=1, now=T0)
             self.assertEqual(job.worker_id, gpu.id)
             # A second job occupies the CPU worker, so after expiry the GPU is the only free one...
@@ -252,6 +250,32 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([job.track_id for job in jobs], [bare.id])
             self.assertEqual(await tq.queue_page_without_lyrics(session, [], user_id=1, now=T0), 0)
             self.assertEqual(len(list(await session.scalars(select(TranscriptionJob)))), 1)
+
+    async def test_failed_job_without_lyrics_is_retried_once_and_a_lyric_keeps_its_failure(self):
+        async with self.sessions() as session:
+            bare = MusicTrack(title="no text", artist="b", album="", filename="b.mp3", storage_name="b" * 32 + ".mp3",
+                              mime="audio/mpeg", sha256="b" * 64, size=10, duration=10, deleted=False)
+            kept = MusicTrack(title="has text", artist="a", album="", filename="a.mp3", storage_name="a" * 32 + ".mp3",
+                              mime="audio/mpeg", sha256="a" * 64, size=10, duration=10, deleted=False)
+            session.add_all([bare, kept])
+            await session.flush()
+            session.add(MusicEnrichment(track_id=kept.id, fingerprint="x", original={},
+                                        result={"lyrics": {"text": "уже есть"}}, owner_lyrics={}, checked_at=T0))
+            session.add(TranscriptionJob(track_id=bare.id, sha256=bare.sha256, duration=10, language="ru", state="failed",
+                                         attempts=3, failed_workers=[], progress={}, result={}, error="cuda_oom",
+                                         created_at=T0, updated_at=T0, finished_at=T0))
+            session.add(TranscriptionJob(track_id=kept.id, sha256=kept.sha256, duration=10, language="ru", state="failed",
+                                         attempts=3, failed_workers=[], progress={}, result={}, error="cuda_oom",
+                                         created_at=T0, updated_at=T0, finished_at=T0))
+            await session.commit()
+            self.assertEqual(await tq.queue_page_without_lyrics(session, [], user_id=1, now=T0), 1)
+            jobs = {job.track_id: job for job in await session.scalars(select(TranscriptionJob))}
+            self.assertEqual(jobs[bare.id].state, "queued")
+            self.assertEqual(jobs[bare.id].attempts, 0)
+            self.assertTrue(jobs[bare.id].result.get("retried_failed"))
+            self.assertEqual(jobs[kept.id].state, "failed")
+            self.assertEqual(await tq.queue_page_without_lyrics(session, [], user_id=1, now=T0), 0)
+            self.assertEqual(jobs[bare.id].state, "queued")
 
     async def test_running_status_has_minutes_estimate(self):
         async with self.sessions() as session:
@@ -515,7 +539,7 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         with await self.no_catalog():
             await self.request("POST", f"/api/mini/music/tracks/{track['id']}/transcription", json={})
         busy = await self.request("POST", "/agent/transcription/poll", headers=self.agent,
-                                  json=self.poll_body(load={"cpu_percent": 96, "busy": True}))
+                                  json=self.poll_body(load={"gpu_percent": 96, "busy": True}))
         self.assertIsNone(busy.json()["job"])
         self.assertEqual((await self.request("GET", f"/api/mini/music/tracks/{track['id']}/transcription")).json()["status"], "queued")
         job = (await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())).json()["job"]

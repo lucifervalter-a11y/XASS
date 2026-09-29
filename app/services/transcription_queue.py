@@ -77,11 +77,11 @@ def worker_online(worker: TranscriptionWorker, now: datetime) -> bool:
 
 
 def worker_overloaded(worker: TranscriptionWorker) -> bool:
-    # The installed client sets busy at 70 %. One lease already limits a worker
-    # to a single job, so only a measured CPU or GPU above the ceiling waits.
+    # Desktop CPU stays above 90% with ordinary apps, and the installed client
+    # reports busy at 70%. One lease already limits a worker to a single job,
+    # so only a busy GPU waits.
     load = worker.load or {}
-    return (_num(load.get("cpu_percent")) > BUSY_PERCENT
-            or _num(load.get("gpu_percent")) > BUSY_PERCENT)
+    return _num(load.get("gpu_percent")) > BUSY_PERCENT
 
 
 async def _active_worker_ids(session) -> set[int]:
@@ -109,7 +109,7 @@ async def preparing_percent(session, now: datetime) -> int | None:
 
 
 async def free_workers(session, now: datetime) -> list[TranscriptionWorker]:
-    """Online, at or under the CPU/GPU ceiling, and not already holding a job."""
+    """Online, GPU at or under the ceiling, and not already holding a job."""
     busy = await _active_worker_ids(session)
     return sorted((item for item in await online_workers(session, now)
                    if item.id not in busy and not worker_overloaded(item)),
@@ -396,6 +396,27 @@ async def _sweep_lyric_jobs(session, *, user_id: int | None, now: datetime, limi
         job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
         job.finished_at, job.updated_at = None, now
         created += 1
+    failed = list(await session.scalars(select(TranscriptionJob).where(
+        TranscriptionJob.state == "failed").limit(40)))
+    if failed:
+        records = {row.track_id: row for row in await session.scalars(select(MusicEnrichment).where(
+            MusicEnrichment.track_id.in_([job.track_id for job in failed])))}
+        revived = 0
+        for job in failed:
+            if revived >= 20 or job.state != "failed":
+                continue
+            if str(job.error or "").startswith("no_speech"):
+                continue
+            result = job.result or {}
+            if result.get("retried_failed") or result.get("retried_empty"):
+                continue
+            if _stored_lyrics(records.get(job.track_id)):
+                continue
+            job.result = {**result, "retried_failed": True}
+            job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
+            job.finished_at, job.updated_at = None, now
+            revived += 1
+            created += 1
     key = _cursor_key(session)
     cursor = int(_cursors.get(key, 0) or 0)
     looked = 0
