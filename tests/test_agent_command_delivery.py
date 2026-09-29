@@ -4,11 +4,19 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import func, select
+from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Base
 from app.models import AgentCommand
-from app.services.agent_commands import acknowledge_agent_commands, deliver_agent_commands, enqueue_agent_command
+from app.services.agent_commands import (
+    acknowledge_agent_commands,
+    deliver_agent_commands,
+    enqueue_agent_command,
+    latest_agent_commands,
+    latest_agent_commands_stmt,
+)
 
 
 class AgentCommandDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -73,6 +81,78 @@ class AgentCommandDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(item.status, "cancelled")
             self.assertEqual(item.result["message"], "Отменено")
             notify.assert_not_awaited()
+
+    async def test_same_idempotency_key_returns_one_row(self) -> None:
+        async with self.sessions() as session:
+            first = await enqueue_agent_command(
+                session, source_name="PC", command="reboot", payload={}, actor_user_id=42, idempotency_key="tap-1",
+            )
+            second = await enqueue_agent_command(
+                session, source_name="PC", command="reboot", payload={"again": True}, actor_user_id=42, idempotency_key="tap-1",
+            )
+            self.assertEqual(first.id, second.id)
+            self.assertEqual(second.payload, {})
+            other_key = await enqueue_agent_command(
+                session, source_name="PC", command="reboot", payload={}, actor_user_id=42, idempotency_key="tap-2",
+            )
+            other_command = await enqueue_agent_command(
+                session, source_name="PC", command="lock", payload={}, actor_user_id=42, idempotency_key="tap-1",
+            )
+            other_source = await enqueue_agent_command(
+                session, source_name="Other", command="reboot", payload={}, actor_user_id=42, idempotency_key="tap-1",
+            )
+            blank_a = await enqueue_agent_command(
+                session, source_name="PC", command="ping", payload={}, actor_user_id=42, idempotency_key="  ",
+            )
+            blank_b = await enqueue_agent_command(
+                session, source_name="PC", command="ping", payload={}, actor_user_id=42, idempotency_key=None,
+            )
+            self.assertEqual(len({first.id, other_key.id, other_command.id, other_source.id, blank_a.id, blank_b.id}), 6)
+            reboot_rows = await session.scalar(
+                select(func.count()).select_from(AgentCommand).where(
+                    AgentCommand.source_name == "PC",
+                    AgentCommand.command == "reboot",
+                )
+            )
+            self.assertEqual(reboot_rows, 2)
+
+    async def test_fresh_delivery_is_not_retried_before_90s(self) -> None:
+        async with self.sessions() as session:
+            item = await enqueue_agent_command(
+                session, source_name="PC", command="ping", payload={"n": 1}, actor_user_id=1, idempotency_key="once",
+            )
+            first = await deliver_agent_commands(session, source_name="PC")
+            self.assertEqual(first, [{"id": item.id, "command": "ping", "payload": {"n": 1}, "attempt": 1}])
+            self.assertEqual(await deliver_agent_commands(session, source_name="PC"), [])
+            stored = await session.get(AgentCommand, item.id)
+            stored.delivered_at = datetime.now(timezone.utc) - timedelta(seconds=89)
+            await session.commit()
+            self.assertEqual(await deliver_agent_commands(session, source_name="PC"), [])
+            stored.delivered_at = datetime.now(timezone.utc) - timedelta(seconds=91)
+            await session.commit()
+            third = await deliver_agent_commands(session, source_name="PC")
+            self.assertEqual(third, [{"id": item.id, "command": "ping", "payload": {"n": 1}, "attempt": 2}])
+
+    async def test_latest_command_is_max_id_per_source_not_a_full_scan(self) -> None:
+        sql = str(
+            latest_agent_commands_stmt(["PC", "Other"]).compile(
+                dialect=sqlite_dialect.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        ).lower()
+        self.assertIn("max(", sql)
+        self.assertIn("group by", sql)
+        self.assertIn("join", sql)
+        self.assertNotIn("order by", sql)
+        async with self.sessions() as session:
+            rows = [AgentCommand(source_name="PC", command="ping", status="completed") for _ in range(30)]
+            rows.append(AgentCommand(source_name="Other", command="lock", status="pending"))
+            session.add_all(rows)
+            await session.commit()
+            found = await latest_agent_commands(session, ["PC", "Other", "Missing"])
+            self.assertEqual(set(found), {"PC", "Other"})
+            self.assertEqual(found["PC"].id, max(row.id for row in rows if row.source_name == "PC"))
+            self.assertEqual(found["Other"].command, "lock")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -123,6 +123,10 @@ class AgentArchiveTarget(Base):
 
 class AgentCommand(Base):
     __tablename__ = "agent_commands"
+    __table_args__ = (
+        Index("ix_agent_commands_source_status_id", "source_name", "status", "id"),
+        UniqueConstraint("idempotency_key", name="uq_agent_commands_idempotency_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
@@ -135,6 +139,9 @@ class AgentCommand(Base):
     not_before_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # sha256(source_name:command:client key). NULL rows are not deduped.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class MessageLog(Base):

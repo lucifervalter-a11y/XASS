@@ -56,6 +56,20 @@ def _apply_runtime_migrations(connection) -> None:
         command_columns = {item["name"] for item in inspector.get_columns("agent_commands")}
         if "not_before_at" not in command_columns:
             connection.execute(text(f"ALTER TABLE agent_commands ADD COLUMN not_before_at {datetime_type}"))
+        if "idempotency_key" not in command_columns:
+            connection.execute(text("ALTER TABLE agent_commands ADD COLUMN idempotency_key VARCHAR(64)"))
+        if "attempt_count" not in command_columns:
+            connection.execute(text("ALTER TABLE agent_commands ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"))
+        index_names = {item["name"] for item in inspector.get_indexes("agent_commands")}
+        unique_names = {item.get("name") for item in inspector.get_unique_constraints("agent_commands")}
+        if "ix_agent_commands_source_status_id" not in index_names:
+            connection.execute(text(
+                "CREATE INDEX ix_agent_commands_source_status_id ON agent_commands (source_name, status, id)"
+            ))
+        if "uq_agent_commands_idempotency_key" not in index_names | unique_names:
+            connection.execute(text(
+                "CREATE UNIQUE INDEX uq_agent_commands_idempotency_key ON agent_commands (idempotency_key)"
+            ))
     if "agent_pair_codes" in tables:
         pair_columns = {item["name"] for item in inspector.get_columns("agent_pair_codes")}
         if "owner_e2e_public_jwk" not in pair_columns:
