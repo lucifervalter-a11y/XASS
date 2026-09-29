@@ -63,21 +63,24 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             job4, _ = await tq.request_job(session, self.track(4), language="ru", user_id=1, now=T0)
             self.assertEqual((job4.state, job4.worker_id), ("queued", None))
 
-    async def test_busy_means_cpu_or_gpu_over_70_percent_or_reported_busy(self):
+    async def test_cpu_or_gpu_over_95_blocks_and_the_client_busy_flag_does_not(self):
         async with self.sessions() as session:
-            await self.worker(session, 1, GPU, load={"cpu_percent": 20, "gpu_percent": 71})
-            await self.worker(session, 2, BIG_CPU, load={"cpu_percent": 71})
-            await self.worker(session, 3, SMALL_CPU, load={"cpu_percent": 0, "busy": True})
+            await self.worker(session, 1, GPU, load={"cpu_percent": 20, "gpu_percent": 96})
+            await self.worker(session, 2, BIG_CPU, load={"cpu_percent": 96})
             await self.worker(session, 4, GPU, now=T0 - timedelta(seconds=tq.WORKER_STALE_SEC + 1))
             await self.worker(session, 5, GPU, enabled=False)
             await self.worker(session, 6, GPU, state="installing")
             job, _ = await tq.request_job(session, self.track(), language="ru", user_id=1, now=T0)
             self.assertEqual(job.state, "queued")
             status = await tq.status_payload(session, 1, T0)
-            self.assertEqual(status["status"], "queued")  # online but busy
-            ok = await self.worker(session, 7, SMALL_CPU, load={"cpu_percent": 70, "gpu_percent": None})
+            self.assertEqual(status["status"], "queued")
+            desktop = await self.worker(session, 3, SMALL_CPU,
+                                        load={"cpu_percent": 82, "gpu_percent": 58, "busy": True})
             await tq.schedule(session, T0)
-            self.assertEqual(job.worker_id, ok.id)
+            self.assertEqual(job.worker_id, desktop.id)
+            edge = await self.worker(session, 7, GPU, load={"cpu_percent": 95, "gpu_percent": None, "busy": True})
+            job2, _ = await tq.request_job(session, self.track(2), language="ru", user_id=1, now=T0)
+            self.assertEqual(job2.worker_id, edge.id)
 
     async def test_waiting_for_pc_when_no_worker_is_online(self):
         async with self.sessions() as session:
@@ -138,7 +141,7 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             gpu = await self.worker(session, 1, GPU)
             cpu = await self.worker(session, 2, BIG_CPU)
-            await self.worker(session, 3, BIG_CPU, load={"busy": True})
+            await self.worker(session, 3, BIG_CPU, load={"cpu_percent": 96})
             job, _ = await tq.request_job(session, self.track(), language="ru", user_id=1, now=T0)
             self.assertEqual(job.worker_id, gpu.id)
             # A second job occupies the CPU worker, so after expiry the GPU is the only free one...
@@ -512,7 +515,7 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         with await self.no_catalog():
             await self.request("POST", f"/api/mini/music/tracks/{track['id']}/transcription", json={})
         busy = await self.request("POST", "/agent/transcription/poll", headers=self.agent,
-                                  json=self.poll_body(load={"cpu_percent": 95}))
+                                  json=self.poll_body(load={"cpu_percent": 96, "busy": True}))
         self.assertIsNone(busy.json()["job"])
         self.assertEqual((await self.request("GET", f"/api/mini/music/tracks/{track['id']}/transcription")).json()["status"], "queued")
         job = (await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())).json()["job"]

@@ -27,7 +27,7 @@ RUN_LEASE_SEC = 300            # running workers renew every ~60 s
 MIN_DEADLINE_SEC = 30 * 60     # hard cap for one run: max(30 min, 12 x duration)
 DEADLINE_FACTOR = 12
 MAX_ATTEMPTS = 3
-BUSY_PERCENT = 70.0
+BUSY_PERCENT = 95.0
 MAX_LINES = 2000
 ACTIVE = ("assigned", "running")
 
@@ -77,8 +77,10 @@ def worker_online(worker: TranscriptionWorker, now: datetime) -> bool:
 
 
 def worker_overloaded(worker: TranscriptionWorker) -> bool:
+    # The installed client sets busy at 70 %. One lease already limits a worker
+    # to a single job, so only a measured CPU or GPU above the ceiling waits.
     load = worker.load or {}
-    return (bool(load.get("busy")) or _num(load.get("cpu_percent")) > BUSY_PERCENT
+    return (_num(load.get("cpu_percent")) > BUSY_PERCENT
             or _num(load.get("gpu_percent")) > BUSY_PERCENT)
 
 
@@ -107,7 +109,7 @@ async def preparing_percent(session, now: datetime) -> int | None:
 
 
 async def free_workers(session, now: datetime) -> list[TranscriptionWorker]:
-    """Online, not over 70 % CPU/GPU and not already holding a job (max 1 per worker)."""
+    """Online, at or under the CPU/GPU ceiling, and not already holding a job."""
     busy = await _active_worker_ids(session)
     return sorted((item for item in await online_workers(session, now)
                    if item.id not in busy and not worker_overloaded(item)),
