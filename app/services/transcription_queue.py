@@ -301,13 +301,22 @@ async def job_state(session, track_id: int) -> str | None:
     return await session.scalar(select(TranscriptionJob.state).where(TranscriptionJob.track_id == track_id))
 
 
-_TEMPORARY_LYRICS = frozenset({"unavailable", "rate_limited"})
 _ACTIVE_JOB = frozenset({"queued", "assigned", "running"})
+# One library open used to queue only the page the phone asked for (50 tracks).
+# The PC poll keeps filling from the rest of the library.
+_SWEEP_LIMIT = 40
+_SWEEP_LOOK = 400
+_cursors: dict[str, int] = {}
 
 
 def shown_lyrics_missing(value: dict | None) -> bool:
-    """The screen would say there is no text. A catalog outage is not that."""
-    if not isinstance(value, dict) or value.get("status") in _TEMPORARY_LYRICS:
+    """True when the payload has no words to show.
+
+    A catalog timeout with an empty body is a song without text: the PC
+    transcribes it. Timed catalog lines still win later, because the lyrics
+    route keeps a synced catalog hit ahead of a finished transcription.
+    """
+    if not isinstance(value, dict):
         return False
     if str(value.get("text") or "").strip():
         return False
@@ -319,7 +328,7 @@ def shown_lyrics_missing(value: dict | None) -> bool:
 
 
 async def queue_pc_if_no_lyrics(session, track_id: int, value, *, user_id: int | None, now: datetime) -> bool:
-    """Queue the owner's PC when the catalog found nothing to show.
+    """Queue the owner's PC when this response has no words.
 
     Timed or plain catalog text is left as-is. A finished job is not run again,
     and a failed one waits for an explicit retry. Returns True while a job is
@@ -350,29 +359,92 @@ def _stored_lyrics(record: MusicEnrichment | None) -> bool:
     return bool(str(lyrics.get("text") or "").strip())
 
 
-async def queue_page_without_lyrics(session, tracks, *, user_id: int | None, now: datetime) -> int:
-    """Queue this library page. Opening one song used to be the only way in."""
-    pending = [track for track in tracks if getattr(track, "id", None) and not getattr(track, "deleted", False)]
-    if not pending:
-        return 0
-    ids = [track.id for track in pending]
-    existing = {row.track_id: row for row in await session.scalars(select(TranscriptionJob).where(TranscriptionJob.track_id.in_(ids)))}
-    records = {row.track_id: row for row in await session.scalars(select(MusicEnrichment).where(MusicEnrichment.track_id.in_(ids)))}
+def _cursor_key(session) -> str:
+    bind = session.bind
+    url = getattr(bind, "url", None)
+    return str(url) if url is not None else str(id(bind))
+
+
+def _fresh_job(track, user_id: int | None, now: datetime) -> TranscriptionJob:
+    return TranscriptionJob(track_id=track.id, sha256=str(track.sha256 or "")[:64], duration=_num(track.duration),
+                            language="ru", state="queued", failed_workers=[], progress={}, result={},
+                            requested_by=user_id, created_at=now, updated_at=now)
+
+
+async def _insert_job(session, track, user_id: int | None, now: datetime) -> bool:
+    """Insert one job. A concurrent insert rolls back only this savepoint."""
+    try:
+        async with session.begin_nested():
+            session.add(_fresh_job(track, user_id, now))
+            await session.flush()
+        return True
+    except IntegrityError:
+        return False
+
+
+async def _sweep_lyric_jobs(session, *, user_id: int | None, now: datetime, limit: int = _SWEEP_LIMIT) -> int:
+    """Queue songs the phone has not opened yet. One batch per library load or PC poll."""
     created = 0
-    for track in pending:
-        job = existing.get(track.id)
-        if job is not None:
-            if (job.state == "failed" and str(job.error or "").startswith("no_speech")
-                    and not (job.result or {}).get("retried_empty")):
-                job.result = {**(job.result or {}), "retried_empty": True}
-                job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
-                job.finished_at, job.updated_at = None, now
-                created += 1
+    silent = list(await session.scalars(select(TranscriptionJob).where(
+        TranscriptionJob.state == "failed", TranscriptionJob.error.startswith("no_speech")).limit(20)))
+    for job in silent:
+        if (job.result or {}).get("retried_empty"):
             continue
-        if _stored_lyrics(records.get(track.id)):
-            continue
-        await request_job(session, track, language="ru", user_id=user_id, now=now)
+        job.result = {**(job.result or {}), "retried_empty": True}
+        job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
+        job.finished_at, job.updated_at = None, now
         created += 1
+    key = _cursor_key(session)
+    cursor = int(_cursors.get(key, 0) or 0)
+    looked = 0
+    queued = 0
+    while queued < limit and looked < _SWEEP_LOOK:
+        batch = list(await session.scalars(select(MusicTrack).where(
+            MusicTrack.deleted.is_(False), MusicTrack.id > cursor).order_by(MusicTrack.id).limit(50)))
+        if not batch:
+            cursor = 0
+            break
+        ids = [track.id for track in batch]
+        existing = set(await session.scalars(select(TranscriptionJob.track_id).where(TranscriptionJob.track_id.in_(ids))))
+        records = {row.track_id: row for row in await session.scalars(select(MusicEnrichment).where(MusicEnrichment.track_id.in_(ids)))}
+        for track in batch:
+            cursor = track.id
+            looked += 1
+            if track.id not in existing and not _stored_lyrics(records.get(track.id)):
+                if await _insert_job(session, track, user_id, now):
+                    queued += 1
+                    created += 1
+            if queued >= limit or looked >= _SWEEP_LOOK:
+                break
+        if queued >= limit or looked >= _SWEEP_LOOK:
+            break
+    _cursors[key] = cursor
+    return created
+
+
+async def queue_page_without_lyrics(session, tracks, *, user_id: int | None, now: datetime) -> int:
+    """Queue this library page, then the next songs in the library that have no text."""
+    pending = [track for track in tracks if getattr(track, "id", None) and not getattr(track, "deleted", False)]
+    created = 0
+    if pending:
+        ids = [track.id for track in pending]
+        existing = {row.track_id: row for row in await session.scalars(select(TranscriptionJob).where(TranscriptionJob.track_id.in_(ids)))}
+        records = {row.track_id: row for row in await session.scalars(select(MusicEnrichment).where(MusicEnrichment.track_id.in_(ids)))}
+        for track in pending:
+            job = existing.get(track.id)
+            if job is not None:
+                if (job.state == "failed" and str(job.error or "").startswith("no_speech")
+                        and not (job.result or {}).get("retried_empty")):
+                    job.result = {**(job.result or {}), "retried_empty": True}
+                    job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
+                    job.finished_at, job.updated_at = None, now
+                    created += 1
+                continue
+            if _stored_lyrics(records.get(track.id)):
+                continue
+            await request_job(session, track, language="ru", user_id=user_id, now=now)
+            created += 1
+    created += await _sweep_lyric_jobs(session, user_id=user_id, now=now)
     if created:
         await schedule(session, now)
         await session.commit()

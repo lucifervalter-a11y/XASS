@@ -6,12 +6,13 @@ provider response is never followed.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import re
 import time
 
 import httpx
 
-from app.services.music_artwork import _jpeg_thumbnail
+from app.services.music_artwork import CACHE_VERSION, _jpeg_thumbnail, store_external_thumbnail
 from app.services.music_enrichment import USER_AGENT, _norm
 from app.services.music_query import is_unknown_artist, search_names
 
@@ -233,3 +234,129 @@ async def display_cover(title: str, artist: str, album: str = "") -> bytes | Non
             if len(_misses) > 4000:
                 _misses.clear()
         return jpeg
+
+
+def cover_file(root: Path, sha256: str) -> Path:
+    return Path(root) / ".artwork" / f"{sha256}-{CACHE_VERSION}.jpg"
+
+
+def cover_miss_is_fresh(title: str, artist: str, album: str = "") -> bool:
+    """True when this exact name was looked up and Deezer had no cover recently."""
+    artist, title = search_names(str(title or ""), str(artist or ""))
+    key = f"{_norm(artist)}\n{_norm(title)}\n{_norm(album or '')}"
+    return _misses.get(key, 0) > time.monotonic()
+
+
+def cover_rows(tracks) -> list[dict]:
+    rows = []
+    for track in tracks:
+        sha = str(getattr(track, "sha256", "") or "")
+        storage = str(getattr(track, "storage_name", "") or "")
+        if not sha or not storage:
+            continue
+        rows.append({"id": getattr(track, "id", None), "title": str(getattr(track, "title", "") or ""),
+                     "artist": str(getattr(track, "artist", "") or ""), "album": str(getattr(track, "album", "") or ""),
+                     "sha256": sha, "storage_name": storage})
+    return rows
+
+
+_cover_cursors: dict[str, int] = {}
+
+
+async def cover_candidates(session, root, *, limit: int = 4, look: int = 60) -> list[dict]:
+    """Next tracks with no stored cover. Walks the library across polls."""
+    from sqlalchemy import select
+
+    from app.music_models import MusicTrack
+    bind = session.bind
+    key = str(getattr(bind, "url", None) or id(bind))
+    cursor = int(_cover_cursors.get(key, 0) or 0)
+    chosen: list[dict] = []
+    scanned = 0
+    while len(chosen) < limit and scanned < look:
+        batch = list(await session.scalars(select(MusicTrack).where(
+            MusicTrack.deleted.is_(False), MusicTrack.id > cursor).order_by(MusicTrack.id).limit(40)))
+        if not batch:
+            cursor = 0
+            break
+        for track in batch:
+            cursor = track.id
+            scanned += 1
+            row = cover_rows([track])
+            if not row:
+                continue
+            item = row[0]
+            try:
+                ready = cover_file(root, item["sha256"]).is_file()
+            except OSError:
+                ready = False
+            if not ready and not cover_miss_is_fresh(item["title"], item["artist"], item["album"]):
+                chosen.append(item)
+            if len(chosen) >= limit or scanned >= look:
+                break
+        if len(chosen) >= limit or scanned >= look:
+            break
+    _cover_cursors[key] = cursor
+    return chosen
+
+
+async def _remember_names(session_factory, track_id: int, title: str, artist: str, picked: tuple[str, str]) -> None:
+    from sqlalchemy import update
+
+    from app.music_models import MusicTrack
+    async with session_factory() as session:
+        await session.execute(update(MusicTrack).where(
+            MusicTrack.id == track_id, MusicTrack.deleted.is_(False),
+            MusicTrack.title == title, MusicTrack.artist == artist).values(artist=picked[0], title=picked[1]))
+        await session.commit()
+
+
+async def prefetch_exact_covers(root, rows, session_factory=None, *, limit: int = 4) -> int:
+    """Save an exact Deezer cover for a few tracks. A miss stays a miss."""
+    root = Path(root)
+    pending = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sha = str(row.get("sha256") or "")
+        storage = str(row.get("storage_name") or "")
+        if not sha or not storage:
+            continue
+        try:
+            if cover_file(root, sha).is_file():
+                continue
+        except OSError:
+            continue
+        if cover_miss_is_fresh(str(row.get("title") or ""), str(row.get("artist") or ""), str(row.get("album") or "")):
+            continue
+        pending.append(row)
+        if len(pending) >= limit:
+            break
+    if not pending:
+        return 0
+
+    async def fetch(row):
+        try:
+            jpeg = await display_cover(str(row.get("title") or ""), str(row.get("artist") or ""), str(row.get("album") or ""))
+        except (OSError, ValueError, TypeError):
+            jpeg = None
+        return row, jpeg
+
+    stored = 0
+    for row, jpeg in await asyncio.gather(*(fetch(item) for item in pending)):
+        if not jpeg:
+            continue
+        saved = await asyncio.to_thread(store_external_thumbnail, root, str(row["sha256"]), str(row["storage_name"]), jpeg)
+        if saved is None:
+            continue
+        stored += 1
+        track_id = row.get("id")
+        picked = adopted_catalog_names(str(row.get("title") or ""), str(row.get("artist") or ""), str(row.get("album") or ""))
+        if picked and session_factory is not None and isinstance(track_id, int):
+            await _remember_names(session_factory, track_id, str(row.get("title") or ""), str(row.get("artist") or ""), picked)
+    return stored
+
+
+async def run_cover_prefetch(root, rows, session_factory=None, limit: int = 4) -> int:
+    """Background entry. Looks up the implementation at call time so tests can replace it."""
+    return await prefetch_exact_covers(root, rows, session_factory, limit=limit)

@@ -1,9 +1,15 @@
 """Exact-name covers. No live provider calls."""
 from __future__ import annotations
 
+import io
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from app.services.music_covers import adopted_catalog_names, cover_queries, cover_url, pick_cover_digest, pick_joined_release
+from PIL import Image
+
+from app.services.music_covers import adopted_catalog_names, cover_file, cover_queries, cover_url, pick_cover_digest, pick_joined_release, prefetch_exact_covers
 
 DIGEST = "b" * 32
 OTHER = "c" * 32
@@ -72,6 +78,40 @@ class CoverPickTests(unittest.TestCase):
         self.assertEqual(adopted_catalog_names("MARRY ME, BELLAMY - GENSHIN IMPACT", ""), ("Marry Me, Bellamy", "GENSHIN IMPACT"))
         music_covers._chosen["\nурал гайсин священная война\n"] = ("урал гайсин", "Хочу быть с ней и всё")
         self.assertIsNone(adopted_catalog_names("урал гайсин священная война", ""))
+
+
+def _jpeg() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (20, 30, 40)).save(buffer, "JPEG")
+    return buffer.getvalue()
+
+
+class CoverPrefetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_cover_is_stored_and_a_miss_is_not(self):
+        jpeg = _jpeg()
+        sha = "ab" * 32
+        storage = "cd" * 16 + ".mp3"
+        other = "ef" * 32
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            row = {"id": 1, "title": "Конфетка", "artist": "Marry Me, Bellamy", "album": "", "sha256": sha, "storage_name": storage}
+            missed = {"id": 2, "title": "священная война", "artist": "урал гайсин", "album": "", "sha256": other, "storage_name": "12" * 16 + ".mp3"}
+            calls = []
+
+            async def fake(title, artist, album=""):
+                calls.append(title)
+                return jpeg if title == "Конфетка" else None
+
+            with patch("app.services.music_covers.display_cover", fake):
+                stored = await prefetch_exact_covers(root, [row, missed])
+            self.assertEqual(stored, 1)
+            self.assertEqual(calls, ["Конфетка", "священная война"])
+            self.assertTrue(cover_file(root, sha).is_file())
+            self.assertFalse(cover_file(root, other).exists())
+            calls.clear()
+            with patch("app.services.music_covers.display_cover", fake):
+                self.assertEqual(await prefetch_exact_covers(root, [row, missed]), 0)
+            self.assertEqual(calls, ["священная война"])
 
 
 if __name__ == "__main__":

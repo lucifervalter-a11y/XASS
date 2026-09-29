@@ -58,9 +58,16 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test")
         self.headers = {"x-test-owner": "42"}
         self.audio = silent_wav()
+        # Library and PC poll schedule a Deezer cover fetch after the response.
+        # Keep the suite offline; the cover function has its own tests.
+        from app.services import music_covers
+        self._cover_prefetch = music_covers.prefetch_exact_covers
+        music_covers.prefetch_exact_covers = AsyncMock(return_value=0)
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        from app.services import music_covers
+        music_covers.prefetch_exact_covers = self._cover_prefetch
         await self.engine.dispose()
         self.temp.cleanup()
 

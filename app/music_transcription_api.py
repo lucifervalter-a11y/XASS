@@ -7,9 +7,10 @@ the same credential used for heartbeats and command delivery.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -86,7 +87,7 @@ class FailBody(BaseModel):
     reason: str = Field(default="worker_error", max_length=200)
 
 
-def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable[bool]] | None = None):
+def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable[bool]] | None = None, *, music_root: Path | None = None):
     router = APIRouter()
 
     async def find_track(session, track_id):
@@ -142,7 +143,7 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
             return await tq.status_payload(session, track_id, now)
 
     @router.post("/agent/transcription/poll")
-    async def poll(payload: PollBody, auth=Depends(agent), session=Depends(get_session)):
+    async def poll(payload: PollBody, background_tasks: BackgroundTasks, auth=Depends(agent), session=Depends(get_session)):
         async with _queue_lock:
             now = tq.now_utc()
             worker = await tq.upsert_worker(session, credential_id=auth.credential_id, source_name=auth.source_name,
@@ -150,6 +151,12 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
                 capabilities=payload.capabilities.model_dump(), load=payload.load.model_dump(), now=now,
                 setup=payload.setup.model_dump() if payload.setup else None)
             await tq.release_worker_jobs(session, worker, now, running_job_id=payload.running_job_id)
+            # The phone only queues the page it opened. Each poll takes the next songs with no text.
+            await tq.queue_page_without_lyrics(session, [], user_id=None, now=now)
+            covers = []
+            if music_root is not None and payload.enabled:
+                from app.services.music_covers import cover_candidates
+                covers = await cover_candidates(session, music_root, limit=4)
             job = None
             if tq.worker_online(worker, now) and payload.running_job_id is None:
                 await tq.schedule(session, now)
@@ -169,6 +176,12 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
                         "lease_sec": tq.RUN_LEASE_SEC, "renew_every_sec": 60,
                         "deadline_at": tq.aware(job.deadline_at).isoformat()}
             await session.commit()
+            if covers:
+                from sqlalchemy.ext.asyncio import async_sessionmaker
+
+                from app.services.music_covers import run_cover_prefetch
+                factory = async_sessionmaker(session.bind, expire_on_commit=False)
+                background_tasks.add_task(run_cover_prefetch, music_root, covers, factory, 4)
             return body
 
     async def running_job(session, auth, job_id):

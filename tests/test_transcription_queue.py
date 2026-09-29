@@ -225,6 +225,31 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job.result["lines"], [{"start": 1.0, "end": 2.0, "text": "a"}, {"start": 3.0, "end": 3.2, "text": "b"}])
             self.assertEqual(job.result["model"], "large-v3")
 
+    async def test_empty_outage_is_missing_text_and_real_words_are_not(self):
+        self.assertFalse(tq.shown_lyrics_missing(None))
+        self.assertFalse(tq.shown_lyrics_missing({"status": "unavailable", "text": "есть", "synced": False, "lines": []}))
+        self.assertTrue(tq.shown_lyrics_missing({"status": "unavailable", "text": "", "synced": False, "lines": []}))
+        self.assertTrue(tq.shown_lyrics_missing({"status": "rate_limited", "text": "  ", "synced": False, "lines": []}))
+        self.assertFalse(tq.shown_lyrics_missing({"text": "есть", "synced": True, "lines": [{"text": "есть"}]}))
+
+    async def test_sweep_queues_a_song_with_no_text_and_skips_stored_lyrics(self):
+        async with self.sessions() as session:
+            spoken = MusicTrack(title="has text", artist="a", album="", filename="a.mp3", storage_name="a" * 32 + ".mp3",
+                                mime="audio/mpeg", sha256="a" * 64, size=10, duration=10, deleted=False)
+            bare = MusicTrack(title="no text", artist="b", album="", filename="b.mp3", storage_name="b" * 32 + ".mp3",
+                              mime="audio/mpeg", sha256="b" * 64, size=10, duration=10, deleted=False)
+            session.add_all([spoken, bare])
+            await session.flush()
+            session.add(MusicEnrichment(track_id=spoken.id, fingerprint="x", original={},
+                                        result={"lyrics": {"text": "уже есть"}}, owner_lyrics={}, checked_at=T0))
+            await session.commit()
+            created = await tq.queue_page_without_lyrics(session, [], user_id=1, now=T0)
+            self.assertEqual(created, 1)
+            jobs = list(await session.scalars(select(TranscriptionJob)))
+            self.assertEqual([job.track_id for job in jobs], [bare.id])
+            self.assertEqual(await tq.queue_page_without_lyrics(session, [], user_id=1, now=T0), 0)
+            self.assertEqual(len(list(await session.scalars(select(TranscriptionJob)))), 1)
+
     async def test_running_status_has_minutes_estimate(self):
         async with self.sessions() as session:
             gpu = await self.worker(session, 1, GPU)
@@ -410,27 +435,49 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
             jobs = list(await session.scalars(select(TranscriptionJob)))
         self.assertEqual([(job.track_id, job.state, job.language) for job in jobs], [(track["id"], "queued", "ru")])
 
-    async def test_real_catalog_text_and_outages_do_not_queue(self):
+    async def test_real_catalog_text_stays_and_an_empty_outage_queues_the_pc(self):
         synced = {"status": "synced", "synced": True, "lines": [{"start": 0, "end": 1, "text": "есть текст"}],
                   "text": "есть текст", "source": "lrclib"}
         with_words = {"status": "candidate", "reason": "duration_mismatch",
                       "lyrics": {"text": "есть текст", "lines": [{"time": 1, "text": "есть текст"}],
                                  "synced": True, "source": "lrclib"}}
+        kept = await self.upload()
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=with_words)), \
+             patch("app.services.synced_lyrics.LrclibClient.lookup", AsyncMock(return_value=synced)):
+            page = await self.request("GET", f"/api/mini/music/tracks/{kept['id']}/lyrics")
+            playing = await self.request("GET", f"/api/mini/music/tracks/{kept['id']}/timed-lyrics")
+        self.assertEqual(page.json()["lyrics"]["text"], "есть текст")
+        self.assertEqual(playing.json()["lyrics"].get("text", ""), "есть текст")
+        self.assertNotIn("transcription_pending", playing.json()["lyrics"])
         down = {"status": "unavailable", "synced": False, "lines": [], "text": ""}
         outage = {"status": "unavailable", "lyrics": {"text": "", "lines": [], "synced": False}}
-        cases = ((self.audio, synced, with_words, "есть текст"),
-                 (test_music_api.silent_wav(6), down, outage, ""))
-        for data, lookup, enrich, text in cases:
-            track = await self.upload(data)
-            with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=enrich)), \
-                 patch("app.services.synced_lyrics.LrclibClient.lookup", AsyncMock(return_value=lookup)):
-                page = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/lyrics")
-                playing = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/timed-lyrics")
-            self.assertEqual(page.json()["lyrics"]["text"], text)
-            self.assertEqual(playing.json()["lyrics"].get("text", ""), text)
-            self.assertNotIn("transcription_pending", playing.json()["lyrics"])
+        bare = await self.upload(test_music_api.silent_wav(6))
+        with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value=outage)), \
+             patch("app.services.synced_lyrics.LrclibClient.lookup", AsyncMock(return_value=down)):
+            page = await self.request("GET", f"/api/mini/music/tracks/{bare['id']}/lyrics")
+            playing = await self.request("GET", f"/api/mini/music/tracks/{bare['id']}/timed-lyrics")
+        self.assertEqual(page.json()["lyrics"]["text"], "")
+        self.assertTrue(playing.json()["lyrics"]["transcription_pending"])
         async with self.sessions() as session:
-            self.assertIsNone(await session.scalar(select(TranscriptionJob)))
+            jobs = list(await session.scalars(select(TranscriptionJob)))
+        self.assertEqual([job.track_id for job in jobs], [bare["id"]])
+
+    async def test_pc_poll_queues_a_song_nobody_opened(self):
+        track = await self.upload()
+        polled = await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())
+        self.assertEqual(polled.status_code, 200, polled.text)
+        self.assertEqual(polled.json()["job"]["track_id"], track["id"])
+
+    async def test_library_queues_songs_beyond_the_loaded_page(self):
+        first = await self.upload(test_music_api.silent_wav(5))
+        second = await self.upload(test_music_api.silent_wav(6))
+        self.assertNotEqual(first["id"], second["id"])
+        page = await self.request("GET", "/api/mini/music/library", params={"limit": 1})
+        self.assertEqual(page.status_code, 200, page.text)
+        self.assertEqual(len(page.json()["tracks"]), 1)
+        async with self.sessions() as session:
+            ids = sorted(job.track_id for job in await session.scalars(select(TranscriptionJob)))
+        self.assertEqual(ids, sorted([first["id"], second["id"]]))
 
     async def test_failed_transcription_is_not_requeued_by_opening_the_song(self):
         track = await self.upload()
