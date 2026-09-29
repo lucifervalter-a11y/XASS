@@ -25,6 +25,9 @@ _NOISE = re.compile(
 _EXT = re.compile(r"\.(?:mp3|m4a|flac|wav|ogg|opus|aac|wma)$", re.I)
 _EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]|\{\s*\}")
 _DASH = re.compile(r"\s+[-–—]\s+")
+# "01 - Artist - Title" / "01. Artist - Title". A bare "7 rings" is a title and stays.
+_INDEX = re.compile(r"^\d{1,3}\s*[-._)]\s+")
+_REUPLOAD = re.compile(r"\b(?:re-?uploads?)\b", re.I)
 UNKNOWN_ARTISTS = frozenset({"", "unknown", "unknown artist", "various artists", "va", "неизвестен",
                              "неизвестный исполнитель", "<unknown>", "без исполнителя"})
 
@@ -43,6 +46,7 @@ def clean_search_text(value: Any) -> str:
         text = _NOISE.sub(" ", text)
     text = _DOMAIN.sub(" ", text)
     text = _EMPTY_BRACKETS.sub(" ", text)
+    text = _REUPLOAD.sub(" ", text)
     text = " ".join(text.split())
     # Separators left dangling by a removed tag: "Artist - [site.ru]" -> "Artist".
     text = re.sub(r"^(?:[-–—|•·.,:;]\s*)+|(?:\s*[-–—|•·,:;])+$", "", text).strip()
@@ -63,7 +67,7 @@ def search_names(title: Any, artist: Any) -> tuple[str, str]:
     "Нексюша [mp3xa.cc] - Фенибут" with no artist -> ("Нексюша", "Фенибут").
     With a known artist, a repeated "Artist - " prefix is dropped from the title.
     """
-    clean_title = clean_search_text(title)
+    clean_title = _INDEX.sub("", clean_search_text(title)).strip()
     clean_artist = "" if is_unknown_artist(artist) else clean_search_text(artist)
     parts = _DASH.split(clean_title, maxsplit=1)
     if len(parts) == 2 and parts[0].strip() and parts[1].strip():
@@ -73,3 +77,21 @@ def search_names(title: Any, artist: Any) -> tuple[str, str]:
         if _key(left) == _key(clean_artist):
             return clean_artist, right
     return clean_artist, clean_title
+
+
+def filename_artist_title(title: Any, artist: Any) -> tuple[str, str] | None:
+    """Artist and title written in an untagged "Artist - Title" filename.
+
+    A tagged file keeps its artist. Returns nothing when there is no separator,
+    so a title that merely contains both words is not guessed apart.
+    """
+    if not is_unknown_artist(artist):
+        return None
+    cleaned = _INDEX.sub("", clean_search_text(title)).strip()
+    # One separator only. "A - B - C" is left whole rather than renaming the file.
+    if len(_DASH.split(cleaned)) != 2:
+        return None
+    found_artist, found_title = search_names(title, artist)
+    if not found_artist or not found_title:
+        return None
+    return found_artist, found_title

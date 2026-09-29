@@ -210,6 +210,13 @@ class MusicArtworkTests(unittest.TestCase):
         self.assertEqual(track.title, "my_old_track")  # Read-only migration, no DB mutation.
         track.title = "Artist_Title From Real Tags"
         self.assertEqual(track_json(track)["title"], track.title)
+        track.title = "MARRY ME, BELLAMY - Конфетка.mp3".replace(".mp3", "")
+        track.filename = "MARRY ME, BELLAMY - Конфетка.mp3"
+        track.artist = ""
+        shown = track_json(track)
+        self.assertEqual(shown["artist"], "MARRY ME, BELLAMY")
+        self.assertEqual(shown["title"], "Конфетка")
+        self.assertEqual(track.title, "MARRY ME, BELLAMY - Конфетка")
 
 
 if __name__ == "__main__":

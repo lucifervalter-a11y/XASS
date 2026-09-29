@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.services.music_covers import cover_queries, cover_url, pick_cover_digest
+from app.services.music_covers import adopted_catalog_names, cover_queries, cover_url, pick_cover_digest, pick_joined_release
 
 DIGEST = "b" * 32
 OTHER = "c" * 32
@@ -49,6 +49,29 @@ class CoverPickTests(unittest.TestCase):
         self.assertEqual(pick_cover_digest(rows, "я молодой вампир", "урал гайсин", ""), OTHER)
         self.assertIsNone(pick_cover_digest(rows, "Song", "Artist", ""))
         self.assertEqual(cover_queries("урал гайсин", "блюз"), ["урал гайсин блюз", "блюз"])
+
+    def test_untagged_filename_matches_one_artist_title_and_ignores_a_different_song(self):
+        rows = [
+            {"title": "Конфетка", "artist": {"name": "Marry Me, Bellamy"}, "album": {"title": "Конфетка", "md5_image": DIGEST}},
+            {"title": "КОНФЕТКА (REMIX)", "artist": {"name": "Marry Me, Bellamy"}, "album": {"title": "Remix", "md5_image": OTHER}},
+            {"title": "Хочу быть с ней и всё", "artist": {"name": "урал гайсин"}, "album": {"title": "Single", "md5_image": "d" * 32}},
+        ]
+        found = pick_joined_release(rows, "Marry Me Bellamy Конфетка")
+        self.assertEqual(found[0], DIGEST)
+        self.assertEqual(found[1], "Marry Me, Bellamy")
+        self.assertIsNone(pick_joined_release(rows, "урал гайсин священная война"))
+        self.assertIsNone(pick_joined_release(rows, "Marry Me Bellamy"))
+
+    def test_a_longer_near_title_does_not_rename_the_track(self):
+        from app.services import music_covers
+        music_covers._chosen.clear()
+        key_artist, key_title = "MARRY ME, BELLAMY", "GENSHIN IMPACT"
+        music_covers._chosen[f"{music_covers._norm(key_artist)}\n{music_covers._norm(key_title)}\n"] = ("Marry Me, Bellamy", "GENSHIN IMPACT vamp")
+        self.assertIsNone(adopted_catalog_names("MARRY ME, BELLAMY - GENSHIN IMPACT", ""))
+        music_covers._chosen[f"{music_covers._norm(key_artist)}\n{music_covers._norm(key_title)}\n"] = ("Marry Me, Bellamy", "GENSHIN IMPACT")
+        self.assertEqual(adopted_catalog_names("MARRY ME, BELLAMY - GENSHIN IMPACT", ""), ("Marry Me, Bellamy", "GENSHIN IMPACT"))
+        music_covers._chosen["\nурал гайсин священная война\n"] = ("урал гайсин", "Хочу быть с ней и всё")
+        self.assertIsNone(adopted_catalog_names("урал гайсин священная война", ""))
 
 
 if __name__ == "__main__":

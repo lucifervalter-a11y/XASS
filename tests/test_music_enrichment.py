@@ -412,6 +412,21 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.service().enrich(track))["status"], "insufficient_metadata")
         self.assertEqual(self.requests, [])
 
+    async def test_bare_503_does_not_silence_the_catalog_for_a_minute(self):
+        def handle(request):
+            if request.url.host == "lrclib.net":
+                return httpx.Response(503)
+            return httpx.Response(200, json={"recordings": []})
+        service = self.service(lyrics=[], recordings=[], handler=handle)
+        result = await service.enrich(self.track)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotIn("retry_after", result)
+        self.clock.value += 6
+        self.requests.clear()
+        again = await service.enrich(self.track, refresh=True)
+        self.assertEqual(again["status"], "unavailable")
+        self.assertTrue(any(request.url.host == "lrclib.net" for request in self.requests))
+
     async def test_provider_unavailable_does_not_discard_matched_lyrics(self):
         result = await self.service(handler=lambda req: httpx.Response(503) if req.url.host == "musicbrainz.org" else None).enrich(self.track)
         self.assertEqual(result["status"], "matched")

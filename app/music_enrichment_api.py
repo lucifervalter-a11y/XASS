@@ -19,6 +19,7 @@ from app.db import get_session
 from app.music_models import MusicEnrichment, MusicTrack
 from app.services.music_library import track_json
 from app.services.music_lyrics import empty_lyrics, parse_lyrics
+from app.services.music_query import filename_artist_title
 
 _locks = WeakValueDictionary()
 CATALOG_BUDGET_SECONDS = 18
@@ -88,6 +89,27 @@ async def catalog_lookup(snapshot, candidate=None, *, refresh=False):
     return result, artwork
 
 
+async def adopt_filename_names(session, track) -> None:
+    """Store "Artist - Title" from an untagged filename before the catalog is asked.
+
+    A dismissed lookup keeps the owner's original tags. The split is the same
+    one covers already use, so the list stops showing the whole file name.
+    """
+    split = filename_artist_title(track.title, track.artist)
+    if split is None:
+        return
+    artist, title = split
+    if artist == track.artist and title == track.title:
+        return
+    changed = await session.execute(update(MusicTrack).where(MusicTrack.id == track.id,
+        MusicTrack.deleted.is_(False), MusicTrack.title == track.title,
+        MusicTrack.artist == track.artist).values(title=title[:240], artist=artist[:240]))
+    if changed.rowcount != 1:
+        return
+    track.title, track.artist = title[:240], artist[:240]
+    await session.commit()
+
+
 async def enrich_saved_track(session, track_id, *, refresh=False):
     # Locks are per database and track; never hold a DB transaction over network I/O.
     key = (str(session.bind.url), track_id)
@@ -95,6 +117,8 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
     async with lock:
         track = await find_track(session, track_id)
         record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+        if record is None or not record.dismissed:
+            await adopt_filename_names(session, track)
         now = datetime.now(timezone.utc)
         confirmed_candidate, previous_result, previous_artwork = None, None, None
         if record:

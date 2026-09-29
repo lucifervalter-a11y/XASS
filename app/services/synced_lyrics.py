@@ -167,7 +167,7 @@ class LrclibClient:
             return {"status": "insufficient_metadata", "synced": False, "lines": [], "text": ""}
         fallback = None
         try:
-            async with httpx.AsyncClient(transport=self._transport, timeout=httpx.Timeout(7, connect=4), trust_env=False,
+            async with httpx.AsyncClient(transport=self._transport, timeout=httpx.Timeout(4, connect=3), trust_env=False,
                                          follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
                 for guessed_artist, guessed_title in guesses:
                     if guessed_artist:

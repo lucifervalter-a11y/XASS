@@ -15,6 +15,7 @@ from weakref import WeakValueDictionary
 
 import mutagen
 
+from app.services.music_query import filename_artist_title
 from app.services.pwa_auth import _session_generation, _session_secret
 
 FORMATS = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
@@ -88,6 +89,11 @@ def track_json(track) -> dict:
     payload = {key: getattr(track, key) for key in ("id", "title", "artist", "album", "duration", "favorite", "size", "mime", "filename")}
     if payload["title"] == Path(payload["filename"]).stem:
         payload["title"] = display_title(payload["filename"])
+        # Untagged downloads keep "Artist - Title.mp3" in the title column.
+        # The list shows the two names; the file and its tags stay as imported.
+        split = filename_artist_title(payload["title"], payload["artist"])
+        if split:
+            payload["artist"], payload["title"] = split
     payload["artwork_path"] = f"/api/mini/music/tracks/{track.id}/artwork"
     return payload
 

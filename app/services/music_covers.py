@@ -26,6 +26,8 @@ _EXTRA_REJECT = frozenset({"remix", "live", "edit", "cover", "radio", "extended"
                            "karaoke", "demo", "acoustic", "remaster", "remastered"})
 _misses: dict[str, float] = {}
 _hits: dict[str, bytes] = {}
+# Canonical artist, title for a query key, remembered with the cover pick.
+_chosen: dict[str, tuple[str, str]] = {}
 _locks: dict[str, asyncio.Lock] = {}
 _slots = asyncio.Semaphore(4)
 
@@ -63,8 +65,15 @@ def cover_queries(artist: str, title: str) -> list[str]:
     return [first] if first else []
 
 
-def pick_cover_digest(rows, title: str, artist: str, album: str = "") -> str | None:
-    """Same artist and title. A matching album wins; a remix does not."""
+def _row_names(row: dict) -> tuple[str, str, str]:
+    artist = (row.get("artist") or {}).get("name") if isinstance(row.get("artist"), dict) else ""
+    title = str(row.get("title") or "")
+    album_row = row.get("album") if isinstance(row.get("album"), dict) else {}
+    return str(artist or ""), title, str(album_row.get("md5_image") or "")
+
+
+def pick_cover_match(rows, title: str, artist: str, album: str = "") -> tuple[str, str, str] | None:
+    """(digest, catalog artist, catalog title). Same artist and title. A matching album wins."""
     want_title, want_artist, want_album = _cover_text(title), _cover_text(artist), _norm(album)
     if not want_title or not want_artist:
         return None
@@ -72,18 +81,49 @@ def pick_cover_digest(rows, title: str, artist: str, album: str = "") -> str | N
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
             continue
-        names = {_cover_text(str(row.get("title") or "")), _cover_text(str(row.get("title_short") or ""))}
-        got_artist = _cover_text((row.get("artist") or {}).get("name") if isinstance(row.get("artist"), dict) else "")
-        if got_artist != want_artist or not any(_titles_match(want_title, name) for name in names):
+        row_artist, row_title, digest = _row_names(row)
+        names = {_cover_text(row_title), _cover_text(str(row.get("title_short") or ""))}
+        if _cover_text(row_artist) != want_artist or not any(_titles_match(want_title, name) for name in names):
             continue
-        album_row = row.get("album") if isinstance(row.get("album"), dict) else {}
-        digest = str(album_row.get("md5_image") or "")
         if cover_url(digest) is None:
             continue
+        album_row = row.get("album") if isinstance(row.get("album"), dict) else {}
+        choice = (digest, row_artist, row_title)
         if want_album and _norm(album_row.get("title")) == want_album:
-            return digest
-        fallback = fallback or digest
+            return choice
+        fallback = fallback or choice
     return fallback
+
+
+def pick_cover_digest(rows, title: str, artist: str, album: str = "") -> str | None:
+    """Same artist and title. A matching album wins; a remix does not."""
+    found = pick_cover_match(rows, title, artist, album)
+    return None if found is None else found[0]
+
+
+def pick_joined_release(rows, query: str) -> tuple[str, str, str] | None:
+    """One row whose artist and title are exactly the untagged filename, in either order.
+
+    Two different pairs are a miss: a nearby song by the same artist is not this file.
+    """
+    want = _cover_text(query)
+    if not want:
+        return None
+    found: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        row_artist, row_title, digest = _row_names(row)
+        pair = (_cover_text(row_artist), _cover_text(row_title))
+        if not pair[0] or not pair[1]:
+            continue
+        joined = (f"{pair[0]} {pair[1]}", f"{pair[1]} {pair[0]}")
+        if want not in joined or cover_url(digest) is None:
+            continue
+        found.setdefault(pair, (digest, row_artist, row_title))
+    if len(found) != 1:
+        return None
+    return next(iter(found.values()))
 
 
 async def _download(client: httpx.AsyncClient, url: str) -> bytes | None:
@@ -104,9 +144,42 @@ async def _download(client: httpx.AsyncClient, url: str) -> bytes | None:
     return b"".join(chunks)
 
 
+def chosen_names(title: str, artist: str, album: str = "") -> tuple[str, str] | None:
+    """Catalog spelling remembered by the last cover lookup for these tags."""
+    artist, title = search_names(title, artist)
+    return _chosen.get(f"{_norm(artist)}\n{_norm(title)}\n{_norm(album)}")
+
+
+def adopted_catalog_names(title: str, artist: str, album: str = "") -> tuple[str, str] | None:
+    """Names worth storing: the exact split, or one row that is the whole filename.
+
+    A longer near-title (one extra word) can still supply a cover, but it does
+    not rename the track.
+    """
+    picked = chosen_names(title, artist, album)
+    if not picked or not is_unknown_artist(artist):
+        return None
+    catalog_artist, catalog_title = picked
+    guessed_artist, guessed_title = search_names(title, artist)
+    same_split = bool(_cover_text(guessed_artist)) and _cover_text(guessed_artist) == _cover_text(catalog_artist) and _cover_text(guessed_title) == _cover_text(catalog_title)
+    whole = _cover_text(f"{guessed_artist} {guessed_title}".strip())
+    joined = {_cover_text(f"{catalog_artist} {catalog_title}"), _cover_text(f"{catalog_title} {catalog_artist}")}
+    if not same_split and whole not in joined:
+        return None
+    if catalog_artist == artist and catalog_title == title:
+        return None
+    return catalog_artist[:240], catalog_title[:240]
+
+
 async def display_cover(title: str, artist: str, album: str = "") -> bytes | None:
     artist, title = search_names(title, artist)
-    if is_unknown_artist(artist) or not _norm(title):
+    # An untagged "artist_title_reUploads" file has no dash. Search the whole
+    # string and keep a cover only when one catalog row is exactly those words.
+    unnamed = is_unknown_artist(artist)
+    if unnamed:
+        if not _norm(title):
+            return None
+    elif not _norm(title):
         return None
     key = f"{_norm(artist)}\n{_norm(title)}\n{_norm(album)}"
     now = time.monotonic()
@@ -125,7 +198,9 @@ async def display_cover(title: str, artist: str, album: str = "") -> bytes | Non
                 async with httpx.AsyncClient(timeout=httpx.Timeout(6, connect=3), trust_env=False,
                         follow_redirects=False, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}) as client:
                     rows = []
-                    for query in cover_queries(artist, title):
+                    queries = [title] if unnamed else cover_queries(artist, title)
+                    picked = None
+                    for query in queries:
                         response = await client.get("https://api.deezer.com/search", params={"q": query, "limit": 15})
                         if response.status_code != 200:
                             continue
@@ -133,11 +208,16 @@ async def display_cover(title: str, artist: str, album: str = "") -> bytes | Non
                         found = payload.get("data") if isinstance(payload, dict) else None
                         if isinstance(found, list):
                             rows.extend(found)
-                        digest = pick_cover_digest(rows, title, artist, album)
-                        if digest:
+                        picked = pick_joined_release(rows, title) if unnamed else pick_cover_match(rows, title, artist, album)
+                        if picked:
                             break
+                    digest, picked_artist, picked_title = picked if picked else ("", "", "")
+                    if picked_artist and picked_title:
+                        if len(_chosen) > 500:
+                            _chosen.clear()
+                        _chosen[key] = (picked_artist, picked_title)
                     else:
-                        digest = None
+                        _chosen.pop(key, None)
                     url = cover_url(digest or "")
                     if url:
                         raw = await _download(client, url)

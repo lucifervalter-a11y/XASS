@@ -78,12 +78,16 @@ def _signature(track):
     cut = getattr(track, "is_excerpt", False) is True or bool(_CUT.search(title))
     cleaned = _REUPLOAD.sub(" ", _CUT.sub(" ", title))
     cleaned = " ".join(re.sub(r"\(\s*\)|\[\s*\]", " ", cleaned).strip(" -").split())
-    parts = re.split(r"\s+[-–—]\s+", cleaned)
+    # "01. Artist - Title" — the index is not part of the artist. More than one
+    # dash stays intact: "A - B - C" is not assumed to be artist plus title.
+    indexed = re.sub(r"^\d{1,3}\s*[-._)]\s+", "", cleaned).strip()
+    parts = re.split(r"\s+[-–—]\s+", indexed)
     if not artist and len(parts) == 2:
         artist, cleaned = map(str.strip, parts)
     elif artist and len(parts) == 2 and _norm(parts[0]) == _norm(artist) and parts[1].strip():
-        # "Artist - Title" repeated in the title field of a tagged file.
         cleaned = parts[1].strip()
+    else:
+        cleaned = indexed or cleaned
     return {"title": cleaned, "artist": artist, "album": album, "duration": _duration(getattr(track, "duration", 0)),
             "cut": cut, "query": cleaned if not artist else f"{artist} {cleaned}"}
 
@@ -272,17 +276,24 @@ class MusicEnrichmentService:
             raise _ProviderFailure("rate_limited", math.ceil(remaining))
         await self._sleep(max(0, self._next - self._clock()))
         try:
-            async with asyncio.timeout(12):
-                async with httpx.AsyncClient(transport=self._transport, timeout=httpx.Timeout(8, connect=4),
+            # One hung lyric host must not spend the phone's whole request.
+            # A 503 with no Retry-After is an outage, not a minute of silence.
+            async with asyncio.timeout(5):
+                async with httpx.AsyncClient(transport=self._transport, timeout=httpx.Timeout(4, connect=3),
                         trust_env=False, follow_redirects=False, headers={"User-Agent": USER_AGENT,
                         "Accept": "application/json" if maximum == MAX_JSON_BYTES else "image/jpeg,image/png,image/gif",
                         "Accept-Encoding": "identity"}) as client:
                     for hop in range(4):
                         async with client.stream("GET", url, params=params if hop == 0 else None) as response:
                             if response.status_code in {429, 503}:
-                                value = response.headers.get("retry-after", "60")
+                                value = response.headers.get("retry-after", "")
+                                if response.status_code == 503 and not str(value).strip():
+                                    self._blocked[host] = self._clock() + 5
+                                    raise _ProviderFailure("unavailable")
+                                if not str(value).strip():
+                                    value = "60"
                                 try:
-                                    delay = int(value) if value.isdigit() and len(value) < 12 else parsedate_to_datetime(value).timestamp() - self._wall_clock()
+                                    delay = int(value) if str(value).isdigit() and len(str(value)) < 12 else parsedate_to_datetime(value).timestamp() - self._wall_clock()
                                     delay = max(1, delay)
                                 except (ValueError, TypeError, OverflowError):
                                     delay = 60

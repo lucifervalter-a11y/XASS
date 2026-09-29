@@ -652,11 +652,18 @@ def build_router(settings, require_owner, public_origin):
         sha, storage = track.sha256, track.storage_name
         await session.rollback()
         from app.services.music_artwork import store_external_thumbnail
-        from app.services.music_covers import display_cover
+        from app.services.music_covers import adopted_catalog_names, display_cover
         try:
             jpeg = await display_cover(title, artist, album)
         except (OSError, ValueError, TypeError):
             jpeg = None
+        picked = adopted_catalog_names(title, artist, album)
+        # Untagged file: keep the catalog's artist and title when they are exact.
+        if picked:
+            await session.execute(update(MusicTrack).where(MusicTrack.id == track_id,
+                MusicTrack.deleted.is_(False), MusicTrack.title == title,
+                MusicTrack.artist == artist).values(artist=picked[0], title=picked[1]))
+            await session.commit()
         if not jpeg:
             raise HTTPException(404, "Обложка пока не найдена")
         saved = await asyncio.to_thread(store_external_thumbnail, root, sha, storage, jpeg)
