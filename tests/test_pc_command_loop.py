@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import sys
 import tempfile
 import threading
@@ -38,6 +39,7 @@ class PcCommandLoopTests(unittest.TestCase):
         self.telemetry = self.context.enter_context(patch.object(client_agent, "build_payload", return_value={"metrics": {}}))
         self.context.enter_context(patch("music_bridge.start_music_bridge", return_value=True))
         self.clock = 100.0
+        self.drain_commands = True
         self.sleeps: list[float] = []
         self.payloads: list[dict] = []
         self.context.enter_context(patch.object(client_agent.time, "monotonic", side_effect=lambda: self.clock))
@@ -47,6 +49,8 @@ class PcCommandLoopTests(unittest.TestCase):
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.clock += seconds
+        if self.drain_commands:
+            self.assertTrue(client_agent.wait_for_agent_commands(2), "command worker did not finish")
 
     def run_responses(self, responses: list[dict | Exception]) -> None:
         pending = iter(responses)
@@ -188,6 +192,91 @@ class PcCommandLoopTests(unittest.TestCase):
         result = self.payloads[1]["command_results"][0]
         self.assertFalse(result["ok"])
         self.assertIn("расшифровать", result["message"])
+
+    def test_file_download_does_not_block_the_next_heartbeat(self) -> None:
+        self.drain_commands = False
+        release = threading.Event()
+        logged: list[tuple[int, int, str]] = []
+
+        def upload(*_args, **_kwargs):
+            release.wait(2)
+            return {"filename": "song.mp3"}
+
+        def capture(command_id: int, attempt: int, _duration_ms: float, name: str) -> None:
+            logged.append((command_id, attempt, name))
+
+        pending = iter([
+            {"commands": [{"id": 5, "command": "file_download", "payload": {"path": "secret-path"}, "attempt": 4}]},
+            {},
+        ])
+        client = MagicMock()
+
+        def post(_url, *, headers, json):
+            self.payloads.append(json)
+            if len(self.payloads) == 2:
+                self.assertNotIn(5, [row.get("id") for row in json.get("command_results") or []])
+                self.assertNotIn("secret-path", str(json))
+                release.set()
+            try:
+                body = next(pending)
+            except StopIteration:
+                raise StopLoop()
+            return httpx.Response(200, json=body, request=httpx.Request("POST", _url))
+
+        client.post.side_effect = post
+        context = MagicMock()
+        context.__enter__.return_value = client
+        with (
+            patch.object(client_agent, "upload_requested_file", side_effect=upload),
+            patch.object(client_agent, "_log_command", side_effect=capture),
+            patch.object(client_agent, "create_http_client", return_value=context),
+            self.assertRaises(StopLoop),
+        ):
+            client_agent.run_agent(self.config)
+        self.assertGreaterEqual(len(self.payloads), 2)
+        self.assertEqual(logged, [(5, 4, "file_download")])
+        self.assertNotIn("secret-path", str(logged))
+
+    def test_full_queue_reports_busy_without_stalling_heartbeat(self) -> None:
+        self.drain_commands = False
+        release = threading.Event()
+        original = queue.Queue.put_nowait
+        state = {"n": 0}
+
+        def put_nowait(queue_self, item):
+            state["n"] += 1
+            if state["n"] > 1:
+                raise queue.Full
+            return original(queue_self, item)
+
+        def block(_command_id: int) -> None:
+            release.wait(3)
+
+        pending = iter([{"commands": [{"id": 1, "command": "lock"}, {"id": 2, "command": "lock"}]}, {}])
+        client = MagicMock()
+
+        def post(_url, *, headers, json):
+            self.payloads.append(json)
+            if len(self.payloads) == 2:
+                self.assertIn("агент занят", [row.get("message") for row in json.get("command_results") or []])
+                release.set()
+                raise StopLoop()
+            try:
+                body = next(pending)
+            except StopIteration:
+                raise StopLoop()
+            return httpx.Response(200, json=body, request=httpx.Request("POST", _url))
+
+        client.post.side_effect = post
+        context = MagicMock()
+        context.__enter__.return_value = client
+        with (
+            patch.object(queue.Queue, "put_nowait", put_nowait),
+            patch.object(client_agent, "_lock_workstation", side_effect=block),
+            patch.object(client_agent, "create_http_client", return_value=context),
+            self.assertRaises(StopLoop),
+        ):
+            client_agent.run_agent(self.config)
 
 
 class ArchiveWorkerTests(unittest.TestCase):

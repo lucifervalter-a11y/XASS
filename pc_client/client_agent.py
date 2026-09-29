@@ -47,6 +47,10 @@ from remote_tools import (
     upload_requested_file,
 )
 from network_client import create_http_client
+try:
+    from agent_command_worker import CommandExecutor
+except ModuleNotFoundError:
+    from pc_client.agent_command_worker import CommandExecutor
 from music_player import MUSIC_COMMANDS, handle_music_command, music_snapshot
 from music_storage import storage_tick, storage_snapshot
 try:
@@ -67,6 +71,7 @@ _last_heartbeat_error = ""
 _last_heartbeat_error_at = ""
 _last_server_version = ""
 COMMAND_POLL_INTERVAL_SEC = 5.0
+_executor: CommandExecutor | None = None
 
 
 class _ArchiveSyncWorker:
@@ -680,7 +685,6 @@ def _handle_workspace_command(
         return True
     except Exception as exc:
         store_command_result(command_id, False, f"{command_name}: {exc}")
-        print(f"[pc-client] {command_name} failed: {exc}", flush=True)
         return True
 
 
@@ -751,6 +755,125 @@ def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], co
         return None
 
 
+def _log_command(command_id: int, attempt: int, duration_ms: float, name: str) -> None:
+    print(
+        f"[pc-client] command id={command_id} attempt={attempt} dur_ms={duration_ms:.0f} name={name}",
+        flush=True,
+    )
+
+
+def _dispatch_agent_command(
+    job: dict[str, Any],
+    client: httpx.Client,
+    *,
+    config: dict[str, Any],
+    source_name: str,
+    archive_busy: bool,
+) -> str | None:
+    if job.get("kind") == "auto":
+        manifest = job.get("manifest") if isinstance(job.get("manifest"), dict) else {}
+        if job.get("installer"):
+            return _apply_installer_update(config, manifest, None)
+        return _apply_update(config, manifest, None)
+
+    command_id = int(job["id"])
+    command_name = str(job.get("command") or "")
+    command_payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    manifest = job.get("manifest") if isinstance(job.get("manifest"), dict) else None
+    installer_manifest = job.get("installer_manifest") if isinstance(job.get("installer_manifest"), dict) else None
+    started = time.perf_counter()
+    stop: str | None = None
+    try:
+        if command_name == "music_storage_sync":
+            storage_tick(config, DATA_ROOT, force=True)
+            store_command_result(command_id, True, "Синхронизация хранилища запрошена", storage_snapshot())
+        elif command_name in MUSIC_COMMANDS:
+            try:
+                music_details = handle_music_command(command_name, command_payload, config)
+                store_command_result(command_id, True, "Музыкальный плеер: команда принята", music_details)
+            except Exception as exc:
+                from music_player import MusicError
+                message = str(exc) if isinstance(exc, MusicError) else "Не удалось выполнить музыкальную команду. Проверьте аудиовыход Windows"
+                store_command_result(command_id, False, message, music_snapshot())
+        elif command_name == "lock":
+            _lock_workstation(command_id)
+        elif command_name == "sleep":
+            _sleep_workstation(command_id)
+        elif command_name in {"reboot", "shutdown"}:
+            _power_command(
+                command_id,
+                reboot=command_name == "reboot",
+                delay_sec=int(command_payload.get("delay_sec") or 0),
+            )
+        elif command_name == "ping":
+            latency = float(job.get("latency_ms") or 0)
+            store_command_result(
+                command_id,
+                True,
+                f"Соединение активно, задержка {latency:.0f} мс",
+                {"latency_ms": round(latency, 1)},
+            )
+        elif command_name == "open_archive":
+            _open_archive_folder(config, command_id)
+        elif command_name == "cleanup_archive":
+            if archive_busy:
+                store_command_result(command_id, False, "Архив ещё синхронизируется. Повторите очистку после завершения синхронизации.")
+            else:
+                result = cleanup_archive(config, force=True)
+                store_command_result(
+                    command_id,
+                    True,
+                    f"Локальный архив очищен: {result['removed_files']} файлов",
+                    result,
+                )
+        elif _handle_workspace_command(
+            command_name,
+            command_payload,
+            command_id=command_id,
+            config=config,
+            source_name=source_name,
+            client=client,
+        ):
+            pass
+        elif command_name == "check_update":
+            update_info = installer_manifest if is_installer_build() else manifest
+            available = bool(update_info and update_info.get("available"))
+            version = str((update_info or {}).get("version") or current_version())
+            store_command_result(
+                command_id,
+                True,
+                f"Доступно обновление {version}" if available else "Версия уже актуальна",
+                {"available": available, "version": version},
+            )
+        elif command_name == "restart":
+            stop = _restart_agent(config, command_id)
+        elif command_name == "update":
+            if is_installer_build() and installer_manifest and installer_manifest.get("available"):
+                stop = _apply_installer_update(config, installer_manifest, command_id)
+            elif not is_installer_build() and manifest and manifest.get("available"):
+                stop = _apply_update(config, manifest, command_id)
+            else:
+                store_command_result(command_id, True, "Версия уже актуальна")
+        else:
+            store_command_result(command_id, False, f"Неизвестная команда агента: {command_name or 'empty'}")
+    except Exception:
+        store_command_result(command_id, False, "Команда агента не выполнена")
+    finally:
+        try:
+            attempt = max(1, int(job.get("attempt") or 1))
+        except (TypeError, ValueError):
+            attempt = 1
+        _log_command(command_id, attempt, (time.perf_counter() - started) * 1000, command_name)
+    return stop
+
+
+def wait_for_agent_commands(timeout: float = 2.0) -> bool:
+    executor = _executor
+    if executor is None:
+        return True
+    return executor.wait(timeout)
+
+
 def run_agent(config: dict[str, Any]) -> str:
     global _last_heartbeat_error, _last_heartbeat_error_at, _last_heartbeat_latency_ms, _last_server_version
     endpoint = f"{config['server_url'].rstrip('/')}/agent/heartbeat"
@@ -781,234 +904,195 @@ def run_agent(config: dict[str, Any]) -> str:
         flush=True,
     )
 
-    failed_auto_revision = ""
     consecutive_failures = 0
     sleep_seconds = 0.0
     telemetry: dict[str, Any] | None = None
     telemetry_collected_at = 0.0
     last_successful_heartbeat_at = 0.0
     archive_worker = _ArchiveSyncWorker()
-    with create_http_client(
-        str(config["server_url"]),
-        timeout=20,
-        trust_env=trust_env_proxy,
-    ) as client:
-        while True:
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
-            if telemetry is None or time.monotonic() - telemetry_collected_at >= interval_sec:
-                telemetry = build_payload({**config, "source_name": source_name, "source_type": source_type})
-                telemetry_collected_at = time.monotonic()
-            payload = {
-                **telemetry,
-                "command_results": load_command_results(),
-                "archive_cursor": archive_cursor(config),
-                "last_error": _last_heartbeat_error,
-                "last_error_at": _last_heartbeat_error_at,
-                "server_version_seen": _last_server_version,
-                "music_player": music_snapshot(),
-                "music_storage": storage_snapshot(),
-            }
-            sent_result_ids = [
-                int(item.get("id"))
-                for item in payload.get("command_results", [])
-                if str(item.get("id", "")).isdigit()
-            ]
-            try:
-                heartbeat_started = time.perf_counter()
-                response = client.post(endpoint, headers=headers, json=payload)
-                _last_heartbeat_latency_ms = (time.perf_counter() - heartbeat_started) * 1000
-                response.raise_for_status()
-                body = _parse_json_body(response)
-                if not isinstance(body, dict):
-                    content_type = response.headers.get("content-type", "")
-                    preview = _response_preview(response.text)
-                    raise RuntimeError(
-                        "heartbeat failed: backend returned non-JSON response. "
-                        f"Check server URL ({config['server_url']}). "
-                        f"content-type={content_type!r}, body={preview!r}"
+
+    def handler(job: dict[str, Any], command_client: httpx.Client) -> str | None:
+        return _dispatch_agent_command(
+            job,
+            command_client,
+            config=config,
+            source_name=source_name,
+            archive_busy=archive_worker.busy,
+        )
+
+    executor = CommandExecutor(handler, server_url=str(config["server_url"]), trust_env=trust_env_proxy)
+    global _executor
+    _executor = executor
+    try:
+        with create_http_client(
+            str(config["server_url"]),
+            timeout=20,
+            trust_env=trust_env_proxy,
+        ) as client:
+            while True:
+                if executor.stop_reason:
+                    return executor.stop_reason
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+                if executor.stop_reason:
+                    return executor.stop_reason
+                if telemetry is None or time.monotonic() - telemetry_collected_at >= interval_sec:
+                    telemetry = build_payload({**config, "source_name": source_name, "source_type": source_type})
+                    telemetry_collected_at = time.monotonic()
+                payload = {
+                    **telemetry,
+                    "command_results": load_command_results(),
+                    "archive_cursor": archive_cursor(config),
+                    "last_error": _last_heartbeat_error,
+                    "last_error_at": _last_heartbeat_error_at,
+                    "server_version_seen": _last_server_version,
+                    "music_player": music_snapshot(),
+                    "music_storage": storage_snapshot(),
+                }
+                sent_result_ids = [
+                    int(item.get("id"))
+                    for item in payload.get("command_results", [])
+                    if str(item.get("id", "")).isdigit()
+                ]
+                try:
+                    heartbeat_started = time.perf_counter()
+                    response = client.post(endpoint, headers=headers, json=payload)
+                    _last_heartbeat_latency_ms = (time.perf_counter() - heartbeat_started) * 1000
+                    response.raise_for_status()
+                    body = _parse_json_body(response)
+                    if not isinstance(body, dict):
+                        content_type = response.headers.get("content-type", "")
+                        preview = _response_preview(response.text)
+                        raise RuntimeError(
+                            "heartbeat failed: backend returned non-JSON response. "
+                            f"Check server URL ({config['server_url']}). "
+                            f"content-type={content_type!r}, body={preview!r}"
+                        )
+                    _last_server_version = str(body.get("server_version") or "")[:32]
+                    msg = (
+                        f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')} "
+                        f"latency={_last_heartbeat_latency_ms:.0f}ms"
                     )
-                _last_server_version = str(body.get("server_version") or "")[:32]
-                msg = (
-                    f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')} "
-                    f"latency={_last_heartbeat_latency_ms:.0f}ms"
-                )
-                if body.get("new_source"):
-                    msg += " | новый агент зарегистрирован"
-                last_successful_heartbeat_at = time.time()
-                write_agent_status(
-                    "online",
-                    detail=msg,
-                    server_time=str(body.get("server_time") or ""),
-                    latency_ms=round(_last_heartbeat_latency_ms, 1),
-                    agent_version=current_version(),
-                    server_version=_last_server_version,
-                    last_error="",
-                    heartbeat_at=last_successful_heartbeat_at,
-                )
-                print(msg, flush=True)
-                consecutive_failures = 0
-                _last_heartbeat_error = ""
-                _last_heartbeat_error_at = ""
-                sleep_seconds = min(float(interval_sec), COMMAND_POLL_INTERVAL_SEC)
-                commands = body.get("commands") if isinstance(body.get("commands"), list) else []
-                if sent_result_ids:
-                    still_pending = {
-                        int(command.get("id"))
-                        for command in commands
-                        if isinstance(command, dict) and str(command.get("id", "")).isdigit()
-                    }
-                    clear_command_results([item for item in sent_result_ids if item not in still_pending])
+                    if body.get("new_source"):
+                        msg += " | новый агент зарегистрирован"
+                    last_successful_heartbeat_at = time.time()
+                    write_agent_status(
+                        "online",
+                        detail=msg,
+                        server_time=str(body.get("server_time") or ""),
+                        latency_ms=round(_last_heartbeat_latency_ms, 1),
+                        agent_version=current_version(),
+                        server_version=_last_server_version,
+                        last_error="",
+                        heartbeat_at=last_successful_heartbeat_at,
+                    )
+                    print(msg, flush=True)
+                    consecutive_failures = 0
+                    _last_heartbeat_error = ""
+                    _last_heartbeat_error_at = ""
+                    sleep_seconds = min(float(interval_sec), COMMAND_POLL_INTERVAL_SEC)
+                    commands = body.get("commands") if isinstance(body.get("commands"), list) else []
+                    if sent_result_ids:
+                        still_pending = {
+                            int(command.get("id"))
+                            for command in commands
+                            if isinstance(command, dict) and str(command.get("id", "")).isdigit()
+                        }
+                        clear_command_results([item for item in sent_result_ids if item not in still_pending])
 
-                manifest = body.get("update") if isinstance(body.get("update"), dict) else None
-                installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
-                config["archive_enabled"] = bool(body.get("archive_enabled"))
-                storage_tick(config, DATA_ROOT)
-                update_command_id: int | None = None
-                for command in commands:
-                    if not isinstance(command, dict):
-                        continue
-                    try:
-                        command_id = int(command.get("id"))
-                    except (TypeError, ValueError):
-                        continue
-                    command_name = str(command.get("command") or "").strip().lower()
-                    command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-                    if not _command_needs_execution(command_id):
-                        continue
-                    # Persist before execution. If the process dies after a power or
-                    # lock command, the same server delivery cannot execute it twice.
-                    mark_command_processed(command_id, command_name)
-                    if command_name == "music_storage_sync":
-                        storage_tick(config, DATA_ROOT, force=True)
-                        store_command_result(command_id, True, "Синхронизация хранилища запрошена", storage_snapshot())
-                        continue
-                    if command_name in MUSIC_COMMANDS:
-                        try:
-                            music_details = handle_music_command(command_name, command_payload, config)
-                            store_command_result(command_id, True, "Музыкальный плеер: команда принята", music_details)
-                        except Exception as exc:
-                            from music_player import MusicError
-                            message = str(exc) if isinstance(exc, MusicError) else "Не удалось выполнить музыкальную команду. Проверьте аудиовыход Windows"
-                            store_command_result(command_id, False, message, music_snapshot())
-                        continue
-                    if command_name == "lock":
-                        _lock_workstation(command_id)
-                        continue
-                    if command_name == "sleep":
-                        _sleep_workstation(command_id)
-                        continue
-                    if command_name in {"reboot", "shutdown"}:
-                        _power_command(
-                            command_id,
-                            reboot=command_name == "reboot",
-                            delay_sec=int(command_payload.get("delay_sec") or 0),
-                        )
-                        continue
-                    if command_name == "ping":
-                        store_command_result(
-                            command_id,
-                            True,
-                            f"Соединение активно, задержка {_last_heartbeat_latency_ms:.0f} мс",
-                            {"latency_ms": round(_last_heartbeat_latency_ms, 1)},
-                        )
-                        continue
-                    if command_name == "open_archive":
-                        _open_archive_folder(config, command_id)
-                        continue
-                    if command_name == "cleanup_archive":
-                        if archive_worker.busy:
-                            store_command_result(command_id, False, "Архив ещё синхронизируется. Повторите очистку после завершения синхронизации.")
+                    manifest = body.get("update") if isinstance(body.get("update"), dict) else None
+                    installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
+                    config["archive_enabled"] = bool(body.get("archive_enabled"))
+                    storage_tick(config, DATA_ROOT)
+                    batch = executor.next_batch()
+                    accepted = False
+                    chosen_update: dict[str, Any] | None = None
+                    duplicate_updates: list[dict[str, Any]] = []
+                    for command in commands:
+                        if not isinstance(command, dict):
                             continue
-                        result = cleanup_archive(config, force=True)
-                        store_command_result(
-                            command_id,
-                            True,
-                            f"Локальный архив очищен: {result['removed_files']} файлов",
-                            result,
-                        )
-                        continue
-                    if _handle_workspace_command(
-                        command_name,
-                        command_payload,
-                        command_id=command_id,
-                        config=config,
-                        source_name=source_name,
-                        client=client,
-                    ):
-                        continue
-                    if command_name == "check_update":
-                        update_info = installer_manifest if is_installer_build() else manifest
-                        available = bool(update_info and update_info.get("available"))
-                        version = str((update_info or {}).get("version") or current_version())
-                        store_command_result(
-                            command_id,
-                            True,
-                            f"Доступно обновление {version}" if available else "Версия уже актуальна",
-                            {"available": available, "version": version},
-                        )
-                        continue
-                    if command_name == "restart":
-                        return _restart_agent(config, command_id)
-                    if command_name == "update":
-                        if update_command_id is None:
-                            update_command_id = command_id
+                        try:
+                            command_id = int(command.get("id"))
+                        except (TypeError, ValueError):
+                            continue
+                        command_name = str(command.get("command") or "").strip().lower()
+                        command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+                        try:
+                            attempt = max(1, int(command.get("attempt")))
+                        except (TypeError, ValueError):
+                            attempt = 1
+                        job = {
+                            "kind": "command",
+                            "id": command_id,
+                            "command": command_name,
+                            "payload": command_payload,
+                            "attempt": attempt,
+                            "batch": batch,
+                            "manifest": manifest,
+                            "installer_manifest": installer_manifest,
+                            "latency_ms": _last_heartbeat_latency_ms,
+                        }
+                        # Update runs after the other commands from this response, on the worker.
+                        if command_name == "update":
+                            if chosen_update is None:
+                                chosen_update = job
+                            else:
+                                duplicate_updates.append(job)
+                            continue
+                        if executor.accept(job) == "queued":
+                            accepted = True
+                    saw_update = False
+                    if chosen_update is not None:
+                        outcome = executor.accept(chosen_update)
+                        if outcome == "skipped":
+                            for duplicate in duplicate_updates:
+                                outcome = executor.accept(duplicate)
+                                if outcome == "queued":
+                                    accepted = True
+                                if outcome != "skipped":
+                                    chosen_update = duplicate
+                                    saw_update = True
+                                    break
+                            duplicate_updates = duplicate_updates[duplicate_updates.index(chosen_update) + 1:] if saw_update else []
                         else:
-                            store_command_result(
-                                command_id,
-                                False,
-                                f"Повторный запрос обновления отменён: выполняется команда №{update_command_id}.",
-                                {"duplicate_of": update_command_id},
-                            )
-                        continue
-                    store_command_result(command_id, False, f"Неизвестная команда агента: {command_name or 'empty'}")
-
-                if update_command_id is not None:
-                    if is_installer_build() and installer_manifest and installer_manifest.get("available"):
-                        update_result = _apply_installer_update(config, installer_manifest, update_command_id)
-                        if update_result:
-                            return update_result
-                    elif not is_installer_build() and manifest and manifest.get("available"):
-                        update_result = _apply_update(config, manifest, update_command_id)
-                        if update_result:
-                            return update_result
-                    else:
-                        store_command_result(update_command_id, True, "Версия уже актуальна")
-                elif is_installer_build() and installer_manifest and installer_manifest.get("available") and bool(config.get("auto_update", True)):
-                    revision = str(installer_manifest.get("revision") or "")
-                    if revision and revision != failed_auto_revision:
-                        update_result = _apply_installer_update(config, installer_manifest, None)
-                        if update_result:
-                            return update_result
-                        failed_auto_revision = revision
-                elif manifest and manifest.get("available") and bool(config.get("auto_update", True)):
-                    revision = str(manifest.get("revision") or "")
-                    if revision and revision != failed_auto_revision:
-                        update_result = _apply_update(config, manifest, None)
-                        if update_result:
-                            return update_result
-                        failed_auto_revision = revision
-                archive_worker.submit(config, body, headers)
-                if load_command_results():
-                    # Acknowledge promptly instead of waiting another telemetry interval.
-                    sleep_seconds = 0.1
-            except Exception as exc:
-                error = f"[pc-client] heartbeat failed: {exc}"
-                _last_heartbeat_error = str(exc)[:1000]
-                _last_heartbeat_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                write_agent_status(
-                    "offline",
-                    detail=error,
-                    latency_ms=round(_last_heartbeat_latency_ms, 1),
-                    agent_version=current_version(),
-                    server_version=_last_server_version,
-                    last_error=str(exc)[:1000],
-                    heartbeat_at=last_successful_heartbeat_at,
-                )
-                print(error, flush=True)
-                consecutive_failures += 1
-                base_delay = min(90.0, 3.0 * (2 ** min(consecutive_failures - 1, 5)))
-                sleep_seconds = base_delay + random.uniform(0.0, min(3.0, base_delay * 0.2))
+                            saw_update = True
+                            if outcome == "queued":
+                                accepted = True
+                        if saw_update and chosen_update is not None:
+                            for duplicate in duplicate_updates:
+                                executor.complete_duplicate(duplicate, int(chosen_update["id"]))
+                    if not saw_update and is_installer_build() and installer_manifest and installer_manifest.get("available") and bool(config.get("auto_update", True)):
+                        revision = str(installer_manifest.get("revision") or "")
+                        if revision:
+                            executor.submit_auto({"manifest": installer_manifest, "installer": True, "revision": revision})
+                    elif not saw_update and manifest and manifest.get("available") and bool(config.get("auto_update", True)):
+                        revision = str(manifest.get("revision") or "")
+                        if revision:
+                            executor.submit_auto({"manifest": manifest, "installer": False, "revision": revision})
+                    archive_worker.submit(config, body, headers)
+                    if load_command_results() or accepted:
+                        # Acknowledge promptly instead of waiting another telemetry interval.
+                        sleep_seconds = 0.1
+                except Exception as exc:
+                    error = f"[pc-client] heartbeat failed: {exc}"
+                    _last_heartbeat_error = str(exc)[:1000]
+                    _last_heartbeat_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    write_agent_status(
+                        "offline",
+                        detail=error,
+                        latency_ms=round(_last_heartbeat_latency_ms, 1),
+                        agent_version=current_version(),
+                        server_version=_last_server_version,
+                        last_error=str(exc)[:1000],
+                        heartbeat_at=last_successful_heartbeat_at,
+                    )
+                    print(error, flush=True)
+                    consecutive_failures += 1
+                    base_delay = min(90.0, 3.0 * (2 ** min(consecutive_failures - 1, 5)))
+                    sleep_seconds = base_delay + random.uniform(0.0, min(3.0, base_delay * 0.2))
+    finally:
+        executor.close()
+        _executor = None
 
 
 def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:

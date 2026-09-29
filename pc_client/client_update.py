@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -575,6 +576,9 @@ def launch_update_helper(
         pass
 
 
+_RESULTS_LOCK = threading.Lock()
+
+
 def load_command_results() -> list[dict[str, Any]]:
     try:
         payload = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))
@@ -584,15 +588,17 @@ def load_command_results() -> list[dict[str, Any]]:
 
 
 def store_command_result(command_id: int, ok: bool, message: str, details: dict[str, Any] | None = None) -> None:
-    rows = [row for row in load_command_results() if int(row.get("id", -1)) != int(command_id)]
-    rows.append({"id": int(command_id), "ok": bool(ok), "message": str(message)[:1000], "details": details or {}})
-    atomic_write_json(RESULTS_PATH, rows[-50:], backup=False)
+    with _RESULTS_LOCK:
+        rows = [row for row in load_command_results() if int(row.get("id", -1)) != int(command_id)]
+        rows.append({"id": int(command_id), "ok": bool(ok), "message": str(message)[:1000], "details": details or {}})
+        atomic_write_json(RESULTS_PATH, rows[-50:], backup=False)
 
 
 def clear_command_results(command_ids: list[int]) -> None:
-    ids = {int(item) for item in command_ids}
-    remaining = [row for row in load_command_results() if int(row.get("id", -1)) not in ids]
-    if remaining:
-        atomic_write_json(RESULTS_PATH, remaining, backup=False)
-    elif RESULTS_PATH.exists():
-        RESULTS_PATH.unlink()
+    with _RESULTS_LOCK:
+        ids = {int(item) for item in command_ids}
+        remaining = [row for row in load_command_results() if int(row.get("id", -1)) not in ids]
+        if remaining:
+            atomic_write_json(RESULTS_PATH, remaining, backup=False)
+        elif RESULTS_PATH.exists():
+            RESULTS_PATH.unlink()
