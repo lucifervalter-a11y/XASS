@@ -250,6 +250,12 @@ def build_router(settings, require_owner, public_origin):
             query = query.order_by(MusicTrack.created_at.desc(), MusicTrack.id.desc())
         rows = list(await session.scalars(query.offset(offset).limit(limit)))
         playlists = list(await session.scalars(select(MusicPlaylist).order_by(MusicPlaylist.id.desc())))
+        # Songs nobody opened still need a cover fetch per row and a lyric job.
+        # The page the phone just loaded is the batch; the computer takes them one by one.
+        from app.music_transcription_api import _queue_lock
+        from app.services.transcription_queue import now_utc, queue_page_without_lyrics
+        async with _queue_lock:
+            await queue_page_without_lyrics(session, rows, user_id=getattr(user, "user_id", None), now=now_utc())
         return {"ok": True, "tracks": [track_json(item) for item in rows],
                 "total": total, "offset": offset, "has_more": offset + len(rows) < total,
                 "next_offset": offset + len(rows) if offset + len(rows) < total else None,

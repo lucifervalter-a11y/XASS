@@ -124,10 +124,11 @@ def load_whisper(device: str, threads: int, models: Path):
                         download_root=str(models / "whisper"))
 
 
-def transcribe(vocals: Path, language: str, device: str, threads: int, models: Path, duration_hint: float = 0) -> tuple[list[dict], str]:
-    model = load_whisper(device, threads, models)
+def transcribe(vocals: Path, language: str, device: str, threads: int, models: Path, duration_hint: float = 0,
+               vad_filter: bool = True, model=None) -> tuple[list[dict], str]:
+    model = model or load_whisper(device, threads, models)
     segments, info = model.transcribe(str(vocals), language=None if language in {"", "auto"} else language,
-                                      word_timestamps=True, vad_filter=True, beam_size=5,
+                                      word_timestamps=True, vad_filter=vad_filter, beam_size=5,
                                       condition_on_previous_text=False)
     total = float(getattr(info, "duration", 0) or duration_hint or 0)
     collected = []
@@ -136,6 +137,17 @@ def transcribe(vocals: Path, language: str, device: str, threads: int, models: P
         if total > 0:
             progress("transcribe", min(0.99, float(_get(segment, "end", 0) or 0) / total))
     return build_lines(collected), str(getattr(info, "language", "") or language)
+
+
+def hear(source: Path, vocals: Path, language: str, device: str, threads: int, models: Path) -> tuple[list[dict], str]:
+    """Vocals first. A sung or tuned vocal often disappears into the mix or the VAD."""
+    found_language = language
+    model = load_whisper(device, threads, models)
+    for target, vad in ((vocals, True), (vocals, False), (source, False)):
+        lines, found_language = transcribe(target, language, device, threads, models, vad_filter=vad, model=model)
+        if lines:
+            return lines, found_language
+    return [], found_language
 
 
 def run(args) -> dict:
@@ -157,13 +169,13 @@ def run(args) -> dict:
         vocals = separate_vocals(Path(args.input), workdir, device, args.threads)
     progress("transcribe", 0.0)
     try:
-        lines, language = transcribe(vocals, args.language, device, args.threads, models)
+        lines, language = hear(Path(args.input), vocals, args.language, device, args.threads, models)
     except GPU_ERRORS as exc:
         if device != "cuda":
             raise
         print(f"cuda transcription failed, falling back to cpu: {exc}", file=sys.stderr, flush=True)
         device = "cpu"
-        lines, language = transcribe(vocals, args.language, device, args.threads, models)
+        lines, language = hear(Path(args.input), vocals, args.language, device, args.threads, models)
     return {"lines": lines, "language": language, "model": MODEL, "device": device,
             "elapsed_sec": round(time.monotonic() - started, 1)}
 

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Base
 from app.models import AgentCredential, HeartbeatSource
-from app.music_models import MusicTrack
+from app.music_models import MusicEnrichment, MusicTrack
 from app.services import transcription_queue as tq
 from app.services.synced_lyrics import LyricsCache, resolve
 from app.transcription_models import TranscriptionJob, TranscriptionWorker
@@ -364,6 +364,31 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         job = (await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())).json()["job"]
         self.assertEqual(job["track_id"], track["id"])
         self.assertEqual((await self.request("GET", route)).json()["status"], "running")
+
+    async def test_library_page_queues_songs_without_text_and_retries_a_silent_one(self):
+        bare = await self.upload()
+        spoken = await self.upload(test_music_api.silent_wav(6))
+        missed = await self.upload(test_music_api.silent_wav(7))
+        async with self.sessions() as session:
+            session.add(MusicEnrichment(track_id=spoken["id"], fingerprint="x", original={},
+                                        result={"lyrics": {"text": "уже есть", "lines": [], "synced": False}},
+                                        owner_lyrics={}, checked_at=datetime.now(timezone.utc)))
+            session.add(TranscriptionJob(track_id=missed["id"], sha256="a" * 64, duration=7, language="ru",
+                                         state="failed", error="no_speech_detected", failed_workers=[], progress={},
+                                         result={}, created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc)))
+            await session.commit()
+        page = await self.request("GET", "/api/mini/music/library")
+        self.assertEqual(page.status_code, 200, page.text)
+        self.assertEqual(page.json()["total"], 3)
+        async with self.sessions() as session:
+            jobs = {job.track_id: job for job in await session.scalars(select(TranscriptionJob))}
+        self.assertEqual(jobs[bare["id"]].state, "queued")
+        self.assertNotIn(spoken["id"], jobs)
+        self.assertEqual(jobs[missed["id"]].state, "queued")
+        self.assertTrue(jobs[missed["id"]].result.get("retried_empty"))
+        await self.request("GET", "/api/mini/music/library")
+        async with self.sessions() as session:
+            self.assertEqual(len(list(await session.scalars(select(TranscriptionJob)))), 2)
 
     async def test_empty_catalog_lyrics_queue_the_pc_once(self):
         """Found recording, no words: the lyrics screen and Now Playing start the PC."""

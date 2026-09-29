@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.music_models import MusicTrack
+from app.music_models import MusicEnrichment, MusicTrack
 from app.transcription_models import TranscriptionJob, TranscriptionWorker
 
 WORKER_STALE_SEC = 75          # idle workers poll every ~20 s
@@ -337,6 +337,46 @@ async def queue_pc_if_no_lyrics(session, track_id: int, value, *, user_id: int |
     await request_job(session, track, language="ru", user_id=user_id, now=now)
     await session.commit()
     return True
+
+
+def _stored_lyrics(record: MusicEnrichment | None) -> bool:
+    if record is None:
+        return False
+    owner = record.owner_lyrics if isinstance(record.owner_lyrics, dict) else {}
+    if not owner.get("disabled") and str(owner.get("text") or "").strip():
+        return True
+    result = record.result if isinstance(record.result, dict) and not record.dismissed else {}
+    lyrics = result.get("lyrics") if isinstance(result.get("lyrics"), dict) else {}
+    return bool(str(lyrics.get("text") or "").strip())
+
+
+async def queue_page_without_lyrics(session, tracks, *, user_id: int | None, now: datetime) -> int:
+    """Queue this library page. Opening one song used to be the only way in."""
+    pending = [track for track in tracks if getattr(track, "id", None) and not getattr(track, "deleted", False)]
+    if not pending:
+        return 0
+    ids = [track.id for track in pending]
+    existing = {row.track_id: row for row in await session.scalars(select(TranscriptionJob).where(TranscriptionJob.track_id.in_(ids)))}
+    records = {row.track_id: row for row in await session.scalars(select(MusicEnrichment).where(MusicEnrichment.track_id.in_(ids)))}
+    created = 0
+    for track in pending:
+        job = existing.get(track.id)
+        if job is not None:
+            if (job.state == "failed" and str(job.error or "").startswith("no_speech")
+                    and not (job.result or {}).get("retried_empty")):
+                job.result = {**(job.result or {}), "retried_empty": True}
+                job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
+                job.finished_at, job.updated_at = None, now
+                created += 1
+            continue
+        if _stored_lyrics(records.get(track.id)):
+            continue
+        await request_job(session, track, language="ru", user_id=user_id, now=now)
+        created += 1
+    if created:
+        await schedule(session, now)
+        await session.commit()
+    return created
 
 
 def as_owner_lyrics(result: dict) -> dict:

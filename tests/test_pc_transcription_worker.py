@@ -554,6 +554,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(cleaned), 3)
         self.assertNotIn("DimaTorzok", " ".join(line["text"] for line in cleaned))
 
+    def test_hear_retries_a_silent_vocal_stem_on_the_original_mix(self):
+        calls = []
+
+        def fake(path, language, device, threads, models, duration_hint=0, vad_filter=True, model=None):
+            calls.append((Path(path).name, vad_filter))
+            if len(calls) < 3:
+                return [], "ru"
+            return [{"start": 0.0, "end": 1.0, "text": "я урал"}], "ru"
+
+        with patch.object(runner, "load_whisper", lambda *args, **kwargs: object()), patch.object(runner, "transcribe", fake):
+            lines, language = runner.hear(Path("song.mp3"), Path("vocals.wav"), "ru", "cpu", 1, Path("models"))
+        self.assertEqual(calls, [("vocals.wav", True), ("vocals.wav", False), ("song.mp3", False)])
+        self.assertEqual(lines[0]["text"], "я урал")
+        self.assertEqual(language, "ru")
+
     def fake_modules(self, *, cuda_fails=False):
         calls = {"demucs": [], "whisper": []}
 
