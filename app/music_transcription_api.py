@@ -98,7 +98,8 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
 
     async def agent(x_api_key: str | None = Header(default=None), session=Depends(get_session)):
         auth = await authenticate_agent_api_key(session, api_key=x_api_key,
-            global_agent_api_key=getattr(settings, "agent_api_key", ""))
+            global_agent_api_key=getattr(settings, "agent_api_key", ""),
+            global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)))
         if not auth:
             raise HTTPException(401, "Invalid agent key")
         if not auth.credential_id:

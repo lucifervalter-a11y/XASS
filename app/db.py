@@ -38,6 +38,26 @@ async def init_db() -> None:
         await connection.run_sync(_apply_runtime_migrations)
 
 
+def _column_is_unique(inspector, table: str, column: str) -> bool:
+    try:
+        constraints = inspector.get_unique_constraints(table)
+    except NotImplementedError:
+        constraints = []
+    for item in constraints:
+        if column in (item.get("column_names") or []):
+            return True
+    for item in inspector.get_indexes(table):
+        if item.get("unique") and column in (item.get("column_names") or []):
+            return True
+    return False
+
+
+def _ensure_unique_column(connection, inspector, table: str, column: str, index_name: str) -> None:
+    if _column_is_unique(inspector, table, column):
+        return
+    connection.execute(text(f"CREATE UNIQUE INDEX {index_name} ON {table} ({column})"))
+
+
 def _apply_runtime_migrations(connection) -> None:
     inspector = inspect(connection)
     datetime_type = "TIMESTAMP WITH TIME ZONE" if connection.dialect.name == "postgresql" else "DATETIME"
@@ -78,6 +98,10 @@ def _apply_runtime_migrations(connection) -> None:
         cred_columns = {item["name"] for item in inspector.get_columns("agent_credentials")}
         if "e2e_public_jwk" not in cred_columns:
             connection.execute(text("ALTER TABLE agent_credentials ADD COLUMN e2e_public_jwk TEXT"))
+        _ensure_unique_column(connection, inspector, "agent_credentials", "api_key_hash", "uq_agent_credentials_api_key_hash")
+        _ensure_unique_column(connection, inspector, "agent_credentials", "source_name", "uq_agent_credentials_source_name")
+    if "heartbeat_sources" in tables:
+        _ensure_unique_column(connection, inspector, "heartbeat_sources", "source_name", "uq_heartbeat_sources_source_name")
     if "app_config" not in tables:
         return
 

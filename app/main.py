@@ -62,6 +62,7 @@ from app.services.agent_pairing import (
     claim_pair_code_and_issue_key,
     dump_e2e_public_jwk,
     issue_pair_code,
+    require_explicit_global_agent_key,
     revoke_active_pair_codes,
 )
 from app.services.agent_updates import build_agent_package, build_update_manifest
@@ -679,6 +680,7 @@ async def _update_miniapp_menu_button(public_url: str) -> None:
 async def lifespan(_: FastAPI):
     if Path(".migration-pending").exists():
         raise RuntimeError("Migration is staged. Stop the source server, then run deploy/migrate.py activate")
+    require_explicit_global_agent_key(settings.agent_api_key, enabled=bool(getattr(settings, "agent_api_key_enabled", False)))
     ensure_data_dirs()
     ensure_profile_exists(Path(settings.profile_json_path))
     ensure_projects_exists(Path(settings.projects_json_path))
@@ -790,7 +792,7 @@ async def agent_update_manifest(
 ) -> dict[str, Any]:
     """Desktop update checks must never consume commands or impersonate a heartbeat."""
     auth = await authenticate_agent_api_key(
-        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key,
+        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -829,7 +831,7 @@ async def agent_heartbeat(
     auth = await authenticate_agent_api_key(
         session,
         api_key=x_api_key,
-        global_agent_api_key=settings.agent_api_key,
+        global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -1000,7 +1002,7 @@ async def agent_workspace_asset_upload(
     x_xass_filename: str | None = Header(default=None),
 ) -> dict[str, Any]:
     auth = await authenticate_agent_api_key(
-        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key,
+        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -1045,7 +1047,7 @@ async def agent_workspace_asset_download(
     x_xass_source: str | None = Header(default=None),
 ) -> FileResponse:
     auth = await authenticate_agent_api_key(
-        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key,
+        session, api_key=x_api_key, global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -1078,7 +1080,7 @@ async def agent_archive_media(
     auth = await authenticate_agent_api_key(
         session,
         api_key=x_api_key,
-        global_agent_api_key=settings.agent_api_key,
+        global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -1146,7 +1148,7 @@ async def _agent_update_package_response(
     auth = await authenticate_agent_api_key(
         session,
         api_key=x_api_key,
-        global_agent_api_key=settings.agent_api_key,
+        global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -1216,7 +1218,7 @@ async def agent_migration_export_download(
     auth = await authenticate_agent_api_key(
         session,
         api_key=x_api_key,
-        global_agent_api_key=settings.agent_api_key,
+        global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
@@ -1266,7 +1268,7 @@ async def agent_installer_download(
     auth = await authenticate_agent_api_key(
         session,
         api_key=x_api_key,
-        global_agent_api_key=settings.agent_api_key,
+        global_agent_api_key=settings.agent_api_key, global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
     )
     if auth is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")

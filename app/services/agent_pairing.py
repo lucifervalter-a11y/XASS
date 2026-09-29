@@ -5,13 +5,16 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import SourceType
 from app.models import AgentCredential, AgentPairCode, HeartbeatSource
 
 PAIR_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# Shared heartbeat key. Deprecated: new agents receive an issued ag_ key.
+DEFAULT_AGENT_API_KEY = "change-me-agent-key"
 
 
 def _now_utc() -> datetime:
@@ -198,6 +201,21 @@ async def revoke_active_pair_codes(session: AsyncSession) -> int:
     return len(rows)
 
 
+def global_agent_key_active(key: str | None, *, enabled: bool) -> str | None:
+    cleaned = (key or "").strip()
+    if not enabled or not cleaned or cleaned == DEFAULT_AGENT_API_KEY:
+        return None
+    return cleaned
+
+
+def require_explicit_global_agent_key(key: str | None, *, enabled: bool) -> None:
+    # An enabled shared key that is still the placeholder must not boot into a 401 oracle.
+    if not enabled:
+        return
+    if global_agent_key_active(key, enabled=True) is None:
+        raise RuntimeError("AGENT_API_KEY is empty or still the default; refusing to start")
+
+
 async def claim_pair_code_and_issue_key(
     session: AsyncSession,
     *,
@@ -212,51 +230,69 @@ async def claim_pair_code_and_issue_key(
 
     now = _now_utc()
     code_hash = _hash_secret(normalized_code)
-    pair = await session.scalar(
-        select(AgentPairCode).where(
-            AgentPairCode.code_hash == code_hash,
-            AgentPairCode.is_active.is_(True),
-            AgentPairCode.expires_at > now,
-        )
-    )
-    if pair is None:
-        raise PairingError("Pair code is invalid or expired")
-    if pair.used_count >= pair.max_uses:
-        pair.is_active = False
-        pair.consumed_at = pair.consumed_at or now
-        await session.commit()
-        raise PairingError("Pair code already used")
-
     candidate_name = normalize_source_name(source_name)
-    unique_source_name = await ensure_unique_source_name(session, candidate_name)
+    for _ in range(3):
+        # One UPDATE owns the code. A second claim sees rowcount 0.
+        claim = await session.execute(
+            update(AgentPairCode)
+            .where(
+                AgentPairCode.code_hash == code_hash,
+                AgentPairCode.is_active.is_(True),
+                AgentPairCode.expires_at > now,
+                AgentPairCode.used_count < AgentPairCode.max_uses,
+            )
+            .values(
+                used_count=AgentPairCode.used_count + 1,
+                is_active=AgentPairCode.used_count + 1 < AgentPairCode.max_uses,
+                consumed_at=case(
+                    (AgentPairCode.used_count + 1 >= AgentPairCode.max_uses, now),
+                    else_=AgentPairCode.consumed_at,
+                ),
+                updated_at=now,
+            )
+        )
+        if claim.rowcount != 1:
+            await session.rollback()
+            existing = await session.scalar(select(AgentPairCode).where(AgentPairCode.code_hash == code_hash))
+            if existing is not None and existing.used_count >= existing.max_uses:
+                raise PairingError("Pair code already used")
+            raise PairingError("Pair code is invalid or expired")
 
-    api_key = generate_agent_api_key()
-    credential = AgentCredential(
-        source_name=unique_source_name,
-        source_type=source_type.value,
-        api_key_hash=_hash_secret(api_key),
-        key_hint=_key_hint(api_key),
-        is_active=True,
-        created_by_user_id=pair.created_by_user_id,
-        issued_at=now,
-        e2e_public_jwk=dump_e2e_public_jwk(e2e_public_jwk),
-    )
-    session.add(credential)
-
-    pair.used_count += 1
-    if pair.used_count >= pair.max_uses:
-        pair.is_active = False
-        pair.consumed_at = now
-
-    await session.commit()
-    return PairClaimResult(
-        source_name=unique_source_name,
-        source_type=source_type,
-        agent_api_key=api_key,
-        issued_at=now,
-        key_hint=credential.key_hint,
-        owner_e2e_public_jwk=normalize_e2e_public_jwk(pair.owner_e2e_public_jwk),
-    )
+        pair = await session.scalar(
+            select(AgentPairCode)
+            .where(AgentPairCode.code_hash == code_hash)
+            .execution_options(populate_existing=True)
+        )
+        if pair is None:
+            await session.rollback()
+            raise PairingError("Pair code is invalid or expired")
+        unique_source_name = await ensure_unique_source_name(session, candidate_name)
+        api_key = generate_agent_api_key()
+        credential = AgentCredential(
+            source_name=unique_source_name,
+            source_type=source_type.value,
+            api_key_hash=_hash_secret(api_key),
+            key_hint=_key_hint(api_key),
+            is_active=True,
+            created_by_user_id=pair.created_by_user_id,
+            issued_at=now,
+            e2e_public_jwk=dump_e2e_public_jwk(e2e_public_jwk),
+        )
+        session.add(credential)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            continue
+        return PairClaimResult(
+            source_name=unique_source_name,
+            source_type=source_type,
+            agent_api_key=api_key,
+            issued_at=now,
+            key_hint=credential.key_hint,
+            owner_e2e_public_jwk=normalize_e2e_public_jwk(pair.owner_e2e_public_jwk),
+        )
+    raise PairingError("Pair code is invalid or expired")
 
 
 async def authenticate_agent_api_key(
@@ -264,12 +300,14 @@ async def authenticate_agent_api_key(
     *,
     api_key: str | None,
     global_agent_api_key: str,
+    global_key_enabled: bool = False,
 ) -> AgentAuthResult | None:
     key = (api_key or "").strip()
     if not key:
         return None
 
-    if global_agent_api_key and hmac.compare_digest(key, global_agent_api_key):
+    active_global = global_agent_key_active(global_agent_api_key, enabled=global_key_enabled)
+    if active_global is not None and hmac.compare_digest(key, active_global):
         return AgentAuthResult(mode="global")
 
     credential = await session.scalar(

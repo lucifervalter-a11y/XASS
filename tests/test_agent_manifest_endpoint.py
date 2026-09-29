@@ -33,7 +33,7 @@ class AgentManifestEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.context = ExitStack()
         self.context.enter_context(patch.dict(main.app.dependency_overrides, {main.get_session: get_session}))
-        self.context.enter_context(patch.object(main, "settings", SimpleNamespace(agent_api_key="global-key", profile_public_url="https://fallback.example/profile")))
+        self.context.enter_context(patch.object(main, "settings", SimpleNamespace(agent_api_key="global-key", agent_api_key_enabled=True, profile_public_url="https://fallback.example/profile")))
         self.config = SimpleNamespace(service_base_url="https://public.example/miniapp.php")
         self.context.enter_context(patch.object(main, "get_or_create_app_config", new=AsyncMock(return_value=self.config)))
         self.source = self.context.enter_context(patch.object(main, "build_update_manifest", return_value={"available": True, "distribution": "source"}))

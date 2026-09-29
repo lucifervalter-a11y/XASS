@@ -29,7 +29,7 @@ class LegacyMigrationDownloadTests(unittest.IsolatedAsyncioTestCase):
             await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=[AgentCredential.__table__, AgentCommand.__table__]))
         self.session = async_sessionmaker(self.engine, expire_on_commit=False)()
         self.addAsyncCleanup(self.session.close)
-        self.settings_patch = patch.object(main, "settings", SimpleNamespace(agent_api_key="shared-legacy-key", owner_user_id=42, agent_migration_export_dir=str(self.root)))
+        self.settings_patch = patch.object(main, "settings", SimpleNamespace(agent_api_key="shared-legacy-key", agent_api_key_enabled=True, owner_user_id=42, agent_migration_export_dir=str(self.root)))
         self.settings_patch.start()
         self.addCleanup(self.settings_patch.stop)
         for source, key in (("ПК владельца", "owner-pc-key"), ("Other PC", "other-pc-key")):

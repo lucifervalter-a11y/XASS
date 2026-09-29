@@ -189,7 +189,7 @@ uvicorn app.main:app --reload --port 8000
 | `BOT_TOKEN` | Токен Telegram‑бота из BotFather |
 | `OWNER_USER_ID` | Telegram ID владельца |
 | `DATABASE_URL` | PostgreSQL для production или SQLite для локального запуска |
-| `AGENT_API_KEY` | Резервный общий ключ heartbeat; новые ПК получают персональные ключи |
+| `AGENT_API_KEY` | Устарело. Общий ключ heartbeat выключен, пока `AGENT_API_KEY_ENABLED` не равен `true` и значение не является заглушкой. Новые ПК получают персональный ключ при привязке |
 | `PROFILE_PUBLIC_URL` | Публичный HTTPS‑адрес сайта и Mini App |
 | `USE_POLLING` | `true` для локального запуска без webhook |
 | `PWA_COOKIE_SECURE` | `true` на публичном HTTPS‑домене |
