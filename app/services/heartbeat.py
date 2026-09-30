@@ -65,7 +65,11 @@ async def process_heartbeat(
     payload: HeartbeatPayload,
 ) -> tuple[HeartbeatSource, bool, bool]:
     await ensure_agent_attached(session, payload.source_name)
-    source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == payload.source_name))
+    source = await session.scalar(
+        select(HeartbeatSource)
+        .where(HeartbeatSource.source_name == payload.source_name)
+        .with_for_update()
+    )
     recovered = False
     is_new = source is None
     now = _now_utc()

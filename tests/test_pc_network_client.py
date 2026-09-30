@@ -29,6 +29,23 @@ class PcNetworkClientTests(unittest.TestCase):
             network_client.create_http_client("https://xass.example", timeout=5)
         self.assertNotIn("transport", client.call_args.kwargs)
 
+    def test_https_resolver_skips_private_and_loopback_answers(self) -> None:
+        response = MagicMock()
+        response.json.return_value = {
+            "Answer": [
+                {"type": 1, "data": "127.0.0.1"},
+                {"type": 1, "data": "10.0.0.8"},
+                {"type": 1, "data": "169.254.1.1"},
+                {"type": 1, "data": "203.0.113.25"},
+            ]
+        }
+        with patch.object(network_client.httpx, "get", return_value=response):
+            self.assertEqual(network_client.resolve_https_ipv4("xass.example"), "203.0.113.25")
+
+    def test_literal_loopback_host_is_rejected(self) -> None:
+        self.assertEqual(network_client.resolve_https_ipv4("127.0.0.1"), "")
+        self.assertEqual(network_client.resolve_https_ipv4("10.1.2.3"), "")
+
     def test_backend_replaces_only_configured_hostname(self) -> None:
         backend = network_client._HostOverrideBackend({"xass.example": "203.0.113.25"})
         backend._backend = MagicMock()
