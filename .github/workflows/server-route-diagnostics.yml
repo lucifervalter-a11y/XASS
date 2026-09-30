@@ -30,12 +30,15 @@ jobs:
           set -euo pipefail
           cd /home/red/serverredus
           printf 'deployed_revision=%s\n' "$(git rev-parse HEAD)"
-          sudo systemctl show serverredus-backend \
+          systemctl show serverredus-backend \
             --property=MainPID --property=ExecStart --property=WorkingDirectory \
             --no-pager
+          backend_pid="$(systemctl show serverredus-backend --property=MainPID --value)"
+          printf 'process_cwd=%s\n' "$(readlink "/proc/$backend_pid/cwd" 2>/dev/null || printf unavailable)"
           printf '%s\n' '--- nginx route directives ---'
-          sudo nginx -T 2>&1 | grep -nE \
-            'configuration file|server_name[[:space:]]+redvps\.site|location.*agent|proxy_pass|proxy_hide_header|proxy_cache|proxy_ignore_headers|rewrite.*agent' \
+          grep -RnsE \
+            'server_name[[:space:]]+redvps\.site|location.*agent|proxy_pass|proxy_hide_header|proxy_cache|proxy_ignore_headers|rewrite.*agent' \
+            /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null \
             || true
           printf '%s\n' '--- checked-out backend contract ---'
           .venv/bin/python - <<'PY'
