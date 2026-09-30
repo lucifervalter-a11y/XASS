@@ -1,4 +1,4 @@
-const CACHE = 'xass-shell-v16';
+const CACHE = 'xass-shell-v17';
 const OFFLINE = '/offline.html';
 const SHELL = [
   OFFLINE,
