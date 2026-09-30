@@ -199,7 +199,7 @@ struct NativeRemoteFileTarget: Identifiable {
     /// Keep upload proof binding byte-for-byte compatible with the server's
     /// `safe_workspace_filename`; otherwise a weird filename could be approved
     /// under one value and stored under another.
-    static func workspaceFilename(_ value: String) -> String {
+    nonisolated static func workspaceFilename(_ value: String) -> String {
         let leaf = value.replacingOccurrences(of: "\\", with: "/").split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? ""
         let trimmed = leaf.trimmingCharacters(in: .whitespacesAndNewlines)
         let forbidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "<>:\"/\\|?*"))
