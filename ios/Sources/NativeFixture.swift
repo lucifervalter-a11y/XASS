@@ -40,8 +40,8 @@ import UIKit
         ["id": 6, "title": "Последний поезд", "artist": "Тестовая коллекция", "duration": 256]
     ]
     static let deviceData: [[String: Any]] = [
-        ["id": 1, "source_type": "PC_AGENT", "source_name": "Студия", "is_online": true, "agent_version": "0.17.0"],
-        ["id": 2, "source_type": "PC_AGENT", "source_name": "Ноутбук", "is_online": false, "agent_version": "0.17.0"]
+        ["id": 1, "source_type": "PC_AGENT", "source_name": "Студия", "is_online": true, "agent_version": "0.21.0"],
+        ["id": 2, "source_type": "PC_AGENT", "source_name": "Ноутбук", "is_online": false, "agent_version": "0.21.0"]
     ]
     static let playlistData: [[String: Any]] = [
         ["id": 1, "name": "Вечер", "track_ids": [1, 3, 5]]
@@ -52,7 +52,7 @@ import UIKit
         let components = URLComponents(string: path)
         let endpoint = components?.path ?? path
         if endpoint == "/api/mini/bootstrap" {
-            return ["ok": true, "sources": Self.deviceData, "app_version": "0.18.0",
+            return ["ok": true, "sources": Self.deviceData, "app_version": "0.21.0",
                     "user": ["first_name": "Артём", "is_owner": true],
                     "status": ["name": "Тестовый XASS"],
                     "metrics": ["cpu_percent": 12, "ram_used_percent": 38],

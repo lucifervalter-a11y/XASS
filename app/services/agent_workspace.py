@@ -72,7 +72,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _safe_filename(value: object, fallback: str) -> str:
+def safe_workspace_filename(value: object, fallback: str = "xass-file.bin") -> str:
     name = Path(str(value or "").replace("\\", "/")).name.strip()
     name = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", name).strip(" .")
     return (name or fallback)[:180]
@@ -157,7 +157,7 @@ def store_asset(
     temporary.write_bytes(body)
     os.replace(temporary, content_path)
     created_at = time.time()
-    safe_name = _safe_filename(filename, "screenshot.jpg" if normalized_kind == "screenshot" else "xass-file.bin")
+    safe_name = safe_workspace_filename(filename, "screenshot.jpg" if normalized_kind == "screenshot" else "xass-file.bin")
     metadata = {
         "token": token,
         "source_name": str(source_name)[:128],

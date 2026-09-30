@@ -1,5 +1,6 @@
 ﻿import argparse
 import ctypes
+import ipaddress
 import json
 import os
 import platform
@@ -46,7 +47,14 @@ from remote_tools import (
     receive_uploaded_file,
     upload_requested_file,
 )
-from network_client import create_http_client
+from network_client import (
+    activate_physical_fallback,
+    create_http_client,
+    invalidate_network_state,
+    network_signature,
+    preferred_connection,
+    require_secure_transport,
+)
 try:
     from agent_command_worker import CommandExecutor
 except ModuleNotFoundError:
@@ -72,6 +80,97 @@ _last_heartbeat_error_at = ""
 _last_server_version = ""
 COMMAND_POLL_INTERVAL_SEC = 5.0
 _executor: CommandExecutor | None = None
+
+
+class _HeartbeatClient:
+    """Rebuild the HTTP pool after a route/VPN failure without restarting XASS."""
+
+    def __init__(self, server_url: str, *, timeout: float, trust_env: bool) -> None:
+        self.server_url = server_url
+        parsed = urlsplit(server_url)
+        self._origin = (parsed.scheme.casefold(), str(parsed.hostname or "").casefold(),
+                        parsed.port or (443 if parsed.scheme.casefold() == "https" else 80))
+        self._https = self._origin[0] == "https"
+        self.timeout = timeout
+        self.trust_env = trust_env
+        self.prefer_system_dns = False
+        self.local_address = ""
+        self._network_signature = network_signature()
+        self._context = None
+        self._client = None
+
+    def __enter__(self):
+        self._open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._close(exc_type, exc, traceback)
+
+    def _open(self) -> None:
+        self._context = create_http_client(
+            self.server_url,
+            timeout=self.timeout,
+            trust_env=self.trust_env,
+            prefer_system_dns=self.prefer_system_dns,
+            local_address=self.local_address,
+        )
+        self._client = self._context.__enter__()
+
+    def _close(self, exc_type=None, exc=None, traceback=None) -> None:
+        context, self._context, self._client = self._context, None, None
+        if context is not None:
+            context.__exit__(exc_type, exc, traceback)
+
+    def post(self, *args, **kwargs):
+        target = args[0] if args else kwargs.get("url", "")
+        parsed = urlsplit(str(target or ""))
+        target_origin = (parsed.scheme.casefold(), str(parsed.hostname or "").casefold(),
+                         parsed.port or (443 if parsed.scheme.casefold() == "https" else 80))
+        if target_origin != self._origin:
+            raise ValueError("heartbeat target must use the configured server origin")
+        signature = network_signature()
+        if signature and self._network_signature and signature != self._network_signature:
+            # A route/adapter changed between heartbeats.  Avoid reusing a TLS
+            # socket tied to the old NIC.  When a physical LAN address exists,
+            # bind only this XASS client to it; global Windows routes stay
+            # untouched and certificate/SNI verification still uses the
+            # configured HTTPS hostname.
+            self._close()
+            invalidate_network_state(str(urlsplit(self.server_url).hostname or ""))
+            self.local_address = activate_physical_fallback(
+                self.server_url, trust_env=self.trust_env,
+            ) if self._https else ""
+            if self.local_address:
+                self.prefer_system_dns, self.local_address = preferred_connection(
+                    self.server_url, trust_env=self.trust_env,
+                )
+            else:
+                self.prefer_system_dns = False
+            self._network_signature = signature
+            self._open()
+        try:
+            return self._client.post(*args, **kwargs)
+        except httpx.TransportError as exc:
+            # A keep-alive socket and its DoH fallback belong to the old
+            # adapter.  Close both before the next heartbeat and alternate to
+            # Windows DNS, which is important for split-tunnel VPNs.
+            self._close(type(exc), exc, exc.__traceback__)
+            invalidate_network_state(str(urlsplit(self.server_url).hostname or ""))
+            selected = activate_physical_fallback(
+                self.server_url, trust_env=self.trust_env,
+            ) if self._https else ""
+            # Keep retrying through the currently verified physical adapter.
+            # Clearing it on every second failure made persistent VPN routes
+            # alternate between a working bound pool and a broken unbound one.
+            if selected:
+                self.prefer_system_dns, self.local_address = preferred_connection(
+                    self.server_url, trust_env=self.trust_env,
+                )
+            else:
+                self.local_address, self.prefer_system_dns = "", False
+            self._network_signature = network_signature()
+            self._open()
+            raise
 
 
 class _ArchiveSyncWorker:
@@ -121,9 +220,47 @@ def normalize_server_url(value: str) -> str:
         return "http://127.0.0.1:8001"
     if raw.startswith("http://") or raw.startswith("https://"):
         return raw.rstrip("/")
-    if ":" in raw:
-        return f"http://{raw}".rstrip("/")
-    return f"http://{raw}:8001".rstrip("/")
+    # A bare public host used to become HTTP, exposing the one-time pair code
+    # and the issued long-lived API key to every network hop.  Bare remote
+    # addresses are HTTPS now; plaintext stays convenient only on loopback.
+    loopback = False
+    has_port = False
+    try:
+        address = ipaddress.ip_address(raw.strip("[]"))
+        loopback = address.is_loopback
+        raw = f"[{address}]" if address.version == 6 else str(address)
+    except ValueError:
+        try:
+            parsed = urlsplit(f"//{raw}")
+            host = str(parsed.hostname or "")
+            has_port = parsed.port is not None
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = host.casefold() in {"localhost", "localhost.localdomain"}
+        except ValueError:
+            loopback = False
+    if loopback:
+        return f"http://{raw}{'' if has_port else ':8001'}".rstrip("/")
+    return f"https://{raw}".rstrip("/")
+
+
+def _allow_insecure_http(config: dict[str, Any] | None = None) -> bool:
+    value = (config or {}).get("allow_insecure_http", False)
+    if isinstance(value, str):
+        value = value.strip().casefold() in {"1", "true", "yes", "on"}
+    env = os.getenv("XASS_ALLOW_INSECURE_HTTP", "").strip().casefold()
+    return bool(value) or env in {"1", "true", "yes", "on"}
+
+
+def require_secret_transport(server_url: str, *, allow_insecure_http: bool = False) -> str:
+    """Reject credentials over remote plaintext unless development opted in."""
+
+    normalized = normalize_server_url(server_url)
+    return require_secure_transport(
+        normalized,
+        allow_insecure_http=bool(allow_insecure_http) or _allow_insecure_http(),
+    )
 
 
 def _response_preview(text: str, limit: int = 220) -> str:
@@ -154,13 +291,11 @@ def _build_server_candidates(value: str) -> list[str]:
     host = parsed.hostname
     candidates = [normalized]
     if parsed.scheme == "https":
-        candidates.extend(
-            [
-                f"https://{host}:8001",
-                f"http://{host}:8001",
-                f"http://{host}:8000",
-            ]
-        )
+        # Never turn a verified public origin into a plaintext API endpoint.
+        # VPN recovery is handled by binding the HTTPS socket to a physical
+        # adapter; changing the scheme would expose the paired agent key and
+        # command traffic on the network.
+        candidates.append(f"https://{host}:8001")
     else:
         candidates.extend(
             [
@@ -333,7 +468,9 @@ def claim_pair_code(
     source_name: str,
     source_type: str,
     e2e_public_jwk: dict[str, Any] | None = None,
+    allow_insecure_http: bool = False,
 ) -> dict[str, Any]:
+    server_url = require_secret_transport(server_url, allow_insecure_http=allow_insecure_http)
     endpoint = f"{server_url.rstrip('/')}/agent/pair/claim"
     payload = {
         "pair_code": pair_code.strip(),
@@ -401,6 +538,7 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
             source_name=source_name,
             source_type=source_type,
             e2e_public_jwk=staging.get("e2e_public_jwk"),
+            allow_insecure_http=_allow_insecure_http(existing),
         )
         api_key = str(result.get("agent_api_key") or "").strip()
         source_name = str(result.get("source_name") or source_name)
@@ -453,6 +591,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-only", action="store_true")
     parser.add_argument("--no-auto-update", action="store_true")
     parser.add_argument("--desktop-managed", action="store_true")
+    parser.add_argument("--allow-insecure-http", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -492,6 +631,9 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
         updated = True
     if args.desktop_managed:
         config["desktop_managed"] = True
+    if args.allow_insecure_http:
+        config["allow_insecure_http"] = True
+        updated = True
 
     pair_code = (args.pair_code or "").strip()
     if pair_code:
@@ -509,6 +651,7 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
             source_name=source_name,
             source_type=source_type,
             e2e_public_jwk=config.get("e2e_public_jwk"),
+            allow_insecure_http=_allow_insecure_http(config),
         )
         config["server_url"] = server_url
         config["api_key"] = str(result.get("agent_api_key") or "").strip()
@@ -701,6 +844,7 @@ def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: 
                 manifest,
                 api_key=str(config.get("api_key") or ""),
                 trust_env=bool(config.get("trust_env_proxy", False)),
+                allow_insecure_http=_allow_insecure_http(config),
                 progress=report,
             )
             operation.phase("verifying", "Пакет проверен")
@@ -735,6 +879,7 @@ def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], co
                 manifest,
                 api_key=str(config.get("api_key") or ""),
                 trust_env=bool(config.get("trust_env_proxy", False)),
+                allow_insecure_http=_allow_insecure_http(config),
                 progress=report,
             )
             operation.phase("verifying", "Установщик проверен")
@@ -876,7 +1021,11 @@ def wait_for_agent_commands(timeout: float = 2.0) -> bool:
 
 def run_agent(config: dict[str, Any]) -> str:
     global _last_heartbeat_error, _last_heartbeat_error_at, _last_heartbeat_latency_ms, _last_server_version
-    endpoint = f"{config['server_url'].rstrip('/')}/agent/heartbeat"
+    server_url = require_secret_transport(
+        str(config.get("server_url") or ""), allow_insecure_http=_allow_insecure_http(config),
+    )
+    config["server_url"] = server_url
+    endpoint = f"{server_url.rstrip('/')}/agent/heartbeat"
     headers = {"X-Api-Key": config["api_key"]}
     interval_sec = max(1, int(config.get("interval_sec", 30)))
     source_name = str(config.get("source_name") or socket.gethostname())
@@ -924,7 +1073,7 @@ def run_agent(config: dict[str, Any]) -> str:
     global _executor
     _executor = executor
     try:
-        with create_http_client(
+        with _HeartbeatClient(
             str(config["server_url"]),
             timeout=20,
             trust_env=trust_env_proxy,
@@ -1088,8 +1237,11 @@ def run_agent(config: dict[str, Any]) -> str:
                     )
                     print(error, flush=True)
                     consecutive_failures += 1
-                    base_delay = min(90.0, 3.0 * (2 ** min(consecutive_failures - 1, 5)))
-                    sleep_seconds = base_delay + random.uniform(0.0, min(3.0, base_delay * 0.2))
+                    # Adapter/VPN switches are usually brief.  Long 48–90 s
+                    # sleeps made the healthy agent look permanently offline
+                    # after the network was already back.
+                    base_delay = min(15.0, 1.0 * (2 ** min(consecutive_failures - 1, 4)))
+                    sleep_seconds = base_delay + random.uniform(0.0, min(1.0, base_delay * 0.15))
     finally:
         executor.close()
         _executor = None
@@ -1114,6 +1266,8 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
         config["auto_update"] = True
     if "desktop_managed" not in config:
         config["desktop_managed"] = False
+    if "allow_insecure_http" not in config:
+        config["allow_insecure_http"] = False
     if "archive_folder" not in config:
         config["archive_folder"] = ""
     if "archive_enabled" not in config:

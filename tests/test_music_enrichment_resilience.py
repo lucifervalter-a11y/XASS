@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import io
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
+
+from PIL import Image
 
 from app.music_enrichment_api import catalog_lookup
 from app.music_models import MusicEnrichment, MusicTrack
@@ -222,6 +225,91 @@ class MusicEnrichmentResilienceTests(unittest.IsolatedAsyncioTestCase):
             saved = await session.get(MusicEnrichment, track["id"])
             self.assertEqual(saved.owner_lyrics["text"], "Owner draft")
             self.assertTrue(saved.owner_lyrics["disabled"])
+
+    async def test_owner_can_store_clear_and_preserve_translation_and_transliteration(self):
+        track, route = await self.prepared()
+        lyrics_route = route.replace("/enrichment", "/lyrics")
+        companion_route = lyrics_route + "/companions"
+        self.assertEqual((await self.request("PUT", companion_route, headers={"x-test-owner": "guest"},
+                                            json={"translation": "Hello"})).status_code, 403)
+        saved = await self.request("PUT", companion_route, json={
+            "translation": "  Hello\r\nworld  ", "translation_language": "en",
+            "transliteration": "Privet mir", "transliteration_scheme": "user"})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["companions"]["translation"],
+                         {"text": "Hello\nworld", "language": "en", "source": "owner", "automatic": False})
+        self.assertTrue(saved.json()["enrichment"]["lyrics_transliteration_available"])
+        await self.request("PUT", lyrics_route, json={"text": "Новый текст", "source": "on_device_transcription"})
+        shown = (await self.request("GET", lyrics_route)).json()["lyrics"]
+        self.assertEqual(shown["companions"]["transliteration"]["text"], "Privet mir")
+        cleared = await self.request("PUT", companion_route, json={"translation": ""})
+        self.assertNotIn("translation", cleared.json()["companions"])
+        self.assertIn("transliteration", cleared.json()["companions"])
+
+    async def test_timed_lyrics_endpoint_aligns_companions_for_the_native_player_only_when_safe(self):
+        track, route = await self.prepared()
+        lyrics_route = route.replace("/enrichment", "/lyrics")
+        source = "[00:01.00]Первая строка\n[00:03.00]Вторая строка"
+        saved = await self.request("PUT", lyrics_route,
+                                   json={"text": source, "source": "on_device_transcription"})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        companions = await self.request("PUT", lyrics_route + "/companions", json={
+            "translation": "First line\nSecond line", "translation_language": "en",
+            "transliteration": "[00:01.00]Pervaya stroka\n[00:03.00]Vtoraya stroka",
+            "transliteration_scheme": "user",
+        })
+        self.assertEqual(companions.status_code, 200, companions.text)
+
+        timed = await self.request("GET", lyrics_route.replace("/lyrics", "/timed-lyrics"))
+        self.assertEqual(timed.status_code, 200, timed.text)
+        value = timed.json()["lyrics"]
+        self.assertEqual([row["translation"] for row in value["lines"]], ["First line", "Second line"])
+        self.assertEqual([row["pronunciation"] for row in value["lines"]],
+                         ["Pervaya stroka", "Vtoraya stroka"])
+        self.assertEqual(value["companions"]["translation"]["language"], "en")
+
+        # A partial edit remains available to fix, but is not displayed beside
+        # the wrong timed rows by the Swift client contract.
+        await self.request("PUT", lyrics_route + "/companions", json={"translation": "Only one line"})
+        mismatched = (await self.request("GET", lyrics_route.replace("/lyrics", "/timed-lyrics"))).json()["lyrics"]
+        self.assertTrue(all("translation" not in row for row in mismatched["lines"]))
+        self.assertEqual(mismatched["companions"]["translation"]["text"], "Only one line")
+        self.assertEqual([row["pronunciation"] for row in mismatched["lines"]],
+                         ["Pervaya stroka", "Vtoraya stroka"])
+
+    async def test_owner_artwork_upload_is_authenticated_bounded_normalized_and_revisioned(self):
+        track, route = await self.prepared()
+        endpoint = route.replace("/enrichment", "/artwork")
+        source = io.BytesIO()
+        Image.new("RGBA", (900, 600), (15, 30, 60, 120)).save(source, format="PNG")
+        body = source.getvalue()
+        for headers, expected in (({}, 401), ({"x-test-owner": "guest"}, 403)):
+            response = await self.request("PUT", endpoint, headers={**headers, "content-type": "image/png"}, content=body)
+            self.assertEqual(response.status_code, expected)
+        self.assertEqual((await self.request("PUT", endpoint, headers={**self.headers, "content-type": "image/svg+xml"},
+                                             content=b"<svg/>")).status_code, 415)
+        oversized = await self.request("PUT", endpoint, headers={**self.headers, "content-type": "image/png",
+            "content-length": str(8 * 1024 * 1024 + 1)}, content=b"")
+        self.assertEqual(oversized.status_code, 413)
+        self.assertEqual((await self.request("PUT", endpoint, headers={**self.headers, "content-type": "image/png"},
+                                             content=b"not an image")).status_code, 400)
+        response = await self.request("PUT", endpoint, headers={**self.headers, "content-type": "image/png"}, content=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        value = response.json()
+        self.assertEqual(value["artwork"]["source"], "owner")
+        self.assertFalse(value["artwork"]["automatic"])
+        self.assertTrue(value["enrichment"]["artwork_available"])
+        async with self.sessions() as session:
+            record = await session.get(MusicEnrichment, track["id"])
+            self.assertTrue(record.artwork_data.startswith(b"\xff\xd8\xff"))
+            self.assertLessEqual(len(record.artwork_data), 512 * 1024)
+            self.assertEqual(record.result["manual_artwork"]["source"], "owner")
+            first_revision = record.revision
+        again = await self.request("PUT", endpoint, headers={**self.headers, "content-type": "image/png"}, content=body)
+        self.assertGreater(again.json()["artwork"]["revision"], first_revision)
+        served = await self.request("GET", endpoint)
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(served.headers["content-type"], "image/jpeg")
 
 
 if __name__ == "__main__":

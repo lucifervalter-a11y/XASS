@@ -66,7 +66,7 @@ struct MusicPressStyle: ButtonStyle {
 }
 
 struct MusicCollection: Identifiable, Equatable {
-    enum Kind { case album, artist }
+    enum Kind: Equatable { case album, artist }
     let id: String
     let title: String
     let subtitle: String

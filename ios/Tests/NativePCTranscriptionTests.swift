@@ -74,7 +74,35 @@ final class NativePCTranscriptionTests: XCTestCase {
         XCTAssertEqual(model.status?.status, "queued")
         XCTAssertEqual(api.requests.first?.1, "POST")
         XCTAssertEqual(api.requests.first?.2?["language"] as? String, "ru")
+        XCTAssertEqual(api.requests.first?.2?["force"] as? Bool, false)
         model.stop()
         XCTAssertEqual(doneCalls, 0)
+    }
+
+    @MainActor func testForceTimingsRequestAndPlainLyricsPolicy() async throws {
+        XCTAssertTrue(PCTranscriptionRequestPolicy.needsForcedTimings(["lyrics": [
+            "text": "Первая строка\nВторая строка", "synced": false, "lines": []
+        ]]))
+        XCTAssertFalse(PCTranscriptionRequestPolicy.needsForcedTimings(["lyrics": [
+            "text": "Первая строка", "synced": true,
+            "lines": [["start": 1.0, "end": 2.0, "text": "Первая строка"]]
+        ]]))
+        let api = PCTranscriptionFixture()
+        api.statuses = [["ok": true, "status": "waiting_for_pc"]]
+        let model = PCTranscriptionModel()
+        model.request(api: api, trackID: 9, language: "auto", force: true) {}
+        for _ in 0..<100 where api.requests.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(api.requests.first?.2?["force"] as? Bool, true)
+        model.stop()
+    }
+
+    @MainActor func testFinishedInitialStatusIsNotReportedAsAnActivePoller() async throws {
+        let api = PCTranscriptionFixture()
+        api.statuses = [["ok": true, "status": "none"]]
+        let model = PCTranscriptionModel()
+        model.start(api: api, trackID: 9) { XCTFail("An idle status is not a completed transcription") }
+        for _ in 0..<100 where model.isPolling { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.isPolling)
+        XCTAssertEqual(model.status?.status, "none")
     }
 }

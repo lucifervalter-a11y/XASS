@@ -42,6 +42,12 @@ DANGEROUS_AGENT_COMMANDS = {
     "lock", "sleep", "reboot", "shutdown", "restart", "update",
     "cleanup_archive", "file_delete", "migration_download",
 }
+# These commands expose private workstation data or write a user-selected file.
+# They need the same fresh, payload-bound approval as destructive actions, but
+# remain a separate category for notifications and UI wording.
+SENSITIVE_AGENT_COMMANDS = {
+    "screenshot", "file_download", "clipboard_get", "file_upload",
+}
 
 
 def _now_utc() -> datetime:

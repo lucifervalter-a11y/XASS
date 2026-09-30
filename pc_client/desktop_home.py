@@ -10,10 +10,10 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageOps, ImageTk
 
-from desktop_widgets import ModernButton, RoundedPanel, icon_image, rounded_image
+from desktop_widgets import (
+    ACCENT as BLUE, BG, CARD, LILAC, LINE, MUTED, TEXT, EmptyState, ModernButton, RoundedPanel, icon_badge, icon_image, rounded_image,
+)
 
-BG, CARD, LINE = "#202022", "#2b2b2f", "#3b3b42"
-TEXT, MUTED, BLUE, LILAC = "#f5f5f7", "#b1b1bb", "#829cff", "#c495f4"
 CARD_NAME = "red!"
 
 
@@ -154,7 +154,7 @@ class HomeHero(tk.Canvas):
         self.itemconfigure(self._heading, text=greeting, font=self._title_font)
         self.itemconfigure(
             self._description,
-            text=f"{machine} · Локальное управление и подключение к XASS",
+            text=f"{machine} · Этот компьютер и подключение к XASS",
             width=max(250, int(width * .53)),
         )
 
@@ -200,17 +200,19 @@ class HomeGrid(tk.Frame):
 
 def build_home(app: Any) -> None:
     app.metric_bars = {}
-    status = RoundedPanel(app.content, bg=CARD, padx=22, pady=16)
-    status.pack(fill="x", pady=(0, 14))
-    _icon(status, "monitor", size=34).pack(side="left", padx=(0, 18))
+    status = RoundedPanel(app.content, bg=CARD, padx=20, pady=16)
+    status.pack(fill="x", pady=(0, 16))
+    icon_badge(status, "monitor", size=28).pack(side="left", padx=(0, 16))
     copy = tk.Frame(status, bg=CARD)
     copy.pack(side="left", fill="x", expand=True)
+    tk.Label(copy, text="Состояние", bg=CARD, fg=BLUE, font=("Segoe UI Semibold", 9)).pack(anchor="w")
     title = tk.Frame(copy, bg=CARD)
-    title.pack(fill="x")
+    title.pack(fill="x", pady=(4, 0))
     app.hero_dot = tk.Label(title, text="●", bg=CARD, fg=app.status_color, font=("Segoe UI", 11))
     app.hero_dot.pack(side="left", padx=(0, 8))
     app.home_connection_text = tk.StringVar()
-    tk.Label(title, textvariable=app.home_connection_text, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="left")
+    app.hero_status = tk.Label(title, textvariable=app.home_connection_text, bg=CARD, fg=app.status_color, font=("Segoe UI Semibold", 15))
+    app.hero_status.pack(side="left")
     detail = tk.StringVar()
     tk.Label(copy, textvariable=detail, bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", pady=(3, 0))
 
@@ -224,76 +226,80 @@ def build_home(app: Any) -> None:
     status_changed()
 
     app.home_hero = HomeHero(app.content, app)
-    app.home_hero.pack(fill="x", pady=(0, 14))
+    app.home_hero.pack(fill="x", pady=(0, 16))
 
     metrics = HomeGrid(app.content, breakpoint=760)
-    metrics.pack(fill="x", pady=(0, 12))
+    metrics.pack(fill="x", pady=(0, 16))
     for key, label, icon, variable, color in (
         ("cpu", "Процессор", "cpu", app.cpu_var, BLUE),
         ("memory", "Память", "memory", app.memory_var, LILAC),
         ("disk", "Диск", "disk", app.disk_var, BLUE),
     ):
-        card = RoundedPanel(metrics, bg=CARD, padx=18, pady=17)
+        card = RoundedPanel(metrics, bg=CARD, padx=18, pady=16)
         metrics.add(card)
-        _icon(card, icon, size=34, color=color).pack(side="left", padx=(0, 14))
+        icon_badge(card, icon, size=26, color=color).pack(side="left", padx=(0, 14))
         content = tk.Frame(card, bg=CARD)
         content.pack(side="left", fill="both", expand=True)
-        row = tk.Frame(content, bg=CARD)
-        row.pack(fill="x", pady=(0, 10))
-        tk.Label(row, text=label, bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(side="left")
-        tk.Label(row, textvariable=variable, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 12)).pack(side="right")
-        track = tk.Canvas(content, height=6, bg="#44444a", highlightthickness=0)
+        tk.Label(content, text=label, bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w")
+        tk.Label(content, textvariable=variable, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(2, 8))
+        track = tk.Canvas(content, height=6, bg="#3c3c48", highlightthickness=0)
         track.pack(fill="x")
         bar = track.create_rectangle(0, 0, 0, 6, fill=color, outline=color)
         app.metric_bars[key] = (track, bar)
     metrics.after_idle(metrics.arrange)
 
     actions = HomeGrid(app.content)
-    actions.pack(fill="x", pady=(0, 14))
+    actions.pack(fill="x", pady=(0, 16))
     for heading, subtitle, icon, target, color in (
         ("Команды", "Действия на этом ПК", "terminal", "commands", BLUE),
         ("Файлы и архив", "Локальные данные", "folder", "archive", LILAC),
         ("Обновления", "Версия и установка", "update", "updates", BLUE),
     ):
-        card = RoundedPanel(actions, bg=CARD, padx=18, pady=20)
+        card = RoundedPanel(actions, bg=CARD, padx=18, pady=18)
         actions.add(card)
-        tile_icon = _icon(card, icon, size=42, color=color)
+        tile_icon = icon_badge(card, icon, size=26, color=color)
         tile_icon.pack(side="left", padx=(0, 14))
-        arrow = _icon(card, "chevron", size=19)
+        arrow = _icon(card, "chevron", size=18)
         arrow.pack(side="right", padx=(8, 0))
         copy = tk.Frame(card, bg=CARD)
         copy.pack(side="left", fill="x", expand=True)
         button = ModernButton(copy, text=heading, command=lambda view=target: app.show_view(view),
                               bg=CARD, fg=TEXT, activebackground="#36363d",
-                              anchor="w", padx=4, pady=4, font=("Segoe UI Semibold", 12))
+                              anchor="w", padx=0, pady=2, font=("Segoe UI Semibold", 14))
         button.pack(fill="x")
-        caption = tk.Label(copy, text=subtitle, bg=CARD, fg=MUTED, font=("Segoe UI", 10))
-        caption.pack(anchor="w", padx=4, pady=(4, 0))
-        # The entire tile is a target; the heading keeps keyboard focus/activation.
-        for surface in (card, card._background, copy, tile_icon, arrow, caption):
-            surface.configure(cursor="hand2")
-            surface.bind("<ButtonRelease-1>", lambda _event, view=target: app.show_view(view))
+        caption = tk.Label(copy, text=subtitle, bg=CARD, fg=MUTED, font=("Segoe UI", 11))
+        caption.pack(anchor="w", pady=(2, 0))
+
+        def bind_open(widget, view=target):
+            if isinstance(widget, ModernButton):
+                return
+            widget.configure(cursor="hand2")
+            widget.bind("<ButtonRelease-1>", lambda _event, item=view: app.show_view(item))
+            for child in widget.winfo_children():
+                bind_open(child, view)
+
+        bind_open(card)
     actions.after_idle(actions.arrange)
 
     music = RoundedPanel(app.content, bg=CARD, padx=18, pady=16)
-    music.pack(fill="x", pady=(0, 14))
-    _icon(music, "music", size=34, color=LILAC).pack(side="left", padx=(0, 14))
+    music.pack(fill="x", pady=(0, 16))
+    icon_badge(music, "music", size=26, color=LILAC).pack(side="left", padx=(0, 14))
     music_copy = tk.Frame(music, bg=CARD)
     music_copy.pack(side="left", fill="x", expand=True)
-    tk.Label(music_copy, text="Музыка", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(anchor="w")
-    tk.Label(music_copy, text="Файлы на этом ПК, без сервера", bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
+    tk.Label(music_copy, text="Музыка", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 15)).pack(anchor="w")
+    tk.Label(music_copy, text="Файлы на этом компьютере, без сервера", bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", pady=(2, 0))
     ModernButton(
         music, text="Открыть", command=lambda: app.show_view("music"),
         bg=BLUE, fg="#12131c", activebackground="#9aafff", padx=16, pady=8,
     ).pack(side="right")
 
-    event_card = RoundedPanel(app.content, bg=CARD, padx=20, pady=14)
+    event_card = RoundedPanel(app.content, bg=CARD, padx=20, pady=16)
     event_card.pack(fill="x")
     heading = tk.Frame(event_card, bg=CARD)
-    heading.pack(fill="x", pady=(0, 10))
-    tk.Label(heading, text="Последние события", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
+    heading.pack(fill="x", pady=(0, 12))
+    tk.Label(heading, text="Последние события", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 15)).pack(side="left")
     ModernButton(heading, text="Открыть журнал", command=lambda: app.show_view("journal"), bg=CARD,
-                 fg=BLUE, activebackground="#36363d", padx=7, pady=3, font=("Segoe UI", 10)).pack(side="right")
+                 fg=BLUE, activebackground="#36363d", padx=8, pady=4, font=("Segoe UI Semibold", 10)).pack(side="right")
     tk.Frame(event_card, bg=LINE, height=1).pack(fill="x")
     event_rows = tk.Frame(event_card, bg=CARD)
     event_rows.pack(fill="x")
@@ -305,16 +311,22 @@ def build_home(app: Any) -> None:
             child.destroy()
         recent = app.history[-2:][::-1]
         if not recent:
-            tk.Label(event_rows, text="События подключения и обновления появятся здесь.", bg=CARD, fg=MUTED,
-                     font=("Segoe UI", 10)).pack(anchor="w", pady=(14, 3))
+            EmptyState(
+                event_rows,
+                "Событий ещё нет",
+                "Подключение, команды и обновления появятся в этом списке.",
+                icon="journal",
+                framed=False,
+                bg=CARD,
+            ).pack(fill="x", pady=(8, 2))
         for entry in recent:
             line = tk.Frame(event_rows, bg=CARD)
-            line.pack(fill="x", pady=(11, 0))
+            line.pack(fill="x", pady=(12, 0))
             tk.Label(line, text="●", bg=CARD, fg=BLUE, font=("Segoe UI", 9)).pack(side="left", padx=(0, 12))
             safe = app._redact_log(entry)
-            tk.Label(line, text=safe[:8], bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(0, 18))
-            message = tk.Label(line, text=safe[10:][:180], bg=CARD, fg=MUTED, font=("Segoe UI", 9), anchor="w", justify="left")
+            tk.Label(line, text=safe[:8], bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(side="left", padx=(0, 16))
+            message = tk.Label(line, text=safe[10:][:180], bg=CARD, fg=TEXT, font=("Segoe UI", 11), anchor="w", justify="left")
             message.pack(side="left", fill="x", expand=True)
-            line.bind("<Configure>", lambda event, label=message: label.configure(wraplength=max(120, event.width - 110)))
+            line.bind("<Configure>", lambda event, label=message: label.configure(wraplength=max(120, event.width - 120)))
     app._render_home_events = render_events
     render_events()

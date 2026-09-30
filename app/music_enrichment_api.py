@@ -6,12 +6,13 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import re
 from types import SimpleNamespace
 from typing import Literal
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import update
 
@@ -20,6 +21,9 @@ from app.music_models import MusicEnrichment, MusicTrack
 from app.services.music_library import track_json
 from app.services.music_lyrics import empty_lyrics, parse_lyrics
 from app.services.music_query import filename_artist_title
+from app.services.agent_workspace import AssetUploadTooLarge, read_bounded_body
+
+MAX_OWNER_ARTWORK_BYTES = 8 * 1024 * 1024
 
 _locks = WeakValueDictionary()
 CATALOG_BUDGET_SECONDS = 18
@@ -56,13 +60,102 @@ def result_json(record):
     if record and record.dismissed:
         result = {"status": "disabled", "lyrics": empty_lyrics()}
     result["can_restore"] = bool(record and record.original and not record.dismissed)
-    result["artwork_available"] = bool(record and record.artwork_data and not record.dismissed)
+    result["artwork_available"] = stored_artwork_available(record)
     result["owner_lyrics_available"] = bool(record and (record.owner_lyrics or {}).get("text"))
     result["owner_lyrics_enabled"] = result["owner_lyrics_available"] and not bool(record.owner_lyrics.get("disabled"))
+    companions = lyrics_companions(record)
+    result["lyrics_translation_available"] = "translation" in companions
+    result["lyrics_transliteration_available"] = "transliteration" in companions
     if record and result.get("candidates"):
         result["candidate_token"] = hashlib.sha256(json.dumps([record.revision, record.fingerprint,
             result["candidates"]], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return result
+
+
+def lyrics_companions(record) -> dict:
+    """Return only bounded owner-authored companion text safe for clients."""
+    owner = record.owner_lyrics if record and isinstance(record.owner_lyrics, dict) else {}
+    raw = owner.get("companions") if isinstance(owner.get("companions"), dict) else {}
+    out = {}
+    for key in ("translation", "transliteration"):
+        item = raw.get(key)
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()[:64000]
+        if not text:
+            continue
+        # Companion text is never presented as provider-verified. Automatic
+        # translation/transliteration would require a separately configured,
+        # attributable provider; this endpoint stores only the owner's input.
+        value = {"text": text, "source": "owner", "automatic": False}
+        if key == "translation":
+            language = str(item.get("language") or "").strip()[:16]
+            if language:
+                value["language"] = language
+        else:
+            value["scheme"] = str(item.get("scheme") or "user")[:24]
+        out[key] = value
+    return out
+
+
+def with_aligned_lyrics_companions(lyrics: dict, companions: dict) -> dict:
+    """Attach owner companion text only when every displayed line aligns.
+
+    Timed companion LRC must match every base timestamp (within a small
+    formatting tolerance). Plain companion text must have exactly one non-empty
+    row per base row. A mismatch stays available in ``companions`` for editing,
+    but is never shown against the wrong sung line.
+    """
+    result = dict(lyrics or {})
+    if companions:
+        result["companions"] = companions
+    rows = result.get("lines")
+    if not isinstance(rows, list) or not rows or len(rows) > 2000:
+        return result
+    copied = [dict(row) if isinstance(row, dict) else {} for row in rows]
+    starts: list[float] = []
+    for row in copied:
+        raw = row.get("start", row.get("time"))
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+            return result
+        starts.append(float(raw))
+
+    for companion_key, line_key in (("translation", "translation"),
+                                    ("transliteration", "pronunciation")):
+        item = companions.get(companion_key) if isinstance(companions, dict) else None
+        text = str(item.get("text") or "") if isinstance(item, dict) else ""
+        parsed = parse_lyrics(text)
+        values: list[str] = []
+        if parsed.get("synced"):
+            timed = parsed.get("lines") if isinstance(parsed.get("lines"), list) else []
+            if len(timed) != len(copied):
+                continue
+            valid = True
+            for expected, row in zip(starts, timed):
+                raw_time = row.get("time") if isinstance(row, dict) else None
+                value = str(row.get("text") or "").strip() if isinstance(row, dict) else ""
+                if (isinstance(raw_time, bool) or not isinstance(raw_time, (int, float))
+                        or not math.isfinite(float(raw_time)) or abs(float(raw_time) - expected) > .75
+                        or not value):
+                    valid = False
+                    break
+                values.append(value[:500])
+            if not valid:
+                continue
+        else:
+            values = [line.strip()[:500] for line in str(parsed.get("text") or "").splitlines() if line.strip()]
+            if len(values) != len(copied):
+                continue
+        for row, value in zip(copied, values):
+            row[line_key] = value
+    result["lines"] = copied
+    return result
+
+
+def stored_artwork_available(record) -> bool:
+    result = record.result if record and isinstance(record.result, dict) else {}
+    manual = result.get("manual_artwork") if isinstance(result.get("manual_artwork"), dict) else {}
+    return bool(record and record.artwork_data and (not record.dismissed or manual.get("source") == "owner"))
 
 
 async def catalog_lookup(snapshot, candidate=None, *, refresh=False):
@@ -238,6 +331,13 @@ class LyricsSourceBody(BaseModel):
     source: Literal["catalog", "owner"]
 
 
+class LyricsCompanionBody(BaseModel):
+    translation: str | None = Field(default=None, max_length=64000)
+    translation_language: str | None = Field(default=None, pattern=r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2,8})?$")
+    transliteration: str | None = Field(default=None, max_length=64000)
+    transliteration_scheme: Literal["user", "iso9", "custom"] | None = None
+
+
 class CandidateBody(BaseModel):
     index: int = Field(ge=0, le=2, strict=True)
     candidate_token: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -326,10 +426,94 @@ def build_router(require_owner):
         if record is None:
             record = MusicEnrichment(track_id=track_id, fingerprint=fingerprint(track), original=identity(track), result={})
             session.add(record)
-        record.owner_lyrics = value
+        # Re-transcription replaces only the primary words/timing. A manually
+        # corrected translation or transliteration remains reversible data.
+        companions = lyrics_companions(record)
+        record.owner_lyrics = {**value, **({"companions": companions} if companions else {})}
         record.revision = (record.revision or 0) + 1
         await session.commit()
         return {"ok": True, "lyrics": value}
+
+    @router.put("/api/mini/music/tracks/{track_id}/lyrics/companions")
+    async def lyrics_companion(track_id: int, payload: LyricsCompanionBody,
+                               user=Depends(require_owner), session=Depends(get_session)):
+        if not payload.model_fields_set:
+            raise HTTPException(400, "Передайте перевод или транслитерацию.")
+        track = await lock_track_row(session, track_id)
+        record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+        if record is None:
+            record = MusicEnrichment(track_id=track_id, fingerprint=fingerprint(track),
+                                     original=identity(track), result={}, owner_lyrics={})
+            session.add(record)
+        owner = dict(record.owner_lyrics or {})
+        companions = lyrics_companions(record)
+        if "translation" in payload.model_fields_set:
+            text = str(payload.translation or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+            if text:
+                language = payload.translation_language or (companions.get("translation") or {}).get("language") or ""
+                companions["translation"] = {"text": text, "source": "owner", "automatic": False,
+                                             **({"language": language} if language else {})}
+            else:
+                companions.pop("translation", None)
+        elif "translation_language" in payload.model_fields_set:
+            if "translation" not in companions:
+                raise HTTPException(409, "Сначала сохраните перевод.")
+            companions["translation"]["language"] = payload.translation_language or ""
+        if "transliteration" in payload.model_fields_set:
+            text = str(payload.transliteration or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+            if text:
+                scheme = payload.transliteration_scheme or (companions.get("transliteration") or {}).get("scheme") or "user"
+                companions["transliteration"] = {"text": text, "scheme": scheme,
+                                                  "source": "owner", "automatic": False}
+            else:
+                companions.pop("transliteration", None)
+        elif "transliteration_scheme" in payload.model_fields_set:
+            if "transliteration" not in companions:
+                raise HTTPException(409, "Сначала сохраните транслитерацию.")
+            companions["transliteration"]["scheme"] = payload.transliteration_scheme or "user"
+        changed = owner.get("companions") != companions
+        if companions:
+            owner["companions"] = companions
+        else:
+            owner.pop("companions", None)
+        if changed:
+            record.owner_lyrics = owner
+            record.revision = (record.revision or 0) + 1
+        await session.commit()
+        return {"ok": True, "companions": companions, "enrichment": result_json(record)}
+
+    @router.put("/api/mini/music/tracks/{track_id}/artwork")
+    async def owner_artwork(track_id: int, request: Request,
+                            user=Depends(require_owner), session=Depends(get_session)):
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type not in {"image/jpeg", "image/png"}:
+            raise HTTPException(415, "Поддерживаются JPEG и PNG")
+        await find_track(session, track_id)
+        await session.rollback()
+        try:
+            source = await read_bounded_body(request, limit=MAX_OWNER_ARTWORK_BYTES)
+        except AssetUploadTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
+        from app.services.music_artwork import _jpeg_thumbnail
+        jpeg = await asyncio.to_thread(_jpeg_thumbnail, source)
+        if jpeg is None:
+            raise HTTPException(400, "Не удалось безопасно обработать изображение")
+        track = await lock_track_row(session, track_id)
+        record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+        if record is None:
+            record = MusicEnrichment(track_id=track_id, fingerprint=fingerprint(track), original=identity(track),
+                                     result={}, owner_lyrics={}, checked_at=datetime.now(timezone.utc))
+            session.add(record)
+        result = dict(record.result or {})
+        now = datetime.now(timezone.utc)
+        result["manual_artwork"] = {"source": "owner", "automatic": False, "updated_at": now.isoformat()}
+        record.result = result
+        record.artwork_data = jpeg
+        record.revision = (record.revision or 0) + 1
+        await session.commit()
+        return {"ok": True, "artwork": {"source": "owner", "automatic": False,
+                "content_type": "image/jpeg", "bytes": len(jpeg), "revision": record.revision},
+                "enrichment": result_json(record)}
 
     @router.patch("/api/mini/music/tracks/{track_id}/lyrics/source")
     async def lyrics_source(track_id: int, payload: LyricsSourceBody, user=Depends(require_owner), session=Depends(get_session)):

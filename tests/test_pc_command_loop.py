@@ -52,6 +52,88 @@ class PcCommandLoopTests(unittest.TestCase):
         if self.drain_commands:
             self.assertTrue(client_agent.wait_for_agent_commands(2), "command worker did not finish")
 
+    def test_heartbeat_rebuilds_pool_and_switches_dns_after_transport_failure(self) -> None:
+        first, second = MagicMock(), MagicMock()
+        first.post.side_effect = httpx.ConnectError("adapter changed")
+        second.post.return_value = "reconnected"
+        first_context, second_context = MagicMock(), MagicMock()
+        first_context.__enter__.return_value = first
+        second_context.__enter__.return_value = second
+        with patch.object(client_agent, "create_http_client", side_effect=[first_context, second_context]) as factory, \
+                patch.object(client_agent, "invalidate_network_state") as invalidate, \
+                patch.object(client_agent, "activate_physical_fallback", return_value="192.168.1.111"), \
+                patch.object(client_agent, "preferred_connection", return_value=(True, "192.168.1.111")), \
+                patch.object(client_agent, "network_signature", return_value=(("wi-fi", "192.168.1.111", True),)):
+            with client_agent._HeartbeatClient("https://xass.example", timeout=20, trust_env=False) as client:
+                with self.assertRaises(httpx.ConnectError):
+                    client.post("https://xass.example/agent/heartbeat")
+                self.assertEqual(client.post("https://xass.example/agent/heartbeat"), "reconnected")
+        self.assertFalse(factory.call_args_list[0].kwargs["prefer_system_dns"])
+        self.assertTrue(factory.call_args_list[1].kwargs["prefer_system_dns"])
+        self.assertEqual(factory.call_args_list[1].kwargs["local_address"], "192.168.1.111")
+        invalidate.assert_called_once_with("xass.example")
+
+    def test_heartbeat_never_sends_headers_to_another_origin(self) -> None:
+        context, raw = MagicMock(), MagicMock()
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context), \
+                patch.object(client_agent, "network_signature", return_value=()):
+            with client_agent._HeartbeatClient("https://xass.example", timeout=20, trust_env=False) as client:
+                with self.assertRaises(ValueError):
+                    client.post("https://attacker.example/collect", headers={"X-Api-Key": "secret"})
+        raw.post.assert_not_called()
+
+    def test_https_backend_discovery_never_downgrades_to_plaintext(self) -> None:
+        candidates = client_agent._build_server_candidates("https://redvps.site")
+        self.assertEqual(candidates, ["https://redvps.site", "https://redvps.site:8001"])
+        self.assertTrue(all(value.startswith("https://") for value in candidates))
+
+        raw = MagicMock()
+        raw.get.side_effect = httpx.ConnectError("unreachable")
+        context = MagicMock()
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context):
+            selected = client_agent.discover_backend_url("https://redvps.site")
+        self.assertEqual(selected, "https://redvps.site")
+        self.assertTrue(all(call.args[0].startswith("https://") for call in raw.get.call_args_list))
+
+    def test_bare_remote_server_defaults_to_https_but_loopback_stays_http(self) -> None:
+        self.assertEqual(client_agent.normalize_server_url("redvps.site"), "https://redvps.site")
+        self.assertEqual(client_agent.normalize_server_url("51.250.80.137"), "https://51.250.80.137")
+        self.assertEqual(client_agent.normalize_server_url("redvps.site:8001"), "https://redvps.site:8001")
+        self.assertEqual(client_agent.normalize_server_url("127.0.0.1"), "http://127.0.0.1:8001")
+        self.assertEqual(client_agent.normalize_server_url("localhost:9000"), "http://localhost:9000")
+
+    def test_pairing_refuses_remote_http_before_sending_code(self) -> None:
+        with patch.object(client_agent, "create_http_client") as factory, \
+                patch.dict(client_agent.os.environ, {"XASS_ALLOW_INSECURE_HTTP": ""}):
+            with self.assertRaisesRegex(RuntimeError, "не передаёт код привязки"):
+                client_agent.claim_pair_code(
+                    server_url="http://example.invalid:8001",
+                    pair_code="one-time-secret",
+                    source_name="PC",
+                    source_type="PC_AGENT",
+                )
+        factory.assert_not_called()
+
+    def test_remote_http_requires_explicit_development_opt_in(self) -> None:
+        self.assertEqual(
+            client_agent.require_secret_transport("http://example.invalid:8001", allow_insecure_http=True),
+            "http://example.invalid:8001",
+        )
+        self.assertEqual(
+            client_agent.require_secret_transport("http://127.0.0.1:8001"),
+            "http://127.0.0.1:8001",
+        )
+
+    def test_agent_refuses_remote_http_before_building_heartbeat_client(self) -> None:
+        config = {**self.config, "server_url": "http://example.invalid:8001"}
+        with patch.object(client_agent, "_HeartbeatClient") as heartbeat, \
+                patch.dict(client_agent.os.environ, {"XASS_ALLOW_INSECURE_HTTP": ""}):
+            with self.assertRaisesRegex(RuntimeError, "не передаёт код привязки"):
+                client_agent.run_agent(config)
+        heartbeat.assert_not_called()
+
     def run_responses(self, responses: list[dict | Exception]) -> None:
         pending = iter(responses)
         client = MagicMock()

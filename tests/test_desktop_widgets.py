@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from pc_client.desktop_widgets import (
-    ACCENT, BG, CARD, HOVER, ModernButton, NavButton, RoundedPanel, _icon_raster, rounded_image,
+    ACCENT, BG, CARD, HOVER, EmptyState, ModernButton, NavButton, RoundedPanel, _icon_raster, page_header, rounded_image,
 )
 
 
@@ -19,7 +19,7 @@ class DecorationTests(unittest.TestCase):
     def test_every_navigation_and_status_icon_has_visible_monoline_pixels(self):
         for name in ("home", "monitor", "link", "folder", "archive", "journal", "update", "settings",
                      "terminal", "cpu", "memory", "disk", "chevron", "globe", "shield", "play", "pause", "music",
-                     "previous", "next", "stop"):
+                     "previous", "next", "stop", "file"):
             with self.subTest(name=name):
                 icon = _icon_raster(name, 24, ACCENT)
                 self.assertEqual(icon.size, (24, 24))
@@ -107,6 +107,27 @@ class NativeWidgetTests(unittest.TestCase):
         nav.destroy()
         variable.set("No destroyed-widget callback")
         self.render()
+
+    def test_empty_state_and_page_header_share_one_type_scale(self):
+        header = page_header(self.root, "Подключение", "Свяжите этот компьютер.", kicker="Связь")
+        header.pack(fill="x")
+        blank = EmptyState(self.root, "В папке пока пусто", "Файлы появятся здесь.", icon="folder")
+        blank.pack(fill="x", pady=12)
+        inline = EmptyState(self.root, "Событий ещё нет", "Журнал соберёт их здесь.", icon="journal", framed=False, bg=CARD)
+        inline.pack(fill="x")
+        self.render()
+        texts = []
+
+        def walk(widget):
+            if isinstance(widget, tk.Label) and widget.cget("text"):
+                texts.append(str(widget.cget("text")))
+            for child in widget.winfo_children():
+                walk(child)
+
+        walk(self.root)
+        for expected in ("Связь", "Подключение", "Свяжите этот компьютер.", "В папке пока пусто", "Файлы появятся здесь.", "Событий ещё нет"):
+            self.assertIn(expected, texts)
+        self.assertGreater(header.winfo_reqheight(), 40)
 
 
 if __name__ == "__main__":

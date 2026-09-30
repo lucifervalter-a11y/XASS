@@ -155,6 +155,7 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
     }
 
     static func allowsUploadPath(_ path: String) -> Bool {
+        if isArtworkUploadPath(path) { return true }
         guard let parts = URLComponents(string: path), parts.scheme == nil, parts.host == nil, parts.fragment == nil,
               !parts.path.contains(".."), !parts.path.contains("\\"),
               !parts.path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
@@ -172,27 +173,45 @@ final class OwnerAPI: NSObject, OwnerService, URLSessionDataDelegate, @unchecked
         return true
     }
 
+    static func isArtworkUploadPath(_ path: String) -> Bool {
+        guard let parts = URLComponents(string: path), parts.scheme == nil, parts.host == nil,
+              parts.query == nil, parts.fragment == nil,
+              !parts.path.contains(".."), !parts.path.contains("\\"),
+              parts.percentEncodedPath == parts.path,
+              !parts.path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              let decoded = parts.path.removingPercentEncoding, decoded == parts.path else { return false }
+        return parts.path.range(of: #"^/api/mini/music/tracks/[1-9][0-9]*/artwork$"#,
+                                options: .regularExpression) != nil
+    }
+
     @MainActor func upload(_ path: String, data: Data, headers: [String: String]) async throws -> [String: Any] {
-        guard Self.allowsUploadPath(path), !data.isEmpty, data.count <= Self.maxAssetBytes else { throw OwnerAPIError.invalidResponse }
-        let allowedHeaders: Set<String> = ["content-type", "x-xass-cipher", "x-xass-inner-type"]
+        let artworkUpload = Self.isArtworkUploadPath(path)
+        let maximum = artworkUpload ? 8 * 1024 * 1024 : Self.maxAssetBytes
+        guard Self.allowsUploadPath(path), !data.isEmpty, data.count <= maximum else { throw OwnerAPIError.invalidResponse }
+        let allowedHeaders: Set<String> = ["content-type", "x-xass-cipher", "x-xass-inner-type", "x-xass-action-proof"]
         guard Set(headers.keys.map { $0.lowercased() }).count == headers.count,
               headers.allSatisfy({ key, value in allowedHeaders.contains(key.lowercased()) && !value.isEmpty && value.utf8.count <= 200 && value.unicodeScalars.allSatisfy { (32...126).contains(Int($0.value)) } }) else { throw OwnerAPIError.invalidResponse }
+        let contentType = headers.first { $0.key.lowercased() == "content-type" }?.value.lowercased()
+        guard !artworkUpload || (headers.count == 1 && ["image/jpeg", "image/png"].contains(contentType ?? "")) else {
+            throw OwnerAPIError.invalidResponse
+        }
         guard let saved = savedSession(), saved.expires > Date(), !saved.value.isEmpty,
               saved.value.utf8.count < 8192, !saved.value.contains("\r"), !saved.value.contains("\n"), !saved.value.contains(";") else { throw OwnerAPIError.signedOut }
         var parts = URLComponents(url: origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
         parts.queryItems = [.init(name: "_p", value: path)]
         var request = URLRequest(url: parts.url!)
-        request.httpMethod = "POST"; request.httpBody = data
+        request.httpMethod = artworkUpload ? "PUT" : "POST"; request.httpBody = data
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(contentType ?? "application/octet-stream", forHTTPHeaderField: "Content-Type")
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         request.setValue("xass_pwa=" + saved.value, forHTTPHeaderField: "Cookie")
         request.setValue(origin.url.absoluteString, forHTTPHeaderField: "Origin")
         try Task.checkCancellation()
         return try await withCheckedThrowingContinuation { done in
             let task = session.dataTask(with: request)
-            transfers[task.taskIdentifier] = Transfer(completion: .json(done), path: path, method: "POST"); task.resume()
+            transfers[task.taskIdentifier] = Transfer(completion: .json(done), path: path,
+                                                       method: artworkUpload ? "PUT" : "POST"); task.resume()
         }
     }
 

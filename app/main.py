@@ -40,6 +40,7 @@ from app.enums import SaveMode
 from app.models import AgentCommand, AgentCredential, AgentStateSnapshot, AppConfig, HeartbeatSource, MediaAsset, MessageLog, MessageRevision, PinnedConversation
 from app.services.agent_commands import (
     DANGEROUS_AGENT_COMMANDS,
+    SENSITIVE_AGENT_COMMANDS,
     acknowledge_agent_commands,
     cancel_agent_command,
     deliver_agent_commands,
@@ -74,6 +75,7 @@ from app.services.agent_workspace import (
     normalize_remote_location,
     read_asset_body,
     read_bounded_body,
+    safe_workspace_filename,
     store_asset as store_workspace_asset,
 )
 from app.services.app_config import (
@@ -194,7 +196,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.20.1"
+APP_VERSION = "0.21.0"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -1115,13 +1117,8 @@ async def _telegram_media_response(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media is unavailable")
     asset.telegram_file_path = file_path
     await session.commit()
-    file_url = f"{bot_client.file_url}/{file_path.lstrip('/')}"
     try:
-        upstream = await bot_client.client.send(
-            bot_client.client.build_request("GET", file_url),
-            stream=True,
-        )
-        upstream.raise_for_status()
+        upstream = await bot_client.open_file_stream(file_path)
     except Exception as exc:
         logger.warning("Could not open Telegram media stream for asset %s: %s", asset.id, exc)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Telegram media stream is unavailable") from exc
@@ -2952,6 +2949,8 @@ async def mini_agent_file_upload(
     root: str,
     path: str = "",
     filename: str = "",
+    x_telegram_init_data: str | None = Header(default=None),
+    x_xass_action_proof: str | None = Header(default=None),
     user: MiniAppUser = Depends(require_mini_owner),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
@@ -2962,6 +2961,20 @@ async def mini_agent_file_upload(
         root_name, relative_path = normalize_remote_location(root, path)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    safe_name = safe_workspace_filename(filename or request.headers.get("x-xass-filename"), "xass-file.bin")
+    # Authenticate before consuming a potentially large/chunked request body.
+    await _require_pwa_action_proof(
+        session=session,
+        user=user,
+        telegram_init_data=x_telegram_init_data or "",
+        action_proof=x_xass_action_proof or "",
+        purpose=f"agent:file_upload:{source.source_name}",
+        binding={
+            "source_id": source.id,
+            "command": "file_upload",
+            "payload": {"root": root_name, "path": relative_path, "filename": safe_name},
+        },
+    )
     try:
         body = await read_asset_body(request, settings, kind="file_upload")
     except AssetUploadTooLarge as exc:
@@ -2973,7 +2986,7 @@ async def mini_agent_file_upload(
             settings,
             source_name=source.source_name,
             kind="file_upload",
-            filename=filename or request.headers.get("x-xass-filename") or "xass-file.bin",
+            filename=safe_name,
             content_type=request.headers.get("content-type", "application/octet-stream"),
             body=body,
             ttl_seconds=30 * 60,
@@ -3067,7 +3080,7 @@ async def mini_agent_command(
         if delay_sec < 0 or delay_sec > 3600:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Задержка должна быть от 0 до 3600 секунд")
         command_payload["delay_sec"] = delay_sec
-    if command_name in DANGEROUS_AGENT_COMMANDS:
+    if command_name in DANGEROUS_AGENT_COMMANDS | SENSITIVE_AGENT_COMMANDS:
         await _require_pwa_action_proof(
             session=session,
             user=user,
@@ -3481,10 +3494,9 @@ async def mini_conversation_avatar(
                 file_path = str(telegram_file.get("file_path") or "")
                 if not file_path:
                     raise ValueError("No avatar path")
-                response = await bot_client.client.get(f"{bot_client.file_url}/{file_path}")
-                response.raise_for_status()
-                body = response.content
-                media_type = response.headers.get("content-type") or "image/jpeg"
+                body, media_type = await bot_client.download_file_bytes(
+                    file_path, max_bytes=settings.conversation_avatar_max_bytes,
+                )
                 if not media_type.startswith("image/") or not body or len(body) > settings.conversation_avatar_max_bytes:
                     raise ValueError("Invalid avatar response")
                 await asyncio.to_thread(store_cached_avatar, cache_dir, chat_id, body, media_type)

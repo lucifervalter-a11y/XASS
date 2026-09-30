@@ -35,6 +35,32 @@ final class NativeSystemVolumeTests: XCTestCase {
         XCTAssertTrue(view.isUserInteractionEnabled)
         XCTAssertFalse(view.isAccessibilityElement, "Do not hide the native adjustable slider behind its parent")
         XCTAssertGreaterThanOrEqual(view.bounds.height, 44)
+        XCTAssertLessThanOrEqual(view.volumeThumbImage(for: .normal)?.size.width ?? 100, 14,
+                                 "The public system slider thumb must stay inside the compact row")
+        let track = view.volumeSliderRect(forBounds: view.bounds)
+        for value: Float in [0, 1] {
+            let thumb = view.volumeThumbRect(forBounds: view.bounds, volumeSliderRect: track, value: value)
+            XCTAssertTrue(view.bounds.insetBy(dx: -0.5, dy: -0.5).contains(thumb),
+                          "The thumb must remain inside MPVolumeView at both extremes")
+        }
+    }
+
+    @MainActor func testAuthenticatedArtworkReachesSystemNowPlayingAndRejectsLateTrack() throws {
+        let origin = try ServerOrigin("https://now-playing-art-\(UUID().uuidString.lowercased()).invalid")
+        let library = try OfflineLibrary(origin: origin), tracks = try installSilentTracks(in: library)
+        defer { try? FileManager.default.removeItem(at: library.directory) }
+        let audio = AudioController(); audio.configure(origin); defer { audio.disconnect() }
+        audio.playOffline(tracks[0])
+        let red = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 24)).image { context in
+            UIColor.systemRed.setFill(); context.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
+        }
+        audio.setNowPlayingArtwork(red, for: tracks[0].id)
+        XCTAssertNotNil(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork)
+        audio.setNowPlayingArtwork(nil, for: tracks[1].id)
+        XCTAssertNotNil(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyArtwork],
+                        "A late response for another track must not clear the active cover")
+        audio.stop()
+        XCTAssertNil(MPNowPlayingInfoCenter.default().nowPlayingInfo)
     }
 
     @MainActor func testLocalBusyPlayerKeepsSystemControlInVisibleHierarchy() async {

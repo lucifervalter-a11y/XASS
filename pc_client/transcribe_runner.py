@@ -125,10 +125,13 @@ def load_whisper(device: str, threads: int, models: Path):
 
 
 def transcribe(vocals: Path, language: str, device: str, threads: int, models: Path, duration_hint: float = 0,
-               vad_filter: bool = True, model=None) -> tuple[list[dict], str]:
+               vad_filter: bool = True, recognition_pass: int = 1, model=None) -> tuple[list[dict], str]:
     model = model or load_whisper(device, threads, models)
+    second_pass = recognition_pass == 2
     segments, info = model.transcribe(str(vocals), language=None if language in {"", "auto"} else language,
-                                      word_timestamps=True, vad_filter=vad_filter, beam_size=5,
+                                      word_timestamps=True, vad_filter=vad_filter,
+                                      beam_size=8 if second_pass else 5,
+                                      temperature=(0.0, 0.2, 0.4) if second_pass else 0.0,
                                       condition_on_previous_text=False)
     total = float(getattr(info, "duration", 0) or duration_hint or 0)
     collected = []
@@ -139,12 +142,16 @@ def transcribe(vocals: Path, language: str, device: str, threads: int, models: P
     return build_lines(collected), str(getattr(info, "language", "") or language)
 
 
-def hear(source: Path, vocals: Path, language: str, device: str, threads: int, models: Path) -> tuple[list[dict], str]:
+def hear(source: Path, vocals: Path, language: str, device: str, threads: int, models: Path,
+         recognition_pass: int = 1) -> tuple[list[dict], str]:
     """Vocals first. A sung or tuned vocal often disappears into the mix or the VAD."""
     found_language = language
     model = load_whisper(device, threads, models)
-    for target, vad in ((vocals, True), (vocals, False), (source, False)):
-        lines, found_language = transcribe(target, language, device, threads, models, vad_filter=vad, model=model)
+    attempts = (((source, True), (source, False), (vocals, False)) if recognition_pass == 2
+                else ((vocals, True), (vocals, False), (source, False)))
+    for target, vad in attempts:
+        lines, found_language = transcribe(target, language, device, threads, models, vad_filter=vad,
+                                           recognition_pass=recognition_pass, model=model)
         if lines:
             return lines, found_language
     return [], found_language
@@ -169,13 +176,15 @@ def run(args) -> dict:
         vocals = separate_vocals(Path(args.input), workdir, device, args.threads)
     progress("transcribe", 0.0)
     try:
-        lines, language = hear(Path(args.input), vocals, args.language, device, args.threads, models)
+        lines, language = hear(Path(args.input), vocals, args.language, device, args.threads, models,
+                               recognition_pass=args.recognition_pass)
     except GPU_ERRORS as exc:
         if device != "cuda":
             raise
         print(f"cuda transcription failed, falling back to cpu: {exc}", file=sys.stderr, flush=True)
         device = "cpu"
-        lines, language = hear(Path(args.input), vocals, args.language, device, args.threads, models)
+        lines, language = hear(Path(args.input), vocals, args.language, device, args.threads, models,
+                               recognition_pass=args.recognition_pass)
     return {"lines": lines, "language": language, "model": MODEL, "device": device,
             "elapsed_sec": round(time.monotonic() - started, 1)}
 
@@ -279,11 +288,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="XASS song transcription runner")
     parser.add_argument("--input", default="")
     parser.add_argument("--output", default="")
-    parser.add_argument("--language", default="ru")
+    parser.add_argument("--language", default="auto")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cpu")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--models", required=True)
     parser.add_argument("--workdir", default="")
+    parser.add_argument("--recognition-pass", type=int, choices=(1, 2), default=1)
     parser.add_argument("--warmup", action="store_true")
     parser.add_argument("--parent-pid", type=int, default=0)
     return parser.parse_args(argv)

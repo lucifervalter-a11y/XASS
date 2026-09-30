@@ -1,7 +1,9 @@
 name: Deploy to redvps.site
 
 on:
-  push:
+  workflow_run:
+    workflows: [Tests and interface contracts]
+    types: [completed]
     branches: [main]
 
 concurrency:
@@ -11,11 +13,18 @@ concurrency:
 
 jobs:
   deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - name: Resolve VPS host through DNS-over-HTTPS
         id: vps
         shell: bash
@@ -55,13 +64,19 @@ jobs:
             flock -w 120 9 || { echo 'Another server deployment is still running.'; exit 1; }
             echo '[INFO] Fetching release for bounded rollback backup...'
             git fetch --prune origin main
-            git show '${{ github.sha }}:deploy/predeploy_backup.py' | .venv/bin/python - '${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}'
+            git merge-base --is-ancestor '${{ github.event.workflow_run.head_sha }}' origin/main
+            git show '${{ github.event.workflow_run.head_sha }}:deploy/predeploy_backup.py' | .venv/bin/python - '${{ github.event.workflow_run.head_sha }}-${{ github.run_id }}-${{ github.run_attempt }}'
             # Backup files stay private; new public checkout files must be readable by PHP-FPM/nginx.
             umask 022
-            bash deploy/update.sh
+            verified_update="$(mktemp deploy/.verified-update.XXXXXX.sh)"
+            trap 'rm -f -- "$verified_update"' EXIT
+            git show '${{ github.event.workflow_run.head_sha }}:deploy/update.sh' > "$verified_update"
+            bash "$verified_update" '${{ github.event.workflow_run.head_sha }}'
+            rm -f -- "$verified_update"
+            trap - EXIT
             # Also covers upgrading from an older, already-running update.sh.
             .venv/bin/python deploy/repair_public_permissions.py
-            git merge-base --is-ancestor '${{ github.sha }}' HEAD
+            test "$(git rev-parse HEAD)" = '${{ github.event.workflow_run.head_sha }}'
             for path in miniapp.php assets/miniapp-device-key.js health; do
               curl --fail --silent --show-error --retry 2 --retry-all-errors --connect-timeout 8 --max-time 20 "https://redvps.site/$path" > /dev/null
             done

@@ -8,8 +8,12 @@ from tkinter import font as tkfont
 from typing import Any, Callable
 from PIL import Image, ImageDraw, ImageTk
 
-BG, CARD, HOVER, LINE = "#202022", "#2b2b2f", "#34343a", "#3b3b42"
-TEXT, MUTED, ACCENT, LILAC = "#f5f5f7", "#b1b1bb", "#829cff", "#c495f4"
+# Content stays #202022 so screens that paint that canvas still meet the cards.
+BG, CARD, HOVER, LINE = "#202022", "#2b2b2f", "#34343a", "#43434f"
+SIDEBAR = "#141418"
+FIELD, WELL, NOTE = "#1a1a1e", "#35353f", "#1a1a1e"
+TEXT, MUTED, ACCENT, ACCENT_SOFT = "#f5f5f7", "#b1b1bb", "#829cff", "#9aafff"
+LILAC, GREEN, AMBER, RED = "#c495f4", "#61c554", "#efb65c", "#f36b76"
 
 
 def _parent_background(parent):
@@ -150,6 +154,9 @@ def _icon_raster(name, size=22, color=TEXT):
         solid_box((16, 5, 19, 19), 0.8)
     elif name == "stop":
         solid_box((6, 6, 18, 18), 2)
+    elif name == "file":
+        line([(7, 3), (14, 3), (19, 8), (19, 21), (7, 21)], True)
+        line([(14, 3), (14, 8), (19, 8)])
     else:
         raise ValueError(f"Unknown XASS icon: {name}")
     return image.resize((size, size), Image.Resampling.LANCZOS)
@@ -160,9 +167,88 @@ def icon_image(master, name, size=22, color=TEXT):
     return ImageTk.PhotoImage(_icon_raster(name, size, color), master=master)
 
 
+def icon_badge(parent, name, *, size=26, color=ACCENT, well=None, radius=16):
+    """Icon sitting in a lifted chip so a row reads as a control, not a bare glyph."""
+    fill = well or WELL
+    host = _parent_background(parent)
+    badge = RoundedPanel(parent, bg=fill, parent_bg=host, radius=radius, padx=10, pady=10, border_width=0)
+    graphic = icon_image(badge, name, size, color)
+    label = tk.Label(badge, image=graphic, bg=fill, borderwidth=0)
+    label.image = graphic
+    label.pack()
+    return badge
+
+
+def page_header(parent, title, subtitle="", *, kicker="", bg=None):
+    """One page title: accent rule, optional kicker, sentence subtitle."""
+    stage = bg or BG
+    top = tk.Frame(parent, bg=stage)
+    bar = tk.Canvas(top, width=3, height=28, bg=stage, highlightthickness=0, borderwidth=0)
+    bar.pack(side="left", fill="y", padx=(0, 14))
+
+    def paint_rule(_event=None):
+        height = bar.winfo_height()
+        if height < 8:
+            return
+        bar.delete("rule")
+        bar.create_rectangle(0, 3, 3, height - 3, fill=ACCENT, outline=ACCENT, tags="rule")
+
+    bar.bind("<Configure>", paint_rule)
+    copy = tk.Frame(top, bg=stage)
+    copy.pack(side="left", fill="x", expand=True)
+    if kicker:
+        tk.Label(copy, text=kicker, bg=stage, fg=ACCENT, anchor="w", justify="left",
+                 font=("Segoe UI Semibold", 9)).pack(fill="x", pady=(0, 3))
+    tk.Label(copy, text=title, bg=stage, fg=TEXT, anchor="w", justify="left",
+             font=("Segoe UI Semibold", 24)).pack(fill="x")
+    if subtitle:
+        tk.Label(copy, text=subtitle, bg=stage, fg=MUTED, anchor="w", justify="left",
+                 font=("Segoe UI", 11)).pack(fill="x", pady=(6, 0))
+    return top
+
+
+def quiet_note(parent, text, *, icon="shield", bg=None, pady=(16, 0), color=ACCENT):
+    """Inset note under a page, for warnings that should not look like another form."""
+    stage = bg or _parent_background(parent)
+    panel = RoundedPanel(parent, bg=NOTE, parent_bg=stage, radius=14, padx=16, pady=14, border_color="#333342")
+    panel.pack(fill="x", pady=pady)
+    row = tk.Frame(panel, bg=NOTE)
+    row.pack(fill="x")
+    icon_badge(row, icon, size=20, color=color, radius=14).pack(side="left", anchor="n", padx=(0, 12))
+    tk.Label(row, text=text, bg=NOTE, fg=MUTED, justify="left", anchor="w", wraplength=680,
+             font=("Segoe UI", 11)).pack(side="left", fill="x", expand=True)
+    return panel
+
+
+class EmptyState(tk.Frame):
+    """Illustrated blank page or blank card. Title, explanation, optional action."""
+
+    def __init__(self, parent, title, message, *, icon="folder", bg=None, framed=True,
+                 command=None, action="", tone="accent"):
+        stage = _parent_background(parent)
+        surface = bg or CARD
+        super().__init__(parent, bg=stage if framed else surface, highlightthickness=0, borderwidth=0)
+        host = self
+        if framed:
+            host = RoundedPanel(self, bg=surface, parent_bg=stage, radius=16, padx=28, pady=28, border_color=LINE)
+            host.pack(fill="x")
+        else:
+            self.configure(padx=6, pady=8)
+        color = RED if tone == "danger" else ACCENT
+        icon_badge(host, icon, size=28, color=color).pack(anchor="w")
+        tk.Label(host, text=title, bg=surface, fg=TEXT, anchor="w", justify="left",
+                 font=("Segoe UI Semibold", 16)).pack(fill="x", pady=(14, 4))
+        tk.Label(host, text=message, bg=surface, fg=MUTED, anchor="w", justify="left",
+                 font=("Segoe UI", 11), wraplength=560).pack(fill="x")
+        if command is not None and action:
+            ModernButton(host, text=action, command=command, bg=ACCENT, fg="#12131c",
+                         activebackground=ACCENT_SOFT, padx=16, pady=9,
+                         font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(16, 0))
+
+
 class RoundedPanel(tk.Frame):
     """A normal Frame whose children pack/grid directly over a rounded backdrop."""
-    def __init__(self, parent, *, bg=CARD, parent_bg=None, radius=12,
+    def __init__(self, parent, *, bg=CARD, parent_bg=None, radius=16,
                  border_color=LINE, border_width=1, padx=20, pady=20, **options):
         self._fill = bg
         self._parent_bg = parent_bg or _parent_background(parent)
@@ -240,7 +326,7 @@ class ModernButton(tk.Canvas):
     def __init__(self, parent, text="", command: Callable | None = None, *, bg=HOVER, fg=TEXT,
                  activebackground=None, activeforeground=None, disabledforeground="#74747e",
                  font=("Segoe UI Semibold", 10), padx=18, pady=10, width=0, height=0,
-                 radius=9, border_color=None, icon=None, icon_size=20, anchor="center", state="normal",
+                 radius=10, border_color=None, icon=None, icon_size=20, anchor="center", state="normal",
                  parent_bg=None, **options):
         self._values = dict(text=text, command=command, bg=bg, fg=fg,
             activebackground=activebackground or HOVER, activeforeground=activeforeground or fg,
@@ -461,9 +547,10 @@ class NavButton(ModernButton):
         self._nav_active = active
         self._nav_normal = options.pop("bg", BG)
         self._nav_selected = options.pop("selectedbackground", HOVER)
-        defaults = dict(bg=self._nav_selected if active else self._nav_normal, fg=TEXT if active else MUTED,
-            activebackground=HOVER, activeforeground=TEXT, anchor="w", padx=20, pady=12,
-            font=("Segoe UI", 11), icon=icon, icon_size=26, radius=9)
+        self._nav_muted = options.get("fg", MUTED)
+        defaults = dict(bg=self._nav_selected if active else self._nav_normal, fg=TEXT if active else self._nav_muted,
+            activebackground=HOVER, activeforeground=TEXT, anchor="w", padx=16, pady=9,
+            font=("Segoe UI Semibold", 11), icon=icon, icon_size=22, radius=10)
         defaults.update(options)
         super().__init__(parent, text, command, **defaults)
         self._values["active"] = active
@@ -471,17 +558,19 @@ class NavButton(ModernButton):
     def set_active(self, active):
         self._nav_active = bool(active)
         super().configure(active=self._nav_active, bg=self._nav_selected if active else self._nav_normal,
-                          fg=TEXT if active else MUTED)
+                          fg=TEXT if active else self._nav_muted)
 
     def configure(self, cnf=None, **options):
         if cnf and not isinstance(cnf, str):
             options = dict(cnf, **options)
             cnf = None
+        if "fg" in options and "active" not in options:
+            self._nav_muted = options["fg"]
         if "active" in options:
             active = bool(options.pop("active"))
             self._nav_active = active
             options.setdefault("bg", self._nav_selected if active else self._nav_normal)
-            options.setdefault("fg", TEXT if active else MUTED)
+            options.setdefault("fg", TEXT if active else self._nav_muted)
             options["active"] = active
         return super().configure(cnf, **options)
 

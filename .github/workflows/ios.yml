@@ -3,22 +3,34 @@ name: Build XASS iOS (unsigned)
 on:
   workflow_dispatch:
   push:
-    branches: [main, "codex/**"]
+    branches: ["codex/**"]
     paths: ["ios/**", ".github/workflows/ios.yml", "assets/xass-app-icon-source.png"]
+  workflow_run:
+    workflows: [Tests and interface contracts]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: xass-ios-${{ github.ref }}
+  group: xass-ios-${{ github.event_name == 'workflow_run' && 'main' || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - name: Install project generator
         run: brew install xcodegen
       - name: Generate Xcode project
@@ -104,7 +116,12 @@ jobs:
           retention-days: 14
 
   publish:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -112,6 +129,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: XASS-iOS-UNSIGNED-requires-signing
@@ -119,11 +139,17 @@ jobs:
       - name: Publish explicitly unsigned iOS release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           if gh release view ios-latest >/dev/null 2>&1; then
             gh release edit ios-latest --title "XASS iOS — unsigned, requires your signing" --notes-file ios/UNSIGNED.md --prerelease
           else
-            gh release create ios-latest --target "$GITHUB_SHA" --title "XASS iOS — unsigned, requires your signing" --notes-file ios/UNSIGNED.md --prerelease
+            gh release create ios-latest --target "$RELEASE_SHA" --title "XASS iOS — unsigned, requires your signing" --notes-file ios/UNSIGNED.md --prerelease
           fi
           gh release upload ios-latest release/XASS-unsigned.ipa release/XASS-unsigned.ipa.sha256 release/UNSIGNED.md release/iOS-native-*.png --clobber
+          git tag --force ios-latest "$RELEASE_SHA"
+          git push --force origin refs/tags/ios-latest
+          remote_sha="$(git ls-remote --refs origin refs/tags/ios-latest | awk '{print $1}')"
+          test "$remote_sha" = "$RELEASE_SHA"

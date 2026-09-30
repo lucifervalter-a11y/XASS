@@ -384,6 +384,7 @@ class WorkerFlowTests(unittest.TestCase):
         self.assertEqual(command[command.index("--device") + 1], "cuda")
         self.assertEqual(command[command.index("--language") + 1], "ru")
         self.assertEqual(command[command.index("--threads") + 1], str(tw.thread_limit(tw.capabilities(GPU))))
+        self.assertEqual(command[command.index("--recognition-pass") + 1], "1")
         self.assertIn("--parent-pid", command)
         self.assertEqual(launched["kwargs"]["env"]["OMP_NUM_THREADS"], command[command.index("--threads") + 1])
         complete = [item for item in self.requests if item[1].endswith("/complete")]
@@ -421,6 +422,13 @@ class WorkerFlowTests(unittest.TestCase):
             worker.popen = popen
             self.assertEqual(worker.process(client, self.job), "failed")
             self.assertEqual(self.requests[-1][2]["reason"], "no_speech_detected")
+
+            before = len(self.requests)
+            self.assertEqual(worker.process(client, {**self.job, "recognition_pass": 2}), "done")
+            complete = self.requests[-1]
+            self.assertEqual(complete[1], "/agent/transcription/jobs/7/complete")
+            self.assertEqual(complete[2]["lines"], [])
+            self.assertFalse(any(path.endswith("/fail") for _, path, _, _ in self.requests[before:]))
 
     def test_lost_lease_kills_runner_and_does_not_report(self):
         processes = []
@@ -530,6 +538,13 @@ class WorkerFlowTests(unittest.TestCase):
         cmd = worker.runner_command(self.job, self.root / "in.mp3", self.root / "out.json", self.root, 2)
         self.assertEqual(cmd[cmd.index("--device") + 1], "cpu")
 
+    def test_runner_command_bounds_recognition_pass(self):
+        worker = self.worker(lambda *a, **k: FakeProcess())
+        for raw, expected in ((2, "2"), (1, "1"), (99, "1"), ("2", "1"), (None, "1")):
+            cmd = worker.runner_command({**self.job, "recognition_pass": raw}, self.root / "in.mp3",
+                                        self.root / "out.json", self.root, 2)
+            self.assertEqual(cmd[cmd.index("--recognition-pass") + 1], expected)
+
     def test_non_individual_key_or_missing_server_does_nothing(self):
         worker = tw.TranscriptionWorker({"server_url": "https://x", "api_key": "global", tw.CONFIG_KEY: True}, self.root, self.root,
                                         client_factory=lambda: (_ for _ in ()).throw(AssertionError("no network")))
@@ -557,17 +572,39 @@ class RunnerTests(unittest.TestCase):
     def test_hear_retries_a_silent_vocal_stem_on_the_original_mix(self):
         calls = []
 
-        def fake(path, language, device, threads, models, duration_hint=0, vad_filter=True, model=None):
-            calls.append((Path(path).name, vad_filter))
+        def fake(path, language, device, threads, models, duration_hint=0, vad_filter=True,
+                 recognition_pass=1, model=None):
+            calls.append((Path(path).name, vad_filter, recognition_pass))
             if len(calls) < 3:
                 return [], "ru"
             return [{"start": 0.0, "end": 1.0, "text": "я урал"}], "ru"
 
         with patch.object(runner, "load_whisper", lambda *args, **kwargs: object()), patch.object(runner, "transcribe", fake):
             lines, language = runner.hear(Path("song.mp3"), Path("vocals.wav"), "ru", "cpu", 1, Path("models"))
-        self.assertEqual(calls, [("vocals.wav", True), ("vocals.wav", False), ("song.mp3", False)])
+        self.assertEqual(calls, [("vocals.wav", True, 1), ("vocals.wav", False, 1), ("song.mp3", False, 1)])
         self.assertEqual(lines[0]["text"], "я урал")
         self.assertEqual(language, "ru")
+
+    def test_second_pass_changes_source_vad_beam_and_temperature(self):
+        attempts = []
+
+        class Model:
+            def transcribe(self, path, **kwargs):
+                attempts.append((Path(path).name, kwargs))
+                if len(attempts) < 3:
+                    return iter(()), SimpleNamespace(duration=1, language="ru")
+                words = [SimpleNamespace(start=0.0, end=1.0, word=" строка")]
+                segment = SimpleNamespace(start=0.0, end=1.0, text="строка", words=words)
+                return iter((segment,)), SimpleNamespace(duration=1, language="ru")
+
+        with patch.object(runner, "load_whisper", return_value=Model()):
+            lines, _ = runner.hear(Path("song.mp3"), Path("vocals.wav"), "ru", "cpu", 1,
+                                   Path("models"), recognition_pass=2)
+        self.assertEqual([(name, call["vad_filter"]) for name, call in attempts],
+                         [("song.mp3", True), ("song.mp3", False), ("vocals.wav", False)])
+        self.assertTrue(all(call["beam_size"] == 8 for _, call in attempts))
+        self.assertTrue(all(call["temperature"] == (0.0, 0.2, 0.4) for _, call in attempts))
+        self.assertEqual(lines[0]["text"], "строка")
 
     def fake_modules(self, *, cuda_fails=False):
         calls = {"demucs": [], "whisper": []}
@@ -594,14 +631,15 @@ class RunnerTests(unittest.TestCase):
                    "faster_whisper": types.SimpleNamespace(WhisperModel=WhisperModel)}
         return modules, calls
 
-    def run_main(self, device, **kw):
+    def run_main(self, device, recognition_pass=1, **kw):
         modules, calls = self.fake_modules(**kw)
         with tempfile.TemporaryDirectory() as temp, patch.dict(sys.modules, modules), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             root = Path(temp)
             (root / "in.mp3").write_bytes(b"ID3")
             code = runner.main(["--input", str(root / "in.mp3"), "--output", str(root / "out.json"), "--language", "ru",
-                                "--device", device, "--threads", "3", "--models", str(root / "m"), "--workdir", str(root / "w")])
+                                "--device", device, "--threads", "3", "--models", str(root / "m"), "--workdir", str(root / "w"),
+                                "--recognition-pass", str(recognition_pass)])
             result = json.loads((root / "out.json").read_text("utf-8")) if code == 0 else None
         return code, result, calls
 
@@ -645,6 +683,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls["whisper"], [("large-v3", "cuda", "float16", 3)])
         self.assertEqual(calls["transcribe"]["language"], "ru")
         self.assertTrue(calls["transcribe"]["word_timestamps"])
+        self.assertEqual((calls["transcribe"]["beam_size"], calls["transcribe"]["temperature"]), (5, 0.0))
         self.assertEqual(calls["threads"], 3)
         self.assertEqual(result["lines"], [{"start": 1.0, "end": 2.0, "text": "Привет мир"}])
         self.assertEqual((result["model"], result["device"]), ("large-v3", "cuda"))

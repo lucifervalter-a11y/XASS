@@ -13,7 +13,7 @@ if str(CLIENT_ROOT) not in sys.path:
 
 import client_agent
 from app.main import _agent_attention
-from app.services.agent_commands import ALLOWED_AGENT_COMMANDS, DANGEROUS_AGENT_COMMANDS
+from app.services.agent_commands import ALLOWED_AGENT_COMMANDS, DANGEROUS_AGENT_COMMANDS, SENSITIVE_AGENT_COMMANDS
 from app.services.app_config import prepare_audit_payload, sanitize_audit_payload
 
 
@@ -25,6 +25,7 @@ class ControlCenterTests(unittest.TestCase):
         )
         self.assertTrue({"update", "restart", "sleep", "reboot", "shutdown", "lock"} <= DANGEROUS_AGENT_COMMANDS)
         self.assertNotIn("ping", DANGEROUS_AGENT_COMMANDS)
+        self.assertEqual(SENSITIVE_AGENT_COMMANDS, {"screenshot", "file_download", "clipboard_get", "file_upload"})
 
     def test_agent_attention_explains_every_reason(self) -> None:
         reasons, needs_update = _agent_attention(

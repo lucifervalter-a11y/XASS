@@ -1,13 +1,73 @@
 from __future__ import annotations
 
 import unittest
+import traceback
 from unittest.mock import AsyncMock
 
-from app.bot_api import TelegramBotClient
+import httpx
+
+from app.bot_api import TelegramApiError, TelegramBotClient, TelegramFileResponse
 from app.services.message_logging import _extract_chat, _extract_media_items, forwarded_from_label
 
 
 class BotMediaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transport_error_never_exposes_bot_token(self) -> None:
+        token = "123456789:super-secret-bot-token"
+
+        def fail(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError(f"failed URL {request.url}", request=request)
+
+        client = TelegramBotClient(token)
+        await client.client.aclose()
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(fail))
+        try:
+            with self.assertRaises(TelegramApiError) as raised:
+                await client.get_me()
+            rendered = "".join(traceback.format_exception(raised.exception))
+            self.assertNotIn(token, str(raised.exception))
+            self.assertNotIn(token, rendered)
+            self.assertIn("method=getMe", str(raised.exception))
+        finally:
+            await client.close()
+
+    async def test_file_http_error_never_exposes_bot_token(self) -> None:
+        token = "123456789:another-secret-token"
+
+        def unavailable(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, request=request)
+
+        client = TelegramBotClient(token)
+        await client.client.aclose()
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(unavailable))
+        try:
+            with self.assertRaises(TelegramApiError) as raised:
+                await client.open_file_stream("music/file.mp3")
+            rendered = "".join(traceback.format_exception(raised.exception))
+            self.assertNotIn(token, str(raised.exception))
+            self.assertNotIn(token, rendered)
+            self.assertIn("http=503", str(raised.exception))
+        finally:
+            await client.close()
+
+    async def test_file_close_error_never_exposes_bot_token(self) -> None:
+        token = "123456789:close-secret-token"
+        request = httpx.Request("GET", f"https://api.telegram.org/file/bot{token}/music/file.mp3")
+
+        class ClosingResponse:
+            status_code = 200
+            headers = httpx.Headers({"content-type": "audio/mpeg"})
+
+            async def aclose(self) -> None:
+                raise httpx.ReadError(f"close failed for {request.url}", request=request)
+
+        response = TelegramFileResponse(ClosingResponse())  # type: ignore[arg-type]
+        with self.assertRaises(TelegramApiError) as raised:
+            await response.aclose()
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn(token, str(raised.exception))
+        self.assertNotIn(token, rendered)
+        self.assertIn("method=downloadFile", str(raised.exception))
+
     async def test_private_chat_uses_human_name_before_username(self) -> None:
         self.assertEqual(
             _extract_chat(

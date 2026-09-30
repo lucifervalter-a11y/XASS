@@ -74,6 +74,7 @@ struct RemotePlayer: Identifiable, Equatable {
     let duration: Double
     let volume: Double
     let outputID: String
+    let mediaTransport: String
     let error: String?
     init?(_ value: [String: Any]) {
         guard let name = value["source_name"] as? String else { return nil }
@@ -84,6 +85,7 @@ struct RemotePlayer: Identifiable, Equatable {
         trackID = info["track_id"] as? Int; state = info["state"] as? String ?? "stopped"
         position = NativeValue.number(info["position_sec"]); duration = NativeValue.number(info["duration_sec"])
         volume = NativeValue.number(info["volume"], fallback: 70); outputID = info["output_id"] as? String ?? "default"
+        mediaTransport = info["media_transport"] as? String ?? ""
         error = (info["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 }

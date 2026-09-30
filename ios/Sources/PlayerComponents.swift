@@ -42,6 +42,9 @@ struct NowPlayingSlots {
     var onDevices: (() -> Void)?
     var onQueue: (() -> Void)?
     var onMore: (() -> Void)?
+    /// Opens the existing trusted metadata / PC transcription flow directly
+    /// from the lyrics surface. The generic player never performs network work.
+    var onLyricsTools: (() -> Void)?
     var sourceLabel: String = "Моя музыка"
 }
 
@@ -80,6 +83,13 @@ enum NowPlayingCardGeometry {
 
     /// Exactly one side owns each hero id at any time.
     static func heroSources(expanded: Bool) -> (mini: Bool, card: Bool) { (!expanded, expanded) }
+}
+
+enum PlayerDismissPolicy {
+    static func canBegin(downward: Bool, allowedRegion: Bool, expanded: Bool,
+                         gestureArmed: Bool, dismissing: Bool, sliderEditing: Bool) -> Bool {
+        downward && allowedRegion && expanded && gestureArmed && !dismissing && !sliderEditing
+    }
 }
 
 extension AnyTransition {

@@ -227,7 +227,7 @@ final class OwnerAPITests: XCTestCase {
         let api = OwnerAPI(origin: origin, configuration: config, savedSession: { SavedSession(value: "fixture-session", expires: Date().addingTimeInterval(60)) })
         defer { api.invalidate() }
         let path = "/api/mini/agents/PC%2B1/files/upload?root=xass_files&path=Folder%20%2B%20%23A&filename=Report%2B1.txt"
-        let reply = try await api.upload(path, data: payload, headers: ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": "text/plain"])
+        let reply = try await api.upload(path, data: payload, headers: ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": "text/plain", "X-XASS-Action-Proof": "xna_fixture"])
         XCTAssertEqual((reply["command"] as? [String: Any])?["id"] as? Int, 31)
         XCTAssertEqual(received, payload)
         let request = try XCTUnwrap(OwnerHTTPFixture.requests.last)
@@ -235,6 +235,7 @@ final class OwnerAPITests: XCTestCase {
         XCTAssertEqual(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, path)
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-XASS-Cipher"), "xass-sealed-v1")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-XASS-Inner-Type"), "text/plain")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-XASS-Action-Proof"), "xna_fixture")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "xass_pwa=fixture-session")
         do { _ = try await api.upload(path, data: payload, headers: ["Cookie": "untrusted"]); XCTFail("Arbitrary authenticated header accepted") } catch {}
         do { _ = try await api.upload(path, data: Data(repeating: 0, count: OwnerAPI.maxAssetBytes + 1), headers: [:]); XCTFail("Oversized upload accepted") } catch {}
@@ -243,6 +244,8 @@ final class OwnerAPITests: XCTestCase {
     func testUploadCannotTargetAnotherEndpointOrEscapeFileRoots() {
         let base = "/api/mini/agents/PC/files/upload"
         XCTAssertTrue(OwnerAPI.allowsUploadPath(base + "?root=downloads&path=&filename=file.txt"))
+        XCTAssertTrue(OwnerAPI.allowsUploadPath("/api/mini/music/tracks/42/artwork"))
+        XCTAssertTrue(OwnerAPI.isArtworkUploadPath("/api/mini/music/tracks/42/artwork"))
         for path in [
             "https://evil.invalid" + base + "?root=downloads&path=&filename=file.txt",
             "/api/mini/config?root=downloads&path=&filename=file.txt",
@@ -250,8 +253,37 @@ final class OwnerAPITests: XCTestCase {
             base + "?root=downloads&path=%2E%2E&filename=file.txt",
             base + "?root=downloads&path=&filename=folder%2Ffile.txt",
             base + "?root=downloads&path=&filename=file%0A.txt",
-            base + "?root=downloads&path=&filename=file.txt&root=desktop"
+            base + "?root=downloads&path=&filename=file.txt&root=desktop",
+            "/api/mini/music/tracks/0/artwork",
+            "/api/mini/music/tracks/42/artwork?other=1",
+            "/api/mini/music/tracks/42/../artwork"
         ] { XCTAssertFalse(OwnerAPI.allowsUploadPath(path), path) }
+    }
+
+    @MainActor func testArtworkUploadUsesOwnerOnlyPutContract() async throws {
+        OwnerHTTPFixture.requests = []
+        OwnerHTTPFixture.reply = { _ in
+            (200, ["Content-Type": "application/json"],
+             Data(#"{"_s":200,"_b":"{\"ok\":true,\"artwork\":{\"source\":\"owner\",\"content_type\":\"image/jpeg\"}}"}"#.utf8))
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [OwnerHTTPFixture.self]
+        let api = OwnerAPI(origin: try ServerOrigin("https://native-api-fixture.invalid"), configuration: config,
+                           savedSession: { SavedSession(value: "fixture-session", expires: Date().addingTimeInterval(60)) })
+        defer { api.invalidate() }
+        let data = Data([0xff, 0xd8, 0xff, 0xd9])
+        _ = try await api.upload("/api/mini/music/tracks/42/artwork", data: data,
+                                 headers: ["Content-Type": "image/jpeg"])
+        let request = try XCTUnwrap(OwnerHTTPFixture.requests.last)
+        XCTAssertEqual(request.httpMethod, "PUT")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "image/jpeg")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "xass_pwa=fixture-session")
+        do {
+            _ = try await api.upload("/api/mini/music/tracks/42/artwork", data: data,
+                                     headers: ["Content-Type": "text/html"])
+            XCTFail("Non-image artwork upload accepted")
+        } catch { }
+        XCTAssertEqual(OwnerHTTPFixture.requests.count, 1)
     }
     func testNativeModelsRejectMissingIdentityAndBoundQueueAroundCurrentTrack() throws {
         XCTAssertNil(LibraryTrack(["title": "Missing ID"]))

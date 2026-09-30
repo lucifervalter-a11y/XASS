@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import Settings
+from app.bot_api import TelegramBotClient
 from app.db import Base
 from app.music_models import MusicPlaylist, MusicTrack
 from app.services import music_ingest as ingest
@@ -77,8 +78,10 @@ class TelegramMusicIngestTests(unittest.IsolatedAsyncioTestCase):
                                   stream=ChunkStream(data, self))
 
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
-        self.bot = SimpleNamespace(client=self.client, file_url="https://api.telegram.org/file/botFIXTURE_ONLY",
-                                   get_file=AsyncMock(side_effect=metadata))
+        self.bot = TelegramBotClient("FIXTURE_ONLY")
+        await self.bot.client.aclose()
+        self.bot.client = self.client
+        self.bot.get_file = AsyncMock(side_effect=metadata)
         self.send = AsyncMock()
         self.service = ingest.TelegramMusicIngest(self.settings, self.bot, self.sessions, self.send,
                                                  debounce_seconds=0.01)

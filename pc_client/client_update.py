@@ -23,9 +23,9 @@ try:
 except ModuleNotFoundError:  # Imported as pc_client.client_update in tests/tools.
     from pc_client.runtime_state import atomic_write_json, load_json_object
 try:
-    from network_client import create_http_client
+    from network_client import create_http_client, require_secure_transport
 except ModuleNotFoundError:
-    from pc_client.network_client import create_http_client
+    from pc_client.network_client import create_http_client, require_secure_transport
 
 CLIENT_ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", CLIENT_ROOT))
@@ -321,6 +321,7 @@ def download_update(
     *,
     api_key: str,
     trust_env: bool = False,
+    allow_insecure_http: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> Path:
     import httpx
@@ -333,6 +334,7 @@ def download_update(
     revision = str(manifest.get("revision") or "").strip()
     if not url or not revision:
         raise RuntimeError("update manifest is incomplete")
+    url = require_secure_transport(url, allow_insecure_http=allow_insecure_http)
 
     # Every downloader gets a private staging directory. The desktop UI and its
     # background agent can briefly overlap while an old version is restarting;
@@ -405,6 +407,7 @@ def download_installer_update(
     *,
     api_key: str,
     trust_env: bool = False,
+    allow_insecure_http: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> Path:
     import httpx
@@ -420,6 +423,7 @@ def download_installer_update(
     revision = str(manifest.get("revision") or "").strip()
     if not url or not version or not revision:
         raise RuntimeError("installer manifest is incomplete")
+    url = require_secure_transport(url, allow_insecure_http=allow_insecure_http)
 
     UPDATE_ROOT.mkdir(parents=True, exist_ok=True)
     target = UPDATE_ROOT / f"XASS-Setup-{version}-{revision[:12]}.exe"

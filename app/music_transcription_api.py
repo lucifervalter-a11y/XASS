@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from app.db import get_session
 from app.models import AgentCredential
-from app.music_models import MusicTrack
+from app.music_models import MusicEnrichment, MusicTrack
 from app.services import transcription_queue as tq
 from app.services.agent_lifecycle import ensure_agent_attached
 from app.services.agent_pairing import authenticate_agent_api_key
@@ -76,7 +76,9 @@ class Line(BaseModel):
 
 
 class CompleteBody(BaseModel):
-    lines: list[Line] = Field(min_length=1, max_length=tq.MAX_LINES)
+    # An empty result is meaningful for the single bounded recheck: the queue
+    # keeps the first pass instead of scheduling the same expensive work again.
+    lines: list[Line] = Field(max_length=tq.MAX_LINES)
     language: str = Field(default="", max_length=8)
     model: str = Field(default="", max_length=64)
     device: str = Field(default="", max_length=16)
@@ -138,8 +140,9 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
             track = await find_track(session, track_id)
         async with _queue_lock:
             now = tq.now_utc()
-            await tq.request_job(session, track, language=payload.language or "ru",
-                                 user_id=getattr(user, "user_id", None), now=now)
+            await tq.request_job(session, track, language=payload.language or "auto",
+                                 user_id=getattr(user, "user_id", None), now=now,
+                                 recheck=payload.force)
             await session.commit()
             return await tq.status_payload(session, track_id, now)
 
@@ -170,12 +173,22 @@ def build_router(settings, require_owner, catalog_check: Callable[..., Awaitable
                 else:
                     credential = await session.get(AgentCredential, auth.credential_id)
                     ticket = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=TICKET_TTL_SEC)
+                    record = await session.get(MusicEnrichment, track.id)
+                    reference = tq.plain_lyrics_reference(record)
+                    recheck = bool((job.result or {}).get("quality_recheck_requested")
+                                   or (job.result or {}).get("owner_recheck_used"))
                     body["job"] = {"id": job.id, "track_id": track.id, "title": track.title, "artist": track.artist,
                         "duration": track.duration, "mime": track.mime, "filename": track.filename,
                         "language": job.language, "sha256": track.sha256,
+                        "recognition_pass": 2 if recheck else 1,
+                        "quality_recheck": bool((job.result or {}).get("quality_recheck_requested")),
                         "media_path": f"/agent/music/tracks/{track.id}/stream?ticket={ticket}",
                         "lease_sec": tq.RUN_LEASE_SEC, "renew_every_sec": 60,
                         "deadline_at": tq.aware(job.deadline_at).isoformat()}
+                    if reference:
+                        body["job"]["lyrics_reference"] = reference["text"]
+                        body["job"]["lyrics_reference_source"] = reference["source"]
+                        body["job"]["lyrics_reference_only"] = True
             await session.commit()
             if covers:
                 from sqlalchemy.ext.asyncio import async_sessionmaker

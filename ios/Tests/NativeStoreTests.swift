@@ -138,6 +138,48 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertEqual(api.requests.filter { $0.0.contains("library") }.count, 2)
         store.disconnect()
     }
+    @MainActor func testForegroundRefreshReconcilesEveryLoadedPageAndDeletedTail() async {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        var ids = Array(1...120)
+        api.handler = { path, _, _ in
+            guard path.contains("library"), let parts = URLComponents(string: path) else { return nil }
+            let items = parts.queryItems ?? []
+            let offset = Int(items.first(where: { $0.name == "offset" })?.value ?? "0") ?? 0
+            let limit = Int(items.first(where: { $0.name == "limit" })?.value ?? "50") ?? 50
+            let page = Array(ids.dropFirst(offset).prefix(limit))
+            let hasMore = offset + page.count < ids.count
+            var response: [String: Any] = ["ok": true, "tracks": page.map { ["id": $0, "title": "Track \($0)"] },
+                                                   "has_more": hasMore, "playlists": []]
+            if hasMore { response["next_offset"] = offset + page.count }
+            else { response["next_offset"] = NSNull() }
+            return response
+        }
+        await store.refresh()
+        await store.loadMoreTracks()
+        await store.loadMoreTracks()
+        XCTAssertEqual(store.tracks.map(\.id), Array(1...120))
+
+        ids.removeAll { $0 == 110 }
+        await store.refresh()
+        XCTAssertEqual(store.tracks.map(\.id), ids)
+        XCTAssertFalse(store.libraryHasMore)
+        XCTAssertTrue(api.requests.contains { $0.0.contains("limit=120") },
+                      "Refresh must request the full loaded range, not only page one")
+    }
+    @MainActor func testPlayerHeartbeatExplainsLocalNetworkTransport() async throws {
+        let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        defer { store.disconnect() }
+        api.handler = { path, _, _ in
+            if path.contains("players") {
+                return ["ok": true, "players": [["source_name": "Studio", "live": true, "available": true,
+                    "music_player": ["track_id": 1, "state": "playing", "media_transport": "lan"]]]]
+            }
+            return nil
+        }
+        await store.refresh()
+        XCTAssertEqual(store.pcTransportLabel("Studio"), "Напрямую по локальной сети")
+    }
     @MainActor func testShuffleTransferUsesOneCanonicalOrderAndQueuePatchIsPartial() async throws {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
         await store.refresh()

@@ -197,7 +197,7 @@ test('inline and external application scripts are syntactically valid', () => {
 test('shell cache includes the security-updated control client and current music assets', async () => {
   const h = workerHarness();
   await h.install();
-  assert.deepEqual(await h.caches.keys(), ['xass-shell-v15']);
+  assert.deepEqual(await h.caches.keys(), ['xass-shell-v16']);
   for (const extension of ['css', 'js']) {
     const music = `/assets/miniapp-music.${extension}?v=0170`;
     assert(pageSource.includes('"' + music + '"'), 'page must request the new music release');
@@ -205,11 +205,26 @@ test('shell cache includes the security-updated control client and current music
     const old = `/assets/miniapp-music.${extension}?v=0160`;
     assert(!pageSource.includes(old));
     assert.equal(await h.caches.match(old), undefined);
-    const controlVersion = extension === 'js' ? '0190' : '0160';
+    const controlVersion = extension === 'js' ? '0191' : '0160';
     const control = `/assets/miniapp-control-center.${extension}?v=${controlVersion}`;
     assert(pageSource.includes('"' + control + '"'));
     assert.equal(await (await h.caches.match(control)).text(), 'cached:' + control);
   }
   assert(!pageSource.includes('/assets/miniapp-control-center.js?v=0160'));
   assert.equal(await h.caches.match('/assets/miniapp-control-center.js?v=0160'), undefined);
+});
+
+test('privacy-sensitive PC reads and uploads carry a bound fresh action proof', () => {
+  const controlSource = fs.readFileSync(path.join(root, 'assets', 'miniapp-control-center.js'), 'utf8');
+  const dangerous = controlSource.slice(controlSource.indexOf('const DANGEROUS'), controlSource.indexOf('const pendingCommands'));
+  for (const command of ['screenshot', 'file_download', 'clipboard_get']) assert(dangerous.includes("'" + command + "'"));
+  assert.match(controlSource, /X\.agentActionBinding\(source, command, payload\)/);
+  assert.match(controlSource, /X\.passkeyAction\('agent:' \+ command \+ ':' \+ source, binding\)/);
+
+  const upload = controlSource.slice(controlSource.indexOf('async function uploadFile('), controlSource.indexOf('\n  function renderClipboardPanel'));
+  const proof = upload.indexOf("X.passkeyAction('agent:file_upload:' + source, binding)");
+  const read = upload.indexOf('file.arrayBuffer()');
+  assert(proof >= 0 && read > proof, 'approval must happen before reading the selected file');
+  assert.match(upload, /'X-XASS-Action-Proof': proof/);
+  assert.match(pageSource, /command==='file_upload'\)payload\.filename=workspaceFilename/);
 });

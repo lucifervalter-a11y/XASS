@@ -603,10 +603,12 @@ class TranscriptionWorker:
     def runner_command(self, job: dict, source: Path, output: Path, workdir: Path, threads: int) -> list[str]:
         # CUDA only when an NVIDIA GPU is present *and* the CUDA torch wheel was installed.
         device = "cuda" if self._gpu.get("gpu") and self.runtime.variant() == "cu121" else "cpu"
-        language = str(job.get("language") or "ru")
+        language = str(job.get("language") or "auto")
+        recognition_pass = 2 if job.get("recognition_pass") == 2 else 1
         return [str(self.runtime.python), str(self.runtime.runner), "--input", str(source), "--output", str(output),
                 "--language", language, "--device", device, "--threads", str(threads),
-                "--models", str(self.runtime.models), "--workdir", str(workdir), "--parent-pid", str(os.getpid())]
+                "--models", str(self.runtime.models), "--workdir", str(workdir),
+                "--recognition-pass", str(recognition_pass), "--parent-pid", str(os.getpid())]
 
     def run_runner(self, client, job_id: int, command: list[str], threads: int, deadline: float) -> None:
         process = self.popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -671,7 +673,10 @@ class TranscriptionWorker:
                             started + budget)
             result = json.loads(output.read_text(encoding="utf-8"))
             lines = [row for row in result.get("lines", []) if isinstance(row, dict) and str(row.get("text") or "").strip()]
-            if not lines:
+            # The server deliberately owns the prior candidate. Reporting an
+            # empty second pass lets it finish with that candidate immediately;
+            # /fail would consume two more leases before MAX_ATTEMPTS restored it.
+            if not lines and job.get("recognition_pass") != 2:
                 raise TranscriptionError("no_speech_detected")
             response = client.post(f"{self.base}/agent/transcription/jobs/{job_id}/complete", json={
                 "lines": lines[:2000], "language": str(result.get("language") or "")[:8], "model": str(result.get("model") or "")[:64],

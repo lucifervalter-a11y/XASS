@@ -106,6 +106,32 @@ import SwiftUI
     @State private var removedTracks = Set<Int>()
     private var rows: [LibraryTrack] { collection.tracks.filter { !removedTracks.contains($0.id) }.map { store.resolvedTrack($0) } }
     var body: some View {
+        CollectionTrackScroll(store: store, collection: collection, kind: kind, complete: complete, rows: rows, busy: store.busy,
+                              onMenu: { selectedTrack = $0 })
+            .equatable()
+            .background { NativeMusicBackdrop(store: store, trackID: collection.artworkID) }
+            .navigationBarTitleDisplayMode(.inline).toolbarBackground(.hidden, for: .navigationBar)
+            .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track, onDelete: { id in removedTracks.insert(id); onDelete?(id) }) }
+            .accessibilityIdentifier("nativeCollectionDetail")
+    }
+}
+
+/// Track rows stay put while playback publishes. The scroll view is not rebuilt for those ticks.
+private struct CollectionTrackScroll: View, Equatable {
+    let store: NativeStore
+    let collection: MusicCollection
+    let kind: MusicCollection.Kind
+    let complete: Bool
+    let rows: [LibraryTrack]
+    let busy: Bool
+    let onMenu: (LibraryTrack) -> Void
+    @State private var scrolledTrackID: Int?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.collection == rhs.collection && lhs.kind == rhs.kind && lhs.complete == rhs.complete && lhs.rows == rhs.rows && lhs.busy == rhs.busy
+    }
+
+    var body: some View {
         ScrollView {
             VStack(spacing: 22) {
                 if let id = collection.artworkID {
@@ -120,19 +146,18 @@ import SwiftUI
                 HStack(spacing: 12) {
                     Button { store.run { try await store.playAll(rows, shuffled: false) } } label: { Label("Слушать", systemImage: "play.fill").frame(maxWidth: .infinity).padding(.vertical, 8) }.buttonStyle(.borderedProminent).tint(.white).foregroundStyle(.black).accessibilityIdentifier("nativeCollectionPlay")
                     Button { store.run { try await store.playAll(rows, shuffled: true) } } label: { Image(systemName: "shuffle").frame(width: 44, height: 44) }.buttonStyle(.bordered).tint(.white).accessibilityLabel("Перемешать коллекцию")
-                }.disabled(store.busy || rows.isEmpty)
+                }.disabled(busy || rows.isEmpty)
                 if !complete { Text("Это загруженная часть коллекции. Вернитесь к списку и нажмите «Загрузить ещё», чтобы получить остальные треки.").font(.footnote).foregroundStyle(.secondary) }
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { track in
-                        NativeTrackRow(store: store, track: track, rows: rows) { selectedTrack = track }
+                        NativeTrackRow(store: store, track: track, rows: rows) { onMenu(track) }
+                            .id(track.id)
                         Divider().padding(.leading, 60).opacity(0.2)
                     }
-                }
+                }.scrollTargetLayout()
                 NativeMessage(store: store)
             }.padding(20).frame(maxWidth: 660).frame(maxWidth: .infinity)
-        }.background { NativeMusicBackdrop(store: store, trackID: collection.artworkID) }
-            .navigationBarTitleDisplayMode(.inline).toolbarBackground(.hidden, for: .navigationBar)
-            .sheet(item: $selectedTrack) { track in NativeTrackActions(store: store, track: track, onDelete: { id in removedTracks.insert(id); onDelete?(id) }) }
-            .accessibilityIdentifier("nativeCollectionDetail")
+        }
+        .scrollPosition(id: $scrolledTrackID, anchor: .top)
     }
 }

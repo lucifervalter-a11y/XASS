@@ -6,9 +6,11 @@ import base64
 import binascii
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import time
@@ -28,10 +30,34 @@ from app.music_playback import canonical_lan_url, current_session, expire_active
 from app.music_playback_models import MusicRemoteCommand, MusicTransfer
 from app.services.agent_commands import enqueue_agent_command
 from app.services.agent_lifecycle import ensure_agent_attached
+from app.services.agent_pairing import authenticate_agent_api_key
 from app.services.agent_workspace import AssetUploadTooLarge, read_bounded_body
 from app.services.control_status import canonical_web_app_url, source_is_online
 from app.services.music_library import CHUNK_BYTES, MAX_ARCHIVE_UPLOAD_BYTES, archive_upload_limit, content_lock, filename, inspect_audio, issue_ticket, track_json, track_path, verify_ticket
 from app.services.music_storage import ensure_restore_requested, lock_content, lock_track
+
+
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+
+
+def _trusted_track_sha256(value) -> str:
+    """Return the catalog digest used to authenticate every agent media byte."""
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise HTTPException(409, "Контрольная сумма трека повреждена. Загрузите файл повторно")
+    return value.lower()
+
+
+def _bound_agent_key(request: Request, auth: dict) -> str:
+    """Prove that the caller owns the credential named by a signed agent ticket."""
+    raw_key = request.headers.get("x-api-key", "")
+    binding = str(auth.get("b") or "")
+    if (not isinstance(raw_key, str) or not 8 <= len(raw_key) <= 4096
+            or _SHA256_RE.fullmatch(binding) is None):
+        raise HTTPException(403, "Агент не авторизован")
+    supplied = hashlib.sha256(raw_key.encode()).hexdigest()
+    if not secrets.compare_digest(supplied, binding):
+        raise HTTPException(403, "Агент не авторизован")
+    return binding
 
 
 class StartUpload(BaseModel):
@@ -78,6 +104,11 @@ class ControlBody(BaseModel):
     volume: int = Field(default=70, ge=0, le=100)
     expires_at: int | None = Field(default=None, gt=0)
     lan_url: str | None = Field(default=None, max_length=300)
+
+
+class AgentLibraryPlayBody(BaseModel):
+    output_id: str = Field(default="default", max_length=256)
+    volume: int = Field(default=70, ge=0, le=100)
 
 
 class RecoverSessionBody(BaseModel):
@@ -158,6 +189,35 @@ def build_router(settings, require_owner, public_origin):
         if item is None or item.deleted:
             raise HTTPException(404, "Трек не найден")
         return item
+
+    @router.get("/api/mini/music/catalog/discover")
+    async def discover_catalog(response: Response,
+                               q: str = Query(min_length=1, max_length=240),
+                               limit: int = Query(default=20, ge=1, le=30),
+                               user=Depends(require_owner)):
+        """Metadata discovery only; provider audio is never proxied or imported."""
+        from app.services.music_card import discover_music_catalog
+        response.headers["Cache-Control"] = "private, no-store"
+        return {"ok": True, **(await discover_music_catalog(q, limit=limit))}
+
+    async def paired_agent(request: Request, session):
+        auth = await authenticate_agent_api_key(
+            session,
+            api_key=request.headers.get("x-api-key"),
+            global_agent_api_key=getattr(settings, "agent_api_key", ""),
+            global_key_enabled=bool(getattr(settings, "agent_api_key_enabled", False)),
+        )
+        if auth is None:
+            raise HTTPException(401, "Invalid agent key")
+        # A shared legacy key has no durable device identity and must never
+        # receive the owner's private catalog.
+        if not auth.credential_id:
+            raise HTTPException(403, "Для библиотеки привяжите агент отдельным ключом")
+        credential = await session.get(AgentCredential, auth.credential_id)
+        if credential is None or not credential.is_active or credential.source_name != auth.source_name:
+            raise HTTPException(403, "Агент больше не привязан")
+        await ensure_agent_attached(session, auth.source_name)
+        return auth, credential
 
     def processing(upload_id):
         return {"ok": True, "status": "processing", "upload_id": upload_id, "retry_after": 1}
@@ -556,11 +616,13 @@ def build_router(settings, require_owner, public_origin):
         response.headers["Cache-Control"] = "private, no-store"
         record = await session.get(MusicEnrichment, track_id)
         owner = record.owner_lyrics if record and isinstance(record.owner_lyrics, dict) else None
+        from app.music_enrichment_api import lyrics_companions, with_aligned_lyrics_companions
+        companions = lyrics_companions(record)
         # The owner's saved transcript stays until they switch the source to
         # the catalog. Unsynced file tags do not: they used to hide both the
         # catalog text and a finished PC transcription.
         if owner and not owner.get("disabled") and str(owner.get("text") or "").strip():
-            return {"ok": True, "lyrics": owner}
+            return {"ok": True, "lyrics": with_aligned_lyrics_companions(owner, companions)}
         embedded = await asyncio.to_thread(embedded_lyrics, root, track)
         if embedded.get("synced") and embedded.get("text"):
             return {"ok": True, "lyrics": embedded}
@@ -578,6 +640,7 @@ def build_router(settings, require_owner, public_origin):
         elif not str(value.get("text") or "").strip() and embedded.get("text"):
             value = embedded
         value.setdefault("status", result["enrichment"].get("lookup_status") or result["enrichment"].get("status", "not_found"))
+        value = with_aligned_lyrics_companions(value, companions)
         # The catalog can name the recording and still have no words (a duration
         # mismatch, an empty row, an instrumental flag). The phone already shows
         # a finished PC transcript here; queue that work instead of leaving the
@@ -601,11 +664,14 @@ def build_router(settings, require_owner, public_origin):
         response.headers["Cache-Control"] = "private, no-store"
         record = await session.get(MusicEnrichment, track_id)
         owner = record.owner_lyrics if record and record.owner_lyrics else None
+        from app.music_enrichment_api import lyrics_companions, with_aligned_lyrics_companions
+        companions = lyrics_companions(record)
         enrichment = (record.result or {}).get("lyrics") if record and not record.dismissed and isinstance(record.result, dict) else None
         embedded = await asyncio.to_thread(embedded_lyrics, root, track)
         from types import SimpleNamespace
         snapshot = SimpleNamespace(**{key: getattr(track, key) for key in
             ("id", "title", "artist", "album", "duration", "filename", "sha256")})
+        snapshot.is_excerpt = bool((record.original or {}).get("is_excerpt")) if record else False
         from app.services.transcription_queue import done_result, now_utc, queue_pc_if_no_lyrics
         # A finished PC transcription is used only when the catalog has no timed lyrics.
         transcription = await done_result(session, track_id)
@@ -621,6 +687,7 @@ def build_router(settings, require_owner, public_origin):
         if pending and not value.get("synced"):
             # Lets Now Playing re-check soon instead of caching "no lyrics" for hours.
             value["transcription_pending"] = True
+        value = with_aligned_lyrics_companions(value, companions)
         return {"ok": True, "lyrics": value}
 
     async def catalog_has_timed_lyrics(session, track) -> bool:
@@ -644,12 +711,17 @@ def build_router(settings, require_owner, public_origin):
     async def artwork(track_id: int, user=Depends(require_owner), session=Depends(get_session)):
         from app.services.music_artwork import artwork_thumbnail
         track = await find_track(session, track_id)
-        path = await asyncio.to_thread(artwork_thumbnail, root, track)
+        cached = await session.get(MusicEnrichment, track_id)
+        manual = ((cached.result or {}).get("manual_artwork") if cached and isinstance(cached.result, dict) else {})
         headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+        # An explicit owner choice overrides embedded/catalog artwork.
+        if isinstance(manual, dict) and manual.get("source") == "owner" and cached.artwork_data:
+            return Response(cached.artwork_data, media_type="image/jpeg", headers=headers)
+        path = await asyncio.to_thread(artwork_thumbnail, root, track)
         if path is not None:
             return FileResponse(path, media_type="image/jpeg", headers=headers)
-        cached = await session.get(MusicEnrichment, track_id)
-        if cached and not cached.dismissed and cached.artwork_data:
+        from app.music_enrichment_api import stored_artwork_available
+        if stored_artwork_available(cached):
             return Response(cached.artwork_data, media_type="image/jpeg", headers=headers)
         # The library asks for a cover directly. A file without a picture, and a
         # catalog row MusicBrainz could not illustrate, still get an exact-name cover.
@@ -707,15 +779,169 @@ def build_router(settings, require_owner, public_origin):
         return {"ok": True, "playing": True, "track": {key: getattr(track, key) for key in ("id", "title", "artist", "duration", "mime")},
                 "position": position, "path": f"/api/music/tracks/{track.id}/stream?ticket={token}"}
 
+    @router.get("/agent/music/library")
+    async def agent_library(
+        request: Request,
+        response: Response,
+        q: str = Query(default="", max_length=120),
+        offset: int = Query(default=0, ge=0, le=100000),
+        limit: int = Query(default=60, ge=1, le=100),
+        session=Depends(get_session),
+    ):
+        """Small read-only catalog for the native Windows shell.
+
+        The response intentionally omits storage names, hashes, filenames,
+        lyrics, media URLs and tickets.  A paired PC may render the owner's
+        list, but cannot turn this endpoint into a bulk media export.
+        """
+
+        await paired_agent(request, session)
+        filters = [MusicTrack.deleted.is_(False)]
+        if q.strip():
+            escaped = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = "%" + escaped + "%"
+            filters.append(
+                MusicTrack.title.ilike(pattern, escape="\\")
+                | MusicTrack.artist.ilike(pattern, escape="\\")
+                | MusicTrack.album.ilike(pattern, escape="\\")
+            )
+        total = int(await session.scalar(select(func.count()).select_from(MusicTrack).where(*filters)) or 0)
+        query = (
+            select(
+                MusicTrack,
+                MusicEnrichment.artwork_data.is_not(None) & MusicEnrichment.dismissed.is_(False),
+            )
+            .outerjoin(MusicEnrichment, MusicEnrichment.track_id == MusicTrack.id)
+            .where(*filters)
+            .order_by(MusicTrack.created_at.desc(), MusicTrack.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = list((await session.execute(query)).all())
+        response.headers.update({"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+        return {
+            "ok": True,
+            "tracks": [
+                {
+                    "id": track.id,
+                    "title": str(track.title or "")[:240],
+                    "artist": str(track.artist or "")[:240],
+                    "album": str(track.album or "")[:240],
+                    "duration": round(float(track.duration or 0), 3),
+                    "favorite": bool(track.favorite),
+                    "mime": str(track.mime or "")[:80],
+                    "has_artwork": bool(has_artwork),
+                }
+                for track, has_artwork in rows
+            ],
+            "total": total,
+            "offset": offset,
+            "has_more": offset + len(rows) < total,
+            "next_offset": offset + len(rows) if offset + len(rows) < total else None,
+        }
+
+    @router.post("/agent/music/library/{track_id}/play")
+    async def agent_library_play(
+        track_id: int,
+        payload: AgentLibraryPlayBody,
+        request: Request,
+        session=Depends(get_session),
+    ):
+        """Queue one catalog item on the calling paired PC, never return its ticket."""
+
+        auth, credential = await paired_agent(request, session)
+        track = await find_track(session, track_id)
+        if track.mime == "audio/mp4":
+            raise HTTPException(415, "Для воспроизведения на ПК выберите MP3, WAV, FLAC или OGG")
+        trusted_sha256 = _trusted_track_sha256(track.sha256)
+        ticket = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=600)
+        media_path = f"/agent/music/tracks/{track.id}/stream?ticket={ticket}"
+        config = await session.get(AppConfig, 1)
+        web_url = canonical_web_app_url(
+            config.service_base_url if config else "",
+            settings.profile_public_url,
+            public_origin(request)[1],
+        )
+        origin = web_url.split("/miniapp.php", 1)[0]
+        command_payload = {
+            "track_id": track.id,
+            "title": str(track.title or "")[:256],
+            "artist": str(track.artist or "")[:256],
+            "sha256": trusted_sha256,
+            "url": origin + media_path,
+            "media_path": media_path,
+            "output_id": payload.output_id,
+            "volume": payload.volume,
+            "position_sec": 0,
+            "expires_at": int(time.time()) + 120,
+        }
+        from app.services.music_agent_presentation import stored_agent_presentation
+        presentation = await stored_agent_presentation(session, track)
+        if presentation["lyrics"]:
+            command_payload["lyrics"] = presentation["lyrics"]
+        if presentation["catalog_artwork"]:
+            artwork_path = f"/agent/music/tracks/{track.id}/artwork?ticket={ticket}"
+            command_payload.update(artwork_path=artwork_path, artwork_url=origin + artwork_path)
+        await session.execute(
+            update(AgentCommand)
+            .where(
+                AgentCommand.source_name == auth.source_name,
+                AgentCommand.command == "music_play",
+                AgentCommand.status == "pending",
+            )
+            .values(status="cancelled")
+        )
+        item = await enqueue_agent_command(
+            session,
+            source_name=auth.source_name,
+            command="music_play",
+            payload=command_payload,
+            actor_user_id=None,
+        )
+        return {"ok": True, "command_id": item.id, "status": item.status}
+
     @router.api_route("/agent/music/tracks/{track_id}/stream", methods=["GET", "HEAD"])
-    async def agent_stream(track_id: int, ticket: str = "", session=Depends(get_session)):
+    async def agent_stream(track_id: int, request: Request, ticket: str = "", session=Depends(get_session)):
         auth = verify_ticket(settings, ticket, track_id, purposes=("agent",))
         if auth is None:
             raise HTTPException(401, "Ссылка на аудио истекла")
-        credential = await session.scalar(select(AgentCredential).where(AgentCredential.api_key_hash == auth["b"], AgentCredential.is_active.is_(True)))
+        binding = _bound_agent_key(request, auth)
+        credential = await session.scalar(select(AgentCredential).where(
+            AgentCredential.api_key_hash == binding, AgentCredential.is_active.is_(True)))
         if credential is None:
             raise HTTPException(403, "Агент отвязан")
         return await audio_response(await find_track(session, track_id), session)
+
+    @router.get("/agent/music/tracks/{track_id}/artwork")
+    async def agent_artwork(track_id: int, request: Request, ticket: str = "", session=Depends(get_session)):
+        """A bounded stored JPEG for the exact credential-bound media ticket."""
+        auth = verify_ticket(settings, ticket, track_id, purposes=("agent",))
+        if auth is None:
+            raise HTTPException(401, "Ссылка на обложку истекла")
+        binding = _bound_agent_key(request, auth)
+        credential = await session.scalar(select(AgentCredential).where(
+            AgentCredential.api_key_hash == binding, AgentCredential.is_active.is_(True)))
+        if credential is None:
+            raise HTTPException(403, "Агент отвязан")
+        track = await find_track(session, track_id)
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+                   "Referrer-Policy": "no-referrer"}
+        record = await session.get(MusicEnrichment, track_id)
+        manual = ((record.result or {}).get("manual_artwork") if record and isinstance(record.result, dict) else {})
+        if isinstance(manual, dict) and manual.get("source") == "owner" and record.artwork_data:
+            return Response(record.artwork_data, media_type="image/jpeg", headers=headers)
+        # Local extraction/cache lookup only.  Unlike the owner artwork route,
+        # this endpoint never starts an external catalog/provider request.
+        from app.services.music_artwork import MAX_OUTPUT_BYTES, artwork_thumbnail
+        path = await asyncio.to_thread(artwork_thumbnail, root, track)
+        if path is not None:
+            return FileResponse(path, media_type="image/jpeg", headers=headers)
+        from app.music_enrichment_api import stored_artwork_available
+        data = record.artwork_data if stored_artwork_available(record) else None
+        if (not isinstance(data, bytes) or not 3 <= len(data) <= MAX_OUTPUT_BYTES
+                or not data.startswith(b"\xff\xd8\xff")):
+            raise HTTPException(404, "Обложка не сохранена")
+        return Response(data, media_type="image/jpeg", headers=headers)
 
     @router.get("/api/mini/music/players")
     async def players(user=Depends(require_owner), session=Depends(get_session)):
@@ -756,12 +982,21 @@ def build_router(settings, require_owner, public_origin):
             track = await find_track(session, payload.track_id)
             if track.mime == "audio/mp4":
                 raise HTTPException(415, "Для воспроизведения M4A на ПК загрузите версию MP3 или WAV")
+            trusted_sha256 = _trusted_track_sha256(track.sha256)
             value = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=600)
             media_path = f"/agent/music/tracks/{track.id}/stream?ticket={value}"
             config = await session.get(AppConfig, 1)
             web_url = canonical_web_app_url(config.service_base_url if config else "", settings.profile_public_url, public_origin(request)[1])
             origin = web_url.split("/miniapp.php", 1)[0]
-            details.update(track_id=track.id, title=track.title, artist=track.artist, url=origin + media_path, media_path=media_path)
+            details.update(track_id=track.id, title=track.title, artist=track.artist, sha256=trusted_sha256,
+                           url=origin + media_path, media_path=media_path)
+            from app.services.music_agent_presentation import stored_agent_presentation
+            presentation = await stored_agent_presentation(session, track)
+            if presentation["lyrics"]:
+                details["lyrics"] = presentation["lyrics"]
+            if presentation["catalog_artwork"]:
+                artwork_path = f"/agent/music/tracks/{track.id}/artwork?ticket={value}"
+                details.update(artwork_path=artwork_path, artwork_url=origin + artwork_path)
             offered = canonical_lan_url(payload.lan_url, track.id) if payload.lan_url else None
             if offered:
                 details["lan_url"] = offered

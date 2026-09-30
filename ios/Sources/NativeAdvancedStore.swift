@@ -171,10 +171,15 @@ struct NativeRemoteFileTarget: Identifiable {
     private var messageRequest: String?
     private var temporaryFiles: [URL] = []
     private let workspacePrivateKey: () -> Data?
-    init(owner: NativeStore, workspacePrivateKey: (() -> Data?)? = nil) {
+    private let actionProof: (String, [String: Any], String) async throws -> String
+    init(owner: NativeStore, workspacePrivateKey: (() -> Data?)? = nil,
+         actionProof: ((String, [String: Any], String) async throws -> String)? = nil) {
         self.owner = owner
         let keyName = NativeWorkspaceCrypto.keyName(owner.api.origin)
         self.workspacePrivateKey = workspacePrivateKey ?? { SecureStore.load(keyName) }
+        self.actionProof = actionProof ?? { purpose, binding, reason in
+            try await owner.authorization.proof(purpose: purpose, binding: binding, reason: reason)
+        }
     }
 
     func perform(_ action: () async throws -> Void) async {
@@ -190,6 +195,42 @@ struct NativeRemoteFileTarget: Identifiable {
     static func query(_ path: String, _ items: [URLQueryItem]) -> String {
         var parts = URLComponents(); parts.queryItems = items
         return path + "?" + (parts.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
+    }
+    /// Keep upload proof binding byte-for-byte compatible with the server's
+    /// `safe_workspace_filename`; otherwise a weird filename could be approved
+    /// under one value and stored under another.
+    static func workspaceFilename(_ value: String) -> String {
+        let leaf = value.replacingOccurrences(of: "\\", with: "/").split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? ""
+        let trimmed = leaf.trimmingCharacters(in: .whitespacesAndNewlines)
+        let forbidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "<>:\"/\\|?*"))
+        var sanitized = "", replacing = false
+        for scalar in trimmed.unicodeScalars {
+            if forbidden.contains(scalar) {
+                if !replacing { sanitized.append("_") }
+                replacing = true
+            } else {
+                sanitized.unicodeScalars.append(scalar); replacing = false
+            }
+        }
+        sanitized = sanitized.trimmingCharacters(in: CharacterSet(charactersIn: " ."))
+        if sanitized.isEmpty { sanitized = "xass-file.bin" }
+        var limited = "", count = 0
+        for scalar in sanitized.unicodeScalars {
+            if count == 180 { break }
+            limited.unicodeScalars.append(scalar); count += 1
+        }
+        return limited
+    }
+    private func authorizeAgentAction(_ device: NativeDevice, command: String, payload: [String: Any], reason: String) async throws -> String {
+        owner.confirmationActivity?(true)
+        defer { owner.confirmationActivity?(false) }
+        let binding: [String: Any] = ["source_id": device.id, "command": command, "payload": payload]
+        let proof = try await actionProof("agent:\(command):\(device.name)", binding, reason)
+        for _ in 0..<20 {
+            if owner.canSendActions() { return proof }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw OwnerAPIError(status: 0, message: "Вернитесь в XASS и повторите действие.")
     }
     static func date(_ raw: String) -> String {
         let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -281,7 +322,15 @@ struct NativeRemoteFileTarget: Identifiable {
     /// Match the returned command ID. An older successful command is never used as the new result.
     func command(_ device: NativeDevice, name: String, payload: [String: Any] = [:]) async throws -> [String: Any] {
         guard ["screenshot", "files_list", "file_download", "clipboard_get", "clipboard_set"].contains(name) else { throw OwnerAPIError.invalidResponse }
-        let result = try await request(devicePath(device) + "/commands", method: "POST", body: ["command": name, "payload": payload])
+        var body: [String: Any] = ["command": name, "payload": payload]
+        if ["screenshot", "file_download", "clipboard_get"].contains(name) {
+            let action = name == "screenshot" ? "снимок экрана" : name == "clipboard_get" ? "чтение буфера обмена" : "скачивание файла"
+            body["action_proof"] = try await authorizeAgentAction(
+                device, command: name, payload: payload,
+                reason: "Подтвердить \(action) с ПК \(device.name)"
+            )
+        }
+        let result = try await request(devicePath(device) + "/commands", method: "POST", body: body)
         return try await waitForCommand(device, response: result)
     }
     private func waitForCommand(_ device: NativeDevice, response result: [String: Any]) async throws -> [String: Any] {
@@ -363,21 +412,29 @@ struct NativeRemoteFileTarget: Identifiable {
         guard values.isRegularFile == true, let size = values.fileSize, size > 0, size <= 16 * 1024 * 1024 - 33 else {
             throw OwnerAPIError(status: 413, message: "Выберите непустой файл до 16 МБ.")
         }
+        let safeName = Self.workspaceFilename(url.lastPathComponent)
+        let uploadPayload: [String: Any] = ["root": root, "path": path, "filename": safeName]
+        // User presence is verified before Data(contentsOf:) so an unauthorised
+        // request cannot make the app consume or encrypt the selected file.
+        let proof = try await authorizeAgentAction(
+            device, command: "file_upload", payload: uploadPayload,
+            reason: "Загрузить «\(safeName)» на ПК \(device.name)"
+        )
         var bytes = try Data(contentsOf: url, options: .mappedIfSafe)
         guard bytes.count == size else { throw OwnerAPIError(status: 409, message: "Файл изменился во время чтения. Повторите выбор.") }
         let mime = values.contentType?.preferredMIMEType ?? "application/octet-stream"
-        var headers = ["Content-Type": mime]
+        var headers = ["Content-Type": mime, "X-XASS-Action-Proof": proof]
         if let key = try await optionalPeer(device) {
             guard let secret = workspacePrivateKey() else { throw NativeWorkspaceCrypto.missingKey }
             bytes = try NativeWorkspaceCrypto.seal(bytes, privateKey: secret, peer: key, purpose: "file_upload")
-            headers = ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": mime]
+            headers = ["Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1", "X-XASS-Inner-Type": mime, "X-XASS-Action-Proof": proof]
         }
         try Task.checkCancellation()
-        status = "Отправляю файл «\(url.lastPathComponent)»…"
-        let uploadPath = Self.query(devicePath(device) + "/files/upload", [.init(name: "root", value: root), .init(name: "path", value: path), .init(name: "filename", value: url.lastPathComponent)])
+        status = "Отправляю файл «\(safeName)»…"
+        let uploadPath = Self.query(devicePath(device) + "/files/upload", [.init(name: "root", value: root), .init(name: "path", value: path), .init(name: "filename", value: safeName)])
         let response = try await owner.api.upload(uploadPath, data: bytes, headers: headers)
         let result = try await waitForCommand(device, response: response)
-        let savedName = result["filename"] as? String ?? url.lastPathComponent
+        let savedName = result["filename"] as? String ?? safeName
         do { try await listFiles(device, root: root, path: path) }
         catch { self.error = "Файл сохранён, но список папки не обновлён: " + error.localizedDescription }
         status = "Файл «\(savedName)» сохранён на ПК"

@@ -9,6 +9,14 @@ struct SyncedLyricLine: Identifiable, Equatable, Codable {
     let start: Double
     let end: Double
     let text: String
+    let translation: String?
+    let pronunciation: String?
+
+    init(id: Int, start: Double, end: Double, text: String,
+         translation: String? = nil, pronunciation: String? = nil) {
+        self.id = id; self.start = start; self.end = end; self.text = text
+        self.translation = translation; self.pronunciation = pronunciation
+    }
 }
 
 /// Apple-Music-style lyrics for one track, as returned by
@@ -39,13 +47,28 @@ struct SyncedLyrics: Equatable, Codable {
                 return number.doubleValue
             }
             let start = seconds(row["start"]), end = seconds(row["end"])
-            guard start >= 0, start <= 86_400, end >= start, let text = row["text"] as? String, !text.isEmpty else { continue }
+            guard start >= 0, start <= 86_400, end >= start, end <= 86_400,
+                  let text = row["text"] as? String, !text.isEmpty else { continue }
             let shown = NativeLRCText.plainText(String(text.prefix(500)))
             guard !shown.isEmpty else { continue }
-            parsed.append(SyncedLyricLine(id: parsed.count, start: start, end: end, text: shown))
+            func optionalLine(_ keys: [String]) -> String? {
+                for key in keys {
+                    guard let raw = row[key] as? String else { continue }
+                    let value = NativeLRCText.plainText(String(raw.prefix(500)))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !value.isEmpty { return value }
+                }
+                return nil
+            }
+            parsed.append(SyncedLyricLine(id: parsed.count, start: start, end: end, text: shown,
+                translation: optionalLine(["translation", "translated_text"]),
+                pronunciation: optionalLine(["pronunciation", "transliteration", "romanized_text"])))
         }
         parsed.sort { $0.start < $1.start }
-        lines = parsed.enumerated().map { SyncedLyricLine(id: $0.offset, start: $0.element.start, end: $0.element.end, text: $0.element.text) }
+        lines = parsed.enumerated().map {
+            SyncedLyricLine(id: $0.offset, start: $0.element.start, end: $0.element.end, text: $0.element.text,
+                            translation: $0.element.translation, pronunciation: $0.element.pronunciation)
+        }
         self.trackID = trackID
         let raw = value["status"] as? String ?? "not_found"
         status = ["synced", "plain", "instrumental", "not_found", "unavailable", "insufficient_metadata"].contains(raw) ? raw : "not_found"
@@ -105,6 +128,7 @@ struct SyncedLyrics: Equatable, Codable {
     private var pendingTask: Task<Void, Never>?
     private var memory: [Int: SyncedLyrics] = [:]
     private var inflight: [Int: Task<SyncedLyrics?, Never>] = [:]
+    private var fetchGeneration: [Int: Int] = [:]
     private let directory: URL?
     private weak var api: OwnerService?
 
@@ -141,13 +165,25 @@ struct SyncedLyrics: Equatable, Codable {
 
     /// Drops the cached copy (e.g. a PC transcription just finished) and reloads it if it is playing.
     func invalidate(_ id: Int) {
+        pendingTask?.cancel()
         memory.removeValue(forKey: id)
         if let file = file(id) { try? FileManager.default.removeItem(at: file) }
+        fetchGeneration[id, default: 0] &+= 1
+        inflight[id] = nil
         guard id == currentTrackID, autoFetch else { return }
+        loading = current == nil
         Task { [weak self] in
             guard let self = self else { return }
-            let value = await self.fetch(id)
-            if self.currentTrackID == id, let value = value { self.current = value }
+            let value = await self.fetch(id, force: true)
+            guard self.currentTrackID == id else { return }
+            if let value = value {
+                self.current = value
+                self.error = nil
+            } else if self.current == nil {
+                self.error = "Нет связи с сервером. Текст появится, когда сеть вернётся."
+            }
+            self.loading = false
+            self.recheckWhilePending(id)
         }
     }
 
@@ -217,9 +253,10 @@ struct SyncedLyrics: Equatable, Codable {
 
     private func file(_ id: Int) -> URL? { directory?.appendingPathComponent("\(max(0, id)).json") }
 
-    private func fetch(_ id: Int) async -> SyncedLyrics? {
-        if let value = memory[id], fresh(value) { return value }
-        if let running = inflight[id] { return await running.value }
+    private func fetch(_ id: Int, force: Bool = false) async -> SyncedLyrics? {
+        let generation = fetchGeneration[id, default: 0]
+        if !force, let value = memory[id], fresh(value) { return value }
+        if !force, let running = inflight[id] { return await running.value }
         guard let api = api else { return nil }
         let task = Task<SyncedLyrics?, Never> { @MainActor in
             do {
@@ -229,7 +266,9 @@ struct SyncedLyrics: Equatable, Codable {
         }
         inflight[id] = task
         let value = await task.value
-        inflight.removeValue(forKey: id)
+        // A transcription invalidate bumps the generation so this stale reply cannot stick.
+        guard fetchGeneration[id, default: 0] == generation else { return memory[id] }
+        inflight[id] = nil
         guard let value = value else { return memory[id] }
         // Provider outages are not cached as "no lyrics".
         if value.status != "unavailable" || memory[id] == nil {

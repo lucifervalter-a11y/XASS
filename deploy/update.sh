@@ -10,7 +10,17 @@ command -v git >/dev/null 2>&1 || { echo "[ERROR] git is not installed"; exit 1;
 echo "[INFO] Fetching origin/main..."
 before="$(git rev-parse HEAD)"
 git fetch --prune origin main
-git merge --ff-only origin/main
+target_revision="${1:-origin/main}"
+if [[ "$target_revision" != "origin/main" ]]; then
+  [[ "$target_revision" =~ ^[0-9a-f]{40}$ ]] || { echo "[ERROR] Target revision must be a full Git commit hash"; exit 1; }
+  git cat-file -e "${target_revision}^{commit}" 2>/dev/null || { echo "[ERROR] Target revision is not available"; exit 1; }
+  git merge-base --is-ancestor "$target_revision" origin/main || { echo "[ERROR] Target revision is not on origin/main"; exit 1; }
+fi
+git merge --ff-only "$target_revision"
+if [[ "$target_revision" != "origin/main" && "$(git rev-parse HEAD)" != "$target_revision" ]]; then
+  echo "[ERROR] Refusing to roll back a server that is already newer than the verified revision"
+  exit 1
+fi
 echo "[INFO] Restoring readable permissions on tracked public web files..."
 if [[ -x ".venv/bin/python" ]]; then
   .venv/bin/python deploy/repair_public_permissions.py

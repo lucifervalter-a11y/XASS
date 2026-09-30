@@ -22,10 +22,19 @@ final class NativeAdvancedStoreTests: XCTestCase {
     @MainActor func testCommandMatchesNewIDAndRejectsOldSuccess() async throws {
         let api = AdvancedOwnerFixture(), owner = NativeStore(api: api, audio: AudioController())
         defer { owner.disconnect() }
-        let data = NativeAdvancedStore(owner: owner)
+        owner.canSendActions = { true }
+        var proofBinding: [String: Any] = [:]
+        let data = NativeAdvancedStore(owner: owner, actionProof: { purpose, binding, _ in
+            XCTAssertEqual(purpose, "agent:clipboard_get:PC + #1")
+            proofBinding = binding
+            return "xna_fixture"
+        })
         let device = try XCTUnwrap(NativeDevice(["id": 1, "source_type": "PC_AGENT", "source_name": "PC + #1"]))
-        api.handler = { path, method, _ in
-            if method == "POST" { return ["ok": true, "command": ["id": 8]] }
+        api.handler = { path, method, body in
+            if method == "POST" {
+                XCTAssertEqual(body?["action_proof"] as? String, "xna_fixture")
+                return ["ok": true, "command": ["id": 8]]
+            }
             XCTAssertTrue(path.contains("PC%20%2B%20%231"))
             return ["ok": true, "commands": [
                 ["id": 7, "status": "completed", "result": ["ok": true, "details": ["text": "OLD"]]],
@@ -35,6 +44,9 @@ final class NativeAdvancedStoreTests: XCTestCase {
         do { try await data.getClipboard(device); XCTFail("Must reject the current failed command") }
         catch { XCTAssertEqual(error.localizedDescription, "New request failed") }
         XCTAssertEqual(data.clipboard, "")
+        XCTAssertEqual(proofBinding["source_id"] as? Int, 1)
+        XCTAssertEqual(proofBinding["command"] as? String, "clipboard_get")
+        XCTAssertTrue((proofBinding["payload"] as? [String: Any])?.isEmpty == true)
         let previousRequests = api.requests.count
         do { _ = try await data.command(device, name: "shutdown"); XCTFail("Advanced command path must not bypass protected operations") }
         catch {}
@@ -76,6 +88,11 @@ final class NativeAdvancedStoreTests: XCTestCase {
         for name in ["..", ".", "../file", "folder/file", "folder\\file", "C:secret", "\0"] { XCTAssertNil(NativeRemoteFile(["name": name, "type": "file"])) }
         XCTAssertNotNil(NativeRemoteFile(["name": "Отчёт 🎵.txt", "type": "file", "size": 10]))
     }
+    func testWorkspaceFilenameMatchesServerSanitizer() {
+        XCTAssertEqual(NativeAdvancedStore.workspaceFilename("  folder\\bad<>:\"|?*name.txt. "), "bad_name.txt")
+        XCTAssertEqual(NativeAdvancedStore.workspaceFilename("..."), "xass-file.bin")
+        XCTAssertEqual(NativeAdvancedStore.workspaceFilename(String(repeating: "я", count: 181)).unicodeScalars.count, 180)
+    }
     @MainActor func testFailedRuleSavePreservesConfirmedRules() async throws {
         let api = AdvancedOwnerFixture(), owner = NativeStore(api: api, audio: AudioController())
         defer { owner.disconnect() }
@@ -110,9 +127,15 @@ final class NativeAdvancedStoreTests: XCTestCase {
     @MainActor func testFileUploadEncryptsBytesAndPreservesLiteralFilenameAndDestination() async throws {
         let api = AdvancedOwnerFixture(), owner = NativeStore(api: api, audio: AudioController())
         let device = try XCTUnwrap(NativeDevice(["id": 7, "source_type": "PC_AGENT", "source_name": "PC +1"]))
+        owner.canSendActions = { true }
         let ownerKey = P256.KeyAgreement.PrivateKey(), agentKey = P256.KeyAgreement.PrivateKey()
         var availableKey: Data? = ownerKey.rawRepresentation
-        let data = NativeAdvancedStore(owner: owner, workspacePrivateKey: { availableKey })
+        var uploadProofBinding: [String: Any] = [:]
+        let data = NativeAdvancedStore(owner: owner, workspacePrivateKey: { availableKey }, actionProof: { purpose, binding, _ in
+            XCTAssertEqual(purpose, "agent:file_upload:PC +1")
+            uploadProofBinding = binding
+            return "xna_upload_fixture"
+        })
         func jwk(_ key: P256.KeyAgreement.PublicKey) -> [String: Any] {
             let point = key.x963Representation
             return ["kty": "EC", "crv": "P-256", "x": NativeWorkspaceCrypto.encoded(point[1..<33]), "y": NativeWorkspaceCrypto.encoded(point[33..<65])]
@@ -133,6 +156,7 @@ final class NativeAdvancedStoreTests: XCTestCase {
             XCTAssertEqual(headers["Content-Type"], "application/x-xass-sealed")
             XCTAssertEqual(headers["X-XASS-Cipher"], "xass-sealed-v1")
             XCTAssertEqual(headers["X-XASS-Inner-Type"], "text/plain")
+            XCTAssertEqual(headers["X-XASS-Action-Proof"], "xna_upload_fixture")
             XCTAssertNotEqual(bytes, plain)
             XCTAssertEqual(try NativeWorkspaceCrypto.open(bytes, privateKey: agentKey.rawRepresentation, peer: jwk(ownerKey.publicKey), purpose: "file_upload"), plain)
             return ["ok": true, "command": ["id": 19]]
@@ -148,6 +172,9 @@ final class NativeAdvancedStoreTests: XCTestCase {
         }
         try await data.uploadFile(device, url: url, root: "documents", path: "Папка + #A")
         XCTAssertEqual(uploadCount, 1); XCTAssertEqual(data.currentPath, "Папка + #A")
+        XCTAssertEqual(uploadProofBinding["source_id"] as? Int, 7)
+        XCTAssertEqual(uploadProofBinding["command"] as? String, "file_upload")
+        XCTAssertEqual(uploadProofBinding["payload"] as? [String: String], ["root": "documents", "path": "Папка + #A", "filename": "Отчёт + #1.txt"])
         availableKey = nil
         do { try await data.uploadFile(device, url: url, root: "documents", path: "Папка + #A"); XCTFail("A missing owner key must not cause plaintext fallback") }
         catch {}

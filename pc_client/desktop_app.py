@@ -24,7 +24,12 @@ from tkinter import ttk
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
-from desktop_widgets import ModernButton, NavButton, RoundedPanel, icon_image
+from desktop_widgets import (
+    ACCENT, ACCENT_SOFT, AMBER, BG, CARD, FIELD, GREEN, HOVER, LINE, MUTED, RED, SIDEBAR, TEXT,
+    EmptyState, ModernButton, NavButton, RoundedPanel, icon_badge, page_header,
+)
+CARD_HOVER = HOVER
+ACCENT_HOVER = ACCENT_SOFT
 from desktop_home import build_home
 from desktop_music import build_music
 from music_player import MusicPlayer
@@ -51,6 +56,7 @@ from client_agent import (
     ensure_minimal_defaults,
     load_config,
     normalize_server_url,
+    require_secret_transport,
     save_config,
 )
 from e2e_crypto import can_seal, ensure_agent_keys
@@ -84,19 +90,6 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
-BG = "#202022"
-SIDEBAR = "#202022"
-CARD = "#2b2b2f"
-CARD_HOVER = "#34343a"
-FIELD = "#232326"
-LINE = "#3b3b42"
-TEXT = "#f5f5f7"
-MUTED = "#b1b1bb"
-ACCENT = "#829cff"
-ACCENT_HOVER = "#96adff"
-GREEN = "#61c554"
-AMBER = "#efb65c"
-RED = "#f36b76"
 
 
 def miniapp_entry_url(server: str, config: Any) -> str:
@@ -244,6 +237,7 @@ class XassDesktop:
     def __init__(self, root: tk.Tk, *, minimized: bool = False, preview: bool = False) -> None:
         self.root = root
         self.preview = preview
+        self._install_after_guard()
         self.root.title("XASS — предпросмотр" if preview else "XASS")
         screen_width = max(960, self.root.winfo_screenwidth())
         screen_height = max(700, self.root.winfo_screenheight())
@@ -278,7 +272,7 @@ class XassDesktop:
             width=11,
         )
         style.map("XASS.Vertical.TScrollbar", background=[("active", ACCENT)])
-        style.configure("XASS.Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD, bordercolor=FIELD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=4)
+        style.configure("XASS.Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD, bordercolor=FIELD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6)
         icon_path = _resource_path("assets/xass.ico")
         if icon_path.is_file():
             try:
@@ -412,14 +406,14 @@ class XassDesktop:
         )
         return button
 
-    def _card(self, parent: tk.Misc, *, padding: int = 20) -> tk.Frame:
+    def _card(self, parent: tk.Misc, *, padding: int = 20, border_color: str = LINE) -> tk.Frame:
         return RoundedPanel(
             parent,
             bg=CARD,
             padx=padding,
             pady=padding,
-            border_color=LINE,
-            radius=12,
+            border_color=border_color,
+            radius=16,
         )
 
     def _style_window_frame(self) -> None:
@@ -433,7 +427,7 @@ class XassDesktop:
             hwnd = parent(self.root.winfo_id())
             setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
             setter.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
-            for attribute, value in ((19, 1), (20, 1), (35, 0x00222020), (36, 0x00F7F5F5), (33, 2)):
+            for attribute, value in ((19, 1), (20, 1), (35, 0x00181414), (36, 0x00F7F5F5), (33, 2)):
                 setting = ctypes.c_int(value)
                 setter(hwnd, attribute, ctypes.byref(setting), ctypes.sizeof(setting))
         except (AttributeError, OSError, tk.TclError):
@@ -450,84 +444,113 @@ class XassDesktop:
         shell = tk.Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=278)
+        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=252)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
         brand = tk.Frame(self.sidebar, bg=SIDEBAR)
-        brand.pack(fill="x", padx=23, pady=(27, 28))
+        brand.pack(fill="x", padx=18, pady=(18, 10))
         if self.brand_image is not None:
-            tk.Label(brand, image=self.brand_image, bg=SIDEBAR, borderwidth=0).pack(side="left", padx=(0, 12))
+            tk.Label(brand, image=self.brand_image, bg=SIDEBAR, borderwidth=0).pack(side="left", padx=(0, 10))
         brand_copy = tk.Frame(brand, bg=SIDEBAR)
         brand_copy.pack(side="left", anchor="center")
-        tk.Label(brand_copy, text="XASS", bg=SIDEBAR, fg=TEXT, font=("Segoe UI Semibold", 25)).pack(anchor="w")
-        tk.Label(
-            brand_copy,
-            text="WINDOWS",
-            bg=SIDEBAR,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w", pady=(2, 0))
+        tk.Label(brand_copy, text="XASS", bg=SIDEBAR, fg=TEXT, font=("Segoe UI Semibold", 20)).pack(anchor="w")
+        tk.Label(brand_copy, text="для Windows", bg=SIDEBAR, fg="#8d8d9a", font=("Segoe UI", 9)).pack(anchor="w", pady=(1, 0))
+        tk.Frame(self.sidebar, bg="#2a2a34", height=1).pack(fill="x", padx=18, pady=(2, 6))
 
-        for key, label, icon in (
-            ("overview", "Главный экран", "home"),
-            ("computer", "Этот компьютер", "monitor"),
-            ("connection", "Подключение", "link"),
-            ("files", "Файлы", "folder"),
-            ("music", "Музыка", "music"),
-            ("archive", "Архив", "archive"),
-            ("journal", "Журнал", "journal"),
-            ("updates", "Обновления", "update"),
-            ("settings", "Настройки", "settings"),
-        ):
-            if key == "journal":
-                tk.Frame(self.sidebar, bg=LINE, height=1).pack(fill="x", padx=20, pady=18)
-            button = NavButton(
-                self.sidebar,
-                text=label,
-                icon=icon,
-                command=lambda item=key: self.show_view(item),
-                anchor="w",
+        # Reserve the header/footer while the navigation itself can scroll.
+        # Point fonts grow with Windows DPI; fixed-height packing otherwise
+        # removes the last actions entirely in a compact window.
+        navigation = tk.Frame(self.sidebar, bg=SIDEBAR, height=1)
+        navigation.pack(fill="both", expand=True)
+        self.navigation_canvas = tk.Canvas(navigation, bg=SIDEBAR, height=1, width=1,
+                                           highlightthickness=0, borderwidth=0)
+        navigation_scrollbar = ttk.Scrollbar(navigation, orient="vertical",
+                                             command=self.navigation_canvas.yview,
+                                             style="XASS.Vertical.TScrollbar")
+        navigation_scrollbar.pack(side="right", fill="y")
+        self.navigation_canvas.pack(side="left", fill="both", expand=True)
+        self.navigation_canvas.configure(yscrollcommand=navigation_scrollbar.set)
+        self.navigation_content = tk.Frame(self.navigation_canvas, bg=SIDEBAR)
+        self.navigation_window = self.navigation_canvas.create_window(
+            (0, 0), window=self.navigation_content, anchor="nw")
+        self.navigation_content.bind("<Configure>", self._on_navigation_content_configure)
+        self.navigation_canvas.bind("<Configure>", self._on_navigation_canvas_configure)
+
+        groups = (
+            ("Управление", (
+                ("overview", "Главный экран", "home"),
+                ("computer", "Этот компьютер", "monitor"),
+                ("connection", "Подключение", "link"),
+            )),
+            ("Библиотека", (
+                ("files", "Файлы", "folder"),
+                ("music", "Музыка", "music"),
+                ("archive", "Архив", "archive"),
+            )),
+            ("Система", (
+                ("journal", "Журнал", "journal"),
+                ("updates", "Обновления", "update"),
+                ("settings", "Настройки", "settings"),
+            )),
+        )
+        for index, (group, items) in enumerate(groups):
+            tk.Label(
+                self.navigation_content,
+                text=group.upper(),
                 bg=SIDEBAR,
-                fg=MUTED,
-                activebackground=CARD_HOVER,
-                activeforeground=TEXT,
-                relief="flat",
-                borderwidth=0,
-                padx=18,
-                pady=12,
-                cursor="hand2",
-                font=("Segoe UI Semibold", 12),
-                icon_size=26,
-            )
-            button.pack(fill="x", padx=9, pady=3)
-            self.nav_buttons[key] = button
+                fg="#8d8d9a",
+                font=("Segoe UI Semibold", 8),
+                anchor="w",
+            ).pack(fill="x", padx=22, pady=((8 if index else 2), 2))
+            for key, label, icon in items:
+                button = NavButton(
+                    self.navigation_content,
+                    text=label,
+                    icon=icon,
+                    command=lambda item=key: self.show_view(item),
+                    anchor="w",
+                    bg=SIDEBAR,
+                    fg="#a3a3b0",
+                    activebackground="#2a2a34",
+                    activeforeground=TEXT,
+                    selectedbackground="#24242e",
+                    relief="flat",
+                    borderwidth=0,
+                    padx=14,
+                    pady=8,
+                    cursor="hand2",
+                    font=("Segoe UI Semibold", 11),
+                    icon_size=20,
+                )
+                button.pack(fill="x", padx=10, pady=1)
+                button.bind("<FocusIn>", lambda _event, item=button: self._reveal_navigation(item), add="+")
+                self.nav_buttons[key] = button
+
+        self.sidebar.configure(width=max(252, max(button.winfo_reqwidth() for button in self.nav_buttons.values())
+                                         + 20 + navigation_scrollbar.winfo_reqwidth()))
 
         footer = tk.Frame(self.sidebar, bg=SIDEBAR)
-        footer.pack(side="bottom", fill="x", padx=14, pady=14)
-        status_row = tk.Frame(footer, bg=SIDEBAR)
+        footer.pack(side="bottom", fill="x", padx=12, pady=(6, 12))
+        chip = RoundedPanel(footer, bg="#1c1c24", parent_bg=SIDEBAR, radius=14, padx=12, pady=10, border_color="#2e2e3a")
+        chip.pack(fill="x")
+        status_row = tk.Frame(chip, bg="#1c1c24")
         status_row.pack(fill="x")
-        self.side_dot = tk.Label(status_row, text="●", bg=SIDEBAR, fg=self.status_color, font=("Segoe UI", 10))
+        self.side_dot = tk.Label(status_row, text="●", bg="#1c1c24", fg=self.status_color, font=("Segoe UI", 10))
         self.side_dot.pack(side="left")
         self.side_status = tk.Label(
             status_row,
             textvariable=self.connection_var,
-            bg=SIDEBAR,
+            bg="#1c1c24",
             fg=TEXT,
-            font=("Segoe UI", 9),
-            wraplength=178,
+            font=("Segoe UI Semibold", 10),
+            wraplength=168,
             justify="left",
         )
         self.side_status.pack(side="left", padx=(7, 0))
-        tk.Label(
-            footer,
-            text=f"{current_version()}  ·  Windows",
-            bg=SIDEBAR,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w", pady=(7, 0))
+        tk.Label(chip, text=f"{current_version()}  ·  Windows", bg="#1c1c24", fg="#8d8d9a", font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
 
-        tk.Frame(shell, bg=LINE, width=1).pack(side="left", fill="y")
+        tk.Frame(shell, bg="#2a2a34", width=1).pack(side="left", fill="y")
         body = tk.Frame(shell, bg=BG)
         body.pack(side="left", fill="both", expand=True)
         self.body_canvas = tk.Canvas(body, bg=BG, highlightthickness=0, borderwidth=0)
@@ -540,16 +563,31 @@ class XassDesktop:
         self.body_canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.body_canvas.pack(side="left", fill="both", expand=True)
-        self.content = tk.Frame(self.body_canvas, bg=BG, padx=22, pady=20)
+        self.content = tk.Frame(self.body_canvas, bg=BG, padx=28, pady=22)
         self.content_window = self.body_canvas.create_window((0, 0), window=self.content, anchor="nw")
         self.content.bind("<Configure>", self._on_content_configure)
         self.body_canvas.bind("<Configure>", self._on_canvas_configure)
         self.root.bind("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.bind("<Configure>", self._on_window_resize, add="+")
 
+    def _on_navigation_content_configure(self, _event: tk.Event[Any]) -> None:
+        self.navigation_canvas.configure(scrollregion=self.navigation_canvas.bbox("all"))
+
+    def _on_navigation_canvas_configure(self, event: tk.Event[Any]) -> None:
+        self.navigation_canvas.itemconfigure(self.navigation_window, width=max(1, event.width))
+
+    def _reveal_navigation(self, button: tk.Widget) -> None:
+        canvas = self.navigation_canvas
+        top = canvas.canvasy(0)
+        bottom = top + canvas.winfo_height()
+        start, end = button.winfo_y(), button.winfo_y() + button.winfo_height()
+        target = start if start < top else end - canvas.winfo_height() if end > bottom else None
+        if target is not None:
+            canvas.yview_moveto(max(0, target) / max(1, self.navigation_content.winfo_height()))
+
     def _on_window_resize(self, event: tk.Event[Any]) -> None:
         if event.widget is self.root:
-            padding = 7 if event.height < 760 else 12
+            padding = 6 if event.height < 700 else 8 if event.height < 820 else 10
             if padding != getattr(self, "_navigation_padding", None):
                 self._navigation_padding = padding
                 for button in self.nav_buttons.values():
@@ -569,6 +607,14 @@ class XassDesktop:
 
     def _on_mousewheel(self, event: tk.Event[Any]) -> None:
         widget = event.widget
+        ancestor = widget
+        while ancestor is not None and ancestor is not self.sidebar:
+            ancestor = getattr(ancestor, "master", None)
+        if ancestor is self.sidebar:
+            if self.navigation_canvas.yview() != (0.0, 1.0) and event.delta:
+                steps = max(1, min(10, int(abs(event.delta) / 120)))
+                self.navigation_canvas.yview_scroll(-steps if event.delta > 0 else steps, "units")
+            return
         # Text panes keep their own scroll position; all other content scrolls
         # the page even when the cursor is above a card, label or input.
         if isinstance(widget, (tk.Text, tk.Listbox)):
@@ -584,6 +630,15 @@ class XassDesktop:
             widget.destroy()
 
     def show_view(self, name: str) -> None:
+        self._view_revision = int(getattr(self, "_view_revision", 0)) + 1
+        for attr in ("_file_poll", "_file_render_after"):
+            callback = getattr(self, attr, None)
+            if callback:
+                try:
+                    self.root.after_cancel(callback)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
         self.current_view = name
         for key, button in self.nav_buttons.items():
             button.set_active(key == name or (key == "computer" and name == "commands"))
@@ -658,13 +713,8 @@ class XassDesktop:
         parent.bind("<Configure>", arrange)
         parent.after_idle(arrange)
 
-    def _header(self, title: str, subtitle: str) -> None:
-        top = tk.Frame(self.content, bg=BG)
-        top.pack(fill="x", pady=(0, 18))
-        copy = tk.Frame(top, bg=BG)
-        copy.pack(side="left", fill="x", expand=True)
-        tk.Label(copy, text=title, bg=BG, fg=TEXT, font=("Segoe UI", 25)).pack(anchor="w")
-        tk.Label(copy, text=subtitle, bg=BG, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", pady=(5, 0))
+    def _header(self, title: str, subtitle: str, kicker: str = "") -> None:
+        page_header(self.content, title, subtitle, kicker=kicker).pack(fill="x", pady=(2, 20))
 
     def _set_status(self, text: str, color: str) -> None:
         self.connection_var.set(text)
@@ -711,7 +761,7 @@ class XassDesktop:
     def _summary_card(self, parent: tk.Misc, label: str, value: str | tk.StringVar, hint: str) -> tk.Frame:
         card = self._card(parent, padding=17)
         tk.Label(card, text=label.upper(), bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        options: dict[str, Any] = {"bg": CARD, "fg": TEXT, "font": ("Segoe UI Semibold", 14)}
+        options: dict[str, Any] = {"bg": CARD, "fg": TEXT, "font": ("Segoe UI Semibold", 16)}
         if isinstance(value, tk.StringVar):
             options["textvariable"] = value
         else:
@@ -724,7 +774,7 @@ class XassDesktop:
         build_home(self)
 
     def _build_computer(self) -> None:
-        self._header("Этот компьютер", "Агент XASS, локальные ресурсы и соединение")
+        self._header("Этот компьютер", "Агент, ресурсы и соединение с сервером", "Устройство")
         actions = tk.Frame(self.content, bg=BG)
         actions.pack(fill="x", pady=(0, 16))
         self._button(actions, "Команды этого ПК", lambda: self.show_view("commands"), kind="primary").pack(side="left")
@@ -737,23 +787,23 @@ class XassDesktop:
 
         primary = self._card(identity, padding=22)
         identity.add(primary)
-        tk.Label(primary, text="ВАШ КОМПЬЮТЕР", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(primary, text="Ваш компьютер", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w")
         copy = tk.Frame(primary, bg=CARD)
         copy.pack(fill="x", pady=(12, 0))
-        tk.Label(copy, textvariable=self.name_var, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 24)).pack(anchor="w")
+        tk.Label(copy, textvariable=self.name_var, bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 22)).pack(anchor="w")
         status_line = tk.Frame(copy, bg=CARD)
         status_line.pack(anchor="w", pady=(12, 0))
         self.hero_dot = tk.Label(status_line, text="●", bg=CARD, fg=self.status_color, font=("Segoe UI", 12))
         self.hero_dot.pack(side="left")
         self.hero_status = tk.Label(status_line, textvariable=self.connection_var, bg=CARD, fg=self.status_color, font=("Segoe UI Semibold", 13))
         self.hero_status.pack(side="left", padx=(8, 0))
-        channel = "TLS-соединение" if self.server_var.get().lower().startswith("https://") else "Канал с персональным API-ключом"
-        tk.Label(copy, text=channel, bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(8, 16))
+        channel = "TLS-соединение" if self.server_var.get().lower().startswith("https://") else "Локальная разработка без TLS"
+        tk.Label(copy, text=channel, bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", pady=(8, 16))
         self._button(primary, "Настроить подключение", lambda: self.show_view("connection"), kind="secondary").pack(fill="x", side="bottom")
 
         system_info = self._card(identity, padding=22)
         identity.add(system_info)
-        tk.Label(system_info, text="СИСТЕМА", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w", pady=(0, 10))
+        tk.Label(system_info, text="Система", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(0, 8))
         self._connection_row(system_info, "Имя компьютера", socket.gethostname())
         self._connection_row(system_info, "Пользователь", os.environ.get("USERNAME") or "—")
         self._connection_row(system_info, "ОС", f"Windows {platform.release()}" if os.name == "nt" else platform.system())
@@ -765,14 +815,14 @@ class XassDesktop:
 
         resources = self._card(middle, padding=22)
         middle.add(resources)
-        tk.Label(resources, text="Локальные ресурсы", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
+        tk.Label(resources, text="Локальные ресурсы", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(anchor="w", pady=(0, 8))
         self._metric_row(resources, "CPU", self.cpu_var, ACCENT, "cpu")
         self._metric_row(resources, "Память", self.memory_var, ACCENT, "memory", self.memory_detail_var)
         self._metric_row(resources, "Диск", self.disk_var, ACCENT, "disk", self.disk_detail_var)
 
         connection = self._card(middle, padding=22)
         middle.add(connection)
-        tk.Label(connection, text="Соединение с сервером", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 12))
+        tk.Label(connection, text="Соединение с сервером", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(anchor="w", pady=(0, 8))
         server = normalize_server_url(self.server_var.get())
         protocol = "TLS" if server.lower().startswith("https://") else "HTTP"
         self._connection_row(connection, "Сервер", server)
@@ -789,7 +839,7 @@ class XassDesktop:
         tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
         process_head = tk.Frame(self.content, bg=BG)
         process_head.pack(fill="x", pady=(18, 10))
-        tk.Label(process_head, text="Топ-процессы", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
+        tk.Label(process_head, text="Топ-процессы", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(side="left")
         process_card = self._card(self.content, padding=0)
         process_card.pack(fill="x", pady=(0, 4))
         process_rows_frame = tk.Frame(process_card, bg=CARD)
@@ -813,8 +863,18 @@ class XassDesktop:
             for proc in self._process_rows:
                 process_row((proc["name"], str(proc["pid"]), f"{proc['cpu']:.1f}%", f"{proc['ram_mb']:.0f} МБ"))
             if not self._process_rows:
-                message = "Не удалось получить список процессов. Откройте раздел позже." if self._process_sampled_at else "Загружаем процессы…"
-                tk.Label(process_rows_frame, text=message, bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=12)
+                if self._process_sampled_at:
+                    EmptyState(
+                        process_rows_frame,
+                        "Процессы недоступны",
+                        "Список не удалось прочитать. Откройте раздел ещё раз чуть позже.",
+                        icon="cpu",
+                        framed=False,
+                        bg=CARD,
+                        tone="danger",
+                    ).pack(fill="x", padx=8, pady=(4, 8))
+                else:
+                    tk.Label(process_rows_frame, text="Собираем список процессов…", bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", padx=16, pady=16)
         render_processes()
         if not self._process_sampling and time.monotonic() - self._process_sampled_at > 10:
             self._process_sampling = True
@@ -839,28 +899,29 @@ class XassDesktop:
         tk.Frame(self.content, bg=LINE, height=1).pack(fill="x")
         events_head = tk.Frame(self.content, bg=BG)
         events_head.pack(fill="x", pady=(18, 10))
-        tk.Label(events_head, text="Последние события", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="left")
+        tk.Label(events_head, text="Последние события", bg=BG, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(side="left")
         self._button(events_head, "Открыть журнал", lambda: self.show_view("journal"), kind="ghost").pack(side="right")
+        log_card = self._card(self.content, padding=2)
+        log_card.pack(fill="both", expand=True)
         self.overview_log = DarkScrolledText(
-            self.content,
+            log_card,
             height=8,
-            bg=BG,
-            fg="#c7c9ce",
+            bg=CARD,
+            fg="#d5d7de",
             insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
-            highlightbackground=LINE,
-            highlightthickness=1,
-            font=("Cascadia Mono", 9),
-            padx=18,
-            pady=13,
+            highlightthickness=0,
+            font=("Cascadia Mono", 10),
+            padx=16,
+            pady=12,
         )
         self.overview_log.pack(fill="both", expand=True)
         self._style_scrolled_text(self.overview_log)
         for line in self.history[-120:]:
             self.overview_log.insert("end", line + "\n")
         if not self.history:
-            self.overview_log.insert("end", "Здесь появятся события подключения, команды и обновления.\n")
+            self.overview_log.insert("end", "События подключения, команды и обновления появятся здесь.\n")
         self.overview_log.see("end")
         self.overview_log.configure(state="disabled")
 
@@ -879,10 +940,10 @@ class XassDesktop:
         head = tk.Frame(row, bg=background)
         head.pack(fill="x")
         tk.Label(head, text=label, bg=background, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(side="left")
-        tk.Label(head, textvariable=value, bg=background, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="right")
-        track = tk.Canvas(row, height=5, bg="#2b2d31", highlightthickness=0)
+        tk.Label(head, textvariable=value, bg=background, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(side="right")
+        track = tk.Canvas(row, height=6, bg="#3c3c48", highlightthickness=0)
         track.pack(fill="x", pady=(8, 3))
-        bar = track.create_rectangle(0, 0, 0, 5, fill=color, outline=color)
+        bar = track.create_rectangle(0, 0, 0, 6, fill=color, outline=color)
         self.metric_bars[key] = (track, bar)
         if detail is not None:
             tk.Label(row, textvariable=detail, bg=background, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="e")
@@ -890,13 +951,13 @@ class XassDesktop:
     def _connection_row(self, parent: tk.Misc, label: str, value: str | tk.StringVar, color: str = TEXT) -> None:
         parent_bg = str(parent.cget("bg"))
         row = tk.Frame(parent, bg=parent_bg)
-        row.pack(fill="x", pady=6)
+        row.pack(fill="x", pady=7)
         row.columnconfigure(0, weight=1, uniform="value")
         row.columnconfigure(1, weight=1, uniform="value")
-        key_label = tk.Label(row, text=label, bg=parent_bg, fg=MUTED, font=("Segoe UI", 9), anchor="w", justify="left")
+        key_label = tk.Label(row, text=label, bg=parent_bg, fg=MUTED, font=("Segoe UI", 10), anchor="w", justify="left")
         key_label.grid(row=0, column=0, sticky="nw", padx=(0, 12))
         options: dict[str, Any] = {"textvariable": value} if isinstance(value, tk.StringVar) else {"text": value}
-        value_label = tk.Label(row, bg=parent_bg, fg=color, font=("Segoe UI Semibold", 9), justify="right", anchor="e", **options)
+        value_label = tk.Label(row, bg=parent_bg, fg=color, font=("Segoe UI Semibold", 10), justify="right", anchor="e", **options)
         value_label.grid(row=0, column=1, sticky="ne")
         key_label._row_value = value_label._row_value = True
         row.bind("<Configure>", lambda event: (key_label.configure(wraplength=max(70, event.width // 2 - 16)), value_label.configure(wraplength=max(70, event.width // 2 - 4))))
@@ -967,8 +1028,8 @@ class XassDesktop:
             pass
 
     def _field(self, parent: tk.Misc, label: str, variable: tk.StringVar, *, secret: bool = False) -> tk.Entry:
-        tk.Label(parent, text=label, bg=parent.cget("bg"), fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(15, 7))
-        border = RoundedPanel(parent, bg=FIELD, border_color=LINE, radius=9, padx=12, pady=10)
+        tk.Label(parent, text=label, bg=parent.cget("bg"), fg=MUTED, font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(16, 6))
+        border = RoundedPanel(parent, bg=FIELD, border_color=LINE, radius=10, padx=12, pady=10)
         border.pack(fill="x")
         entry = tk.Entry(
             border,
@@ -1044,12 +1105,14 @@ class XassDesktop:
         build_commands(self)
 
     def _build_files(self) -> None:
-        self._header("Файлы", "Только разрешённые папки. Сервер не копирует байты на VPS без запроса.")
+        self._header("Файлы", "Только разрешённые папки. Сервер не забирает байты без запроса.", "Папки")
         self._file_root = getattr(self, "_file_root", "desktop")
+        root_name = self._file_root
+        revision = int(getattr(self, "_view_revision", 0))
         toolbar = tk.Frame(self.content, bg=BG)
-        toolbar.pack(fill="x", pady=(0, 12))
+        toolbar.pack(fill="x", pady=(0, 16))
         for key, label in ROOT_LABELS.items():
-            kind = "primary" if key == self._file_root else "ghost"
+            kind = "primary" if key == self._file_root else "secondary"
             self._button(
                 toolbar,
                 label,
@@ -1057,23 +1120,115 @@ class XassDesktop:
                 kind=kind,
             ).pack(side="left", padx=(0, 8))
         self._flow_actions(toolbar)
-        card = self._card(self.content, padding=8)
+        card = self._card(self.content, padding=6)
         card.pack(fill="both", expand=True)
-        try:
-            listing = {"entries": []} if self.preview else list_files(DATA_ROOT, self._file_root, "")
-            entries = listing.get("entries") or []
-        except Exception as exc:
-            tk.Label(card, text=str(exc), bg=CARD, fg=RED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=16)
+        # RoundedPanel owns an internal background canvas. Replace only the
+        # dynamic rows/placeholder, never the panel's painting infrastructure.
+        file_rows = tk.Frame(card, bg=CARD)
+        file_rows.pack(fill="both", expand=True)
+        if self.preview:
+            EmptyState(
+                file_rows,
+                "В папке пока пусто",
+                "Здесь нет файлов, которые можно показать. Выберите другую папку: рабочий стол, загрузки, документы или XASS Files.",
+                icon="folder", framed=False, bg=CARD,
+            ).pack(fill="x", padx=10, pady=8)
             return
-        if not entries:
-            tk.Label(card, text="В этой папке пока пусто.", bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=16)
-            return
-        for item in entries:
-            row = tk.Frame(card, bg=CARD)
-            row.pack(fill="x", padx=10, pady=4)
-            mark = "папка" if item.get("type") == "directory" else self._format_bytes(int(item.get("size") or 0))
-            tk.Label(row, text=str(item.get("name") or "—"), bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 10)).pack(side="left")
-            tk.Label(row, text=mark, bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="right")
+        loading = EmptyState(
+            file_rows,
+            "Загружаю файлы…",
+            "Окно уже готово — XASS читает содержимое папки в фоне.",
+            icon="folder",
+            framed=False,
+            bg=CARD,
+        )
+        loading.pack(fill="x", padx=10, pady=8)
+
+        def alive() -> bool:
+            return (
+                not bool(getattr(self, "_closing", False))
+                and self.current_view == "files"
+                and revision == int(getattr(self, "_view_revision", -1))
+                and bool(card.winfo_exists())
+            )
+
+        def render_row(item: dict[str, Any], index: int) -> None:
+            if index:
+                tk.Frame(file_rows, bg=LINE, height=1).pack(fill="x", padx=12)
+            row = tk.Frame(file_rows, bg=CARD)
+            row.pack(fill="x", padx=12, pady=10)
+            kind = "folder" if item.get("type") == "directory" else "file"
+            icon_badge(row, kind, size=18, radius=12).pack(side="left", padx=(0, 12))
+            mark = "Папка" if item.get("type") == "directory" else self._format_bytes(int(item.get("size") or 0))
+            # Reserve the fixed size/type before allocating the flexible name.
+            tk.Label(row, text=mark, bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(side="right", padx=(10, 0))
+            copy = tk.Frame(row, bg=CARD)
+            copy.pack(side="left", fill="x", expand=True)
+            tk.Label(copy, text=str(item.get("name") or "—"), bg=CARD, fg=TEXT,
+                     font=("Segoe UI Semibold", 11), anchor="w", wraplength=320, justify="left").pack(fill="x")
+            self._wrap_labels(copy)
+
+        def render_result(listing: dict[str, Any] | None, error: str = "") -> None:
+            if not alive():
+                return
+            for child in file_rows.winfo_children():
+                child.destroy()
+            if error:
+                EmptyState(
+                    file_rows, "Не удалось прочитать папку", error,
+                    icon="folder", framed=False, bg=CARD, tone="danger",
+                ).pack(fill="x", padx=10, pady=10)
+                return
+            entries = list((listing or {}).get("entries") or [])
+            if not entries:
+                EmptyState(
+                    file_rows,
+                    "В папке пока пусто",
+                    "Здесь нет файлов, которые можно показать. Выберите другую папку: рабочий стол, загрузки, документы или XASS Files.",
+                    icon="folder", framed=False, bg=CARD,
+                ).pack(fill="x", padx=10, pady=8)
+                return
+
+            cursor = 0
+
+            def render_batch() -> None:
+                nonlocal cursor
+                self._file_render_after = None
+                if not alive():
+                    return
+                end = min(len(entries), cursor + 32)
+                for index in range(cursor, end):
+                    render_row(entries[index], index)
+                cursor = end
+                if cursor < len(entries):
+                    self._file_render_after = self.root.after_idle(render_batch)
+
+            # The first bounded batch replaces the skeleton in the same Tk
+            # turn; remaining rows yield between batches so navigation and
+            # window painting stay responsive even for the 250-row maximum.
+            render_batch()
+
+        results: queue.Queue[tuple[dict[str, Any] | None, str]] = queue.Queue(maxsize=1)
+
+        def load() -> None:
+            try:
+                results.put((list_files(DATA_ROOT, root_name, ""), ""))
+            except Exception as exc:
+                results.put((None, str(exc)))
+
+        def poll() -> None:
+            self._file_poll = None
+            if not alive():
+                return
+            try:
+                listing, error = results.get_nowait()
+            except queue.Empty:
+                self._file_poll = self.root.after(25, poll)
+                return
+            render_result(listing, error)
+
+        threading.Thread(target=load, name="xass-file-list", daemon=True).start()
+        self._file_poll = self.root.after(25, poll)
 
     def _open_file_root(self, root_name: str) -> None:
         self._file_root = root_name
@@ -1134,23 +1289,23 @@ class XassDesktop:
         build_connection(self)
 
     def _build_settings(self) -> None:
-        self._header("Настройки", "Поведение агента и обслуживание приложения")
+        self._header("Настройки", "Поведение агента и обслуживание приложения", "Приложение")
         columns = ResponsiveColumns(self.content, bg=BG, breakpoint=930)
         columns.pack(fill="both", expand=True)
 
         runtime = self._card(columns, padding=23)
         columns.add(runtime)
-        tk.Label(runtime, text="АГЕНТ", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(runtime, text="Фоновая работа", bg=CARD, fg=TEXT, font=("Segoe UI", 20)).pack(anchor="w", pady=(11, 4))
-        tk.Label(runtime, text="Окно можно свернуть — связь с сервером и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 18))
-        check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
+        tk.Label(runtime, text="Агент", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w")
+        tk.Label(runtime, text="Фоновая работа", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(8, 4))
+        tk.Label(runtime, text="Окно можно свернуть. Связь с сервером и обновления продолжат работать.", bg=CARD, fg=MUTED, justify="left", wraplength=420, font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 16))
+        check = tk.Checkbutton(runtime, text="Устанавливать подписанные обновления автоматически", variable=self.auto_update_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 11))
         check.pack(anchor="w", pady=(6, 4))
-        transcription = tk.Checkbutton(runtime, text="Использовать этот ПК для расшифровки текста", variable=self.transcription_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 9))
+        transcription = tk.Checkbutton(runtime, text="Использовать этот ПК для расшифровки текста", variable=self.transcription_var, bg=CARD, fg=TEXT, activebackground=CARD, activeforeground=TEXT, selectcolor=FIELD, relief="flat", borderwidth=0, font=("Segoe UI", 11))
         transcription.pack(anchor="w", pady=(4, 2))
-        tk.Label(runtime, text="Песни без текста в каталоге распознаются на этом компьютере (Demucs + Whisper) с низким приоритетом. При первом включении XASS сам скачает Python и модели (~3–6 ГБ), права администратора не нужны.", bg=CARD, fg=MUTED, justify="left", wraplength=360, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 2))
+        tk.Label(runtime, text="Песни без текста в каталоге распознаются на этом компьютере (Demucs + Whisper) с низким приоритетом. При первом включении XASS сам скачает Python и модели (~3–6 ГБ), права администратора не нужны.", bg=CARD, fg=MUTED, justify="left", wraplength=420, font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 2))
         transcription_status = tk.Frame(runtime, bg=CARD)
         transcription_status.pack(fill="x", pady=(0, 14))
-        tk.Label(transcription_status, textvariable=self.transcription_state_var, bg=CARD, fg=AMBER, justify="left", wraplength=360, font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(transcription_status, textvariable=self.transcription_state_var, bg=CARD, fg=AMBER, justify="left", wraplength=420, font=("Segoe UI", 11)).pack(anchor="w")
         self._transcription_retry = self._button(transcription_status, "Повторить установку", self.restart_agent, kind="ghost")
         if self._transcription_error:
             self._transcription_retry.pack(fill="x", pady=(6, 0))
@@ -1164,12 +1319,12 @@ class XassDesktop:
 
         maintenance = self._card(columns, padding=23)
         columns.add(maintenance)
-        tk.Label(maintenance, text="ОБСЛУЖИВАНИЕ", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(maintenance, text="Клиент XASS", bg=CARD, fg=TEXT, font=("Segoe UI", 20)).pack(anchor="w", pady=(11, 18))
+        tk.Label(maintenance, text="Обслуживание", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w")
+        tk.Label(maintenance, text="Клиент XASS", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(8, 14))
         self._connection_row(maintenance, "Версия", current_version())
         self._connection_row(maintenance, "Ревизия", current_revision()[:16] or "локальная")
         self._connection_row(maintenance, "Python", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-        tk.Label(maintenance, text="Команды с телефона доступны, пока компьютер включён и агент работает. Закрытие окна сворачивает XASS в системный трей.", bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 10)).pack(fill="x", pady=(16, 0))
+        tk.Label(maintenance, text="Команды с телефона доступны, пока компьютер включён и агент работает. Закрытие окна сворачивает XASS в системный трей.", bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 11)).pack(fill="x", pady=(16, 0))
         on_disk = {}
         try:
             if not self.preview:
@@ -1185,7 +1340,7 @@ class XassDesktop:
         build_updates(self)
 
     def _build_diagnostics(self) -> None:
-        self._header("Журнал", "Безопасный статус GUI, агента, сети и updater")
+        self._header("Журнал", "Статус приложения, агента, сети и обновлений", "Диагностика")
         card = self._card(self.content, padding=21)
         card.pack(fill="x", pady=(0, 14))
         columns = ResponsiveColumns(card, bg=CARD, breakpoint=850)
@@ -1212,26 +1367,35 @@ class XassDesktop:
         self._button(actions, "Экспорт отчёта", self.export_diagnostics, kind="ghost").pack(side="right")
         self._flow_actions(actions)
 
-        self.full_log = DarkScrolledText(
-            self.content,
-            height=15,
-            bg=CARD,
-            fg="#9cadbf",
-            insertbackground=TEXT,
-            relief="flat",
-            borderwidth=0,
-            highlightbackground=LINE,
-            highlightthickness=1,
-            font=("Cascadia Mono", 9),
-            padx=16,
-            pady=14,
-        )
-        self.full_log.pack(fill="both", expand=True)
-        self._style_scrolled_text(self.full_log)
         rows = self.history[-300:] or ([] if self.preview else read_log_tail(300))
-        for line in rows:
-            self.full_log.insert("end", line + "\n")
-        self.full_log.configure(state="disabled")
+        if not rows:
+            EmptyState(
+                self.content,
+                "Журнал пока пуст",
+                "События подключения, команды и обновления будут собираться здесь. Проверка соединения запишет первую строку.",
+                icon="journal",
+            ).pack(fill="x")
+        else:
+            log_card = self._card(self.content, padding=2)
+            log_card.pack(fill="both", expand=True)
+            self.full_log = DarkScrolledText(
+                log_card,
+                height=15,
+                bg=CARD,
+                fg="#d5d7de",
+                insertbackground=TEXT,
+                relief="flat",
+                borderwidth=0,
+                highlightthickness=0,
+                font=("Cascadia Mono", 10),
+                padx=16,
+                pady=14,
+            )
+            self.full_log.pack(fill="both", expand=True)
+            self._style_scrolled_text(self.full_log)
+            for line in rows:
+                self.full_log.insert("end", line + "\n")
+            self.full_log.configure(state="disabled")
 
     def check_connection(self) -> None:
         if self.preview or self._connection_checking:
@@ -1306,20 +1470,21 @@ class XassDesktop:
         messagebox.showinfo("XASS", "Диагностический отчёт сохранён без ключей и приватных сообщений.")
 
     def _build_logs(self) -> None:
-        self._header("Журнал событий", "Heartbeat, команды сервера и установка обновлений")
+        self._header("Журнал событий", "Heartbeat, команды сервера и установка обновлений", "Журнал")
         toolbar = tk.Frame(self.content, bg=BG)
-        toolbar.pack(fill="x", pady=(0, 10))
+        toolbar.pack(fill="x", pady=(0, 12))
         self._button(toolbar, "Очистить экран", self._clear_log_view, kind="ghost").pack(side="right")
+        log_card = self._card(self.content, padding=2)
+        log_card.pack(fill="both", expand=True)
         self.full_log = DarkScrolledText(
-            self.content,
+            log_card,
             bg=CARD,
-            fg="#9cadbf",
+            fg="#d5d7de",
             insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
-            highlightbackground=LINE,
-            highlightthickness=1,
-            font=("Cascadia Mono", 9),
+            highlightthickness=0,
+            font=("Cascadia Mono", 10),
             padx=16,
             pady=14,
         )
@@ -1330,11 +1495,11 @@ class XassDesktop:
         self.full_log.configure(state="disabled")
 
     def _build_archive(self) -> None:
-        self._header("Архив сообщений", "Тексты и файлы бизнес-чатов остаются на этом ПК, даже если в Telegram они уже исчезли")
+        self._header("Архив сообщений", "Тексты и файлы чатов остаются на этом компьютере, даже если в Telegram их уже нет.", "Сообщения")
         status = archive_status(self.config)
         summary = self._card(self.content, padding=18)
         summary.pack(fill="x", pady=(0, 14))
-        tk.Label(summary, text="ЛОКАЛЬНОЕ ХРАНИЛИЩЕ", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(summary, text="Локальное хранилище", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w")
         sync_state = "ожидает повторной доставки" if status.get("pending_retry") else "синхронизирован"
         last_sync = str(status.get("last_sync_at") or "никогда").replace("T", " ")[:19]
         error_line = f"\nПоследняя ошибка: {status.get('last_error')}" if status.get("last_error") else ""
@@ -1344,7 +1509,7 @@ class XassDesktop:
             f"Состояние: {sync_state} · последняя синхронизация: {last_sync} · "
             f"свободно {int(status.get('free_bytes', 0)) / (1024 ** 3):.1f} ГБ{error_line}"
         )
-        tk.Label(summary, textvariable=self.archive_state_var, bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 10)).pack(anchor="w", pady=(9, 12))
+        tk.Label(summary, textvariable=self.archive_state_var, bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 11)).pack(anchor="w", pady=(8, 14))
         actions = tk.Frame(summary, bg=CARD)
         actions.pack(fill="x")
         self._button(actions, "Открыть папку", self.open_archive_folder, kind="primary").pack(side="left")
@@ -1355,22 +1520,31 @@ class XassDesktop:
             self._button(actions, "Отменить перенос", self._archive_cancel.set, kind="danger").pack(side="right")
         self._flow_actions(actions)
 
+        rows = conversation_rows(self.config, 500)
+        if not rows:
+            EmptyState(
+                self.content,
+                "Архив ещё пуст",
+                "Тексты и вложения появятся здесь, когда этот компьютер выбран целью хранения в Mini App. Папка и синхронизация настраиваются выше.",
+                icon="archive",
+            ).pack(fill="x")
+            return
+        log_card = self._card(self.content, padding=2)
+        log_card.pack(fill="both", expand=True)
         self.archive_messages = DarkScrolledText(
-            self.content,
+            log_card,
             bg=CARD,
             fg="#d8dce4",
             insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
-            highlightbackground=LINE,
-            highlightthickness=1,
-            font=("Segoe UI", 10),
+            highlightthickness=0,
+            font=("Segoe UI", 11),
             padx=18,
             pady=14,
         )
         self.archive_messages.pack(fill="both", expand=True)
         self._style_scrolled_text(self.archive_messages)
-        rows = conversation_rows(self.config, 500)
         for row in reversed(rows):
             timestamp = str(row.get("message_date") or row.get("updated_at") or "").replace("T", " ")[:16]
             title = row.get("chat_title") or row.get("from_username") or row.get("chat_id")
@@ -1383,8 +1557,6 @@ class XassDesktop:
             text = str(row.get("text_content") or "Медиа / сообщение без текста").replace("\n", " ")
             media = f"  · файлов: {row.get('media_count')}" if row.get("media_count") else ""
             self.archive_messages.insert("end", f"{timestamp}  {direction} {title}{marker}{media}\n{text}\n\n")
-        if not rows:
-            self.archive_messages.insert("end", "Архив пуст. Включите этот компьютер как цель хранения в XASS Mini App.")
         self.archive_messages.configure(state="disabled")
 
     def choose_archive_folder(self) -> None:
@@ -1613,6 +1785,7 @@ class XassDesktop:
                     source_name=source_name,
                     source_type="PC_AGENT",
                     e2e_public_jwk=self.config.get("e2e_public_jwk"),
+                    allow_insecure_http=bool(self.config.get("allow_insecure_http", False)),
                 )
                 self.config.update(
                     {
@@ -2056,6 +2229,9 @@ class XassDesktop:
         def worker() -> None:
             try:
                 server = discover_backend_url(str(self.config.get("server_url")))
+                server = require_secret_transport(
+                    server, allow_insecure_http=self.config.get("allow_insecure_http") is True,
+                )
                 with create_http_client(
                     server,
                     timeout=25,
@@ -2127,6 +2303,7 @@ class XassDesktop:
                             manifest,
                             api_key=str(self.config.get("api_key")),
                             trust_env=bool(self.config.get("trust_env_proxy", False)),
+                            allow_insecure_http=self.config.get("allow_insecure_http") is True,
                             progress=report,
                         )
                         operation.phase("verifying", "Установщик проверен")
@@ -2141,6 +2318,7 @@ class XassDesktop:
                             manifest,
                             api_key=str(self.config.get("api_key")),
                             trust_env=bool(self.config.get("trust_env_proxy", False)),
+                            allow_insecure_http=self.config.get("allow_insecure_http") is True,
                             progress=report,
                         )
                         operation.phase("verifying", "Пакет проверен")
@@ -2231,9 +2409,54 @@ class XassDesktop:
             player.close()
             self._local_music = None
 
+    def _install_after_guard(self) -> None:
+        # Workers and tray callbacks use root.after to re-enter Tk. Closing the
+        # window must reject their late results rather than register commands
+        # against an already destroyed root.
+        self._tk_after = self.root.after
+        self.root.after = self._guarded_after
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+
+    def _guarded_after(self, milliseconds, callback=None, *args):
+        if getattr(self, "_closing", False):
+            return None
+        try:
+            timer = self._tk_after(milliseconds, callback, *args)
+            # Shutdown can race a worker's cross-thread call into Tcl.
+            if getattr(self, "_closing", False) and timer is not None:
+                self.root.after_cancel(timer)
+                return None
+            return timer
+        except (tk.TclError, RuntimeError):
+            if not getattr(self, "_closing", False):
+                raise
+            return None
+
+    def _on_root_destroy(self, event) -> None:
+        if event.widget is self.root:
+            self._cancel_after_callbacks()
+
+    def _cancel_after_callbacks(self) -> None:
+        self._closing = True
+        # Tk.destroy removes Python Tcl commands, not the pending Tcl timers.
+        # Cancel this interpreter's timers first, including widget paint jobs.
+        try:
+            timers = self.root.tk.call("after", "info")
+            for timer in timers:
+                # Only cancel the event. Each widget owns its registered Python
+                # command and will delete it during destroy; root.after_cancel
+                # would delete a child's command twice during that teardown.
+                self.root.tk.call("after", "cancel", timer)
+        except (tk.TclError, RuntimeError):
+            pass
+        pump = getattr(self, "_music_cast_pump", None)
+        if pump is not None:
+            pump.close()
+            self._music_cast_pump = None
+
     def close(self) -> None:
         if self.preview:
-            self._closing = True
+            self._cancel_after_callbacks()
             self._close_local_music()
             self.root.destroy()
             return
@@ -2247,7 +2470,7 @@ class XassDesktop:
             self.root.iconify()
 
     def _destroy_for_update(self) -> None:
-        self._closing = True
+        self._cancel_after_callbacks()
         self._close_local_music()
         if self.tray_icon is not None:
             try:
@@ -2257,7 +2480,7 @@ class XassDesktop:
         self.root.destroy()
 
     def exit_application(self) -> None:
-        self._closing = True
+        self._cancel_after_callbacks()
         self._close_local_music()
         self.stop_agent()
         if self.tray_icon is not None:

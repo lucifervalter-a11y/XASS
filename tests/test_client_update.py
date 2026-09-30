@@ -179,6 +179,23 @@ class ClientUpdateTests(unittest.TestCase):
         }
         self.assertFalse(verify_manifest(manifest, "agent-secret"))
 
+    def test_signed_remote_http_manifest_is_rejected_before_api_key_is_sent(self) -> None:
+        api_key = "agent-secret"
+        url = "http://updates.example.invalid/package.zip"
+        manifest = {
+            "version": "0.4.3", "revision": "a" * 64, "sha256": "b" * 64,
+            "url": url,
+        }
+        manifest["signature"] = hmac.new(
+            api_key.encode("utf-8"),
+            f"0.4.3\n{'a' * 64}\n{'b' * 64}\n{url}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        with patch.object(client_update, "create_http_client") as client:
+            with self.assertRaisesRegex(RuntimeError, "HTTP"):
+                download_update(manifest, api_key=api_key)
+        client.assert_not_called()
+
     def test_archive_rejects_windows_path_traversal(self) -> None:
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:

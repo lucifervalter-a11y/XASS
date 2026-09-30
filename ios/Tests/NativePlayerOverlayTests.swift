@@ -4,6 +4,14 @@ import SwiftUI
 @testable import XASS
 
 final class NativePlayerOverlayTests: XCTestCase {
+    func testDismissGestureDoesNotInheritMiniPlayerDrag() {
+        XCTAssertFalse(PlayerDismissPolicy.canBegin(downward: true, allowedRegion: true, expanded: true,
+                                                     gestureArmed: false, dismissing: false, sliderEditing: false))
+        XCTAssertTrue(PlayerDismissPolicy.canBegin(downward: true, allowedRegion: true, expanded: true,
+                                                    gestureArmed: true, dismissing: false, sliderEditing: false))
+        XCTAssertFalse(PlayerDismissPolicy.canBegin(downward: true, allowedRegion: true, expanded: true,
+                                                     gestureArmed: true, dismissing: false, sliderEditing: true))
+    }
     func testOnlyOneOverlayAtATime() {
         typealias O = NativeRootOverlay
         XCTAssertEqual(O.resolve(hasTrack: false, expanded: false, devicePicker: false, transferActive: false), .hidden)
@@ -54,6 +62,29 @@ final class NativePlayerOverlayTests: XCTestCase {
         XCTAssertEqual(lyrics.index(at: 400), 2)
         XCTAssertNil(lyrics.index(at: .nan))
         XCTAssertNil(TimedLyrics(lines: []).index(at: 5))
+    }
+
+    func testTimedLyricsExposeOnlyRealInstrumentalGaps() {
+        let lyrics = TimedLyrics(lines: [
+            TimedLyricLine(start: 0, end: 3, text: "one"),
+            TimedLyricLine(start: 6, end: 9, text: "two"),
+            TimedLyricLine(start: 9.5, end: 12, text: "three")
+        ])
+        XCTAssertNil(lyrics.pauseAfterIndex(at: 2.9))
+        XCTAssertEqual(lyrics.pauseAfterIndex(at: 3), 0)
+        XCTAssertEqual(lyrics.pauseAfterIndex(at: 5.99), 0)
+        XCTAssertNil(lyrics.pauseAfterIndex(at: 6))
+        XCTAssertNil(lyrics.pauseAfterIndex(at: 9.25), "A sub-1.5-second spacing is not a musical pause marker")
+        XCTAssertNil(lyrics.pauseAfterIndex(at: .nan))
+    }
+
+    func testPronunciationUsesProviderThenPrivateOnDeviceTransliteration() {
+        let provider = TimedLyricLine(start: 0, end: 2, text: "你好", pronunciation: "ni hao")
+        XCTAssertEqual(LyricPronunciation.text(for: provider), "ni hao")
+        let russian = TimedLyricLine(start: 0, end: 2, text: "Привет")
+        XCTAssertNotNil(LyricPronunciation.text(for: russian))
+        XCTAssertTrue(LyricPronunciation.containsNonLatinLetter(russian.text))
+        XCTAssertNil(LyricPronunciation.text(for: TimedLyricLine(start: 0, end: 2, text: "Hello")))
     }
 
     @MainActor func testFixturePlayerDrivesLyricsAndControls() {

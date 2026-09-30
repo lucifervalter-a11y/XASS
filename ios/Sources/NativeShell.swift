@@ -237,6 +237,7 @@ enum NativeShellSheet: Hashable, Identifiable {
         slots.onDevices = { [store] in returnToNowPlaying = true; store.openRoutePicker() }
         slots.onQueue = { showQueue = true }
         slots.onMore = { [store] in playerActions = store.currentTrack }
+        slots.onLyricsTools = { [store] in playerActions = store.currentTrack }
         return slots
     }
 
@@ -537,7 +538,7 @@ struct NativeTransferWait: View {
                                     Image(systemName: "desktopcomputer")
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(device.name)
-                                        Text(device.online ? "В сети" : "Не в сети")
+                                        Text(device.online ? (store.pcTransportLabel(device.name) ?? "В сети") : "Не в сети")
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -554,6 +555,10 @@ struct NativeTransferWait: View {
 
                     if let device = selectedPC {
                         Section {
+                            Label {
+                                Text("Если трек уже скачан на iPhone, XASS сначала проверит прямую передачу по локальной сети. Ключи и управление всегда остаются в защищённом канале сервера.")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                            } icon: { Image(systemName: "wifi") }
                             if loadingOutputs { ProgressView("Получаю выходы Windows…") }
                             ForEach(store.outputs) { output in
                                 Button { targetOutput = output.id } label: {

@@ -120,20 +120,42 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_dedupe_one_job_per_track_and_done_is_never_rerun(self):
         async with self.sessions() as session:
             gpu = await self.worker(session, 1, GPU)
-            first, created = await tq.request_job(session, self.track(), language="ru", user_id=1, now=T0)
-            again, created_again = await tq.request_job(session, self.track(), language="en", user_id=2, now=T0)
+            first, created = await tq.request_job(session, self.track(duration=10), language="ru", user_id=1, now=T0)
+            again, created_again = await tq.request_job(session, self.track(duration=10), language="en", user_id=2, now=T0)
             self.assertTrue(created)
             self.assertFalse(created_again)
             self.assertEqual(first.id, again.id)
             job = await tq.claim_assigned(session, gpu, T0)
             await tq.complete(session, gpu, job, lines=[{"start": 1, "end": 2, "text": "раз"}], meta={}, now=T0)
-            again, created = await tq.request_job(session, self.track(), language="ru", user_id=3, now=T0 + timedelta(days=1))
+            again, created = await tq.request_job(session, self.track(duration=10), language="ru", user_id=3, now=T0 + timedelta(days=1))
             self.assertFalse(created)
             self.assertEqual(again.state, "done")
             self.assertEqual(len(list(await session.scalars(select(TranscriptionJob)))), 1)
             result = await tq.done_result(session, 1)
             self.assertEqual(result["source"], "pc_transcription")
-            self.assertEqual(result["lines"], [{"start": 1.0, "end": 2.0, "text": "раз"}])
+            self.assertEqual(result["lines"], [{"start": 1.0, "end": 2.0, "text": "раз", "pause_before": 1.0}])
+
+    async def test_owner_force_rechecks_done_job_once_and_repeated_taps_are_idempotent(self):
+        async with self.sessions() as session:
+            gpu = await self.worker(session, 1, GPU)
+            track = self.track(duration=10)
+            job, _ = await tq.request_job(session, track, language="auto", user_id=1, now=T0)
+            await tq.claim_assigned(session, gpu, T0)
+            await tq.complete(session, gpu, job, lines=[{"start": 1, "end": 2, "text": "old words"}],
+                              meta={"model": "large-v3"}, now=T0)
+            await tq.request_job(session, track, language="auto", user_id=1, now=T0, recheck=True)
+            self.assertEqual(job.state, "assigned")
+            self.assertTrue(job.result["owner_recheck_used"])
+            worker_id = job.worker_id
+            await tq.request_job(session, track, language="auto", user_id=1, now=T0, recheck=True)
+            self.assertEqual((job.state, job.worker_id), ("assigned", worker_id))
+            await tq.claim_assigned(session, gpu, T0)
+            await tq.complete(session, gpu, job, lines=[{"start": 1, "end": 4, "text": "new complete words here"}],
+                              meta={"model": "large-v3"}, now=T0)
+            self.assertEqual(job.state, "done")
+            self.assertTrue(job.result["owner_rechecked"])
+            await tq.request_job(session, track, language="auto", user_id=1, now=T0, recheck=True)
+            self.assertEqual(job.state, "done")
 
     async def test_unclaimed_offer_expires_and_goes_to_next_worker_without_spending_attempt(self):
         async with self.sessions() as session:
@@ -223,15 +245,70 @@ class QueueServiceTests(unittest.IsolatedAsyncioTestCase):
             result = await tq.complete(session, gpu, job, lines=[{"start": 3, "end": 2, "text": "  b  "},
                 {"start": 1, "end": 2, "text": "a"}], meta={"model": "large-v3", "device": "cuda"}, now=T0)
             self.assertTrue(result["accepted"])
-            self.assertEqual(job.result["lines"], [{"start": 1.0, "end": 2.0, "text": "a"}, {"start": 3.0, "end": 3.2, "text": "b"}])
+            self.assertEqual(job.result["lines"], [{"start": 1.0, "end": 2.0, "text": "a", "pause_before": 1.0},
+                                                   {"start": 3.0, "end": 3.2, "text": "b", "pause_before": 1.0}])
             self.assertEqual(job.result["model"], "large-v3")
+
+    async def test_obviously_incomplete_transcript_gets_one_recheck_and_keeps_best_pass(self):
+        async with self.sessions() as session:
+            gpu = await self.worker(session, 1, GPU)
+            job, _ = await tq.request_job(session, self.track(duration=180), language="auto", user_id=1, now=T0)
+            await tq.claim_assigned(session, gpu, T0)
+            first = await tq.complete(session, gpu, job, lines=[{"start": 40, "end": 41, "text": "yeah"}],
+                                      meta={"model": "large-v3"}, now=T0)
+            self.assertFalse(first["accepted"])
+            self.assertTrue(first["quality_recheck"])
+            self.assertEqual(job.attempts, 1)
+            self.assertTrue((job.result or {})["quality_recheck_requested"])
+            await tq.claim_assigned(session, gpu, T0)
+            second_lines = [
+                {"start": 12, "end": 18, "text": "first complete lyric line with several words"},
+                {"start": 24, "end": 31, "text": "second complete lyric line with several words"},
+                {"start": 38, "end": 45, "text": "third complete lyric line with several words"},
+            ]
+            second = await tq.complete(session, gpu, job, lines=second_lines,
+                                       meta={"model": "large-v3"}, now=T0 + timedelta(minutes=1))
+            self.assertTrue(second["accepted"])
+            self.assertEqual(job.state, "done")
+            self.assertTrue(job.result["quality_rechecked"])
+            self.assertEqual(job.result["quality_candidates"], 2)
+            self.assertGreater(job.result["quality"]["score"], first["quality"]["score"])
+            self.assertEqual(job.result["lines"][1]["pause_before"], 6.0)
+
+    async def test_empty_second_pass_keeps_first_candidate_without_third_retry(self):
+        async with self.sessions() as session:
+            gpu = await self.worker(session, 1, GPU)
+            job, _ = await tq.request_job(session, self.track(duration=180), language="auto", user_id=1, now=T0)
+            await tq.claim_assigned(session, gpu, T0)
+            await tq.complete(session, gpu, job, lines=[{"start": 40, "end": 41, "text": "yeah"}],
+                              meta={"model": "large-v3"}, now=T0)
+            await tq.claim_assigned(session, gpu, T0)
+            result = await tq.complete(session, gpu, job, lines=[], meta={"model": "large-v3"}, now=T0)
+            self.assertTrue(result["accepted"])
+            self.assertEqual(job.state, "done")
+            self.assertTrue(job.result["quality_second_pass_empty"])
 
     async def test_empty_outage_is_missing_text_and_real_words_are_not(self):
         self.assertFalse(tq.shown_lyrics_missing(None))
         self.assertFalse(tq.shown_lyrics_missing({"status": "unavailable", "text": "есть", "synced": False, "lines": []}))
         self.assertTrue(tq.shown_lyrics_missing({"status": "unavailable", "text": "", "synced": False, "lines": []}))
         self.assertTrue(tq.shown_lyrics_missing({"status": "rate_limited", "text": "  ", "synced": False, "lines": []}))
+        self.assertFalse(tq.shown_lyrics_missing({"status": "instrumental", "text": "", "synced": False, "lines": []}))
         self.assertFalse(tq.shown_lyrics_missing({"text": "есть", "synced": True, "lines": [{"text": "есть"}]}))
+
+    async def test_plain_reference_is_bounded_trusted_and_never_claims_timing(self):
+        record = SimpleNamespace(owner_lyrics={"text": " owner words\r\nnext ", "synced": False},
+                                 result={"lyrics": {"text": "catalog words", "synced": False}}, dismissed=False)
+        self.assertEqual(tq.plain_lyrics_reference(record),
+                         {"text": "owner words\nnext", "source": "owner", "reference_only": True})
+        record.owner_lyrics = {"text": "owner", "disabled": True}
+        self.assertEqual(tq.plain_lyrics_reference(record)["source"], "catalog")
+        record.result = {"lyrics": {"text": "timed", "synced": True,
+                                     "lines": [{"time": 1, "text": "timed"}]}}
+        self.assertEqual(tq.plain_lyrics_reference(record), {})
+        record.owner_lyrics = {"text": "x" * (tq.MAX_REFERENCE_CHARS + 10)}
+        record.result = {}
+        self.assertEqual(len(tq.plain_lyrics_reference(record)["text"]), tq.MAX_REFERENCE_CHARS)
 
     async def test_sweep_queues_a_song_with_no_text_and_skips_stored_lyrics(self):
         async with self.sessions() as session:
@@ -363,9 +440,9 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         polled = await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())
         self.assertEqual(polled.status_code, 200, polled.text)
         job = polled.json()["job"]
-        self.assertEqual((job["track_id"], job["language"]), (track["id"], "ru"))
+        self.assertEqual((job["track_id"], job["language"]), (track["id"], "auto"))
         # The short-lived agent ticket streams the audio only to this credential.
-        audio = await self.request("GET", job["media_path"], headers={})
+        audio = await self.request("GET", job["media_path"], headers=self.agent)
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.content, self.audio)
         self.assertEqual((await self.request("GET", route)).json()["status"], "running")
@@ -386,16 +463,53 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
             lyrics = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/timed-lyrics")
         value = lyrics.json()["lyrics"]
         self.assertEqual((value["source"], value["synced"], value["automatic"]), ("pc_transcription", True, True))
-        self.assertEqual(value["lines"], [{"start": 0.5, "end": 1.5, "text": "первая строка"}])
+        self.assertEqual(value["lines"], [{"start": 0.5, "end": 1.5, "text": "первая строка", "pause_before": 0.5}])
         self.assertNotIn("transcription_pending", value)
         with patch("app.services.music_enrichment.enrich_track", AsyncMock(return_value={"status": "not_found"})):
             plain = await self.request("GET", f"/api/mini/music/tracks/{track['id']}/lyrics")
         self.assertEqual(plain.json()["lyrics"]["source"], "pc_transcription")
-        self.assertEqual(plain.json()["lyrics"]["lines"], [{"time": 0.5, "text": "первая строка"}])
-        # Joining a done job never re-runs it.
-        again = await self.request("POST", route, json={"force": True})
+        self.assertEqual(plain.json()["lyrics"]["lines"], [{
+            "time": 0.5, "start": 0.5, "end": 1.5,
+            "pause_before": 0.5, "text": "первая строка",
+        }])
+        # Joining a done job without the explicit owner recheck never re-runs it.
+        again = await self.request("POST", route, json={})
         self.assertEqual(again.json()["status"], "done")
         self.assertIsNone((await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())).json()["job"])
+
+    async def test_empty_second_pass_completes_with_first_candidate_at_the_http_boundary(self):
+        track = await self.upload()
+        async with self.sessions() as session:
+            stored = await session.get(MusicTrack, track["id"])
+            stored.duration = 180
+            await session.commit()
+        route = f"/api/mini/music/tracks/{track['id']}/transcription"
+        with await self.no_catalog():
+            await self.request("POST", route, json={})
+        first = (await self.request("POST", "/agent/transcription/poll", headers=self.agent,
+                                    json=self.poll_body())).json()["job"]
+        self.assertEqual(first["recognition_pass"], 1)
+        weak = await self.request("POST", f"/agent/transcription/jobs/{first['id']}/complete",
+                                  headers=self.agent,
+                                  json={"lines": [{"start": 40, "end": 41, "text": "yeah"}]})
+        self.assertEqual(weak.status_code, 200, weak.text)
+        self.assertTrue(weak.json()["quality_recheck"])
+
+        second = (await self.request("POST", "/agent/transcription/poll", headers=self.agent,
+                                     json=self.poll_body())).json()["job"]
+        self.assertEqual(second["recognition_pass"], 2)
+        empty = await self.request("POST", f"/agent/transcription/jobs/{second['id']}/complete",
+                                   headers=self.agent, json={"lines": []})
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json()["state"], "done")
+        status = (await self.request("GET", route)).json()
+        self.assertEqual(status["status"], "done")
+        self.assertIsNone((await self.request("POST", "/agent/transcription/poll", headers=self.agent,
+                                              json=self.poll_body())).json()["job"])
+        async with self.sessions() as session:
+            job = await session.scalar(select(TranscriptionJob).where(TranscriptionJob.track_id == track["id"]))
+            self.assertEqual(job.attempts, 1)
+            self.assertTrue(job.result["quality_second_pass_empty"])
 
     async def test_installing_pc_reports_setup_progress_to_owner_status(self):
         track = await self.upload()
@@ -442,8 +556,8 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
         async with self.sessions() as session:
             self.assertEqual(len(list(await session.scalars(select(TranscriptionJob)))), 2)
 
-    async def test_empty_catalog_lyrics_queue_the_pc_once(self):
-        """Found recording, no words: the lyrics screen and Now Playing start the PC."""
+    async def test_verified_instrumental_does_not_queue_a_hallucinated_transcript(self):
+        """A verified instrumental result must not be replaced by Whisper noise."""
         track = await self.upload()
         page = f"/api/mini/music/tracks/{track['id']}/lyrics"
         timed = f"/api/mini/music/tracks/{track['id']}/timed-lyrics"
@@ -456,11 +570,11 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
             playing = await self.request("GET", timed)
             again = await self.request("GET", timed)
         self.assertEqual(opened.json()["lyrics"]["text"], "")
-        self.assertTrue(playing.json()["lyrics"]["transcription_pending"])
-        self.assertTrue(again.json()["lyrics"]["transcription_pending"])
+        self.assertNotIn("transcription_pending", playing.json()["lyrics"])
+        self.assertNotIn("transcription_pending", again.json()["lyrics"])
         async with self.sessions() as session:
             jobs = list(await session.scalars(select(TranscriptionJob)))
-        self.assertEqual([(job.track_id, job.state, job.language) for job in jobs], [(track["id"], "queued", "ru")])
+        self.assertEqual(jobs, [])
 
     async def test_real_catalog_text_stays_and_an_empty_outage_queues_the_pc(self):
         synced = {"status": "synced", "synced": True, "lines": [{"start": 0, "end": 1, "text": "есть текст"}],
@@ -533,6 +647,22 @@ class TranscriptionApiTests(test_music_api.MusicApiTests):
             self.assertIsNone(await session.scalar(select(TranscriptionJob)))
         forced = await self.request("POST", route, json={"force": True, "language": "en"})
         self.assertEqual((forced.json()["status"], forced.json()["language"]), ("waiting_for_pc", "en"))
+
+    async def test_force_plain_lyrics_job_passes_reference_only_to_bound_agent(self):
+        track = await self.upload()
+        async with self.sessions() as session:
+            session.add(MusicEnrichment(track_id=track["id"], fingerprint="f", original={}, result={},
+                                        owner_lyrics={"text": "known plain words", "synced": False}, checked_at=T0))
+            await session.commit()
+        route = f"/api/mini/music/tracks/{track['id']}/transcription"
+        created = await self.request("POST", route, json={"force": True})
+        self.assertEqual(created.status_code, 200, created.text)
+        polled = await self.request("POST", "/agent/transcription/poll", headers=self.agent, json=self.poll_body())
+        self.assertEqual(polled.status_code, 200, polled.text)
+        job = polled.json()["job"]
+        self.assertEqual(job["lyrics_reference"], "known plain words")
+        self.assertEqual(job["lyrics_reference_source"], "owner")
+        self.assertTrue(job["lyrics_reference_only"])
 
     async def test_worker_failure_and_busy_worker_reporting(self):
         track = await self.upload()

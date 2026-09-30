@@ -44,6 +44,21 @@ final class NativeSyncedLyricsTests: XCTestCase {
         XCTAssertEqual(value.lineIndex(at: 13), 1)
         XCTAssertNil(value.lineIndex(at: 20))
         XCTAssertNil(value.lineIndex(at: .nan))
+        let bounded = SyncedLyrics(response: ["lyrics": ["status": "synced", "synced": true, "source": "owner",
+            "lines": [["start": 1.0, "end": 100_000.0, "text": "unbounded"],
+                      ["start": 2.0, "end": 3.0, "text": "safe"]]]], trackID: 4)
+        XCTAssertEqual(bounded?.lines.map(\.text), ["safe"])
+    }
+
+    func testOptionalTranslationAndPronunciationStayBoundToTheirTimedRow() {
+        let value = SyncedLyrics(response: ["lyrics": ["status": "synced", "synced": true, "source": "owner",
+            "lines": [["start": 1.0, "end": 4.0, "text": "你好", "translation": "Привет",
+                       "pronunciation": "ni hao"]]]], trackID: 4)
+        XCTAssertEqual(value?.lines.first?.translation, "Привет")
+        XCTAssertEqual(value?.lines.first?.pronunciation, "ni hao")
+        let mapped = NativeStorePlayerState.timedLyrics(from: value, currentID: 4)
+        XCTAssertEqual(mapped?.lines.first?.translation, "Привет")
+        XCTAssertEqual(mapped?.lines.first?.pronunciation, "ni hao")
     }
 
     @MainActor func testStoreCachesOnDiskAndPublishesActiveLine() async throws {

@@ -137,9 +137,12 @@ def vk_capabilities(configured: bool) -> dict:
     return {"provider": "vk", "configured": configured, "identity_verified": None,
         "token_status": "not_checked" if configured else "not_configured",
         "capabilities": {"now_playing": None, "library_metadata": False, "playlist_metadata": False,
-                         "stream": False, "file_export": False},
+                         "stream": False, "file_export": False, "catalog_discovery": True,
+                         "incremental_file_import": True, "deduplicate_by_sha256": True},
+        "discovery_url": "https://vk.com/audio?section=search",
+        "allowed_import_sources": ["telegram_audio", "zip_archive", "pc_folder", "user_export"],
         "reason_code": "music_access_not_granted",
-        "message": "Подключение статуса VK не даёт доступа к импорту всей музыкальной библиотеки. Нужен разрешённый VK API или ваш экспорт и собственные файлы."}
+        "message": "VK не предоставляет этому приложению разрешённый API выгрузки аудиофайлов. Поиск открывается в VK; собственный экспорт, ZIP или папка импортируются инкрементально без дублей."}
 
 
 async def check_vk_capabilities(token: str, api_version="5.199", *, client=None) -> dict:
@@ -160,7 +163,12 @@ async def check_vk_capabilities(token: str, api_version="5.199", *, client=None)
         response = await client.post("https://api.vk.com/method/status.get", data={
             "access_token": token, "v": api_version, "user_id": users[0]["id"]})
         response.raise_for_status(); body = response.json()
+        status_error = body.get("error") if isinstance(body, dict) else None
         result["capabilities"]["now_playing"] = isinstance(body, dict) and isinstance(body.get("response"), dict)
+        if isinstance(status_error, dict) and type(status_error.get("error_code")) is int:
+            # Expose only the numeric VK error, never the token, request params
+            # or provider message that may echo account details.
+            result["status_error_code"] = status_error["error_code"]
         # No unverified/private audio methods, first-party app IDs, cookies or download promises.
         return result
     except (httpx.HTTPError, ValueError, TypeError, KeyError):

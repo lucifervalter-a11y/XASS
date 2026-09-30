@@ -16,11 +16,19 @@ import os
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 
 from app.services.music_lyrics import parse_lyrics
+from app.services.music_enrichment import (
+    MusicEnrichmentService,
+    _ProviderFailure,
+    _candidate as catalog_candidate,
+    _match as catalog_match,
+    _signature as catalog_signature,
+)
 from app.services.music_query import clean_search_text, search_names
 
 LOG = logging.getLogger(__name__)
@@ -34,7 +42,7 @@ _memory: dict[str, dict] = {}
 _locks: dict[int, asyncio.Lock] = {}
 
 _NOISE = re.compile(
-    r"\s*[\(\[\{](?:official|offical|lyric|lyrics|audio|video|music video|hd|hq|4k|remaster(?:ed)?[^\)\]\}]*|"
+    r"\s*[\(\[\{](?:official|offical|lyric|lyrics|audio|video|music video|hd|hq|4k|"
     r"explicit|clean|visuali[sz]er|премьера|клип|official\s+\w+)[^\)\]\}]*[\)\]\}]", re.I)
 _FEAT = re.compile(r"\s*[\(\[]?\s*(?:feat\.?|ft\.?|featuring|при уч\.?)\s+[^\)\]]*[\)\]]?", re.I)
 _TRACKNO = re.compile(r"^\s*(?:\d{1,3}\s*[-._)]\s+|\d{1,3}\s+(?=\D))")
@@ -106,6 +114,10 @@ def result_from_row(row: dict, duration: float) -> dict | None:
     synced = row.get("syncedLyrics") if isinstance(row.get("syncedLyrics"), str) else ""
     plain = row.get("plainLyrics") if isinstance(row.get("plainLyrics"), str) else ""
     lines = timed_lines(synced, duration) if synced else []
+    # A provider row can carry perfectly valid LRC for a different, much
+    # longer recording. Never stretch or expose timestamps beyond this track.
+    if duration and lines and lines[-1]["start"] > duration + 2:
+        lines = []
     if lines:
         return {"status": "synced", "synced": True, "lines": lines, "text": "\n".join(l["text"] for l in lines),
                 "source": "lrclib", "source_id": row.get("id")}
@@ -118,82 +130,119 @@ def _norm(value: str) -> str:
     return re.sub(r"[^\w]+", "", clean(value).lower())
 
 
-def pick(rows: list, artist: str, title: str, duration: float) -> dict | None:
-    """Best search row: title must match; prefer synced and nearest duration."""
-    want_t, want_a = _norm(title), _norm(artist)
-    best, best_score = None, None
+def _candidate_from_row(row: dict) -> dict | None:
+    if not isinstance(row, dict) or type(row.get("id")) is not int or not 0 < row["id"] < 2**63:
+        return None
+    title, artist, album = (str(row.get(key) or "").strip() for key in ("trackName", "artistName", "albumName"))
+    if not title or not artist or max(len(title), len(artist), len(album)) > 240:
+        return None
+    try:
+        duration = float(row.get("duration") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < duration <= 86400:
+        return None
+    return catalog_candidate(title, artist, album, duration, "lrclib", row["id"])
+
+
+def _verified_row(row: dict | None, signature: dict) -> dict | None:
+    candidate = _candidate_from_row(row) if isinstance(row, dict) else None
+    if candidate is None or catalog_match(signature, candidate) != "matched":
+        return None
+    return row
+
+
+def _lyric_identity(row: dict) -> tuple:
+    """Duplicates are safe only when their actual lyric payload is identical."""
+    return (bool(row.get("instrumental")), str(row.get("syncedLyrics") or "").strip(),
+            str(row.get("plainLyrics") or "").strip())
+
+
+def _pick_for_signature(rows: list, signature: dict) -> dict | None:
+    """Return one verified recording; conflicting provider rows stay ambiguous."""
+    matched: list[tuple[dict, dict]] = []
     for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        got_t = _norm(row.get("trackName") or row.get("name") or "")
-        got_a = _norm(row.get("artistName") or "")
-        # Substring titles attach a remix or a different song. Equality only.
-        if not got_t or got_t != want_t:
-            continue
-        if not want_a or got_a != want_a:
-            continue
-        diff = abs(float(row.get("duration") or 0) - duration) if duration else 0
-        if duration and diff > 12:
-            continue
-        synced = bool(row.get("syncedLyrics"))
-        score = (0 if synced else 1, 0 if got_t == want_t else 1, diff)
-        if best_score is None or score < best_score:
-            best, best_score = row, score
-    return best
+        candidate = _candidate_from_row(row)
+        if candidate is not None and catalog_match(signature, candidate) == "matched":
+            matched.append((row, candidate))
+    if not matched:
+        return None
+    identities = {_lyric_identity(row) for row, _ in matched}
+    if len(identities) != 1:
+        return None
+    return min(matched, key=lambda pair: abs(pair[1]["duration"] - signature["duration"]))[0]
+
+
+def pick(rows: list, artist: str, title: str, duration: float, album: str = "", is_excerpt: bool = False) -> dict | None:
+    """Compatibility wrapper used by tests and callers outside the service."""
+    signature = catalog_signature(SimpleNamespace(title=title, artist=artist, album=album,
+                                                   duration=duration, is_excerpt=is_excerpt))
+    return _pick_for_signature(rows, signature)
 
 
 class LrclibClient:
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None):
-        self._transport = transport
+        # Reuse the hardened provider reader: bounded response bodies, no
+        # redirects/compression, Retry-After backoff and request pacing.
+        self._provider = MusicEnrichmentService(transport=transport)
+        self._lock = asyncio.Lock()
 
-    async def _get(self, client, path, params):
-        response = await client.get(LRCLIB + path, params=params)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
+    async def _get(self, path, params):
+        return await self._provider._json(LRCLIB + path, params)
 
-    async def lookup(self, title, artist, album, duration, filename="", *, budget: float = 18) -> dict:
+    async def lookup(self, title, artist, album, duration, filename="", *, is_excerpt: bool = False,
+                     budget: float = 18) -> dict:
         """Bounded total time so the phone's 25 s request never times out."""
         try:
-            return await asyncio.wait_for(self._lookup(title, artist, album, duration, filename), budget)
+            return await asyncio.wait_for(self._serialized_lookup(title, artist, album, duration, filename,
+                                                                   is_excerpt=is_excerpt), budget)
         except (asyncio.TimeoutError, TimeoutError):
             return {"status": "unavailable", "synced": False, "lines": [], "text": ""}
 
-    async def _lookup(self, title, artist, album, duration, filename="") -> dict:
+    async def _serialized_lookup(self, title, artist, album, duration, filename="", *, is_excerpt=False) -> dict:
+        async with self._lock:
+            return await self._lookup(title, artist, album, duration, filename, is_excerpt=is_excerpt)
+
+    async def _lookup(self, title, artist, album, duration, filename="", *, is_excerpt=False) -> dict:
         duration = float(duration or 0)
+        signature = catalog_signature(SimpleNamespace(title=title, artist=artist, album=album, duration=duration,
+                                                       filename=filename, is_excerpt=is_excerpt))
+        if not signature["artist"] or not signature["title"] or not signature["duration"] or signature["cut"]:
+            return {"status": "insufficient_metadata", "synced": False, "lines": [], "text": ""}
         guesses = queries(title, artist, filename)
         if not guesses:
             return {"status": "insufficient_metadata", "synced": False, "lines": [], "text": ""}
         fallback = None
         try:
-            async with httpx.AsyncClient(transport=self._transport, timeout=httpx.Timeout(4, connect=3), trust_env=False,
-                                         follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
-                for guessed_artist, guessed_title in guesses:
-                    if guessed_artist:
-                        params = {"artist_name": guessed_artist, "track_name": guessed_title}
-                        if duration > 0:
-                            params["duration"] = int(round(duration))
-                        if album and clean(album):
-                            found = result_from_row(await self._get(client, "/get", {**params, "album_name": clean(album)}), duration)
-                            if found and found["synced"]:
-                                return found
-                            fallback = fallback or found
-                        found = result_from_row(await self._get(client, "/get", params), duration)
+            for guessed_artist, guessed_title in guesses:
+                if guessed_artist:
+                    params = {"artist_name": guessed_artist, "track_name": guessed_title}
+                    if duration > 0:
+                        params["duration"] = int(round(duration))
+                    if album and clean(album):
+                        row = _verified_row(await self._get("/get", {**params, "album_name": clean(album)}), signature)
+                        found = result_from_row(row, duration) if row else None
                         if found and found["status"] in {"synced", "instrumental"}:
                             return found
                         fallback = fallback or found
-                        rows = await self._get(client, "/search", {"track_name": guessed_title, "artist_name": guessed_artist})
-                        found = result_from_row(pick(rows or [], guessed_artist, guessed_title, duration), duration)
-                        if found and found["synced"]:
-                            return found
-                        fallback = fallback or found
-                    rows = await self._get(client, "/search", {"q": f"{guessed_artist} {guessed_title}".strip()})
-                    found = result_from_row(pick(rows or [], guessed_artist, guessed_title, duration), duration)
+                    row = _verified_row(await self._get("/get", params), signature)
+                    found = result_from_row(row, duration) if row else None
+                    if found and found["status"] in {"synced", "instrumental"}:
+                        return found
+                    fallback = fallback or found
+                    rows = await self._get("/search", {"track_name": guessed_title, "artist_name": guessed_artist})
+                    row = _pick_for_signature(rows or [], signature)
+                    found = result_from_row(row, duration) if row else None
                     if found and found["synced"]:
                         return found
                     fallback = fallback or found
-        except (httpx.HTTPError, ValueError, OSError) as exc:
+                rows = await self._get("/search", {"q": f"{guessed_artist} {guessed_title}".strip()})
+                row = _pick_for_signature(rows or [], signature)
+                found = result_from_row(row, duration) if row else None
+                if found and found["synced"]:
+                    return found
+                fallback = fallback or found
+        except (_ProviderFailure, httpx.HTTPError, ValueError, OSError) as exc:
             LOG.info("LRCLIB lookup unavailable: %s", type(exc).__name__)
             if fallback:
                 return fallback
@@ -314,7 +363,8 @@ async def resolve(track, *, owner: dict | None, embedded: dict | None, enrichmen
         cached = None if refresh else cache.get(track.id, print_)
         if cached is None:
             looked = await client.lookup(track.title, track.artist, getattr(track, "album", ""), duration,
-                                         getattr(track, "filename", ""))
+                                         getattr(track, "filename", ""),
+                                         is_excerpt=getattr(track, "is_excerpt", False) is True)
             cached = cache.put(track.id, print_, looked)
     if cached.get("synced"):
         return public(cached, track.id)

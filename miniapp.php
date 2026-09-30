@@ -150,12 +150,13 @@ function bytesb64(value){const bytes=new Uint8Array(value),raw=Array.from(bytes,
 function prepareCredentialOptions(options){const o=structuredClone(options);o.challenge=b64bytes(o.challenge);if(o.user?.id)o.user.id=b64bytes(o.user.id);for(const item of o.excludeCredentials||[])item.id=b64bytes(item.id);for(const item of o.allowCredentials||[])item.id=b64bytes(item.id);return o}
 function serializeCredential(credential){const response={clientDataJSON:bytesb64(credential.response.clientDataJSON)};if(credential.response.attestationObject)response.attestationObject=bytesb64(credential.response.attestationObject);if(credential.response.authenticatorData)response.authenticatorData=bytesb64(credential.response.authenticatorData);if(credential.response.signature)response.signature=bytesb64(credential.response.signature);if(credential.response.userHandle)response.userHandle=bytesb64(credential.response.userHandle);if(credential.response.getTransports)response.transports=credential.response.getTransports();return{id:credential.id,rawId:bytesb64(credential.rawId),type:credential.type,response,clientExtensionResults:credential.getClientExtensionResults(),authenticatorAttachment:credential.authenticatorAttachment||null}}
 async function passkeyAuthenticate(purpose='login',binding={}){if(!window.PublicKeyCredential)throw new Error('Это устройство не поддерживает Passkey');const start=await pwaApi('passkeys/login/options',{method:'POST',body:{purpose,binding}});if(start.status!==200||!start.data?.ok)throw new Error(start.data?.detail||'Не удалось начать проверку');const credential=await navigator.credentials.get({publicKey:prepareCredentialOptions(start.data.options)});const done=await pwaApi('passkeys/login/verify',{method:'POST',body:{transaction:start.data.transaction,credential:serializeCredential(credential)}});if(done.status!==200||!done.data?.ok)throw new Error(done.data?.detail||'Passkey отклонён');return done.data}
+function workspaceFilename(value){let name=String(value||'').replace(/\\/g,'/').split('/').pop().trim();name=name.replace(/[\x00-\x1f<>:\"/\\|?*]+/g,'_').replace(/^[ .]+|[ .]+$/g,'');return(name||'xass-file.bin').slice(0,180)}
 function agentActionBinding(source,command,payload={}){
  const agent=(state.boot?.sources||[]).find(item=>item.source_name===source);
  if(!agent||!Number.isSafeInteger(agent.id)||agent.id<=0)throw new Error('Обновите список устройств перед подтверждением');
  payload=JSON.parse(JSON.stringify(payload));
  if(['reboot','shutdown'].includes(command))payload.delay_sec=Number(payload.delay_sec||0);
- if(['files_list','file_download','file_delete'].includes(command))payload={root:String(payload.root||'').trim().toLowerCase(),path:String(payload.path||'').replace(/\\/g,'/').trim().replace(/^\/+|\/+$/g,'').split('/').filter(p=>p!==''&&p!=='.').join('/')};
+ if(['files_list','file_download','file_delete','file_upload'].includes(command)){payload={root:String(payload.root||'').trim().toLowerCase(),path:String(payload.path||'').replace(/\\/g,'/').trim().replace(/^\/+|\/+$/g,'').split('/').filter(p=>p!==''&&p!=='.').join('/')};if(command==='file_upload')payload.filename=workspaceFilename(arguments[2]?.filename)}
  return{source_id:agent.id,command,payload};
 }
 async function passkeyAction(purpose,binding){
@@ -342,7 +343,7 @@ demo||initData?loadBoot():initPwa();
 })();
 </script>
 <script src="/assets/xass-e2e.js?v=0140"></script>
-<script src="/assets/miniapp-control-center.js?v=0190"></script>
+<script src="/assets/miniapp-control-center.js?v=0191"></script>
 <script src="/assets/miniapp-music.js?v=0170"></script>
 <script src="/assets/miniapp-server-migration.js?v=0140"></script>
 <script src="/assets/miniapp-device-key.js?v=0140"></script>

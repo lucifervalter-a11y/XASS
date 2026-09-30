@@ -19,7 +19,7 @@ from app.db import Base, get_session
 from app.range_guard import SingleRangeGuard
 from app.models import AgentCommand, AgentCredential, HeartbeatSource
 from app.music_api import build_router
-from app.music_models import MusicSession, MusicTrack, MusicUpload
+from app.music_models import MusicEnrichment, MusicSession, MusicTrack, MusicUpload
 from app.music_playback_models import MusicPlaybackState
 from app.services.music_library import CHUNK_BYTES, issue_ticket
 from app.services.music_broadcast import current_broadcast
@@ -214,20 +214,99 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_stream_ticket_is_bound_to_an_active_credential(self):
         track = await self.upload()
-        binding = hashlib.sha256(b"fixture-agent-key").hexdigest()
+        key = "fixture-agent-key"
+        binding = hashlib.sha256(key.encode()).hexdigest()
         async with self.sessions() as session:
             session.add(AgentCredential(source_name="PC", api_key_hash=binding, key_hint="fixture", is_active=True))
             await session.commit()
         value = issue_ticket(self.settings, track["id"], purpose="agent", binding=binding)
         path = f"/agent/music/tracks/{track['id']}/stream?ticket={value}"
-        self.assertEqual((await self.client.get(path)).status_code, 200)
+        self.assertEqual((await self.client.get(path)).status_code, 403)
+        self.assertEqual((await self.client.get(path, headers={"X-Api-Key": "wrong-agent-key"})).status_code, 403)
+        self.assertEqual((await self.client.get(path, headers={"X-Api-Key": key})).status_code, 200)
         listen = issue_ticket(self.settings, track["id"], purpose="listen")
         self.assertEqual((await self.client.get(f"/agent/music/tracks/{track['id']}/stream?ticket={listen}")).status_code, 401)
         async with self.sessions() as session:
             credential = await session.scalar(select(AgentCredential))
             credential.is_active = False
             await session.commit()
+        self.assertEqual((await self.client.get(path, headers={"X-Api-Key": key})).status_code, 403)
+
+    async def test_agent_artwork_requires_the_bound_key_and_never_uses_owner_auth(self):
+        track = await self.upload()
+        key = "fixture-agent-key"
+        binding = hashlib.sha256(key.encode()).hexdigest()
+        picture = b"\xff\xd8\xff" + b"stored-jpeg" * 4
+        async with self.sessions() as session:
+            session.add(AgentCredential(source_name="Artwork PC", api_key_hash=binding,
+                key_hint="fixture", is_active=True))
+            session.add(MusicEnrichment(track_id=track["id"], fingerprint="stored", original={}, result={},
+                owner_lyrics={}, artwork_data=picture, dismissed=False, checked_at=datetime.now(timezone.utc)))
+            await session.commit()
+        ticket = issue_ticket(self.settings, track["id"], purpose="agent", binding=binding)
+        path = f"/agent/music/tracks/{track['id']}/artwork?ticket={ticket}"
         self.assertEqual((await self.client.get(path)).status_code, 403)
+        self.assertEqual((await self.client.get(path, headers={"X-Api-Key": "wrong-agent-key"})).status_code, 403)
+        response = await self.client.get(path, headers={"X-Api-Key": key})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, picture)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+        listen = issue_ticket(self.settings, track["id"], purpose="listen")
+        self.assertEqual((await self.client.get(
+            f"/agent/music/tracks/{track['id']}/artwork?ticket={listen}", headers={"X-Api-Key": key})).status_code, 401)
+        async with self.sessions() as session:
+            (await session.scalar(select(AgentCredential))).is_active = False
+            await session.commit()
+        self.assertEqual((await self.client.get(path, headers={"X-Api-Key": key})).status_code, 403)
+
+    async def test_paired_agent_catalog_is_bounded_private_and_can_queue_one_track(self):
+        one = await self.upload(name="one.wav")
+        await self.upload(silent_wav(4), name="second.wav")
+        key = "fixture-library-agent-key"
+        binding = hashlib.sha256(key.encode()).hexdigest()
+        async with self.sessions() as session:
+            session.add(AgentCredential(source_name="Library PC", source_type="PC_AGENT",
+                api_key_hash=binding, key_hint="fixture", is_active=True))
+            await session.commit()
+
+        endpoint = "/agent/music/library"
+        self.assertEqual((await self.client.get(endpoint)).status_code, 401)
+        self.assertEqual((await self.client.get(endpoint, headers=self.headers)).status_code, 401)
+        self.assertEqual((await self.client.get(endpoint, headers={"X-Api-Key": "wrong"})).status_code, 401)
+        self.assertEqual((await self.client.get(endpoint, params={"limit": 101},
+                                                headers={"X-Api-Key": key})).status_code, 422)
+        response = await self.client.get(endpoint, params={"limit": 1}, headers={"X-Api-Key": key})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "private, no-store")
+        body = response.json()
+        self.assertEqual(len(body["tracks"]), 1)
+        self.assertEqual(body["total"], 2)
+        self.assertTrue(body["has_more"])
+        self.assertEqual(set(body["tracks"][0]), {
+            "id", "title", "artist", "album", "duration", "favorite", "mime", "has_artwork",
+        })
+        self.assertNotIn("ticket", response.text)
+        self.assertNotIn("sha256", response.text)
+        self.assertNotIn("filename", response.text)
+        self.assertNotIn("lyrics", response.text)
+
+        with patch("app.services.music_agent_presentation.stored_agent_presentation",
+                   AsyncMock(return_value={"lyrics": "", "catalog_artwork": False})):
+            played = await self.client.post(
+                f"{endpoint}/{one['id']}/play",
+                headers={"X-Api-Key": key},
+                json={"volume": 63, "output_id": "default"},
+            )
+        self.assertEqual(played.status_code, 200, played.text)
+        self.assertEqual(set(played.json()), {"ok", "command_id", "status"})
+        async with self.sessions() as session:
+            command = await session.get(AgentCommand, played.json()["command_id"])
+            self.assertEqual(command.source_name, "Library PC")
+            self.assertEqual(command.command, "music_play")
+            self.assertEqual(command.payload["track_id"], one["id"])
+            self.assertEqual(command.payload["volume"], 63)
+            self.assertTrue(command.payload["url"].startswith("https://fixture.invalid/agent/music/tracks/"))
+            self.assertNotIn(key, str(command.payload))
 
     async def test_cancel_upload_removes_only_selected_unfinished_file(self):
         first, other = await self.start(), await self.start()
@@ -251,13 +330,16 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
         track = await self.upload()
         now = datetime.now(timezone.utc)
         async with self.sessions() as session:
+            session.add(MusicEnrichment(track_id=track["id"], fingerprint="stored", original={},
+                result={"lyrics": {"synced": True, "text": "Строка", "lines": [{"time": 3.5, "text": "Строка"}]}},
+                owner_lyrics={}, artwork_data=b"\xff\xd8\xffstored", dismissed=False, checked_at=now))
             for name in ("Ready", "Old", "Offline", "Unpaired"):
                 session.add(HeartbeatSource(source_name=name, source_type="PC_AGENT", is_online=name != "Offline",
                     last_seen_at=now if name != "Offline" else now - timedelta(minutes=5),
                     last_payload={} if name == "Old" else {"agent_version": "0.16.0", "music_player": {"state": "idle"}}))
                 if name != "Unpaired":
                     session.add(AgentCredential(source_name=name, key_hint="fixture", is_active=True,
-                        api_key_hash=hashlib.sha256(name.encode()).hexdigest()))
+                        api_key_hash=hashlib.sha256((name + "-agent-key").encode()).hexdigest()))
             await session.commit()
         response = await self.request("GET", "/api/mini/music/players")
         self.assertEqual(response.status_code, 200, response.text)
@@ -279,10 +361,13 @@ class MusicApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current.status, "pending")
             self.assertEqual(current.command, "music_play")
             self.assertGreater(current.payload["expires_at"], now.timestamp())
+            self.assertEqual(current.payload["sha256"], hashlib.sha256(self.audio).hexdigest())
             media = current.payload["media_path"]
             self.assertTrue(current.payload["url"].startswith("https://fixture.invalid/agent/music/"))
+            self.assertEqual(current.payload["lyrics"], "[00:03.50]Строка")
+            self.assertEqual(current.payload["artwork_path"].split("ticket=", 1)[1], media.split("ticket=", 1)[1])
             self.assertNotIn("api_key", current.payload)
-        self.assertEqual((await self.client.get(media)).status_code, 200)
+        self.assertEqual((await self.client.get(media, headers={"X-Api-Key": "Ready-agent-key"})).status_code, 200)
         result = await self.request("GET", f"/api/mini/music/control/{commands[-1]}")
         self.assertEqual(result.json()["status"], "pending")
 

@@ -3,7 +3,7 @@ import base64
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import httpx
 from fastapi import FastAPI
@@ -26,7 +26,8 @@ class ClipboardCommandTests(unittest.IsolatedAsyncioTestCase):
                                   created_at=datetime.now(timezone.utc))
         self.enqueue = AsyncMock(return_value=command)
         self.audit = AsyncMock()
-        for name, value in (("enqueue_agent_command", self.enqueue), ("log_admin_action", self.audit)):
+        self.proof = AsyncMock()
+        for name, value in (("enqueue_agent_command", self.enqueue), ("log_admin_action", self.audit), ("_require_pwa_action_proof", self.proof)):
             context = patch.object(main, name, value)
             context.start()
             self.addCleanup(context.stop)
@@ -87,3 +88,21 @@ class ClipboardCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 400)
                 self.enqueue.assert_not_awaited()
                 self.audit.assert_not_awaited()
+
+    async def test_clipboard_read_requires_fresh_proof_bound_to_agent_and_payload(self):
+        command = SimpleNamespace(id=2, source_name="PC", command="clipboard_get", status="pending",
+                                  created_at=datetime.now(timezone.utc))
+        self.enqueue.return_value = command
+        response = await self.client.post("/api/mini/agents/PC/commands",
+            json={"command": "clipboard_get", "payload": {}, "action_proof": "xna_clipboard"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.proof.assert_awaited_once_with(
+            session=self.session, user=ANY, telegram_init_data="", action_proof="xna_clipboard",
+            purpose="agent:clipboard_get:PC",
+            binding={"source_id": 1, "command": "clipboard_get", "payload": {}},
+        )
+
+    async def test_clipboard_write_does_not_prompt_for_read_access(self):
+        response = await self.send({"text": "owner chose to send this"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.proof.assert_not_awaited()

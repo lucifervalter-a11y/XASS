@@ -31,6 +31,18 @@ enum NativeVolumeTarget: Equatable {
         view.showsRouteButton = false // The player already has a separate route picker.
         view.tintColor = UIColor.white.withAlphaComponent(0.8)
         view.backgroundColor = .clear
+        // MPVolumeView remains the public system-volume control, but its stock
+        // thumb is visually too large in the compact player row. A public
+        // appearance API gives it a bounded 14 pt thumb without finding or
+        // mutating private subviews.
+        let thumb = UIGraphicsImageRenderer(size: CGSize(width: 14, height: 14)).image { context in
+            UIColor.white.setFill()
+            context.cgContext.fillEllipse(in: CGRect(x: 1, y: 1, width: 12, height: 12))
+        }
+        view.setVolumeThumbImage(thumb, for: .normal)
+        view.setVolumeThumbImage(thumb, for: .highlighted)
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.accessibilityIdentifier = "nativeSystemVolume"
         // Leave accessibility to the actual native slider, including its value
         // and adjustable actions. Making the parent an AX element would hide it.
@@ -68,7 +80,8 @@ enum NativeVolumeTarget: Equatable {
             if target == .system {
                 HStack(spacing: 14) {
                     Image(systemName: "speaker.fill").font(.caption).accessibilityHidden(true)
-                    NativeSystemVolumeView().frame(height: 44)
+                    NativeSystemVolumeView().frame(maxWidth: .infinity, minHeight: 44, maxHeight: 44)
+                        .padding(.horizontal, 4).layoutPriority(1)
                     Image(systemName: "speaker.wave.2.fill").font(.caption).accessibilityHidden(true)
                 }
                 Text(target.title).font(.caption2).accessibilityIdentifier("nativeSystemVolumeLabel")
@@ -82,14 +95,11 @@ enum NativeVolumeTarget: Equatable {
                     }.accessibilityIdentifier("nativePlaybackGainNotice")
                 }
             } else {
-                HStack(spacing: 14) {
-                    Image(systemName: "speaker.fill").font(.caption).accessibilityHidden(true)
-                    Slider(value: Binding(get: { remoteValue }, set: { draft = $0 }), in: 0...100,
-                        onEditingChanged: updateRemoteVolume)
-                        .tint(.white.opacity(0.7)).disabled(store.busy)
-                        .accessibilityLabel(target.title).accessibilityIdentifier("nativeRemoteVolume")
-                    Image(systemName: "speaker.wave.2.fill").font(.caption).accessibilityHidden(true)
-                }
+                PlayerVolumeSlider(volume: remoteValue / 100, reduceMotion: false,
+                    onEditingChanged: updateRemoteVolume,
+                    onChange: { draft = min(100, max(0, $0 * 100)) })
+                    .disabled(store.busy)
+                    .accessibilityLabel(target.title).accessibilityIdentifier("nativeRemoteVolume")
                 Text(target.title).font(.caption2)
                 if target == .remotePlayer {
                     Text("Кнопки громкости здесь меняют только этот iPhone.").font(.caption2).multilineTextAlignment(.center)
