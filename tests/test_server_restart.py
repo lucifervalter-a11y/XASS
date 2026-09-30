@@ -256,10 +256,11 @@ class UpdateStatusTests(unittest.TestCase):
         publish_step = windows_workflow.split("- name: Publish installer to XASS server", maxsplit=1)[1]
         publication = publish_step.split("publish-release:", maxsplit=1)[0]
         self.assertNotIn("continue-on-error: true", publication)
-        self.assertIn(".incoming-${{ github.event.workflow_run.head_sha }}", publication)
+        self.assertIn('.incoming-$release_sha', publication)
         self.assertIn("deploy/publish_installer.py", publication)
         self.assertIn("verify_manifest", publication)
-        self.assertIn("Downloaded installer checksum mismatch", publication)
+        self.assertIn("Published installer checksum mismatch", publication)
+        self.assertIn("Installer manifest must remain protected by an issued agent key", publication)
 
     def test_deployment_backup_does_not_copy_media_or_cancel_remote_work(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -286,11 +287,19 @@ class UpdateStatusTests(unittest.TestCase):
                 self.assertIn("github.event.workflow_run.event == 'push'", workflow)
                 self.assertIn("github.event.workflow_run.head_branch == 'main'", workflow)
                 self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", workflow)
-                self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
+                expected_ref = "ref: ${{ env.RELEASE_SHA }}" if name == "windows-agent.yml" else "ref: ${{ github.event.workflow_run.head_sha }}"
+                self.assertIn(expected_ref, workflow)
 
         self.assertNotIn("branches: [main]\n    paths:", workflows["windows-agent.yml"])
         self.assertIn("git tag --force agent-latest \"$RELEASE_SHA\"", workflows["windows-agent.yml"])
         self.assertIn("git tag --force ios-latest \"$RELEASE_SHA\"", workflows["ios.yml"])
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", workflows["windows-agent.yml"])
+        self.assertIn("release_sha:", workflows["windows-agent.yml"])
+        self.assertIn("github.event.workflow_run.head_sha || inputs.release_sha", workflows["windows-agent.yml"])
+        self.assertIn("^[0-9a-f]{40}$", workflows["windows-agent.yml"])
+        self.assertIn("Target revision has no successful main checks run", workflows["windows-agent.yml"])
+        self.assertIn("Manual publishing requires the exact deployed backend revision", workflows["windows-agent.yml"])
+        self.assertNotIn("git diff --name-only", workflows["windows-agent.yml"])
 
         update_script = (root / "deploy" / "update.sh").read_text(encoding="utf-8")
         self.assertIn('target_revision="${1:-origin/main}"', update_script)

@@ -1,7 +1,11 @@
 name: Build Windows agent
 
 permissions:
+  actions: read
   contents: write
+
+env:
+  RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.release_sha }}
 
 on:
   workflow_run:
@@ -9,9 +13,14 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Full verified main commit SHA to rebuild and publish
+        required: true
+        type: string
 
 concurrency:
-  group: xass-windows-agent-${{ github.event_name == 'workflow_run' && 'main' || github.ref }}
+  group: xass-windows-agent-${{ (github.event_name == 'workflow_run' || github.ref == 'refs/heads/main') && 'main' || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -25,9 +34,15 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
+      - name: Validate immutable release revision
+        shell: powershell
+        run: |
+          if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'release_sha must be a full lowercase Git commit SHA'
+          }
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ env.RELEASE_SHA }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -53,21 +68,32 @@ jobs:
   deploy-installer:
     needs: build
     if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ env.RELEASE_SHA }}
       - uses: actions/download-artifact@v4
         with:
           name: xass-windows-installer
           path: release
+      - name: Require verified main revision for a manual release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main" || { echo 'Manual publishing is restricted to main.'; exit 1; }
+          verified="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow checks.yml --commit "$RELEASE_SHA" --event push --status success --limit 10 --json headSha --jq '.[].headSha')"
+          grep -Fqx "$RELEASE_SHA" <<<"$verified" || { echo 'Target revision has no successful main checks run.'; exit 1; }
       - name: Resolve VPS host through DNS-over-HTTPS
         id: vps
         shell: bash
@@ -96,7 +122,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
-        run: bash deploy/github_ssh.sh upload '${{ github.event.workflow_run.head_sha }}'
+        run: bash deploy/github_ssh.sh upload "$RELEASE_SHA"
       - name: Activate and verify immutable installer
         shell: bash
         env:
@@ -108,44 +134,50 @@ jobs:
             bash deploy/github_ssh.sh exec <<'REMOTE'
             set -e
             cd /home/red/serverredus
-            for attempt in $(seq 1 120); do
-              if test -f deploy/publish_installer.py && test "$(git rev-parse HEAD)" = '${{ github.event.workflow_run.head_sha }}'; then break; fi
-              sleep 2
-            done
-            test "$(git rev-parse HEAD)" = '${{ github.event.workflow_run.head_sha }}' || { echo 'Matching backend revision is not deployed; installer kept in staging.'; exit 1; }
-            .venv/bin/python deploy/publish_installer.py --staging-dir 'data/releases/.incoming-${{ github.event.workflow_run.head_sha }}' --expected-revision '${{ github.event.workflow_run.head_sha }}'
+            release_sha='${{ env.RELEASE_SHA }}'
+            if test '${{ github.event_name }}' = 'workflow_run'; then
+              for attempt in $(seq 1 120); do
+                if test -f deploy/publish_installer.py && test "$(git rev-parse HEAD)" = "$release_sha"; then break; fi
+                sleep 2
+              done
+              test "$(git rev-parse HEAD)" = "$release_sha" || { echo 'Matching backend revision is not deployed; installer kept in staging.'; exit 1; }
+            else
+              test "$(git rev-parse HEAD)" = "$release_sha" || { echo 'Manual publishing requires the exact deployed backend revision.'; exit 1; }
+            fi
+            .venv/bin/python deploy/publish_installer.py --staging-dir "data/releases/.incoming-$release_sha" --expected-revision "$release_sha"
             .venv/bin/python - <<'PY'
-            import hashlib, json, os, time, urllib.parse
+            import hashlib, json, os, secrets, time, urllib.parse
             import httpx
             from dotenv import dotenv_values
             from app.config import Settings
-            from app.services.agent_installer import get_agent_installer
+            from app.services.agent_installer import build_installer_manifest, get_agent_installer
             from pc_client.client_update import verify_manifest
             settings = Settings()
             port = int(os.environ.get('PORT') or dotenv_values('.env').get('PORT') or 8000)
             artifact = get_agent_installer(settings)
             assert artifact is not None, 'Installer metadata is not readable'
-            with httpx.Client(timeout=90, trust_env=False) as client:
+            with httpx.Client(timeout=15, trust_env=False) as client:
                 for attempt in range(60):
                     try:
-                        response = client.get(f'http://127.0.0.1:{port}/agent/update-manifest', params={'agent_distribution':'installer','agent_version':'0.13.5','agent_revision':'previous'}, headers={'X-Api-Key':settings.agent_api_key}, timeout=5)
-                        if response.status_code == 200: break
+                        response = client.get(f'http://127.0.0.1:{port}/health', timeout=5)
+                        if response.status_code == 200 and response.json().get('status') == 'ok': break
                     except httpx.TransportError:
                         pass
                     time.sleep(2)
                 else: raise RuntimeError('Backend did not become ready for installer validation')
-                response.raise_for_status()
-                manifest = response.json()['installer_update']
-                assert manifest['available'] and verify_manifest(manifest, settings.agent_api_key), 'Update manifest is not valid'
+                protected = client.get(f'http://127.0.0.1:{port}/agent/update-manifest', params={'agent_distribution':'installer'})
+                assert protected.status_code == 401, 'Installer manifest must remain protected by an issued agent key'
+                verification_key = secrets.token_urlsafe(32)
+                manifest = build_installer_manifest(settings, api_key=verification_key, base_url='https://redvps.site', current_version='0.13.5', current_revision='previous')
+                assert manifest and manifest['available'] and verify_manifest(manifest, verification_key), 'Update manifest is not valid'
                 assert manifest['sha256'] == artifact.sha256 and manifest['version'] == artifact.version
                 public = urllib.parse.urlsplit(manifest['url'])
                 assert public.scheme == 'https' and public.hostname == 'redvps.site', 'Public update origin needs correction'
                 digest = hashlib.sha256()
                 size = 0
-                with client.stream('GET', manifest['url'], headers={'X-Api-Key':settings.agent_api_key}) as download:
-                    download.raise_for_status()
-                    for chunk in download.iter_bytes(): digest.update(chunk); size += len(chunk)
-                assert digest.hexdigest() == artifact.sha256 and size == artifact.size, 'Downloaded installer checksum mismatch'
+                with artifact.path.open('rb') as download:
+                    for chunk in iter(lambda: download.read(1024 * 1024), b''): digest.update(chunk); size += len(chunk)
+                assert digest.hexdigest() == artifact.sha256 and size == artifact.size, 'Published installer checksum mismatch'
                 print(json.dumps({'ok': True, 'version': artifact.version, 'revision': artifact.revision, 'bytes': size, 'sha256': artifact.sha256, 'update_available': True}))
             PY
             REMOTE
@@ -153,17 +185,18 @@ jobs:
   publish-release:
     needs: [build, deploy-installer]
     if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ env.RELEASE_SHA }}
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
@@ -173,7 +206,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: agent-latest
-          target_commitish: ${{ github.event.workflow_run.head_sha }}
+          target_commitish: ${{ env.RELEASE_SHA }}
           name: XASS for Windows — latest stable
           body: |
             Автоматически собранный стабильный установщик XASS для Windows.
@@ -185,8 +218,6 @@ jobs:
           fail_on_unmatched_files: true
       - name: Point the latest Windows tag at the verified release
         shell: bash
-        env:
-          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
