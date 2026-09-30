@@ -1,0 +1,56 @@
+name: Read-only server route diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-server-route-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect active backend and nginx routing without secrets
+        shell: bash
+        env:
+          SSH_HOST: 51.250.80.137
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          bash deploy/github_ssh.sh exec <<'REMOTE'
+          set -euo pipefail
+          cd /home/red/serverredus
+          printf 'deployed_revision=%s\n' "$(git rev-parse HEAD)"
+          sudo systemctl show serverredus-backend \
+            --property=MainPID --property=ExecStart --property=WorkingDirectory \
+            --no-pager
+          printf '%s\n' '--- nginx route directives ---'
+          sudo nginx -T 2>&1 | grep -nE \
+            'configuration file|server_name[[:space:]]+redvps\.site|location.*agent|proxy_pass|proxy_hide_header|proxy_cache|proxy_ignore_headers|rewrite.*agent' \
+            || true
+          printf '%s\n' '--- checked-out backend contract ---'
+          .venv/bin/python - <<'PY'
+          import inspect
+          import json
+          from pathlib import Path
+          import app.main as main
+
+          signature = inspect.signature(main.agent_update_manifest)
+          source = inspect.getsource(main.agent_update_manifest)
+          print(json.dumps({
+              "module": str(Path(main.__file__).resolve()),
+              "parameters": list(signature.parameters),
+              "has_installer_branch": "build_installer_manifest if installer" in source,
+              "sets_vary": 'response.headers["Vary"] = "X-Api-Key"' in source,
+          }, sort_keys=True))
+          PY
+          REMOTE
