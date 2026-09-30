@@ -21,12 +21,35 @@ enum NativeVolumeTarget: Equatable {
     }
 }
 
+/// MPVolumeView centers the thumb on the first and last point of its track.
+/// Once a custom thumb is installed, the stock track can still span the full
+/// bounds and leave half of that image outside the view at 0% and 100%.
+/// Reserve exactly the public thumb image's radius at both ends so the visible
+/// and hit-test geometry agree without reaching into MPVolumeView's subviews.
+private final class BoundedMPVolumeView: MPVolumeView {
+    override func volumeSliderRect(forBounds bounds: CGRect) -> CGRect {
+        let stock = super.volumeSliderRect(forBounds: bounds)
+        let thumbWidth = max(
+            volumeThumbImage(for: .normal)?.size.width ?? 0,
+            volumeThumbImage(for: .highlighted)?.size.width ?? 0
+        )
+        let radius = thumbWidth / 2
+        guard radius > 0, bounds.width >= thumbWidth else { return stock }
+
+        let minimumX = max(stock.minX, bounds.minX + radius)
+        let maximumX = min(stock.maxX, bounds.maxX - radius)
+        guard maximumX >= minimumX else { return stock }
+        return CGRect(x: minimumX, y: stock.minY,
+                      width: maximumX - minimumX, height: stock.height)
+    }
+}
+
 /// A visible, interactive system control. No hidden slider, subview lookup,
 /// synthesized control events, KVC, or programmatic system-volume mutation.
 /// MPVolumeView follows hardware buttons and output-route changes itself.
 @MainActor struct NativeSystemVolumeView: UIViewRepresentable {
     static func makeVolumeView() -> MPVolumeView {
-        let view = MPVolumeView(frame: CGRect(x: 0, y: 0, width: 240, height: 44))
+        let view = BoundedMPVolumeView(frame: CGRect(x: 0, y: 0, width: 240, height: 44))
         view.showsVolumeSlider = true
         view.showsRouteButton = false // The player already has a separate route picker.
         view.tintColor = UIColor.white.withAlphaComponent(0.8)
