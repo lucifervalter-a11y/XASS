@@ -97,6 +97,55 @@ class PcCommandLoopTests(unittest.TestCase):
         self.assertEqual(selected, "https://redvps.site")
         self.assertTrue(all(call.args[0].startswith("https://") for call in raw.get.call_args_list))
 
+    def test_legacy_public_http_is_upgraded_only_after_verified_https_health(self) -> None:
+        legacy = "http://redvps.site:8000"
+        self.assertEqual(
+            client_agent._build_server_candidates(legacy),
+            ["https://redvps.site", "https://redvps.site:8000"],
+        )
+        response = httpx.Response(
+            200,
+            json={"status": "ok"},
+            request=httpx.Request("GET", "https://redvps.site/health"),
+        )
+        raw, context = MagicMock(), MagicMock()
+        raw.get.return_value = response
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context) as factory:
+            selected = client_agent.discover_backend_url(legacy)
+
+        self.assertEqual(selected, "https://redvps.site")
+        factory.assert_called_once_with("https://redvps.site", timeout=8, trust_env=False)
+        raw.get.assert_called_once_with("https://redvps.site/health")
+        self.assertNotIn("http://", str(raw.get.call_args))
+
+    def test_legacy_public_http_stays_unusable_when_https_health_fails(self) -> None:
+        legacy = "http://redvps.site:8001"
+        raw, context = MagicMock(), MagicMock()
+        raw.get.side_effect = httpx.ConnectError("TLS endpoint unavailable")
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context) as factory:
+            selected = client_agent.discover_backend_url(legacy)
+
+        self.assertEqual(selected, legacy)
+        self.assertEqual(
+            [call.args[0] for call in factory.call_args_list],
+            ["https://redvps.site", "https://redvps.site:8001"],
+        )
+        self.assertTrue(all(call.args[0].startswith("https://") for call in raw.get.call_args_list))
+
+    def test_loopback_and_explicit_remote_development_http_are_not_migrated(self) -> None:
+        self.assertEqual(
+            client_agent._build_server_candidates("http://127.0.0.1:8001"),
+            ["http://127.0.0.1:8001"],
+        )
+        self.assertEqual(
+            client_agent._build_server_candidates(
+                "http://devbox.invalid:8001", allow_insecure_http=True,
+            ),
+            ["http://devbox.invalid:8001"],
+        )
+
     def test_bare_remote_server_defaults_to_https_but_loopback_stays_http(self) -> None:
         self.assertEqual(client_agent.normalize_server_url("redvps.site"), "https://redvps.site")
         self.assertEqual(client_agent.normalize_server_url("51.250.80.137"), "https://51.250.80.137")

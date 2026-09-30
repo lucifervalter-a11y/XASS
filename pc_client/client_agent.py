@@ -278,13 +278,63 @@ def _parse_json_body(response: httpx.Response) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _build_server_candidates(value: str) -> list[str]:
+def _is_loopback_server(host: str) -> bool:
+    normalized = str(host or "").strip().strip("[]").casefold()
+    if normalized in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _secure_legacy_candidates(parsed: Any) -> list[str]:
+    """Build HTTPS-only replacements for an old public HTTP endpoint.
+
+    Versions before 0.21 commonly saved ``http://host:8000`` while nginx
+    exposed the same XASS instance at the canonical HTTPS origin.  The health
+    check is intentionally unauthenticated; no pair code or agent key is ever
+    attached to these probes.
+    """
+
+    host = str(parsed.hostname or "")
+    if not host:
+        return []
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    path = str(parsed.path or "").rstrip("/")
+    canonical = f"https://{display_host}{path}"
+    candidates = [canonical]
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        candidates.append(f"https://{display_host}:8001{path}")
+    elif port != 443:
+        # Canonical 443 is tried first.  Keeping the old numeric port as a
+        # TLS-only fallback supports installations that terminate TLS there.
+        candidates.append(f"https://{display_host}:{port}{path}")
+    return candidates
+
+
+def _build_server_candidates(value: str, *, allow_insecure_http: bool = False) -> list[str]:
     normalized = normalize_server_url(value)
     parsed = urlsplit(normalized)
     if not parsed.hostname:
         return [normalized]
 
     base_path = parsed.path.rstrip("/")
+    if (
+        parsed.scheme.casefold() == "http"
+        and not _is_loopback_server(str(parsed.hostname or ""))
+        and not allow_insecure_http
+    ):
+        # This is a one-way upgrade probe.  If none of the HTTPS candidates is
+        # healthy, discover_backend_url returns the original value and the
+        # secret-transport guard rejects it before credentials can be sent.
+        candidates = _secure_legacy_candidates(parsed)
+        return list(dict.fromkeys(item.rstrip("/") for item in candidates)) or [normalized]
+
     if parsed.port is not None or base_path:
         return [normalized]
 
@@ -315,20 +365,29 @@ def _build_server_candidates(value: str) -> list[str]:
     return unique
 
 
-def discover_backend_url(server_url: str) -> str:
-    candidates = _build_server_candidates(server_url)
-    with create_http_client(server_url, timeout=8, trust_env=False) as client:
-        for candidate in candidates:
-            health_url = f"{candidate}/health"
-            try:
+def discover_backend_url(server_url: str, *, allow_insecure_http: bool = False) -> str:
+    """Find a healthy backend without ever downgrading a public endpoint.
+
+    Each candidate owns its adaptive client so TLS SNI/certificate validation
+    and VPN route recovery are anchored to the exact origin being tested.
+    """
+
+    candidates = _build_server_candidates(
+        server_url, allow_insecure_http=allow_insecure_http,
+    )
+    for candidate in candidates:
+        try:
+            client_context = create_http_client(candidate, timeout=8, trust_env=False)
+            with client_context as client:
+                health_url = f"{candidate}/health"
                 response = client.get(health_url)
-            except Exception:
-                continue
-            if response.status_code >= 400:
-                continue
-            payload = _parse_json_body(response)
-            if isinstance(payload, dict) and str(payload.get("status") or "").lower() == "ok":
-                return candidate
+        except Exception:
+            continue
+        if response.status_code >= 400:
+            continue
+        payload = _parse_json_body(response)
+        if isinstance(payload, dict) and str(payload.get("status") or "").lower() == "ok":
+            return candidate
     return normalize_server_url(server_url)
 
 
@@ -526,7 +585,9 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
     pair_code = input("Код привязки (из /agents), Enter если хотите ввести AGENT_API_KEY: ").strip()
     api_key = ""
     if pair_code:
-        discovered_url = discover_backend_url(server_url)
+        discovered_url = discover_backend_url(
+            server_url, allow_insecure_http=_allow_insecure_http(existing),
+        )
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             server_url = discovered_url
@@ -638,7 +699,9 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
     pair_code = (args.pair_code or "").strip()
     if pair_code:
         server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
-        discovered_url = discover_backend_url(server_url)
+        discovered_url = discover_backend_url(
+            server_url, allow_insecure_http=_allow_insecure_http(config),
+        )
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             server_url = discovered_url
@@ -1294,7 +1357,9 @@ def _run_main() -> None:
             print(f"Используется конфиг: {CONFIG_PATH}")
 
         server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
-        discovered_url = discover_backend_url(server_url)
+        discovered_url = discover_backend_url(
+            server_url, allow_insecure_http=_allow_insecure_http(config),
+        )
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             config["server_url"] = discovered_url
