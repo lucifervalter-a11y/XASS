@@ -306,7 +306,9 @@ import UIKit
         .overlay(alignment: .bottom) { MiniPlayerProgress(progress: player.progress).padding(.horizontal, 16).padding(.bottom, 3) }
         .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
         .padding(.horizontal, 10).padding(.bottom, 6)
-        .simultaneousGesture(swipe)
+        // Once a real drag is recognised it wins over the title button.  A
+        // vertical finger move must never also be delivered as "open player".
+        .highPriorityGesture(swipe)
         .onChange(of: touching) { _, active in
             guard !active else { return }
             horizontal = nil
@@ -408,6 +410,10 @@ private enum PlayerDragMode { case undecided, active, ignored }
     @State private var slideDirection: CGFloat = 1
     /// A scrubber/volume drag is in progress: never start a swipe-down meanwhile.
     @State private var sliderEditing = false
+    /// A drag that began on the mini player must not be inherited by the card
+    /// mounted under the same finger.  Without this short hand-off window a
+    /// slight vertical movement can expand and immediately collapse the player.
+    @State private var dismissGestureArmed = false
     @State private var metadataHeight: CGFloat = 64
     @State private var controlsHeight: CGFloat = 276
     @AccessibilityFocusState private var titleFocused: Bool
@@ -433,6 +439,13 @@ private enum PlayerDragMode { case undecided, active, ignored }
             if value > 0, dragOffset == 0 { headerZone = value }
         }
         .onChange(of: expanded) { _, value in if value { dismissing = false } }
+        .task(id: expanded) {
+            dismissGestureArmed = false
+            guard expanded else { return }
+            try? await Task.sleep(for: .milliseconds(320))
+            guard !Task.isCancelled, expanded else { return }
+            dismissGestureArmed = true
+        }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { onCollapse() }
@@ -512,36 +525,26 @@ private enum PlayerDragMode { case undecided, active, ignored }
             let widthLimit = min(box.size.width - 56, 420)
             let heightLimit = box.size.height - metadataHeight - controlsHeight - topPadding - gap - 22 - bottomPadding
             let side = max(120, min(widthLimit, heightLimit))
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(spacing: 0) {
-                    topGroup(side: side, gap: gap)
-                        .padding(.horizontal, showLyrics ? 24 : 28)
-                        .padding(.top, topPadding)
-                        .padding(.bottom, showLyrics ? 4 : 0)
-                        .frame(maxWidth: showLyrics ? 640 : 560)
-                    if showLyrics {
-                        lyricsRegion.transition(.opacity)
-                    } else {
-                        Spacer(minLength: 22)
-                    }
-                    controls(compact: showLyrics)
-                        .padding(.horizontal, 28)
-                        .frame(maxWidth: 560)
+            if showLyrics {
+                // Do not wrap lyrics in a disabled outer ScrollView. SwiftUI's
+                // scrollDisabled environment value also disables every nested
+                // scroll view, which made the timed text impossible to swipe.
+                playerLayout(side: side, gap: gap, topPadding: topPadding, bottomPadding: bottomPadding)
+                    .frame(height: box.size.height, alignment: .top)
+            } else {
+                ScrollView(.vertical, showsIndicators: false) {
+                    playerLayout(side: side, gap: gap, topPadding: topPadding, bottomPadding: bottomPadding)
+                        .frame(minHeight: box.size.height, alignment: .top)
+                        .background(alignment: .topLeading) {
+                            PlayerScrollViewTuner { atTop in scrollAtTop = atTop }
+                                .frame(width: 1, height: 1).accessibilityHidden(true)
+                        }
                 }
-                .padding(.bottom, bottomPadding)
-                .frame(maxWidth: .infinity)
-                // Lyrics: exactly one screen (the lyrics list scrolls itself).
-                .frame(height: showLyrics ? box.size.height : nil)
-                .frame(minHeight: box.size.height, alignment: .top)
-                .background(alignment: .topLeading) {
-                    PlayerScrollViewTuner { atTop in scrollAtTop = atTop }
-                        .frame(width: 1, height: 1).accessibilityHidden(true)
-                }
+                .scrollBounceBehavior(.basedOnSize)
+                // While the card is dragged the content never scrolls: it moves only once.
+                .scrollDisabled(dragMode == .active)
+                .accessibilityIdentifier("nowPlayingScroll")
             }
-            .scrollBounceBehavior(.basedOnSize)
-            // While the card is dragged the content never scrolls: it moves only once.
-            .scrollDisabled(showLyrics || dragMode == .active)
-            .accessibilityIdentifier("nowPlayingScroll")
         }
         .onPreferenceChange(NowPlayingMetadataHeightKey.self) { value in
             if value > 0, abs(value - metadataHeight) > 0.5 { metadataHeight = value }
@@ -549,6 +552,26 @@ private enum PlayerDragMode { case undecided, active, ignored }
         .onPreferenceChange(NowPlayingControlsHeightKey.self) { value in
             if value > 0, abs(value - controlsHeight) > 0.5 { controlsHeight = value }
         }
+    }
+
+    private func playerLayout(side: CGFloat, gap: CGFloat, topPadding: CGFloat, bottomPadding: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            topGroup(side: side, gap: gap)
+                .padding(.horizontal, showLyrics ? 24 : 28)
+                .padding(.top, topPadding)
+                .padding(.bottom, showLyrics ? 4 : 0)
+                .frame(maxWidth: showLyrics ? 640 : 560)
+            if showLyrics {
+                lyricsRegion.transition(.opacity)
+            } else {
+                Spacer(minLength: 22)
+            }
+            controls(compact: showLyrics)
+                .padding(.horizontal, 28)
+                .frame(maxWidth: 560)
+        }
+        .padding(.bottom, bottomPadding)
+        .frame(maxWidth: .infinity)
     }
 
     /// Artwork + title: vertical in artwork mode, one row in lyrics mode. Same views.
@@ -635,7 +658,7 @@ private enum PlayerDragMode { case undecided, active, ignored }
                                                .init(color: .black, location: 1)], startPoint: .top, endPoint: .bottom)
                     }
             }
-            else { TimedLyricsView(player: player, reduceMotion: reduceMotion) }
+            else { TimedLyricsView(player: player, reduceMotion: reduceMotion, onTextTools: slots.onLyricsTools) }
         }
         .frame(maxWidth: 640, maxHeight: .infinity)
         .opacity(chromeOpacity)
@@ -783,7 +806,9 @@ private enum PlayerDragMode { case undecided, active, ignored }
                     let inHeader = value.startLocation.y <= headerZone
                     let allowed = showLyrics ? inHeader : (scrollAtTop || inHeader)
                     // A scrubber/volume drag that drifts downward seeks; it never dismisses.
-                    dragMode = downward && allowed && expanded && !dismissing && !sliderEditing ? .active : .ignored
+                    dragMode = PlayerDismissPolicy.canBegin(downward: downward, allowedRegion: allowed,
+                        expanded: expanded, gestureArmed: dismissGestureArmed,
+                        dismissing: dismissing, sliderEditing: sliderEditing) ? .active : .ignored
                 }
                 guard dragMode == .active else { return }
                 dragOffset = max(0, value.translation.height)

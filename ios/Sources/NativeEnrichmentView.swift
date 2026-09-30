@@ -114,7 +114,7 @@ enum NativeEnrichmentPresentation {
                     }.disabled(working || transcriber.running).accessibilityIdentifier("lyricsSourceToggle")
                 }
             }
-            PCTranscriptionSection(store: store, trackID: trackID)
+            PCTranscriptionSection(store: store, trackID: trackID, forceTimings: needsPCTimings)
             transcriptionSection
             if let message = message { Section { Text(message).font(.callout).textSelection(.enabled) } }
             Section("Источники и оригинал") {
@@ -185,6 +185,10 @@ enum NativeEnrichmentPresentation {
     }
     /// Edited plain lines with the recognizer's timestamps restored (valid LRC).
     private var transcriptToSave: String { NativeLRCText.applyEdit(transcript, to: transcriptLRC) }
+    private var needsPCTimings: Bool {
+        guard let lyrics = info["lyrics"] as? [String: Any] else { return false }
+        return PCTranscriptionRequestPolicy.needsForcedTimings(["lyrics": lyrics])
+    }
     private func lookup(refresh: Bool) {
         guard !working, !transcriber.running else { return }; working = true; message = nil
         job = Task {

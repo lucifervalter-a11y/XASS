@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -72,14 +72,35 @@ class WorkspaceUploadLimitTests(unittest.IsolatedAsyncioTestCase):
         session = SimpleNamespace(scalar=AsyncMock(return_value=SimpleNamespace(id=7, source_name="PC")))
         request, calls = streamed([b"a" * 16, b"b", b"unread"])
         with patch.object(main, "settings", self.settings), patch.object(main, "store_workspace_asset") as store, \
-             patch.object(main, "enqueue_agent_command", new=AsyncMock()) as enqueue:
+             patch.object(main, "enqueue_agent_command", new=AsyncMock()) as enqueue, \
+             patch.object(main, "_require_pwa_action_proof", new=AsyncMock()) as proof:
             with self.assertRaises(HTTPException) as error:
                 await main.mini_agent_file_upload("PC", request, root="documents", path="", filename="file.txt",
-                    user=SimpleNamespace(user_id=42), session=session)
+                    x_telegram_init_data=None, x_xass_action_proof="xna_upload", user=SimpleNamespace(user_id=42), session=session)
             self.assertEqual(error.exception.status_code, 413)
             self.assertEqual(len(calls), 2)
+            proof.assert_awaited_once()
             store.assert_not_called()
             enqueue.assert_not_called()
+
+    async def test_owner_upload_requires_bound_proof_before_reading_body(self):
+        session = SimpleNamespace(scalar=AsyncMock(return_value=SimpleNamespace(id=7, source_name="PC")))
+        request, calls = streamed([b"must not be read"])
+        denied = HTTPException(status_code=428, detail="approval required")
+        with patch.object(main, "_require_pwa_action_proof", new=AsyncMock(side_effect=denied)) as proof, \
+             patch.object(main, "store_workspace_asset") as store, \
+             patch.object(main, "enqueue_agent_command", new=AsyncMock()) as enqueue:
+            with self.assertRaises(HTTPException) as error:
+                await main.mini_agent_file_upload("PC", request, root="Documents", path="Folder/./Child/", filename="bad<>name.txt",
+                    x_telegram_init_data=None, x_xass_action_proof="", user=SimpleNamespace(user_id=42), session=session)
+            self.assertEqual(error.exception.status_code, 428)
+            self.assertEqual(calls, [])
+            proof.assert_awaited_once_with(
+                session=session, user=ANY, telegram_init_data="", action_proof="",
+                purpose="agent:file_upload:PC",
+                binding={"source_id": 7, "command": "file_upload", "payload": {"root": "documents", "path": "Folder/Child", "filename": "bad_name.txt"}},
+            )
+            store.assert_not_called(); enqueue.assert_not_awaited()
 
     async def test_owner_upload_preserves_sealed_bytes_and_filename(self):
         source = SimpleNamespace(id=7, source_name="Мой ПК")
@@ -89,10 +110,12 @@ class WorkspaceUploadLimitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "settings", self.settings), \
              patch.object(main, "store_workspace_asset", return_value={"token": "fixture", "filename": "мой.txt"}) as store, \
              patch.object(main, "enqueue_agent_command", new=AsyncMock(return_value=SimpleNamespace(id=9, status="pending"))) as enqueue, \
-             patch.object(main, "log_admin_action", new=AsyncMock()):
+             patch.object(main, "log_admin_action", new=AsyncMock()), \
+             patch.object(main, "_require_pwa_action_proof", new=AsyncMock()) as proof:
             result = await main.mini_agent_file_upload("Мой ПК", request, root="documents", path="", filename="мой.txt",
-                user=SimpleNamespace(user_id=42), session=session)
+                x_telegram_init_data=None, x_xass_action_proof="xna_upload", user=SimpleNamespace(user_id=42), session=session)
             self.assertTrue(result["ok"])
+            self.assertEqual(proof.await_args.kwargs["binding"], {"source_id": 7, "command": "file_upload", "payload": {"root": "documents", "path": "", "filename": "мой.txt"}})
             self.assertEqual(store.call_args.kwargs["body"], blob)
             self.assertEqual(store.call_args.kwargs["filename"], "мой.txt")
             self.assertEqual(enqueue.await_args.kwargs["payload"]["asset_token"], "fixture")

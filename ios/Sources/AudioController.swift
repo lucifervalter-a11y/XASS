@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import MediaPlayer
 import Combine
+import UIKit
 
 struct DownloadedTrack: Codable, Identifiable {
     var id: Int
@@ -148,6 +149,12 @@ struct NativePlaybackQueue {
     private var cacheDownload: PrivateDownload?
     private var cacheDownloadID: Int?
     private var recordedPlay = false
+    /// Artwork for the currently loaded AVPlayer item. It is deliberately
+    /// track-bound so a late cover request can never replace the Lock Screen
+    /// image of the next song.
+    private var nowPlayingArtwork: MPMediaItemArtwork?
+    private var nowPlayingArtworkImage: UIImage?
+    private var nowPlayingArtworkTrackID = 0
 
     init(player: AVPlayer = AVPlayer()) {
         self.player = player
@@ -259,6 +266,9 @@ struct NativePlaybackQueue {
         try activateAudio()
         transition = UUID(); awaitingTrack = false
         player.pause(); player.replaceCurrentItem(with: nil); loader?.invalidate(); loader = nextLoader
+        if trackID != command.trackID {
+            nowPlayingArtwork = nil; nowPlayingArtworkImage = nil; nowPlayingArtworkTrackID = 0
+        }
         state = "loading"; title = command.title; artist = command.artist; trackID = command.trackID; recordedPlay = false
         position = command.position; duration = 0; error = nil
         // A fresh local play/handoff never inherits a stale zero/70% server
@@ -297,7 +307,8 @@ struct NativePlaybackQueue {
     func stop() {
         transition = UUID(); awaitingTrack = false
         player.pause(); player.replaceCurrentItem(with: nil); itemObserver = nil; loader?.invalidate(); loader = nil
-        state = "stopped"; position = 0; publish(forceReport: true)
+        state = "stopped"; position = 0; nowPlayingArtwork = nil; nowPlayingArtworkImage = nil; nowPlayingArtworkTrackID = 0
+        publish(forceReport: true)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
@@ -328,6 +339,21 @@ struct NativePlaybackQueue {
         }
     }
     func resetPlaybackGain() { setPlaybackGain(100); publish(forceReport: true) }
+    /// Uses only an image already fetched through OwnerService's authenticated
+    /// artwork route. The request handler returns that in-memory image; it does
+    /// not perform network or file I/O from SpringBoard.
+    func setNowPlayingArtwork(_ image: UIImage?, for requestedTrackID: Int) {
+        guard requestedTrackID > 0, requestedTrackID == trackID else { return }
+        if nowPlayingArtworkTrackID == requestedTrackID, image === nowPlayingArtworkImage { return }
+        if let image, image.size.width > 0, image.size.height > 0 {
+            nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            nowPlayingArtworkImage = image
+            nowPlayingArtworkTrackID = requestedTrackID
+        } else {
+            nowPlayingArtwork = nil; nowPlayingArtworkImage = nil; nowPlayingArtworkTrackID = 0
+        }
+        if player.currentItem != nil { publish() }
+    }
     private func setPlaybackGain(_ value: Double) {
         guard value.isFinite else { return }
         let bounded = min(100, max(0, value))
@@ -357,9 +383,20 @@ struct NativePlaybackQueue {
         if let error = error { event["error"] = error }
         emit?(event)
         if player.currentItem != nil {
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = [MPMediaItemPropertyTitle: title, MPMediaItemPropertyArtist: artist,
-                MPMediaItemPropertyPlaybackDuration: duration, MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
-                MPNowPlayingInfoPropertyPlaybackRate: state == "playing" ? 1.0 : 0.0]
+            var info: [String: Any] = [
+                MPMediaItemPropertyTitle: title,
+                MPMediaItemPropertyArtist: artist,
+                MPMediaItemPropertyPlaybackDuration: duration,
+                MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
+                MPNowPlayingInfoPropertyPlaybackRate: state == "playing" ? 1.0 : 0.0,
+                MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+                MPNowPlayingInfoPropertyIsLiveStream: false,
+                MPNowPlayingInfoPropertyExternalContentIdentifier: String(trackID)
+            ]
+            if nowPlayingArtworkTrackID == trackID, let artwork = nowPlayingArtwork {
+                info[MPMediaItemPropertyArtwork] = artwork
+            }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
         if var snapshot = sessionSnapshot, forceReport || Date().timeIntervalSince(lastReport) >= 5 {
             snapshot["state"] = state; snapshot["position"] = position; snapshot["track_id"] = trackID; snapshot["volume"] = playbackGain

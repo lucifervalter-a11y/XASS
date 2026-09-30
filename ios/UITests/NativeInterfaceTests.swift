@@ -93,7 +93,13 @@ final class NativeInterfaceTests: XCTestCase {
         XCTAssertTrue(app.buttons["nativePlayerToggle"].exists, "Now Playing must still be open after scrolling")
         more.tap()
         XCTAssertTrue(app.buttons["nativeDownload"].waitForExistence(timeout: 5), "Download remains available in native track actions")
-        XCTAssertTrue(app.switches["nativeShareSite"].exists, "Website sharing is preserved")
+        let shareSite = app.switches["nativeShareSite"]
+        let shareReachable = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND isHittable == true"),
+            object: shareSite
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [shareReachable], timeout: 5), .completed,
+                       "Website sharing remains present and reachable at large Dynamic Type")
     }
 
     @MainActor func testNativeAlbumsAndArtistsUseActualMetadata() throws {

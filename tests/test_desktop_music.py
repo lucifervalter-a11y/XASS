@@ -17,6 +17,29 @@ finally:
 
 
 class LibraryTests(unittest.TestCase):
+    def test_server_jobs_never_send_agent_key_to_remote_plaintext(self):
+        config = {"server_url": "http://music.example.invalid:8001", "api_key": "ag_fixture"}
+        with patch.object(music, "create_http_client") as client:
+            catalog = music.ServerCatalogJob(config)
+            play = music.ServerPlayJob(config, 1, volume=50)
+            self.assertTrue(catalog.done.wait(2)); self.assertTrue(play.done.wait(2))
+        client.assert_not_called()
+        self.assertTrue(catalog.error); self.assertTrue(play.error)
+
+    def test_phone_cover_is_digest_bound_and_reused_without_disk_reads(self):
+        picture = b"\xff\xd8\xff" + b"cover-fixture"
+        digest = music.hashlib.sha256(picture).hexdigest()
+        music._PHONE_COVER_SHA, music._PHONE_COVER_DATA = "", b""
+        bridge = SimpleNamespace(read_cover=Mock(return_value=picture))
+        with patch.dict(sys.modules, {"music_bridge": bridge}):
+            self.assertEqual(music._phone_cover(digest), picture)
+            self.assertEqual(music._phone_cover(digest), picture)
+            bridge.read_cover.assert_called_once_with(expected_sha256=digest)
+        bridge = SimpleNamespace(read_cover=Mock(return_value=b"\xff\xd8\xffwrong"))
+        with patch.dict(sys.modules, {"music_bridge": bridge}):
+            self.assertEqual(music._phone_cover("0" * 64), b"")
+        self.assertEqual(music._phone_cover("invalid"), b"")
+
     def test_playing_rows_preserves_queue_order_across_three_nexts_and_previous(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(music, "DATA_ROOT", Path(folder)):
             files = [Path(folder) / name for name in ("A.wav", "B.wav", "C.wav")]
@@ -67,6 +90,84 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(job.snapshot["state"], "playing")
             self.assertIn("список", job.error)
 
+    def test_cancelled_open_job_stops_the_late_player_without_saving_history(self):
+        started, release = threading.Event(), threading.Event()
+        player = Mock()
+
+        def play(_path):
+            started.set()
+            release.wait(2)
+            return {"state": "playing"}
+
+        player.play_local.side_effect = play
+        player.command.return_value = {"state": "stopped"}
+        with patch.object(music, "remember_track") as remember:
+            job = music.LocalOpenJob(player, Path("fixture.wav"))
+            self.assertTrue(started.wait(1))
+            job.cancel()
+            release.set()
+            self.assertTrue(job.done.wait(2))
+        player.command.assert_called_once_with("music_stop", {}, {})
+        remember.assert_not_called()
+        self.assertEqual(job.snapshot["state"], "stopped")
+
+    def test_pending_open_snapshot_never_waits_for_the_player_lock(self):
+        opening = SimpleNamespace(done=threading.Event())
+        player = Mock()
+        player.snapshot.side_effect = AssertionError("Tk touched the player while it was opening")
+        previous = {"state": "paused", "title": "Previous", "volume": 31}
+        shown = music._local_snapshot(player, opening, previous)
+        player.snapshot.assert_not_called()
+        self.assertEqual((shown["state"], shown["state_label"], shown["volume"]),
+                         ("loading", "Открываю трек…", 31))
+
+
+class CastCommandPumpTests(unittest.TestCase):
+    def test_volume_drag_runs_off_caller_and_keeps_only_latest_waiting_value(self):
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        worker_ids = []
+
+        def sender(command, payload):
+            calls.append((command, payload))
+            worker_ids.append(threading.get_ident())
+            if len(calls) == 1:
+                started.set()
+                release.wait(2)
+            return {"player": {"state": "playing", "volume": payload["volume"]}}
+
+        pump = music.CastCommandPump(sender)
+        try:
+            first = pump.submit("music_volume", {"volume": 1})
+            self.assertTrue(started.wait(1))
+            for value in range(2, 101):
+                pump.submit("music_volume", {"volume": value})
+            self.assertEqual(len(calls), 1)
+            release.set()
+            self.assertTrue(pump.wait_idle())
+            self.assertEqual([row[1]["volume"] for row in calls], [1, 100])
+            self.assertTrue(all(ident != threading.get_ident() for ident in worker_ids))
+            results = pump.drain()
+            self.assertEqual(results[0][0], first)
+            self.assertEqual(results[-1][2]["volume"], 100)
+            self.assertFalse(pump.busy())
+        finally:
+            release.set()
+            pump.close(wait=True)
+
+    def test_optimistic_state_keeps_remote_controls_from_snapping_back(self):
+        status = {"state": "playing", "volume": 20, "position_sec": 3, "error": ""}
+        status = music._optimistic_cast(status, "music_volume", {"volume": 87})
+        status = music._optimistic_cast(status, "music_seek", {"position_sec": 45})
+        status = music._optimistic_cast(status, "music_pause")
+        self.assertEqual(status["volume"], 87)
+        self.assertEqual(status["position_sec"], 45)
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(music._optimistic_cast(status, "music_resume")["state"], "playing")
+        stopped = music._optimistic_cast({**status, "error": "failed"}, "music_stop")
+        self.assertEqual((stopped["state"], stopped["error"]), ("stopping", ""))
+        self.assertTrue(music._cast_live({**stopped, "track_id": 4}))
+
 
 class MusicRenderTests(unittest.TestCase):
     def setUp(self):
@@ -77,6 +178,9 @@ class MusicRenderTests(unittest.TestCase):
         self.root.withdraw()
         self.errors = []
         self.root.report_callback_exception = lambda *args: self.errors.append(args)
+        self.cast = patch.object(music, "_cast_status", return_value={})
+        self.cast.start()
+        self.addCleanup(self.cast.stop)
         self.addCleanup(self.finish)
 
     def finish(self):
@@ -110,7 +214,7 @@ class MusicRenderTests(unittest.TestCase):
         self.assertIs(stage._photo, photo)
         self.assertIsNone(stage._animation)
 
-    def test_position_only_resize_does_not_rebuild_and_small_disc_frames_are_cached(self):
+    def test_position_only_resize_does_not_rebuild_and_cover_frame_is_cached(self):
         stage = self.stage()
         if stage._resize_job:
             stage.after_cancel(stage._resize_job)
@@ -118,18 +222,14 @@ class MusicRenderTests(unittest.TestCase):
         with patch.object(stage, "after") as after:
             stage._resized(SimpleNamespace(widget=stage, width=900, height=300, y=-40))
             after.assert_not_called()
-        for angle in range(0, 360, 18):
-            stage._angle = angle
-            stage._paint_disc()
-        self.assertEqual(len(stage._disc_photos), 20)
+        stage._paint_cover()
+        self.assertEqual(len(stage._cover_photos), 1)
         photo = stage._photo
         with patch.object(music.ImageTk, "PhotoImage") as created:
-            for angle in range(0, 360, 18):
-                stage._angle = angle
-                stage._paint_disc()
+            stage._paint_cover()
             created.assert_not_called()
         self.assertIs(stage._photo, photo)
-        self.assertTrue(all(image.size == (184, 184) for image in stage._discs.values()))
+        self.assertTrue(all(image.size == (184, 184) for image in stage._covers.values()))
 
     def test_all_text_rows_have_measured_gaps_at_windows_dpi_scales(self):
         original = float(self.root.tk.call("tk", "scaling"))
@@ -176,15 +276,40 @@ class MusicRenderTests(unittest.TestCase):
         player.snapshot.return_value = {"state": "idle", "volume": 70}
         app = SimpleNamespace(root=self.root, content=content, preview=True, local_music=lambda: player,
                               current_view="music", _header=Mock())
-        with patch.object(music, "load_playlist", return_value=[]), patch.object(music.filedialog, "askopenfilename") as picker:
+        with patch.object(music, "load_playlist", return_value=[]), patch.object(music.filedialog, "askopenfilenames") as picker:
             music.build_music(app)
             self.root.update_idletasks()
             controls = next(child for child in content.winfo_children() if isinstance(child, music.MusicControls))
             for button in controls.transport.winfo_children():
-                if button.cget("text") in {"Открыть файл", "Играть"}:
+                if button.cget("text") in {"Добавить музыку", "Играть"}:
                     button.invoke()
             picker.assert_not_called()
             player.play_local.assert_not_called()
+
+    def test_music_page_does_not_touch_player_lock_while_open_job_is_pending(self):
+        content = tk.Frame(self.root)
+        content.place(x=0, y=0, width=900, height=1200)
+        player = Mock()
+        player._path = None
+        player.snapshot.side_effect = AssertionError("blocking snapshot")
+        player.presentation.side_effect = AssertionError("blocking presentation")
+        opening = SimpleNamespace(done=threading.Event(), cancel=Mock())
+        app = SimpleNamespace(root=self.root, content=content, preview=False, local_music=lambda: player,
+                              current_view="music", _header=Mock(), _local_music_job=opening)
+        with patch.object(music, "load_playlist", return_value=[]):
+            music.build_music(app)
+            self.root.update_idletasks()
+        player.snapshot.assert_not_called()
+        player.presentation.assert_not_called()
+        stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+        self.assertEqual((stage.play_button.cget("text"), stage.play_button.cget("state")),
+                         ("Открытие…", "disabled"))
+        controls = next(child for child in content.winfo_children() if isinstance(child, music.MusicControls))
+        local_only = [button for button in controls.transport.winfo_children()
+                      if isinstance(button, music.ModernButton)
+                      and (button.cget("icon") in {"previous", "next"} or button.cget("text") == "Добавить музыку")]
+        self.assertTrue(local_only)
+        self.assertTrue(all(button.cget("state") == "disabled" for button in local_only))
 
     def test_compact_title_and_transport_fit_then_return_to_wide(self):
         stage = self.stage(560)
@@ -238,6 +363,171 @@ class MusicRenderTests(unittest.TestCase):
             self.assertLessEqual(controls.transport.winfo_reqwidth(), 560)
             player.play_local.assert_not_called()
             self.assertEqual(self.root.state(), "withdrawn")
+
+    def jpeg(self):
+        import io
+        buffer = io.BytesIO()
+        music.Image.new("RGB", (12, 8), "#829cff").save(buffer, format="JPEG")
+        return buffer.getvalue()
+
+    def walk(self, widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from self.walk(child)
+
+    def test_cover_queue_and_lyrics_share_one_screen(self):
+        content = tk.Frame(self.root)
+        content.place(x=0, y=0, width=1100, height=1400)
+        picture = self.jpeg()
+        player = Mock()
+        player._path = None
+        player.snapshot.return_value = {
+            "state": "paused", "title": "Ночь", "artist": "red!", "volume": 40,
+            "duration_sec": 90, "position_sec": 12,
+        }
+        player.presentation.return_value = {"lyrics": "[00:10.00]Первая строка\n[00:20.00]Вторая строка", "artwork": picture}
+        app = SimpleNamespace(root=self.root, content=content, local_music=lambda: player,
+                              current_view="music", _header=Mock())
+        music.build_music(app)
+        self.root.update_idletasks()
+        stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+        stage._layout()
+        self.root.update_idletasks()
+        stage._layout()
+        details = next(child for child in content.winfo_children() if isinstance(child, music.MusicDetails))
+        pane = next(widget for widget in self.walk(content) if isinstance(widget, music.LyricsPane))
+        titles = [widget.cget("text") for widget in self.walk(content) if isinstance(widget, tk.Label)]
+        self.assertIn("Моя музыка", titles)
+        self.assertIn("Текст", titles)
+        self.assertEqual(pane.lyrics, "[00:10.00]Первая строка\n[00:20.00]Вторая строка")
+        self.assertEqual(pane._active, 0)
+        self.assertEqual(stage.itemcget(stage._title, "text"), "Ночь")
+        self.assertTrue(stage._art_key)
+        self.assertEqual(next(iter(stage._covers.values())).size, (184, 184))
+        for width, wide in ((1100, True), (560, False)):
+            details._arrange(SimpleNamespace(width=width))
+            self.assertEqual(details._wide, wide)
+            self.assertEqual(int(details.lyrics_card.grid_info()["row"]), 0 if wide else 1)
+        photo = stage._photo
+        with patch.object(music.ImageTk, "PhotoImage") as created:
+            for position in range(13, 19):
+                stage.show({**player.snapshot(), "position_sec": position, "artwork": picture})
+            created.assert_not_called()
+        self.assertIs(stage._photo, photo)
+        self.assertEqual(self.root.state(), "withdrawn")
+
+    def test_phone_track_uses_the_same_cover_controls_queue_and_lyrics(self):
+        content = tk.Frame(self.root)
+        content.place(x=0, y=0, width=1100, height=1400)
+        picture = self.jpeg()
+        player = Mock()
+        player._path = None
+        player.snapshot.return_value = {"state": "idle", "volume": 70}
+        player.presentation.return_value = {}
+        status = {
+            "state": "playing", "track_id": 4, "title": "Звонок", "artist": "Телефон",
+            "position_sec": 3, "duration_sec": 40, "volume": 20, "error": "",
+            "lyrics": "Куплет с телефона",
+        }
+        app = SimpleNamespace(root=self.root, content=content, local_music=lambda: player,
+                              current_view="music", _header=Mock())
+        with patch.object(music, "_cast_status", return_value=status), patch.object(music, "_phone_cover", return_value=picture):
+            with patch.object(music, "LocalOpenJob") as local_job:
+                music.build_music(app)
+                stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+                stage.actions["previous"]()
+                stage.actions["next"]()
+                local_job.assert_not_called()
+            self.root.update_idletasks()
+            stage._layout()
+            self.root.update_idletasks()
+            stage._layout()
+            pane = next(widget for widget in self.walk(content) if isinstance(widget, music.LyricsPane))
+            controls = next(child for child in content.winfo_children() if isinstance(child, music.MusicControls))
+            labels = [widget.cget("text") for widget in self.walk(content) if isinstance(widget, tk.Label)]
+            self.assertEqual(stage.itemcget(stage._title, "text"), "Звонок")
+            self.assertIn("плеер xass", stage.itemcget(stage._state, "text").lower())
+            self.assertEqual(pane.lyrics, "Куплет с телефона")
+            self.assertIn("Телефон", labels)
+            self.assertTrue(stage._art_key)
+            self.assertIn("Пауза", [button.cget("text") for button in controls.transport.winfo_children()])
+            self.assertNotIn("Дальше", [button.cget("text") for button in self.walk(content) if isinstance(button, music.ModernButton)])
+            local_only = [button for button in self.walk(content) if isinstance(button, music.ModernButton)
+                          and (button.cget("icon") in {"previous", "next"} or button.cget("text") == "Добавить музыку")]
+            self.assertTrue(local_only)
+            self.assertTrue(all(button.cget("state") == "disabled" for button in local_only))
+            player.play_local.assert_not_called()
+
+    def test_live_cast_silences_and_replaces_an_already_playing_local_track(self):
+        content = tk.Frame(self.root)
+        content.place(x=0, y=0, width=900, height=1200)
+        player = Mock()
+        player._path = Path("local.wav")
+        player.snapshot.return_value = {
+            "state": "playing", "title": "Local", "artist": "PC", "volume": 70,
+            "duration_sec": 120, "position_sec": 10,
+        }
+        player.presentation.return_value = {}
+        player.command.return_value = {"state": "stopped"}
+        status = {
+            "state": "playing", "track_id": 9, "title": "Remote", "artist": "Phone",
+            "position_sec": 4, "duration_sec": 80, "volume": 25, "error": "",
+        }
+        app = SimpleNamespace(root=self.root, content=content, local_music=lambda: player,
+                              current_view="music", _header=Mock())
+        with patch.object(music, "_cast_status", return_value=status), \
+                patch.object(music, "load_playlist", return_value=[]):
+            music.build_music(app)
+            self.assertTrue(app._local_music_silence_job.done.wait(2))
+            self.root.update_idletasks()
+        player.command.assert_called_once_with("music_stop", {}, {})
+        stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+        stage._layout()
+        self.root.update_idletasks()
+        stage._layout()
+        self.assertEqual(stage.itemcget(stage._title, "text"), "Remote")
+        self.assertIn("плеер xass", stage.itemcget(stage._state, "text").lower())
+        controls = next(child for child in content.winfo_children() if isinstance(child, music.MusicControls))
+        local_only = [button for button in controls.transport.winfo_children()
+                      if isinstance(button, music.ModernButton)
+                      and (button.cget("icon") in {"previous", "next"} or button.cget("text") == "Добавить музыку")]
+        self.assertTrue(local_only)
+        self.assertTrue(all(button.cget("state") == "disabled" for button in local_only))
+
+    def test_phone_loading_disables_play_and_error_button_really_clears_it(self):
+        content = tk.Frame(self.root)
+        content.place(x=0, y=0, width=900, height=1200)
+        player = Mock()
+        player._path = None
+        player.snapshot.return_value = {"state": "idle", "volume": 70}
+        player.presentation.return_value = {}
+        app = SimpleNamespace(root=self.root, content=content, local_music=lambda: player,
+                              current_view="music", _header=Mock())
+        status = {
+            "state": "loading", "track_id": 8, "title": "Track", "artist": "Artist",
+            "position_sec": 0, "duration_sec": 0, "volume": 50, "error": "",
+        }
+        sender = Mock(return_value={"ok": True, "player": {**status, "state": "stopped"}})
+        with patch.object(music, "_cast_status", side_effect=lambda: dict(status)), \
+                patch.object(music, "_send_cast", sender), patch.object(music, "load_playlist", return_value=[]):
+            music.build_music(app)
+            stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+            self.assertEqual(stage.play_button.cget("text"), "Загрузка…")
+            self.assertEqual(stage.play_button.cget("state"), "disabled")
+            stage.play_button.invoke()
+            sender.assert_not_called()
+
+            for child in content.winfo_children():
+                child.destroy()
+            status.update(state="error", error="Download failed")
+            music.build_music(app)
+            stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+            self.assertEqual(stage.play_button.cget("text"), "Сбросить")
+            self.assertEqual(stage.play_button.cget("state"), "normal")
+            stage.play_button.invoke()
+            self.assertTrue(app._music_cast_pump.wait_idle())
+            sender.assert_called_once_with("music_stop", {})
+            app._music_cast_pump.close(wait=True)
 
 
 if __name__ == "__main__":

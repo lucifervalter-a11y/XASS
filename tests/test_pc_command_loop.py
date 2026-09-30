@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import sys
 import tempfile
 import threading
@@ -38,6 +39,7 @@ class PcCommandLoopTests(unittest.TestCase):
         self.telemetry = self.context.enter_context(patch.object(client_agent, "build_payload", return_value={"metrics": {}}))
         self.context.enter_context(patch("music_bridge.start_music_bridge", return_value=True))
         self.clock = 100.0
+        self.drain_commands = True
         self.sleeps: list[float] = []
         self.payloads: list[dict] = []
         self.context.enter_context(patch.object(client_agent.time, "monotonic", side_effect=lambda: self.clock))
@@ -47,6 +49,139 @@ class PcCommandLoopTests(unittest.TestCase):
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.clock += seconds
+        if self.drain_commands:
+            self.assertTrue(client_agent.wait_for_agent_commands(2), "command worker did not finish")
+
+    def test_heartbeat_rebuilds_pool_and_switches_dns_after_transport_failure(self) -> None:
+        first, second = MagicMock(), MagicMock()
+        first.post.side_effect = httpx.ConnectError("adapter changed")
+        second.post.return_value = "reconnected"
+        first_context, second_context = MagicMock(), MagicMock()
+        first_context.__enter__.return_value = first
+        second_context.__enter__.return_value = second
+        with patch.object(client_agent, "create_http_client", side_effect=[first_context, second_context]) as factory, \
+                patch.object(client_agent, "invalidate_network_state") as invalidate, \
+                patch.object(client_agent, "activate_physical_fallback", return_value="192.168.1.111"), \
+                patch.object(client_agent, "preferred_connection", return_value=(True, "192.168.1.111")), \
+                patch.object(client_agent, "network_signature", return_value=(("wi-fi", "192.168.1.111", True),)):
+            with client_agent._HeartbeatClient("https://xass.example", timeout=20, trust_env=False) as client:
+                with self.assertRaises(httpx.ConnectError):
+                    client.post("https://xass.example/agent/heartbeat")
+                self.assertEqual(client.post("https://xass.example/agent/heartbeat"), "reconnected")
+        self.assertFalse(factory.call_args_list[0].kwargs["prefer_system_dns"])
+        self.assertTrue(factory.call_args_list[1].kwargs["prefer_system_dns"])
+        self.assertEqual(factory.call_args_list[1].kwargs["local_address"], "192.168.1.111")
+        invalidate.assert_called_once_with("xass.example")
+
+    def test_heartbeat_never_sends_headers_to_another_origin(self) -> None:
+        context, raw = MagicMock(), MagicMock()
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context), \
+                patch.object(client_agent, "network_signature", return_value=()):
+            with client_agent._HeartbeatClient("https://xass.example", timeout=20, trust_env=False) as client:
+                with self.assertRaises(ValueError):
+                    client.post("https://attacker.example/collect", headers={"X-Api-Key": "secret"})
+        raw.post.assert_not_called()
+
+    def test_https_backend_discovery_never_downgrades_to_plaintext(self) -> None:
+        candidates = client_agent._build_server_candidates("https://redvps.site")
+        self.assertEqual(candidates, ["https://redvps.site", "https://redvps.site:8001"])
+        self.assertTrue(all(value.startswith("https://") for value in candidates))
+
+        raw = MagicMock()
+        raw.get.side_effect = httpx.ConnectError("unreachable")
+        context = MagicMock()
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context):
+            selected = client_agent.discover_backend_url("https://redvps.site")
+        self.assertEqual(selected, "https://redvps.site")
+        self.assertTrue(all(call.args[0].startswith("https://") for call in raw.get.call_args_list))
+
+    def test_legacy_public_http_is_upgraded_only_after_verified_https_health(self) -> None:
+        legacy = "http://redvps.site:8000"
+        self.assertEqual(
+            client_agent._build_server_candidates(legacy),
+            ["https://redvps.site", "https://redvps.site:8000"],
+        )
+        response = httpx.Response(
+            200,
+            json={"status": "ok"},
+            request=httpx.Request("GET", "https://redvps.site/health"),
+        )
+        raw, context = MagicMock(), MagicMock()
+        raw.get.return_value = response
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context) as factory:
+            selected = client_agent.discover_backend_url(legacy)
+
+        self.assertEqual(selected, "https://redvps.site")
+        factory.assert_called_once_with("https://redvps.site", timeout=8, trust_env=False)
+        raw.get.assert_called_once_with("https://redvps.site/health")
+        self.assertNotIn("http://", str(raw.get.call_args))
+
+    def test_legacy_public_http_stays_unusable_when_https_health_fails(self) -> None:
+        legacy = "http://redvps.site:8001"
+        raw, context = MagicMock(), MagicMock()
+        raw.get.side_effect = httpx.ConnectError("TLS endpoint unavailable")
+        context.__enter__.return_value = raw
+        with patch.object(client_agent, "create_http_client", return_value=context) as factory:
+            selected = client_agent.discover_backend_url(legacy)
+
+        self.assertEqual(selected, legacy)
+        self.assertEqual(
+            [call.args[0] for call in factory.call_args_list],
+            ["https://redvps.site", "https://redvps.site:8001"],
+        )
+        self.assertTrue(all(call.args[0].startswith("https://") for call in raw.get.call_args_list))
+
+    def test_loopback_and_explicit_remote_development_http_are_not_migrated(self) -> None:
+        self.assertEqual(
+            client_agent._build_server_candidates("http://127.0.0.1:8001"),
+            ["http://127.0.0.1:8001"],
+        )
+        self.assertEqual(
+            client_agent._build_server_candidates(
+                "http://devbox.invalid:8001", allow_insecure_http=True,
+            ),
+            ["http://devbox.invalid:8001"],
+        )
+
+    def test_bare_remote_server_defaults_to_https_but_loopback_stays_http(self) -> None:
+        self.assertEqual(client_agent.normalize_server_url("redvps.site"), "https://redvps.site")
+        self.assertEqual(client_agent.normalize_server_url("51.250.80.137"), "https://51.250.80.137")
+        self.assertEqual(client_agent.normalize_server_url("redvps.site:8001"), "https://redvps.site:8001")
+        self.assertEqual(client_agent.normalize_server_url("127.0.0.1"), "http://127.0.0.1:8001")
+        self.assertEqual(client_agent.normalize_server_url("localhost:9000"), "http://localhost:9000")
+
+    def test_pairing_refuses_remote_http_before_sending_code(self) -> None:
+        with patch.object(client_agent, "create_http_client") as factory, \
+                patch.dict(client_agent.os.environ, {"XASS_ALLOW_INSECURE_HTTP": ""}):
+            with self.assertRaisesRegex(RuntimeError, "не передаёт код привязки"):
+                client_agent.claim_pair_code(
+                    server_url="http://example.invalid:8001",
+                    pair_code="one-time-secret",
+                    source_name="PC",
+                    source_type="PC_AGENT",
+                )
+        factory.assert_not_called()
+
+    def test_remote_http_requires_explicit_development_opt_in(self) -> None:
+        self.assertEqual(
+            client_agent.require_secret_transport("http://example.invalid:8001", allow_insecure_http=True),
+            "http://example.invalid:8001",
+        )
+        self.assertEqual(
+            client_agent.require_secret_transport("http://127.0.0.1:8001"),
+            "http://127.0.0.1:8001",
+        )
+
+    def test_agent_refuses_remote_http_before_building_heartbeat_client(self) -> None:
+        config = {**self.config, "server_url": "http://example.invalid:8001"}
+        with patch.object(client_agent, "_HeartbeatClient") as heartbeat, \
+                patch.dict(client_agent.os.environ, {"XASS_ALLOW_INSECURE_HTTP": ""}):
+            with self.assertRaisesRegex(RuntimeError, "не передаёт код привязки"):
+                client_agent.run_agent(config)
+        heartbeat.assert_not_called()
 
     def run_responses(self, responses: list[dict | Exception]) -> None:
         pending = iter(responses)
@@ -188,6 +323,91 @@ class PcCommandLoopTests(unittest.TestCase):
         result = self.payloads[1]["command_results"][0]
         self.assertFalse(result["ok"])
         self.assertIn("расшифровать", result["message"])
+
+    def test_file_download_does_not_block_the_next_heartbeat(self) -> None:
+        self.drain_commands = False
+        release = threading.Event()
+        logged: list[tuple[int, int, str]] = []
+
+        def upload(*_args, **_kwargs):
+            release.wait(2)
+            return {"filename": "song.mp3"}
+
+        def capture(command_id: int, attempt: int, _duration_ms: float, name: str) -> None:
+            logged.append((command_id, attempt, name))
+
+        pending = iter([
+            {"commands": [{"id": 5, "command": "file_download", "payload": {"path": "secret-path"}, "attempt": 4}]},
+            {},
+        ])
+        client = MagicMock()
+
+        def post(_url, *, headers, json):
+            self.payloads.append(json)
+            if len(self.payloads) == 2:
+                self.assertNotIn(5, [row.get("id") for row in json.get("command_results") or []])
+                self.assertNotIn("secret-path", str(json))
+                release.set()
+            try:
+                body = next(pending)
+            except StopIteration:
+                raise StopLoop()
+            return httpx.Response(200, json=body, request=httpx.Request("POST", _url))
+
+        client.post.side_effect = post
+        context = MagicMock()
+        context.__enter__.return_value = client
+        with (
+            patch.object(client_agent, "upload_requested_file", side_effect=upload),
+            patch.object(client_agent, "_log_command", side_effect=capture),
+            patch.object(client_agent, "create_http_client", return_value=context),
+            self.assertRaises(StopLoop),
+        ):
+            client_agent.run_agent(self.config)
+        self.assertGreaterEqual(len(self.payloads), 2)
+        self.assertEqual(logged, [(5, 4, "file_download")])
+        self.assertNotIn("secret-path", str(logged))
+
+    def test_full_queue_reports_busy_without_stalling_heartbeat(self) -> None:
+        self.drain_commands = False
+        release = threading.Event()
+        original = queue.Queue.put_nowait
+        state = {"n": 0}
+
+        def put_nowait(queue_self, item):
+            state["n"] += 1
+            if state["n"] > 1:
+                raise queue.Full
+            return original(queue_self, item)
+
+        def block(_command_id: int) -> None:
+            release.wait(3)
+
+        pending = iter([{"commands": [{"id": 1, "command": "lock"}, {"id": 2, "command": "lock"}]}, {}])
+        client = MagicMock()
+
+        def post(_url, *, headers, json):
+            self.payloads.append(json)
+            if len(self.payloads) == 2:
+                self.assertIn("агент занят", [row.get("message") for row in json.get("command_results") or []])
+                release.set()
+                raise StopLoop()
+            try:
+                body = next(pending)
+            except StopIteration:
+                raise StopLoop()
+            return httpx.Response(200, json=body, request=httpx.Request("POST", _url))
+
+        client.post.side_effect = post
+        context = MagicMock()
+        context.__enter__.return_value = client
+        with (
+            patch.object(queue.Queue, "put_nowait", put_nowait),
+            patch.object(client_agent, "_lock_workstation", side_effect=block),
+            patch.object(client_agent, "create_http_client", return_value=context),
+            self.assertRaises(StopLoop),
+        ):
+            client_agent.run_agent(self.config)
 
 
 class ArchiveWorkerTests(unittest.TestCase):

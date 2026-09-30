@@ -12,9 +12,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Base
 from app.models import AgentCommand, AgentCredential, HeartbeatSource
-from app.music_models import MusicSession, MusicTrack
+from app.music_models import MusicEnrichment, MusicSession, MusicTrack
 from app.music_playback_models import MusicPlaybackState
 from app.music_storage_models import MusicStorageCopy, MusicStorageJob
+from app.transcription_models import TranscriptionJob
 from app.services.music_agent_queue import advance_agent_queue, cancel_agent_queue
 from app.services.music_library import verify_ticket
 from test_music_library import silent_wav
@@ -98,11 +99,28 @@ class MusicAgentQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command.payload["output_id"], "fixture-output")
         self.assertEqual(command.payload["volume"], 43)
         self.assertTrue(command.payload["url"].startswith(self.origin + "/agent/music/"))
+        self.assertEqual(command.payload["sha256"], hashlib.sha256(self.audio).hexdigest())
         ticket = command.payload["media_path"].split("ticket=", 1)[1]
         claims = verify_ticket(self.settings, ticket, 2, purposes=("agent",))
         self.assertEqual(claims["b"], self.key_hash)
         self.assertNotIn("api_key", command.payload)
         self.assertLessEqual(command.payload["expires_at"] - datetime.now(timezone.utc).timestamp(), 120)
+
+    async def test_auto_advance_carries_only_stored_presentation_with_the_same_ticket(self):
+        async with self.sessions() as session:
+            session.add(MusicEnrichment(track_id=2, fingerprint="stored", original={},
+                result={"lyrics": {"synced": False, "text": "plain catalog"}}, owner_lyrics={},
+                artwork_data=b"\xff\xd8\xffstored-cover", dismissed=False, checked_at=datetime.now(timezone.utc)))
+            session.add(TranscriptionJob(track_id=2, sha256=hashlib.sha256(self.audio).hexdigest(),
+                duration=60, language="ru", state="done",
+                result={"lines": [{"start": 4.25, "end": 5.0, "text": "Точная строка"}]}))
+            await session.commit()
+        await self.advance()
+        command = (await self.commands())[0]
+        self.assertEqual(command.payload["lyrics"], "[00:04.25]Точная строка")
+        media_ticket = command.payload["media_path"].split("ticket=", 1)[1]
+        self.assertEqual(command.payload["artwork_path"].split("ticket=", 1)[1], media_ticket)
+        self.assertTrue(command.payload["artwork_url"].startswith(self.origin + "/agent/music/"))
 
     async def test_concurrent_and_duplicate_ended_heartbeat_reserve_only_one_command(self):
         results = await asyncio.gather(self.advance(), self.advance())

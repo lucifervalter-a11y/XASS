@@ -9,6 +9,7 @@ const vm = require('node:vm');
 const root = path.join(__dirname, '..');
 const workerSource = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
 const pageSource = fs.readFileSync(path.join(root, 'miniapp.php'), 'utf8');
+const offlineSource = fs.readFileSync(path.join(root, 'offline.html'), 'utf8');
 const origin = 'https://xass.example';
 
 function workerHarness() {
@@ -79,6 +80,50 @@ test('offline app opens the offline page even when an old cache contains another
   h.offline = true;
   const response = await h.dispatch('/miniapp.php?standalone=1', 'navigate');
   assert.equal(await response.text(), 'cached:/offline.html');
+});
+
+test('offline fallback distinguishes device offline, server errors and desktop route failures', () => {
+  const match = offlineSource.match(/<script>([\s\S]*?)<\/script>/);
+  assert.ok(match, 'offline diagnostics script exists');
+  const handlers = {};
+  const nodes = new Map();
+  const document = {
+    getElementById(id) {
+      if (!nodes.has(id)) nodes.set(id, {textContent: '', hidden: false, addEventListener() {}});
+      return nodes.get(id);
+    },
+    querySelectorAll() { return []; },
+    createElement() { return {style: {}, setAttribute() {}, select() {}, remove() {}}; },
+    body: {appendChild() {}},
+    execCommand() { return false; }
+  };
+  const context = vm.createContext({
+    document, console, AbortController, Date,
+    navigator: {onLine: false, userAgent: 'Windows Telegram Desktop', platform: 'Win32', language: 'ru'},
+    location: {hostname: 'redvps.site', pathname: '/miniapp.php', reload() {}},
+    window: {isSecureContext: true, addEventListener(name, handler) { handlers[name] = handler; }},
+    setTimeout() { return 1; }, clearTimeout() {},
+    fetch: async () => { throw new TypeError('Failed to fetch'); }
+  });
+  vm.runInContext(match[1], context);
+  assert.equal(context.classifyConnection({online: false}).kind, 'offline');
+  assert.equal(context.classifyConnection({online: true, healthStatus: 503}).kind, 'server');
+  const route = context.classifyConnection({online: true, healthError: 'TypeError'});
+  assert.equal(route.kind, 'route');
+  assert.equal(route.desktopAdvice, true);
+  assert.match(route.summary, /VPN|DNS|HTTPS/);
+  assert.doesNotMatch(offlineSource, /XASS сейчас без сети|Для входа и управления устройствами нужен интернет/);
+});
+
+test('offline fallback exposes safe copyable server diagnostics', () => {
+  assert.match(offlineSource, /data-host>redvps\.site/);
+  assert.match(offlineSource, /id="copyHost"/);
+  assert.match(offlineSource, /id="copyReport"/);
+  assert.match(offlineSource, /browser_online:/);
+  assert.match(offlineSource, /health_status:/);
+  assert.match(offlineSource, /VPN/);
+  assert.doesNotMatch(offlineSource, /bot[_-]?token|authorization|initData/i);
+  for (const match of offlineSource.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) new vm.Script(match[1]);
 });
 
 test('online assets refresh stable URLs and remain available offline', async () => {
@@ -197,7 +242,7 @@ test('inline and external application scripts are syntactically valid', () => {
 test('shell cache includes the security-updated control client and current music assets', async () => {
   const h = workerHarness();
   await h.install();
-  assert.deepEqual(await h.caches.keys(), ['xass-shell-v15']);
+  assert.deepEqual(await h.caches.keys(), ['xass-shell-v17']);
   for (const extension of ['css', 'js']) {
     const music = `/assets/miniapp-music.${extension}?v=0170`;
     assert(pageSource.includes('"' + music + '"'), 'page must request the new music release');
@@ -205,11 +250,26 @@ test('shell cache includes the security-updated control client and current music
     const old = `/assets/miniapp-music.${extension}?v=0160`;
     assert(!pageSource.includes(old));
     assert.equal(await h.caches.match(old), undefined);
-    const controlVersion = extension === 'js' ? '0190' : '0160';
+    const controlVersion = extension === 'js' ? '0191' : '0160';
     const control = `/assets/miniapp-control-center.${extension}?v=${controlVersion}`;
     assert(pageSource.includes('"' + control + '"'));
     assert.equal(await (await h.caches.match(control)).text(), 'cached:' + control);
   }
   assert(!pageSource.includes('/assets/miniapp-control-center.js?v=0160'));
   assert.equal(await h.caches.match('/assets/miniapp-control-center.js?v=0160'), undefined);
+});
+
+test('privacy-sensitive PC reads and uploads carry a bound fresh action proof', () => {
+  const controlSource = fs.readFileSync(path.join(root, 'assets', 'miniapp-control-center.js'), 'utf8');
+  const dangerous = controlSource.slice(controlSource.indexOf('const DANGEROUS'), controlSource.indexOf('const pendingCommands'));
+  for (const command of ['screenshot', 'file_download', 'clipboard_get']) assert(dangerous.includes("'" + command + "'"));
+  assert.match(controlSource, /X\.agentActionBinding\(source, command, payload\)/);
+  assert.match(controlSource, /X\.passkeyAction\('agent:' \+ command \+ ':' \+ source, binding\)/);
+
+  const upload = controlSource.slice(controlSource.indexOf('async function uploadFile('), controlSource.indexOf('\n  function renderClipboardPanel'));
+  const proof = upload.indexOf("X.passkeyAction('agent:file_upload:' + source, binding)");
+  const read = upload.indexOf('file.arrayBuffer()');
+  assert(proof >= 0 && read > proof, 'approval must happen before reading the selected file');
+  assert.match(upload, /'X-XASS-Action-Proof': proof/);
+  assert.match(pageSource, /command==='file_upload'\)payload\.filename=workspaceFilename/);
 });

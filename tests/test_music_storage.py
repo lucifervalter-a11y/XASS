@@ -30,7 +30,7 @@ class MusicStorageTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.music = self.root / "music"; self.music.mkdir()
         self.settings = SimpleNamespace(music_root=str(self.music), music_min_free_bytes=0,
-            agent_api_key="legacy-global", profile_json_path=str(self.root / "profile.json"), vk_access_token="",
+            agent_api_key="legacy-global", agent_api_key_enabled=True, profile_json_path=str(self.root / "profile.json"), vk_access_token="",
             pwa_session_generation_path=str(self.root / "generation"))
         self.engine = create_async_engine("sqlite+aiosqlite:///" + (self.root / "test.db").as_posix())
         async with self.engine.begin() as connection:

@@ -239,9 +239,38 @@ def _artwork(raw, album):
     releases = [row for row in releases if isinstance(row, dict) and re.fullmatch(_UUID, str(row.get("id", "")))
         and row.get("status") == "Official" and _text(row.get("title"))
         and (not album or _norm(row.get("title")) == _norm(album))]
-    # Different albums/compilations are not interchangeable artwork.
-    if not releases or len({_norm(row["title"]) for row in releases}) != 1:
+    if not releases:
         return {"status": "not_found"}
+    if len({_norm(row["title"]) for row in releases}) != 1:
+        # A recording can occur on its original album, reissues and many
+        # compilations. Prefer no art unless the supplied MB data establishes
+        # exactly one primary Album/EP group, not a search-ranking guess.
+        groups, descriptions = {}, {}
+        for release in releases:
+            group = release.get("release-group")
+            if not isinstance(group, dict) or not re.fullmatch(_UUID, str(group.get("id", ""))):
+                return {"status": "not_found"}
+            primary, secondary = group.get("primary-type"), group.get("secondary-types", [])
+            title = _text(group.get("title"))
+            if (not title or not isinstance(primary, str) or primary not in {"Album", "EP", "Single", "Broadcast", "Other"}
+                    or not isinstance(secondary, list) or len(secondary) > 16
+                    or any(not isinstance(value, str) or not value or len(value) > 80 for value in secondary)):
+                return {"status": "not_found"}
+            identity = group["id"]
+            description = (_norm(title), primary, tuple(sorted(value.casefold() for value in secondary)))
+            if identity in descriptions and descriptions[identity] != description:
+                return {"status": "not_found"}
+            descriptions[identity] = description
+            if primary not in {"Album", "EP"} or {"compilation", "live", "remix"}.intersection(description[2]):
+                continue
+            groups.setdefault(identity, set()).add(release["id"])
+        if len(groups) != 1:
+            return {"status": "not_found"}
+        identity, release_ids = next(iter(groups.items()))
+        return {"status": "candidate", "source": "coverartarchive", "release_group_id": identity,
+            "release_ids": sorted(release_ids),
+            "url": f"https://coverartarchive.org/release-group/{identity}/front-500",
+            "source_url": f"https://musicbrainz.org/release-group/{identity}"}
     release = min(releases, key=lambda row: (_text(row.get("date")) or "9999", row["id"]))
     identity = release["id"]
     return {"status": "candidate", "source": "coverartarchive", "release_id": identity,
@@ -474,7 +503,7 @@ class MusicEnrichmentService:
                 art = _artwork(raw, candidate.get("album") or "")
                 if art.get("status") == "candidate" and (verdict == "matched" or (verdict == "duration_mismatch" and exact)):
                     covers.append((row, art))
-            unique = {art["release_id"]: (row, art) for row, art in covers}
+            unique = {(art.get("release_group_id"), art.get("release_id")): (row, art) for row, art in covers}
             if len(unique) == 1:
                 row, art = next(iter(unique.values()))
                 result["artwork"] = art
@@ -582,16 +611,33 @@ class MusicEnrichmentService:
     async def fetch_artwork(self, artwork):
         if not isinstance(artwork, dict) or artwork.get("source") != "coverartarchive":
             return None
-        identity = artwork.get("release_id")
+        group = artwork.get("release_group_id")
+        identity = group if group is not None else artwork.get("release_id")
         if not isinstance(identity, str) or not re.fullmatch(_UUID, identity):
             return None
-        url = f"https://coverartarchive.org/release/{identity}/front-500"
+        if group is not None:
+            release_ids = artwork.get("release_ids")
+            if (artwork.get("release_id") is not None or not isinstance(release_ids, list)
+                    or not 1 <= len(release_ids) <= 100
+                    or any(not isinstance(value, str) or not re.fullmatch(_UUID, value) for value in release_ids)
+                    or len(set(release_ids)) != len(release_ids)):
+                return None
+        else:
+            release_ids = [identity]
+        url = f"https://coverartarchive.org/{'release-group' if group is not None else 'release'}/{identity}/front-500"
         if artwork.get("url") != url:
             return None
+        # The group endpoint redirects to artwork stored under a release MBID,
+        # not the group MBID. Bind it to the official members supplied by MB;
+        # a canonical release absent from that bounded set safely yields no art.
+        def permitted_redirect(value):
+            return any(_artwork_redirect(value, release_id) or (group is not None
+                and value == f"https://coverartarchive.org/release/{release_id}/front-500")
+                for release_id in release_ids)
         async with self._lock:
             try:
                 data = await self._request(url, maximum=MAX_ARTWORK_BYTES,
-                    redirects=lambda value: _artwork_redirect(value, identity))
+                    redirects=permitted_redirect)
                 if data:
                     result = await asyncio.to_thread(_jpeg_thumbnail, data)
                     return result if result and len(result) <= MAX_THUMBNAIL_BYTES else None

@@ -44,7 +44,10 @@ class SyncedLyricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sl.queries("Numb [Official Audio]", "Linkin Park")[0], ("Linkin Park", "Numb"))
 
     async def test_exact_get_returns_synced(self):
-        mock, calls = transport([(lambda r: r.url.path == "/api/get", {"id": 7, "syncedLyrics": LRC, "plainLyrics": "x"})])
+        mock, calls = transport([(lambda r: r.url.path == "/api/get", {
+            "id": 7, "trackName": "Song", "artistName": "Artist", "duration": 200,
+            "syncedLyrics": LRC, "plainLyrics": "x",
+        })])
         result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 200)
         self.assertEqual(result["status"], "synced")
         self.assertEqual(len(result["lines"]), 3)
@@ -53,8 +56,7 @@ class SyncedLyricsTests(unittest.IsolatedAsyncioTestCase):
     async def test_search_fallback_prefers_synced_near_duration(self):
         rows = [
             {"id": 1, "trackName": "Song", "artistName": "Artist", "duration": 320, "syncedLyrics": LRC},
-            {"id": 2, "trackName": "Song", "artistName": "Artist", "duration": 201, "syncedLyrics": None, "plainLyrics": "plain"},
-            {"id": 3, "trackName": "Song", "artistName": "Artist", "duration": 203, "syncedLyrics": LRC},
+            {"id": 3, "trackName": "Song", "artistName": "Artist", "duration": 201, "syncedLyrics": LRC},
         ]
         mock, _ = transport([(lambda r: r.url.path == "/api/get", None), (lambda r: r.url.path == "/api/search", rows)])
         result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 200)
@@ -70,6 +72,45 @@ class SyncedLyricsTests(unittest.IsolatedAsyncioTestCase):
         result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 200)
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["lines"], [])
+
+    async def test_exact_get_rejects_wrong_recording_and_late_timestamps(self):
+        wrong = {"id": 7, "trackName": "Another Song", "artistName": "Someone Else", "duration": 400,
+                 "syncedLyrics": "[05:00.00]Wrong words"}
+        mock, _ = transport([(lambda r: r.url.path == "/api/get", wrong),
+                             (lambda r: r.url.path == "/api/search", [])])
+        result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 99)
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["lines"], [])
+
+        late = {"id": 8, "trackName": "Song", "artistName": "Artist", "duration": 99,
+                "syncedLyrics": "[05:00.00]Wrong words"}
+        mock, _ = transport([(lambda r: r.url.path == "/api/get", late)])
+        result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 99)
+        self.assertEqual(result["status"], "not_found")
+
+    async def test_variant_and_conflicting_search_rows_are_not_guessed(self):
+        plain = {"id": 2, "trackName": "Song", "artistName": "Artist", "duration": 200,
+                 "plainLyrics": "one version"}
+        synced = {"id": 3, "trackName": "Song", "artistName": "Artist", "duration": 200,
+                  "syncedLyrics": LRC}
+        mock, _ = transport([(lambda r: r.url.path == "/api/get", None),
+                             (lambda r: r.url.path == "/api/search", [plain, synced])])
+        result = await sl.LrclibClient(mock).lookup("Song", "Artist", "", 200)
+        self.assertEqual(result["status"], "not_found")
+
+        remaster = {"id": 4, "trackName": "Song", "artistName": "Artist", "duration": 200,
+                    "syncedLyrics": LRC}
+        mock, _ = transport([(lambda r: r.url.path == "/api/get", remaster),
+                             (lambda r: r.url.path == "/api/search", [remaster])])
+        result = await sl.LrclibClient(mock).lookup("Song (Remastered 2020)", "Artist", "", 200)
+        self.assertEqual(result["status"], "not_found")
+
+    async def test_provider_body_is_bounded(self):
+        def huge(_request):
+            return httpx.Response(200, content=b"{" + b"x" * (1024 * 1024 + 32) + b"}",
+                                  headers={"content-type": "application/json"})
+        result = await sl.LrclibClient(httpx.MockTransport(huge)).lookup("Song", "Artist", "", 200)
+        self.assertEqual(result["status"], "unavailable")
 
     async def test_finished_transcription_beats_instrumental_catalog(self):
         track = SimpleNamespace(id=9, title="Song", artist="Artist", album="", duration=200, filename="a.mp3", sha256="1" * 64)
@@ -95,7 +136,10 @@ class SyncedLyricsTests(unittest.IsolatedAsyncioTestCase):
         owner = {"text": "a", "synced": True, "lines": [{"time": 2.0, "text": "Mine"}], "source": "on_device_transcription"}
         with tempfile.TemporaryDirectory() as folder:
             cache = sl.LyricsCache(Path(folder))
-            mock, calls = transport([(lambda r: r.url.path == "/api/get", {"id": 7, "syncedLyrics": LRC})])
+            mock, calls = transport([(lambda r: r.url.path == "/api/get", {
+                "id": 7, "trackName": "Song", "artistName": "Artist", "duration": 200,
+                "syncedLyrics": LRC,
+            })])
             client = sl.LrclibClient(mock)
             value = await sl.resolve(track, owner=owner, embedded=None, enrichment=None, cache=cache, client=client)
             self.assertEqual(value["lines"][0]["text"], "Mine")

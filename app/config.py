@@ -83,7 +83,10 @@ class Settings(BaseSettings):
     pwa_vapid_private_key: str = ""
     pwa_vapid_subject: str = "mailto:admin@localhost"
     setup_api_key: str = "change-me-setup-key"
+    # Deprecated. New PCs enroll with a pair code and an issued key.
+    # The shared key authenticates only when agent_api_key_enabled is true and the value is not the default.
     agent_api_key: str = "change-me-agent-key"
+    agent_api_key_enabled: bool = False
     agent_pair_code_ttl_minutes: int = 15
     agent_pair_code_length: int = 8
     agent_updates_enabled: bool = True

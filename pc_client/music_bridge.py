@@ -6,7 +6,10 @@ sends pause/seek/volume/stop to 127.0.0.1. Media bytes never travel here.
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import secrets
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,16 +28,23 @@ except ModuleNotFoundError:
 
 STATUS_NAME = "music-playback.json"
 BRIDGE_NAME = "music-bridge.json"
+COVER_NAME = "music-cover.jpg"
+_MAX_COVER = 512 * 1024
+_MAX_LYRICS = 8000
 HEADER = "X-Xass-Bridge"
 COMMANDS = frozenset({"music_pause", "music_resume", "music_seek", "music_stop", "music_volume", "music_status"})
 _STATUS_KEYS = (
     "state", "track_id", "output_id", "position_sec", "duration_sec", "volume",
-    "title", "artist", "error", "downloaded_bytes", "total_bytes",
+    "title", "artist", "error", "downloaded_bytes", "total_bytes", "media_transport",
 )
 _PAYLOAD_KEYS = frozenset({"volume", "position_sec", "output_id"})
 
 _guard = threading.Lock()
+_publish_guard = threading.Lock()
+_cover_cache_guard = threading.Lock()
 _bridge: "Bridge | None" = None
+_cover_read_cache: dict[str, tuple[int, int, str, bytes]] = {}
+_cover_write_cache: dict[str, str] = {}
 
 
 class Bridge:
@@ -65,18 +75,176 @@ def _bridge_path(root: Path) -> Path:
     return root / BRIDGE_NAME
 
 
-def playback_payload(player) -> dict[str, Any]:
-    snap = player.snapshot()
+def _presentation(player) -> tuple[str, bytes]:
+    method = getattr(player, "presentation", None)
+    if not callable(method):
+        return "", b""
+    try:
+        notes = method()
+    except Exception:
+        return "", b""
+    if not isinstance(notes, dict):
+        return "", b""
+    lyrics = notes.get("lyrics")
+    artwork = notes.get("artwork")
+    text = lyrics.replace("\x00", "")[:_MAX_LYRICS] if isinstance(lyrics, str) else ""
+    if (not isinstance(artwork, (bytes, bytearray)) or len(artwork) > _MAX_COVER
+            or not bytes(artwork).startswith(b"\xff\xd8\xff")):
+        return text, b""
+    return text, bytes(artwork)
+
+
+def _reparse(path: Path) -> bool:
+    try:
+        return path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return False
+
+
+def _cover_digest(artwork: bytes) -> str:
+    return hashlib.sha256(artwork).hexdigest() if artwork else ""
+
+
+def _valid_digest(value: Any) -> str:
+    digest = str(value or "").strip().lower()
+    return digest if len(digest) == 64 and all(character in "0123456789abcdef" for character in digest) else ""
+
+
+def _snapshot_and_presentation(player) -> tuple[dict[str, Any], tuple[str, bytes]]:
+    """Read the agent player view under its lock when one is available."""
+    lock = getattr(player, "_lock", None)
+    if lock is not None and callable(getattr(lock, "__enter__", None)):
+        with lock:
+            snap = player.snapshot()
+            notes = _presentation(player)
+    else:
+        snap = player.snapshot()
+        notes = _presentation(player)
+    return (snap if isinstance(snap, dict) else {}), notes
+
+
+def playback_payload(
+    player,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    presentation: tuple[str, bytes] | None = None,
+) -> dict[str, Any]:
+    snap = snapshot if isinstance(snapshot, dict) else player.snapshot()
     payload = {key: snap.get(key) for key in _STATUS_KEYS}
     try:
         payload["reveal"] = int(player.reveal_count())
     except (TypeError, ValueError):
         payload["reveal"] = 0
+    lyrics, artwork = presentation if presentation is not None else _presentation(player)
+    if lyrics:
+        payload["lyrics"] = lyrics
+    # The desktop must never pair a previous track's cover file with the new
+    # status. An empty value explicitly means that this track has no cover.
+    payload["cover_sha256"] = _cover_digest(artwork)
     return payload
 
 
+def _cover_path(root: Path) -> Path:
+    return root / COVER_NAME
+
+
+def read_cover(root: Path | None = None, *, expected_sha256: str | None = None) -> bytes:
+    path = _cover_path(root or DATA_ROOT)
+    expected = _valid_digest(expected_sha256) if expected_sha256 is not None else None
+    if expected_sha256 is not None and not expected:
+        return b""
+    try:
+        if _reparse(path) or not path.is_file():
+            return b""
+        stat = path.stat()
+        if not 0 < stat.st_size <= _MAX_COVER:
+            return b""
+    except OSError:
+        return b""
+    cache_key = str(path)
+    with _cover_cache_guard:
+        cached = _cover_read_cache.get(cache_key)
+        if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+            _mtime, _size, digest, data = cached
+            return data if (expected is None or digest == expected) else b""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return b""
+    if not data.startswith(b"\xff\xd8\xff"):
+        return b""
+    digest = _cover_digest(data)
+    with _cover_cache_guard:
+        _cover_read_cache[cache_key] = (stat.st_mtime_ns, stat.st_size, digest, data)
+    return data if (expected is None or digest == expected) else b""
+
+
+def _write_cover(root: Path, artwork: bytes, digest: str) -> None:
+    path = _cover_path(root)
+    cache_key = str(path)
+    temporary = None
+    descriptor = -1
+    try:
+        if _reparse(root) or _reparse(path):
+            return
+        if not artwork:
+            path.unlink(missing_ok=True)
+            with _cover_cache_guard:
+                _cover_read_cache.pop(cache_key, None)
+                _cover_write_cache[cache_key] = ""
+            return
+        with _cover_cache_guard:
+            known = _cover_write_cache.get(cache_key)
+        if known == digest and path.is_file() and path.stat().st_size == len(artwork):
+            return
+        # On the first publish after a restart, validate the existing file once.
+        # Later 500 ms status ticks use the digest cache and only perform a stat.
+        if read_cover(root, expected_sha256=digest):
+            with _cover_cache_guard:
+                _cover_write_cache[cache_key] = digest
+            return
+        descriptor, raw_temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        temporary = Path(raw_temporary)
+        remaining = memoryview(artwork)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("Could not write cover")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        stat = path.stat()
+        with _cover_cache_guard:
+            _cover_write_cache[cache_key] = digest
+            _cover_read_cache[cache_key] = (stat.st_mtime_ns, stat.st_size, digest, artwork)
+    except OSError:
+        return
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def write_playback(player, root: Path | None = None) -> None:
-    atomic_write_json(_status_path(root or DATA_ROOT), playback_payload(player))
+    folder = root or DATA_ROOT
+    with _publish_guard:
+        snapshot, presentation = _snapshot_and_presentation(player)
+        _lyrics, artwork = presentation
+        digest = _cover_digest(artwork)
+        # Publish bytes first. Until the matching atomic status appears, an old
+        # reader sees a digest mismatch and renders no cover rather than a cover
+        # belonging to another track.
+        _write_cover(folder, artwork, digest)
+        atomic_write_json(
+            _status_path(folder),
+            playback_payload(player, snapshot=snapshot, presentation=presentation),
+        )
 
 
 def read_playback(root: Path | None = None) -> dict[str, Any]:

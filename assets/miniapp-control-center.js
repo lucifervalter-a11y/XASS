@@ -19,7 +19,10 @@
     cleanup_archive: 'Очистка медиа', files_list: 'Открытие папки', file_download: 'Подготовка файла',
     file_delete: 'Удаление файла', clipboard_get: 'Получение буфера', clipboard_set: 'Отправка в буфер',
   };
-  const DANGEROUS = new Set(['lock', 'sleep', 'restart', 'update', 'reboot', 'shutdown', 'cleanup_archive', 'file_delete']);
+  const DANGEROUS = new Set([
+    'lock', 'sleep', 'restart', 'update', 'reboot', 'shutdown', 'cleanup_archive', 'file_delete',
+    'screenshot', 'file_download', 'clipboard_get',
+  ]);
   const pendingCommands = new Map();
   const REASONS = {offline: 'нет связи', high_cpu: 'высокая нагрузка процессора', high_ram: 'мало памяти', low_disk: 'мало места на диске', agent_error: 'ошибка агента', archive_error: 'ошибка архива', update_available: 'доступно обновление'};
   const COMMAND_STATES = {pending: 'Ожидает агента', delivered: 'Доставлена агенту', completed: 'Выполнена', failed: 'Ошибка', cancelled: 'Отменена'};
@@ -621,12 +624,15 @@
     if (file.size > 32 * 1024 * 1024) return X.toast('Максимальный размер — 32 МБ');
     const upload = $('ccFileUpload'); if (upload) upload.disabled = true;
     try {
-      const path = 'agents/' + encodeURIComponent(source) + '/files/upload?root=' + encodeURIComponent(ui.fileRoot) + '&path=' + encodeURIComponent(ui.filePath) + '&filename=' + encodeURIComponent(file.name);
+      const binding = X.agentActionBinding(source, 'file_upload', { root: ui.fileRoot, path: ui.filePath, filename: file.name });
+      const proof = await X.passkeyAction('agent:file_upload:' + source, binding);
+      const target = binding.payload;
+      const path = 'agents/' + encodeURIComponent(source) + '/files/upload?root=' + encodeURIComponent(target.root) + '&path=' + encodeURIComponent(target.path) + '&filename=' + encodeURIComponent(target.filename);
       const peer = XassE2E.agentPublic(source);
-      let body = file, headers = { 'Content-Type': file.type || 'application/octet-stream' };
+      let body = file, headers = { 'Content-Type': file.type || 'application/octet-stream', 'X-XASS-Action-Proof': proof };
       if (peer) {
         body = await XassE2E.sealBytes(new Uint8Array(await file.arrayBuffer()), peer, 'file_upload');
-        headers = { 'Content-Type': 'application/x-xass-sealed', 'X-XASS-Cipher': 'xass-sealed-v1', 'X-XASS-Inner-Type': file.type || 'application/octet-stream' };
+        headers = { 'Content-Type': 'application/x-xass-sealed', 'X-XASS-Cipher': 'xass-sealed-v1', 'X-XASS-Inner-Type': file.type || 'application/octet-stream', 'X-XASS-Action-Proof': proof };
       }
       const response = await rawRequest(path, { method: 'POST', headers, body });
       const data = await response.json().catch(() => ({}));

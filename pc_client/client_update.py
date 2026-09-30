@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -22,9 +23,9 @@ try:
 except ModuleNotFoundError:  # Imported as pc_client.client_update in tests/tools.
     from pc_client.runtime_state import atomic_write_json, load_json_object
 try:
-    from network_client import create_http_client
+    from network_client import create_http_client, require_secure_transport
 except ModuleNotFoundError:
-    from pc_client.network_client import create_http_client
+    from pc_client.network_client import create_http_client, require_secure_transport
 
 CLIENT_ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", CLIENT_ROOT))
@@ -320,6 +321,7 @@ def download_update(
     *,
     api_key: str,
     trust_env: bool = False,
+    allow_insecure_http: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> Path:
     import httpx
@@ -332,6 +334,7 @@ def download_update(
     revision = str(manifest.get("revision") or "").strip()
     if not url or not revision:
         raise RuntimeError("update manifest is incomplete")
+    url = require_secure_transport(url, allow_insecure_http=allow_insecure_http)
 
     # Every downloader gets a private staging directory. The desktop UI and its
     # background agent can briefly overlap while an old version is restarting;
@@ -404,6 +407,7 @@ def download_installer_update(
     *,
     api_key: str,
     trust_env: bool = False,
+    allow_insecure_http: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> Path:
     import httpx
@@ -419,6 +423,7 @@ def download_installer_update(
     revision = str(manifest.get("revision") or "").strip()
     if not url or not version or not revision:
         raise RuntimeError("installer manifest is incomplete")
+    url = require_secure_transport(url, allow_insecure_http=allow_insecure_http)
 
     UPDATE_ROOT.mkdir(parents=True, exist_ok=True)
     target = UPDATE_ROOT / f"XASS-Setup-{version}-{revision[:12]}.exe"
@@ -575,6 +580,9 @@ def launch_update_helper(
         pass
 
 
+_RESULTS_LOCK = threading.Lock()
+
+
 def load_command_results() -> list[dict[str, Any]]:
     try:
         payload = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))
@@ -584,15 +592,17 @@ def load_command_results() -> list[dict[str, Any]]:
 
 
 def store_command_result(command_id: int, ok: bool, message: str, details: dict[str, Any] | None = None) -> None:
-    rows = [row for row in load_command_results() if int(row.get("id", -1)) != int(command_id)]
-    rows.append({"id": int(command_id), "ok": bool(ok), "message": str(message)[:1000], "details": details or {}})
-    atomic_write_json(RESULTS_PATH, rows[-50:], backup=False)
+    with _RESULTS_LOCK:
+        rows = [row for row in load_command_results() if int(row.get("id", -1)) != int(command_id)]
+        rows.append({"id": int(command_id), "ok": bool(ok), "message": str(message)[:1000], "details": details or {}})
+        atomic_write_json(RESULTS_PATH, rows[-50:], backup=False)
 
 
 def clear_command_results(command_ids: list[int]) -> None:
-    ids = {int(item) for item in command_ids}
-    remaining = [row for row in load_command_results() if int(row.get("id", -1)) not in ids]
-    if remaining:
-        atomic_write_json(RESULTS_PATH, remaining, backup=False)
-    elif RESULTS_PATH.exists():
-        RESULTS_PATH.unlink()
+    with _RESULTS_LOCK:
+        ids = {int(item) for item in command_ids}
+        remaining = [row for row in load_command_results() if int(row.get("id", -1)) not in ids]
+        if remaining:
+            atomic_write_json(RESULTS_PATH, remaining, backup=False)
+        elif RESULTS_PATH.exists():
+            RESULTS_PATH.unlink()

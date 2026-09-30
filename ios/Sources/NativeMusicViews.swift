@@ -22,7 +22,8 @@ enum XASSStyle {
         }.aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: radius))
             .accessibilityHidden(true)
             .task(id: "\(trackID)-\(store.artworkRevision)") {
-                image = nil
+                // Keep the current cover until the new bytes arrive. A nil result
+                // still clears a cover that artworkRevision just invalidated.
                 let loaded = await store.artwork(trackID)
                 guard !Task.isCancelled else { return }
                 image = loaded
@@ -104,68 +105,15 @@ enum XASSStyle {
     @State private var collectionRoute: String?
     var body: some View {
         NavigationStack {
-            List {
-                if !store.authorized {
-                    NativeLoginPrompt(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden)
-                }
-                if store.error != nil || store.notice != nil || store.canRecoverPlayback { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
-                HStack(spacing: 12) {
-                    // Multiple NavigationLinks in one List row activate together on iOS.
-                    // A single destination binding gives each explicit button one route.
-                    Button { collectionRoute = "albums" } label: { Label("Альбомы", systemImage: "square.stack").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeAlbums")
-                    Button { collectionRoute = "artists" } label: { Label("Исполнители", systemImage: "person.crop.circle").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeArtists")
-                }.font(.subheadline.weight(.medium)).listRowBackground(Color.clear).listRowSeparator(.hidden)
-                Picker("Библиотека", selection: $filter) {
-                    Text("Все").tag("all"); Text("Избранное").tag("favorites"); Text("Плейлисты").tag("playlists")
-                }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16)).listRowBackground(Color.clear).listRowSeparator(.hidden)
-                if store.isMusicImporting || !store.musicImportResults.isEmpty {
-                    Button { importFiles = true } label: {
-                        if store.isMusicImporting { NativeMusicImportStatus(store: store) }
-                        else { Label("Результат импорта", systemImage: "tray.full").font(.callout) }
-                    }.buttonStyle(.plain).listRowBackground(Color.clear).accessibilityIdentifier("musicImportStatus")
-                }
-                if filter == "playlists" {
-                    Button { playlistToEdit = nil; editingPlaylist = true } label: { Label("Создать плейлист", systemImage: "plus") }.listRowBackground(Color.clear)
-                    ForEach(store.playlists.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }) { playlist in
-                        NavigationLink { NativePlaylistView(store: store, playlistID: playlist.id) } label: {
-                            Label { VStack(alignment: .leading) { Text(playlist.name); Text("Треков: \(playlist.trackIDs.count)").font(.caption).foregroundStyle(.secondary) } } icon: { Image(systemName: "music.note.list").frame(width: 34) }
-                        }.listRowBackground(XASSStyle.surface)
-                    }
-                } else {
-                    // Server already filtered by q / favorite; keep local filter only as a light safety net.
-                    let rows = store.rows(filter: filter, query: "")
-                    if !rows.isEmpty {
-                        HStack(spacing: 10) {
-                            Button { store.run { try await store.playAll(rows, shuffled: false) } } label: { Label("Слушать всё", systemImage: "play.fill").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativePlayAll")
-                            Button { store.run { try await store.playAll(rows, shuffled: true) } } label: { Label("Перемешать", systemImage: "shuffle").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativeShuffleAll")
-                        }.buttonStyle(.bordered).font(.subheadline.weight(.medium)).disabled(store.busy)
-                            .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 10, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
-                    }
-                    ForEach(rows) { track in
-                        NativeTrackRow(store: store, track: track, rows: rows) { selectedTrack = track }
-                            .listRowInsets(EdgeInsets(top: 1, leading: 16, bottom: 1, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
-                            .overlay(alignment: .bottom) { Divider().padding(.leading, 72).padding(.trailing, 16).opacity(0.35) }
-                            .onAppear { if track.id == rows.last?.id { store.run { await store.loadMoreTracks() } } }
-                    }
-                    if store.libraryLoadingMore {
-                        HStack { Spacer(); ProgressView(); Spacer() }
-                            .listRowBackground(Color.clear).listRowSeparator(.hidden)
-                    }
-                    if store.libraryHasMore && !store.libraryLoadingMore && !rows.isEmpty {
-                        Button("Показать ещё") { store.run { await store.loadMoreTracks() } }
-                            .listRowBackground(Color.clear).accessibilityIdentifier("nativeLibraryMore")
-                    }
-                    if rows.isEmpty && store.authorized && !store.loading {
-                        ContentUnavailableView(query.isEmpty ? "Ваша музыка — здесь" : "Ничего не найдено", systemImage: "music.note", description: Text(query.isEmpty ? "Добавьте свои аудиофайлы кнопкой «+»." : "Попробуйте другое название или исполнителя.")).listRowBackground(Color.clear)
-                    }
-                }
-            }.listStyle(.plain).scrollContentBackground(.hidden).background(XASSStyle.background)
-                .navigationTitle("Музыка").searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск")
+            NativeLibraryBrowser(store: store, snapshot: librarySnapshot, query: $query, filter: $filter, importFiles: $importFiles,
+                                 selectedTrack: $selectedTrack, editingPlaylist: $editingPlaylist, playlistToEdit: $playlistToEdit,
+                                 collectionRoute: $collectionRoute)
+                .equatable()
+                .navigationTitle("Музыка")
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) { NavigationLink { NativeDownloadsView(store: store, audio: store.audio) } label: { Image(systemName: "arrow.down.circle") }.accessibilityLabel("Загрузки") }
                     ToolbarItem(placement: .topBarTrailing) { Button { importFiles = true } label: { Image(systemName: "plus").font(.title2) }.disabled(!store.authorized).accessibilityLabel("Добавить музыку") }
                 }
-                .refreshable { await store.refresh() }
                 .onChange(of: query) { _, value in
                     searchTask?.cancel()
                     guard filter != "playlists" else { return }
@@ -184,6 +132,125 @@ enum XASSStyle {
                 .sheet(isPresented: $editingPlaylist) { NativePlaylistEditor(store: store, playlist: playlistToEdit) }
                 .sheet(isPresented: $importFiles) { NativeMusicImportView(store: store) }
         }
+    }
+
+    /// Value snapshot so list equality never reads the main-actor store.
+    private var librarySnapshot: NativeLibrarySnapshot {
+        NativeLibrarySnapshot(
+            rows: store.rows(filter: filter, query: ""),
+            playlists: store.playlists.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) },
+            filter: filter,
+            query: query,
+            authorized: store.authorized,
+            busy: store.busy,
+            error: store.error,
+            notice: store.notice,
+            canRecoverPlayback: store.canRecoverPlayback,
+            libraryHasMore: store.libraryHasMore,
+            libraryLoadingMore: store.libraryLoadingMore,
+            // Loading only affects the empty-state row. Background refreshes of
+            // an already visible library must not rebuild the scroll container.
+            loading: store.tracks.isEmpty && store.loading,
+            isMusicImporting: store.isMusicImporting,
+            hasImportResults: !store.musicImportResults.isEmpty
+        )
+    }
+}
+
+/// Fields that actually change the library list. Playback position, volume and artworkRevision are absent on purpose.
+private struct NativeLibrarySnapshot: Equatable {
+    var rows: [LibraryTrack]
+    var playlists: [LibraryPlaylist]
+    var filter: String
+    var query: String
+    var authorized: Bool
+    var busy: Bool
+    var error: String?
+    var notice: String?
+    var canRecoverPlayback: Bool
+    var libraryHasMore: Bool
+    var libraryLoadingMore: Bool
+    var loading: Bool
+    var isMusicImporting: Bool
+    var hasImportResults: Bool
+}
+
+/// The track list ignores playback ticks. Rebuilding it on every store publish snaps the scroll offset back to the top.
+private struct NativeLibraryBrowser: View, Equatable {
+    let store: NativeStore
+    let snapshot: NativeLibrarySnapshot
+    @Binding var query: String
+    @Binding var filter: String
+    @Binding var importFiles: Bool
+    @Binding var selectedTrack: LibraryTrack?
+    @Binding var editingPlaylist: Bool
+    @Binding var playlistToEdit: LibraryPlaylist?
+    @Binding var collectionRoute: String?
+    @State private var scrolledTrackID: Int?
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.snapshot == rhs.snapshot }
+    private var rows: [LibraryTrack] { snapshot.rows }
+
+    var body: some View {
+        List {
+            if !snapshot.authorized {
+                NativeLoginPrompt(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            }
+            if snapshot.error != nil || snapshot.notice != nil || snapshot.canRecoverPlayback { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
+            HStack(spacing: 12) {
+                // Multiple NavigationLinks in one List row activate together on iOS.
+                // A single destination binding gives each explicit button one route.
+                Button { collectionRoute = "albums" } label: { Label("Альбомы", systemImage: "square.stack").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeAlbums")
+                Button { collectionRoute = "artists" } label: { Label("Исполнители", systemImage: "person.crop.circle").frame(maxWidth: .infinity) }.buttonStyle(.bordered).accessibilityIdentifier("nativeArtists")
+            }.font(.subheadline.weight(.medium)).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            Picker("Библиотека", selection: $filter) {
+                Text("Все").tag("all"); Text("Избранное").tag("favorites"); Text("Плейлисты").tag("playlists")
+            }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16)).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            if snapshot.isMusicImporting || snapshot.hasImportResults {
+                Button { importFiles = true } label: {
+                    if snapshot.isMusicImporting { NativeMusicImportStatus(store: store) }
+                    else { Label("Результат импорта", systemImage: "tray.full").font(.callout) }
+                }.buttonStyle(.plain).listRowBackground(Color.clear).accessibilityIdentifier("musicImportStatus")
+            }
+            if snapshot.filter == "playlists" {
+                Button { playlistToEdit = nil; editingPlaylist = true } label: { Label("Создать плейлист", systemImage: "plus") }.listRowBackground(Color.clear)
+                ForEach(snapshot.playlists) { playlist in
+                    NavigationLink { NativePlaylistView(store: store, playlistID: playlist.id) } label: {
+                        Label { VStack(alignment: .leading) { Text(playlist.name); Text("Треков: \(playlist.trackIDs.count)").font(.caption).foregroundStyle(.secondary) } } icon: { Image(systemName: "music.note.list").frame(width: 34) }
+                    }.listRowBackground(XASSStyle.surface)
+                }
+            } else {
+                // Server already filtered by q / favorite; keep local filter only as a light safety net.
+                if !rows.isEmpty {
+                    HStack(spacing: 10) {
+                        Button { store.run { try await store.playAll(rows, shuffled: false) } } label: { Label("Слушать всё", systemImage: "play.fill").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativePlayAll")
+                        Button { store.run { try await store.playAll(rows, shuffled: true) } } label: { Label("Перемешать", systemImage: "shuffle").frame(maxWidth: .infinity) }.accessibilityIdentifier("nativeShuffleAll")
+                    }.buttonStyle(.bordered).font(.subheadline.weight(.medium)).disabled(snapshot.busy)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 10, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                }
+                ForEach(rows) { track in
+                    NativeTrackRow(store: store, track: track, rows: rows) { selectedTrack = track }
+                        .id(track.id)
+                        .listRowInsets(EdgeInsets(top: 1, leading: 16, bottom: 1, trailing: 16)).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                        .overlay(alignment: .bottom) { Divider().padding(.leading, 72).padding(.trailing, 16).opacity(0.35) }
+                        .onAppear { if track.id == rows.last?.id { store.run { await store.loadMoreTracks() } } }
+                }
+                if snapshot.libraryLoadingMore {
+                    HStack { Spacer(); ProgressView(); Spacer() }
+                        .listRowBackground(Color.clear).listRowSeparator(.hidden)
+                }
+                if snapshot.libraryHasMore && !snapshot.libraryLoadingMore && !rows.isEmpty {
+                    Button("Показать ещё") { store.run { await store.loadMoreTracks() } }
+                        .listRowBackground(Color.clear).accessibilityIdentifier("nativeLibraryMore")
+                }
+                if rows.isEmpty && snapshot.authorized && !snapshot.loading {
+                    ContentUnavailableView(snapshot.query.isEmpty ? "Ваша музыка — здесь" : "Ничего не найдено", systemImage: "music.note", description: Text(snapshot.query.isEmpty ? "Добавьте свои аудиофайлы кнопкой «+»." : "Попробуйте другое название или исполнителя.")).listRowBackground(Color.clear)
+                }
+            }
+        }.listStyle(.plain).scrollContentBackground(.hidden).background(XASSStyle.background)
+            .scrollPosition(id: $scrolledTrackID, anchor: .top)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Поиск")
+            .refreshable { await store.refresh() }
     }
 }
 
@@ -219,31 +286,74 @@ enum XASSStyle {
     let track: LibraryTrack
     var onDelete: ((Int) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var confirmDelete = false
     @State private var acting = false
+    @State private var selectedDetent: PresentationDetent = .medium
     private var current: LibraryTrack { store.resolvedTrack(track) }
     var body: some View {
         NavigationStack {
-            List {
-                Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
-                Button { perform { try await store.download(track) } } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }.disabled(store.audio.downloadIDs.contains(track.id)).accessibilityIdentifier("nativeDownload")
-                NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
-                    Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
-                }.accessibilityIdentifier("nativeTrackInformation")
-                if track.id == store.currentID {
-                    Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
-                        Label(store.shareSaving ? "Сохраняю…" : "Показывать на сайте", systemImage: "dot.radiowaves.left.and.right")
-                    }.disabled(store.shareSaving || store.busy).accessibilityIdentifier("nativeShareSite")
+            VStack(spacing: 0) {
+                // List virtualises rows outside its visible viewport. At the
+                // accessibility text sizes that made essential actions vanish
+                // from both VoiceOver and keyboard navigation until the list
+                // was scrolled. Keep the two playback actions in a real,
+                // non-lazy primary-action card above the scrolling content.
+                VStack(spacing: 0) {
+                    if track.id == store.currentID {
+                        Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
+                            Label(store.shareSaving ? "Сохраняю…" : "Показывать на сайте", systemImage: "dot.radiowaves.left.and.right")
+                        }
+                        .padding(16)
+                        .disabled(store.shareSaving || store.busy)
+                        .accessibilityIdentifier("nativeShareSite")
+                        Divider().padding(.leading, 52)
+                    }
+                    Button { perform { try await store.download(track) } } label: {
+                        Label("Сохранить на iPhone", systemImage: "arrow.down.circle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .padding(16)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.audio.downloadIDs.contains(track.id))
+                    .accessibilityIdentifier("nativeDownload")
                 }
-                Section("Добавить в плейлист") {
-                    if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
-                    ForEach(store.playlists) { playlist in Button(playlist.name) { perform { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) } } }
+                .background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                List {
+                    Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
+                    NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
+                        Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
+                    }.accessibilityIdentifier("nativeTrackInformation")
+                    NavigationLink { NativePCTranscriptionView(store: store, trackID: track.id) } label: {
+                        Label("Текст и таймкоды на ПК", systemImage: "desktopcomputer.and.arrow.down")
+                    }.accessibilityIdentifier("nativeTrackPCTranscription")
+                    Section("Обложка") {
+                        NativeArtworkPicker(store: store, trackID: track.id)
+                    }
+                    Section("Добавить в плейлист") {
+                        if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
+                        ForEach(store.playlists) { playlist in Button(playlist.name) { perform { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) } } }
+                    }
+                    Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
+                    NativeMessage(store: store)
                 }
-                Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
-                NativeMessage(store: store)
-            }.disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }
+            }
+            .background(XASSStyle.background)
+            .disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }
                 .confirmationDialog("Убрать трек из библиотеки? Файл останется на сервере для восстановления.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Убрать трек", role: .destructive) { perform { try await store.deleteTrack(track); onDelete?(track.id) } } }
-        }.presentationDetents([.medium, .large]).interactiveDismissDisabled(acting).tint(XASSStyle.accent)
+        }
+        .presentationDetents([.medium, .large], selection: $selectedDetent)
+        .interactiveDismissDisabled(acting)
+        .tint(XASSStyle.accent)
+        .onAppear {
+            // A half-height sheet leaves too little usable scroll area at the
+            // accessibility sizes. It remains resizable, but starts expanded.
+            if dynamicTypeSize.isAccessibilitySize { selectedDetent = .large }
+        }
     }
     private func perform(_ action: @escaping () async throws -> Void) {
         guard !acting else { return }

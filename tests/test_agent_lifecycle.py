@@ -52,7 +52,7 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.auth_user = self.owner
         self.context = ExitStack()
         self.context.enter_context(patch.dict(main.app.dependency_overrides, {main.get_session: get_session}))
-        self.context.enter_context(patch.object(main, 'settings', SimpleNamespace(agent_api_key='global-key')))
+        self.context.enter_context(patch.object(main, 'settings', SimpleNamespace(agent_api_key='global-key', agent_api_key_enabled=True)))
         self.context.enter_context(patch.object(main, 'miniapp_authenticate', side_effect=lambda token, settings: self.auth_user if token == 'telegram' else None))
         self.context.enter_context(patch.object(main, 'pwa_authenticate_session', return_value=None))
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://localhost')

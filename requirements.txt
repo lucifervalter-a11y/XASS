@@ -1,4 +1,5 @@
-fastapi==0.116.1
+fastapi==0.142.2
+starlette==1.7.0
 uvicorn[standard]==0.35.0
 sqlalchemy==2.0.42
 aiosqlite==0.21.0
@@ -13,4 +14,4 @@ segno==1.6.6
 cryptography==50.0.0
 pywebpush==2.3.0
 mutagen==1.47.0
-Pillow==11.3.0
+Pillow==12.3.0

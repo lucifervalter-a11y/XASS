@@ -38,6 +38,26 @@ async def init_db() -> None:
         await connection.run_sync(_apply_runtime_migrations)
 
 
+def _column_is_unique(inspector, table: str, column: str) -> bool:
+    try:
+        constraints = inspector.get_unique_constraints(table)
+    except NotImplementedError:
+        constraints = []
+    for item in constraints:
+        if column in (item.get("column_names") or []):
+            return True
+    for item in inspector.get_indexes(table):
+        if item.get("unique") and column in (item.get("column_names") or []):
+            return True
+    return False
+
+
+def _ensure_unique_column(connection, inspector, table: str, column: str, index_name: str) -> None:
+    if _column_is_unique(inspector, table, column):
+        return
+    connection.execute(text(f"CREATE UNIQUE INDEX {index_name} ON {table} ({column})"))
+
+
 def _apply_runtime_migrations(connection) -> None:
     inspector = inspect(connection)
     datetime_type = "TIMESTAMP WITH TIME ZONE" if connection.dialect.name == "postgresql" else "DATETIME"
@@ -56,6 +76,20 @@ def _apply_runtime_migrations(connection) -> None:
         command_columns = {item["name"] for item in inspector.get_columns("agent_commands")}
         if "not_before_at" not in command_columns:
             connection.execute(text(f"ALTER TABLE agent_commands ADD COLUMN not_before_at {datetime_type}"))
+        if "idempotency_key" not in command_columns:
+            connection.execute(text("ALTER TABLE agent_commands ADD COLUMN idempotency_key VARCHAR(64)"))
+        if "attempt_count" not in command_columns:
+            connection.execute(text("ALTER TABLE agent_commands ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"))
+        index_names = {item["name"] for item in inspector.get_indexes("agent_commands")}
+        unique_names = {item.get("name") for item in inspector.get_unique_constraints("agent_commands")}
+        if "ix_agent_commands_source_status_id" not in index_names:
+            connection.execute(text(
+                "CREATE INDEX ix_agent_commands_source_status_id ON agent_commands (source_name, status, id)"
+            ))
+        if "uq_agent_commands_idempotency_key" not in index_names | unique_names:
+            connection.execute(text(
+                "CREATE UNIQUE INDEX uq_agent_commands_idempotency_key ON agent_commands (idempotency_key)"
+            ))
     if "agent_pair_codes" in tables:
         pair_columns = {item["name"] for item in inspector.get_columns("agent_pair_codes")}
         if "owner_e2e_public_jwk" not in pair_columns:
@@ -64,6 +98,10 @@ def _apply_runtime_migrations(connection) -> None:
         cred_columns = {item["name"] for item in inspector.get_columns("agent_credentials")}
         if "e2e_public_jwk" not in cred_columns:
             connection.execute(text("ALTER TABLE agent_credentials ADD COLUMN e2e_public_jwk TEXT"))
+        _ensure_unique_column(connection, inspector, "agent_credentials", "api_key_hash", "uq_agent_credentials_api_key_hash")
+        _ensure_unique_column(connection, inspector, "agent_credentials", "source_name", "uq_agent_credentials_source_name")
+    if "heartbeat_sources" in tables:
+        _ensure_unique_column(connection, inspector, "heartbeat_sources", "source_name", "uq_heartbeat_sources_source_name")
     if "app_config" not in tables:
         return
 

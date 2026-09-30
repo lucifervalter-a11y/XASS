@@ -1,6 +1,7 @@
 import mimetypes
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -34,6 +35,36 @@ class TelegramApiError(RuntimeError):
         return " | ".join(parts)
 
 
+def _safe_http_error(message: str, method: str, exc: httpx.HTTPError) -> TelegramApiError:
+    """Convert token-bearing httpx errors into a log-safe public exception."""
+
+    response = getattr(exc, "response", None)
+    status_code = response.status_code if isinstance(response, httpx.Response) else None
+    return TelegramApiError(message, method=method, status_code=status_code)
+
+
+class TelegramFileResponse:
+    """A streamed Telegram response which never rethrows a token-bearing URL."""
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+        self.status_code = response.status_code
+        self.headers = response.headers
+
+    async def aiter_bytes(self, chunk_size: int | None = None):
+        try:
+            async for chunk in self._response.aiter_bytes(chunk_size):
+                yield chunk
+        except httpx.HTTPError as exc:
+            raise _safe_http_error("Telegram file download failed", "downloadFile", exc) from None
+
+    async def aclose(self) -> None:
+        try:
+            await self._response.aclose()
+        except httpx.HTTPError as exc:
+            raise _safe_http_error("Telegram file close failed", "downloadFile", exc) from None
+
+
 class TelegramBotClient:
     def __init__(self, token: str, timeout_sec: int = 20):
         self.token = token
@@ -57,7 +88,10 @@ class TelegramBotClient:
             raise TelegramApiError("BOT_TOKEN is empty")
 
         url = f"{self.base_url}/{method}"
-        response = await self.client.post(url, json=payload, data=data, files=files, timeout=timeout)
+        try:
+            response = await self.client.post(url, json=payload, data=data, files=files, timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise _safe_http_error("Telegram API request failed", method, exc) from None
         body: dict[str, Any]
         try:
             body = response.json()
@@ -217,11 +251,62 @@ class TelegramBotClient:
         return result if isinstance(result, dict) else {}
 
     async def download_file(self, file_path: str, destination: Path) -> None:
-        url = f"{self.file_url}/{file_path}"
-        response = await self.client.get(url)
-        response.raise_for_status()
+        response = await self.open_file_stream(file_path)
+        try:
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+        finally:
+            await response.aclose()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(response.content)
+        destination.write_bytes(body)
+
+    async def open_file_stream(
+        self,
+        file_path: str,
+        *,
+        timeout: float | httpx.Timeout | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> TelegramFileResponse:
+        """Open one Telegram file while keeping the bot token out of errors."""
+
+        cleaned = str(file_path or "").strip().lstrip("/")
+        if not cleaned or len(cleaned) > 1024 or "\\" in cleaned or any(ord(char) < 32 for char in cleaned):
+            raise TelegramApiError("Telegram returned an invalid file path", method="downloadFile")
+        url = f"{self.file_url}/{quote(cleaned, safe='/')}"
+        response: httpx.Response | None = None
+        try:
+            request = self.client.build_request("GET", url, headers=headers, timeout=timeout)
+            response = await self.client.send(request, stream=True)
+            response.raise_for_status()
+            return TelegramFileResponse(response)
+        except httpx.HTTPError as exc:
+            if response is not None:
+                try:
+                    await response.aclose()
+                except httpx.HTTPError:
+                    # Preserve the original, already-sanitized download failure;
+                    # closing a response must never surface its token-bearing URL.
+                    pass
+            raise _safe_http_error("Telegram file download failed", "downloadFile", exc) from None
+
+    async def download_file_bytes(
+        self,
+        file_path: str,
+        *,
+        max_bytes: int,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> tuple[bytes, str]:
+        response = await self.open_file_stream(file_path, timeout=timeout, headers={"Accept-Encoding": "identity"})
+        try:
+            content = bytearray()
+            async for chunk in response.aiter_bytes(64 * 1024):
+                if len(chunk) > max_bytes - len(content):
+                    raise TelegramApiError("Telegram file exceeds the allowed size", method="downloadFile")
+                content.extend(chunk)
+            return bytes(content), str(response.headers.get("content-type") or "application/octet-stream")
+        finally:
+            await response.aclose()
 
     async def send_document(self, chat_id: int, path: Path, caption: str | None = None) -> dict[str, Any]:
         data: dict[str, Any] = {"chat_id": str(chat_id)}

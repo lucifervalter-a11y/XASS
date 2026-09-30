@@ -177,6 +177,19 @@ async def _add_revision(
     session.add(revision)
 
 
+def merge_delete_event(original: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the original message body when Telegram later sends a sparse delete notice."""
+    if not isinstance(original, dict) or original.get("message_id") is None:
+        return dict(payload)
+    kept = dict(original)
+    kept["_xass_delete"] = {
+        "chat": payload.get("chat"),
+        "message_ids": payload.get("message_ids"),
+        "business_connection_id": payload.get("business_connection_id"),
+    }
+    return kept
+
+
 async def _store_media(
     session: AsyncSession,
     bot_client: TelegramBotClient | None,
@@ -339,7 +352,7 @@ async def _mark_deleted_message(
     was_deleted = bool(message_log.deleted)
     message_log.deleted = True
     message_log.deleted_at = now
-    message_log.raw_event = payload
+    message_log.raw_event = merge_delete_event(message_log.raw_event, payload)
     if not was_deleted:
         await _add_revision(session, message_log.id, MessageEventType.DELETE, message_log.text_content)
 

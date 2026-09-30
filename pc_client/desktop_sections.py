@@ -11,17 +11,14 @@ from tkinter import ttk
 from typing import Any
 
 from client_update import UPDATE_RESULT, current_revision, current_version, update_in_progress
-from desktop_widgets import icon_image
+from desktop_widgets import (
+    ACCENT, BG, CARD, FIELD, LILAC, LINE, MUTED, TEXT, icon_badge, page_header, quiet_note, RoundedPanel,
+)
 
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:
     DND_FILES = None
-
-
-BG, CARD, FIELD = "#202022", "#2b2b2f", "#232326"
-TEXT, MUTED, ACCENT, LINE = "#f5f5f7", "#b1b1bb", "#829cff", "#3b3b42"
-LILAC = "#c495f4"
 
 
 class _Columns(tk.Frame):
@@ -53,34 +50,25 @@ class _Columns(tk.Frame):
 
 
 def _label(parent: tk.Misc, text: str = "", *, variable: tk.Variable | None = None,
-           size: int = 10, color: str = MUTED, bold: bool = False, bg: str = CARD) -> tk.Label:
+           size: int = 11, color: str = MUTED, bold: bool = False, bg: str = CARD) -> tk.Label:
     options: dict[str, Any] = {"textvariable": variable} if variable is not None else {"text": text}
     return tk.Label(parent, **options, bg=bg, fg=color, font=("Segoe UI Semibold" if bold else "Segoe UI", size),
                     justify="left", anchor="w", wraplength=760)
 
 
-def _icon(parent: tk.Misc, name: str, *, color: str = ACCENT, size: int = 28, bg: str = CARD) -> tk.Label:
-    image = icon_image(parent, name, size=size, color=color)
-    label = tk.Label(parent, image=image, bg=bg)
-    label._xass_icon = image  # type: ignore[attr-defined]  # Tk needs a strong PhotoImage reference.
-    return label
-
-
-def _header(app: Any, title: str, subtitle: str) -> None:
-    header = tk.Frame(app.content, bg=BG)
-    header.pack(fill="x", pady=(0, 20))
-    _label(header, title, size=22, color=TEXT, bold=True, bg=BG).pack(fill="x")
-    _label(header, subtitle, size=10, bg=BG).pack(fill="x", pady=(6, 0))
+def _header(app: Any, title: str, subtitle: str, kicker: str = "") -> None:
+    page_header(app.content, title, subtitle, kicker=kicker).pack(fill="x", pady=(2, 20))
 
 
 def _card_heading(parent: tk.Misc, title: str, description: str, icon: str, *, color: str = ACCENT) -> None:
     header = tk.Frame(parent, bg=CARD)
-    header.pack(fill="x", pady=(0, 15))
-    _icon(header, icon, color=color).pack(side="left", anchor="n", padx=(0, 13), pady=(2, 0))
+    header.pack(fill="x")
+    icon_badge(header, icon, size=26, color=color).pack(side="left", anchor="n", padx=(0, 14))
     copy = tk.Frame(header, bg=CARD)
     copy.pack(side="left", fill="x", expand=True)
     _label(copy, title, size=16, color=TEXT, bold=True).pack(fill="x")
-    _label(copy, description).pack(fill="x", pady=(5, 0))
+    _label(copy, description, size=11).pack(fill="x", pady=(4, 0))
+    tk.Frame(parent, bg=LINE, height=1).pack(fill="x", pady=(14, 14))
 
 
 def _register_dropzone(zone: tk.Widget, callback: Any) -> bool:
@@ -101,19 +89,19 @@ def _register_dropzone(zone: tk.Widget, callback: Any) -> bool:
 
 def build_connection(app: Any) -> None:
     """Import/drop a connection file, or pair with the original manual fields."""
-    _header(app, "Подключение", "Свяжите этот компьютер с Telegram Mini App и веб-приложением XASS.")
+    _header(app, "Подключение", "Свяжите этот компьютер с Telegram Mini App и веб-приложением XASS.", "Связь")
     columns = _Columns(app.content)
     columns.pack(fill="x")
 
     quick = app._card(columns, padding=22)
     columns.add(quick)
-    _card_heading(quick, "Подключить файлом", "Рекомендуемый способ · без ручного ввода адреса", "link")
+    _card_heading(quick, "Подключить файлом", "Рекомендуемый способ, без ручного ввода адреса", "link")
     _label(quick, "В Mini App откройте «Инструменты» → «Агенты» → «Подключить ПК» и скачайте файл подключения.").pack(fill="x", pady=(0, 16))
 
-    zone = tk.Frame(quick, bg=FIELD, padx=18, pady=20, highlightbackground="#525a76", highlightthickness=1)
+    zone = RoundedPanel(quick, bg=FIELD, radius=14, padx=18, pady=20, border_color="#5a6494")
     zone.pack(fill="x")
-    _icon(zone, "folder", size=34, color=ACCENT, bg=FIELD).pack(anchor="w", pady=(0, 12))
-    drop_title = _label(zone, "Перетащите файл сюда", size=14, color=TEXT, bold=True, bg=FIELD)
+    icon_badge(zone, "folder", size=30, color=ACCENT).pack(anchor="w", pady=(0, 12))
+    drop_title = _label(zone, "Перетащите файл сюда", size=15, color=TEXT, bold=True, bg=FIELD)
     drop_title.pack(fill="x")
     _label(zone, "xass-connect.xass или конфигурация .json", bg=FIELD).pack(fill="x", pady=(6, 15))
     app._button(zone, "Выбрать файл подключения", app.import_connection_file, kind="primary").pack(fill="x")
@@ -121,10 +109,10 @@ def build_connection(app: Any) -> None:
         drop_title.configure(text="Выберите файл подключения")
 
     app._button(quick, "Вставить конфигурацию", app.paste_connection, kind="secondary").pack(fill="x", pady=(12, 0))
-    status = tk.Frame(quick, bg=CARD)
-    status.pack(fill="x", pady=(18, 0))
-    _label(status, "СОСТОЯНИЕ ИМПОРТА", size=9, bold=True).pack(fill="x")
-    _label(status, variable=app.import_status_var, color=TEXT).pack(fill="x", pady=(6, 0))
+    status = RoundedPanel(quick, bg=FIELD, radius=12, padx=14, pady=12, border_width=0)
+    status.pack(fill="x", pady=(16, 0))
+    _label(status, "Состояние импорта", size=9, bold=True, bg=FIELD).pack(fill="x")
+    _label(status, variable=app.import_status_var, color=TEXT, bg=FIELD).pack(fill="x", pady=(6, 0))
 
     manual = app._card(columns, padding=22)
     columns.add(manual)
@@ -147,17 +135,23 @@ def build_connection(app: Any) -> None:
     if app._pairing:
         app.pair_button.configure(state="disabled", text="Подключение…")
 
-    _label(app.content, "Файл подключения и ключ дают доступ к вашему серверу. Не публикуйте их и не отправляйте посторонним.", bg=BG).pack(fill="x", pady=(0, 4))
+    quiet_note(
+        app.content,
+        "Файл подключения и ключ дают доступ к вашему серверу. Не публикуйте их и не отправляйте посторонним.",
+        icon="shield",
+        bg=BG,
+        pady=(4, 0),
+    )
 
 
 def build_updates(app: Any) -> None:
     """Keep live updater variables/progress and original check/restart callbacks."""
-    _header(app, "Обновления", "Новая версия приложения с сохранением привязки и настроек.")
+    _header(app, "Обновления", "Новая версия приложения с сохранением привязки и настроек.", "Версия")
     card = app._card(app.content, padding=22)
     card.pack(fill="x", pady=(0, 16))
-    _card_heading(card, "XASS для Windows", "Канал stable · обновления с вашего сервера", "update")
-    _label(card, variable=app.update_state_var, size=20, color=TEXT, bold=True).pack(fill="x", pady=(2, 6))
-    _label(card, variable=app.update_detail_var).pack(fill="x")
+    _card_heading(card, "XASS для Windows", "Канал stable, обновления с вашего сервера", "update")
+    _label(card, variable=app.update_state_var, size=22, color=TEXT, bold=True).pack(fill="x", pady=(2, 6))
+    _label(card, variable=app.update_detail_var, size=11).pack(fill="x")
     app.update_progress = ttk.Progressbar(card, mode="determinate", style="XASS.Horizontal.TProgressbar")
     app.update_progress.pack(fill="x", pady=(20, 18))
     app._progress_running = False
@@ -190,7 +184,7 @@ def build_updates(app: Any) -> None:
 
 def build_commands(app: Any) -> None:
     """Organize all six existing local actions without replacing their guards."""
-    _header(app, "Команды", "Действия на этом компьютере. Важные операции требуют подтверждения.")
+    _header(app, "Команды", "Действия на этом компьютере. Важные операции требуют подтверждения.", "Действия")
     columns = _Columns(app.content, breakpoint=780)
     columns.pack(fill="x")
 
@@ -218,9 +212,14 @@ def build_commands(app: Any) -> None:
     app._button(actions, "Буфер обмена", app.show_clipboard, kind="secondary").pack(side="left")
     app._flow_actions(actions)
 
-    security = app._card(app.content, padding=22)
+    security = app._card(app.content, padding=22, border_color="#6a3d49")
     security.pack(fill="x")
     _card_heading(security, "Безопасность компьютера", "Блокировка Windows завершает доступ к рабочему столу", "shield")
     _label(security, "После блокировки войти снова можно только на этом ПК: через Windows Hello, PIN или пароль. XASS не обходит экран входа.").pack(fill="x", pady=(0, 16))
     app._button(security, "Заблокировать экран", app.lock_workstation, kind="danger").pack(anchor="w")
-    _label(app.content, "Управление с телефона доступно в Telegram Mini App и веб-приложении, пока фоновый агент подключён к серверу.", bg=BG).pack(fill="x", pady=(16, 0))
+    quiet_note(
+        app.content,
+        "Управление с телефона доступно в Telegram Mini App и веб-приложении, пока фоновый агент подключён к серверу.",
+        icon="link",
+        bg=BG,
+    )

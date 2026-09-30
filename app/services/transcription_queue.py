@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import math
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -29,6 +30,7 @@ DEADLINE_FACTOR = 12
 MAX_ATTEMPTS = 3
 BUSY_PERCENT = 95.0
 MAX_LINES = 2000
+MAX_REFERENCE_CHARS = 8000
 ACTIVE = ("assigned", "running")
 
 MESSAGES = {
@@ -223,7 +225,8 @@ async def schedule(session, now: datetime) -> list[tuple[int, int]]:
     return assigned
 
 
-async def request_job(session, track, *, language: str, user_id: int | None, now: datetime) -> tuple[TranscriptionJob, bool]:
+async def request_job(session, track, *, language: str, user_id: int | None, now: datetime,
+                      recheck: bool = False) -> tuple[TranscriptionJob, bool]:
     """Create or join the single job of a track. Returns (job, created)."""
     job = await session.scalar(select(TranscriptionJob).where(TranscriptionJob.track_id == track.id))
     created = False
@@ -244,6 +247,18 @@ async def request_job(session, track, *, language: str, user_id: int | None, now
         job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
         job.language = language or job.language
         job.finished_at, job.updated_at = None, now
+    elif job.state == "done" and recheck:
+        stored = dict(job.result or {})
+        # The owner's wand/force action gets exactly one fresh pass per stored
+        # result. Repeated taps while queued/running or after that pass are
+        # idempotent and cannot create an unbounded provider/worker loop.
+        if stored.get("owner_recheck_used") is not True:
+            job.result = {"owner_recheck_used": True, "owner_recheck_candidate": stored}
+            job.state, job.attempts, job.failed_workers, job.error = "queued", 0, [], ""
+            job.language = language or job.language
+            job.worker_id = job.lease_expires_at = job.deadline_at = None
+            job.assigned_at = job.started_at = job.finished_at = None
+            job.progress, job.updated_at = {}, now
     await schedule(session, now)
     return job, created
 
@@ -285,12 +300,17 @@ async def status_payload(session, track_id: int, now: datetime) -> dict:
         message = f"{message} · ~{estimate} мин"
     elif status == "preparing_pc":
         message = f"{message}, {setup_percent}%"
+    stored = job.result if isinstance(job.result, dict) else {}
     return {"ok": True, "status": status, "job_id": job.id, "language": job.language, "message": message,
             "estimate_minutes": estimate, "stage": (job.progress or {}).get("stage", "") if status == "running" else "",
             "workers_online": len(online), "attempts": job.attempts, "setup_percent": setup_percent,
             "error": job.error if status == "failed" else "",
             "updated_at": aware(job.updated_at).isoformat() if job.updated_at else None,
-            "line_count": len((job.result or {}).get("lines") or []) if status == "done" else 0}
+            "line_count": len(stored.get("lines") or []) if status == "done" else 0,
+            "quality_recheck": bool(stored.get("quality_recheck_requested")) if status != "done" else False,
+            "quality_rechecked": bool(stored.get("quality_rechecked")) if status == "done" else False,
+            "owner_rechecked": bool(stored.get("owner_rechecked")) if status == "done" else False,
+            "quality": stored.get("quality", {}) if status == "done" else {}}
 
 
 async def done_result(session, track_id: int) -> dict | None:
@@ -320,6 +340,11 @@ def shown_lyrics_missing(value: dict | None) -> bool:
     """
     if not isinstance(value, dict):
         return False
+    # A verified instrumental response is not a missing lyric. Sending it to
+    # Whisper tends to manufacture words from noise and permanently replaces a
+    # correct catalogue result with a hallucinated transcript.
+    if value.get("status") == "instrumental":
+        return False
     if str(value.get("text") or "").strip():
         return False
     if value.get("synced"):
@@ -327,6 +352,35 @@ def shown_lyrics_missing(value: dict | None) -> bool:
             if isinstance(row, dict) and str(row.get("text") or "").strip():
                 return False
     return True
+
+
+def plain_lyrics_reference(record: MusicEnrichment | None) -> dict:
+    """Bounded stored text that may validate recognition, never seed timings.
+
+    Only an owner draft or already persisted catalog result is eligible. Timed
+    text is excluded because it already solves the problem, and the returned
+    marker tells workers not to use this as a Whisper prompt (which can turn a
+    wrong catalog match into hallucinated audio).
+    """
+    if record is None:
+        return {}
+    owner = record.owner_lyrics if isinstance(record.owner_lyrics, dict) else {}
+    catalog = ((record.result or {}).get("lyrics") if isinstance(record.result, dict)
+               and not record.dismissed else {})
+    for value, source in ((owner, "owner"), (catalog, "catalog")):
+        if not isinstance(value, dict) or value.get("disabled") or value.get("synced"):
+            continue
+        if any(isinstance(row, dict) and isinstance(row.get("time", row.get("start")), (int, float))
+               for row in value.get("lines") or []):
+            continue
+        raw = value.get("text")
+        if not isinstance(raw, str):
+            continue
+        text = "".join(char for char in raw.replace("\r\n", "\n").replace("\r", "\n")
+                       if char in "\n\t" or ord(char) >= 32).strip()[:MAX_REFERENCE_CHARS]
+        if text:
+            return {"text": text, "source": source, "reference_only": True}
+    return {}
 
 
 async def queue_pc_if_no_lyrics(session, track_id: int, value, *, user_id: int | None, now: datetime) -> bool:
@@ -344,8 +398,9 @@ async def queue_pc_if_no_lyrics(session, track_id: int, value, *, user_id: int |
     track = await session.get(MusicTrack, track_id)
     if track is None or track.deleted:
         return False
-    # Same default as the phone's language picker.
-    await request_job(session, track, language="ru", user_id=user_id, now=now)
+    # Libraries commonly mix languages. Automatic detection is safer than
+    # forcing Russian on every background transcription.
+    await request_job(session, track, language="auto", user_id=user_id, now=now)
     await session.commit()
     return True
 
@@ -369,7 +424,7 @@ def _cursor_key(session) -> str:
 
 def _fresh_job(track, user_id: int | None, now: datetime) -> TranscriptionJob:
     return TranscriptionJob(track_id=track.id, sha256=str(track.sha256 or "")[:64], duration=_num(track.duration),
-                            language="ru", state="queued", failed_workers=[], progress={}, result={},
+                            language="auto", state="queued", failed_workers=[], progress={}, result={},
                             requested_by=user_id, created_at=now, updated_at=now)
 
 
@@ -408,7 +463,8 @@ async def _sweep_lyric_jobs(session, *, user_id: int | None, now: datetime, limi
             if str(job.error or "").startswith("no_speech"):
                 continue
             result = job.result or {}
-            if result.get("retried_failed") or result.get("retried_empty"):
+            if (result.get("retried_failed") or result.get("retried_empty")
+                    or result.get("quality_recheck_requested") or result.get("owner_recheck_used")):
                 continue
             if _stored_lyrics(records.get(job.track_id)):
                 continue
@@ -465,7 +521,7 @@ async def queue_page_without_lyrics(session, tracks, *, user_id: int | None, now
                 continue
             if _stored_lyrics(records.get(track.id)):
                 continue
-            await request_job(session, track, language="ru", user_id=user_id, now=now)
+            await request_job(session, track, language="auto", user_id=user_id, now=now)
             created += 1
     created += await _sweep_lyric_jobs(session, user_id=user_id, now=now)
     if created:
@@ -476,7 +532,12 @@ async def queue_page_without_lyrics(session, tracks, *, user_id: int | None, now
 
 def as_owner_lyrics(result: dict) -> dict:
     """PC result in the /lyrics payload shape ({text, lines:[{time, text}], synced})."""
-    lines = [{"time": row["start"], "text": row["text"]} for row in result.get("lines") or []]
+    # Keep the original segment bounds and measured silence. Older clients use
+    # only ``time``/``text``; newer clients can animate the real pauses instead
+    # of stretching every sentence until the next one starts.
+    lines = [{"time": row["start"], "start": row["start"], "end": row["end"],
+              "pause_before": row.get("pause_before", 0.0), "text": row["text"]}
+             for row in result.get("lines") or []]
     return {"text": "\n".join(row["text"] for row in lines), "lines": lines, "synced": bool(lines),
             "source": "pc_transcription", "status": "transcribed", "automatic": True}
 
@@ -538,31 +599,132 @@ def clean_lines(rows: list, duration: float) -> list[dict]:
         end = min(max(end, start + 0.2), limit + 1)
         out.append({"start": round(start, 3), "end": round(end, 3), "text": text})
     out.sort(key=lambda item: item["start"])
+    previous_end = 0.0
+    for item in out:
+        # A separate field preserves silence without introducing fake blank
+        # lyric rows. It is derived only from authenticated worker timestamps.
+        item["pause_before"] = round(max(0.0, item["start"] - previous_end), 3)
+        previous_end = max(previous_end, item["end"])
     return out
 
 
-async def complete(session, worker: TranscriptionWorker, job: TranscriptionJob, *, lines: list, meta: dict, now: datetime) -> dict:
-    cleaned = clean_lines(lines, _num(job.duration))
-    if not cleaned:
-        _requeue(job, "empty_transcription", now, count_attempt=True)
-        await schedule(session, now)
-        return {"accepted": False, "state": job.state}
-    job.result = {"status": "synced", "synced": True, "source": "pc_transcription", "lines": cleaned,
-                  "text": "\n".join(item["text"] for item in cleaned),
-                  "language": str(meta.get("language") or job.language)[:8], "model": str(meta.get("model") or "")[:64],
-                  "device": str(meta.get("device") or "")[:16], "worker": worker.source_name,
-                  "elapsed_sec": round(_num(meta.get("elapsed_sec")), 1), "transcribed_at": now.isoformat()}
+_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def transcript_quality(lines: list[dict], duration: float) -> dict:
+    """Return bounded, text-free diagnostics for deciding on one second pass.
+
+    This deliberately flags only obviously incomplete output. Songs can have
+    long intros and sparse vocals, so ordinary low coverage is never enough on
+    its own to trigger a recheck.
+    """
+    text = " ".join(str(row.get("text") or "") for row in lines)
+    words = _WORD.findall(text)
+    chars = sum(1 for char in text if char.isalnum())
+    line_count = len(lines)
+    length = max(0.0, _num(duration))
+    first = min((_num(row.get("start")) for row in lines), default=0.0)
+    last = max((_num(row.get("end")) for row in lines), default=first)
+    span = max(0.0, last - first)
+    span_ratio = min(1.0, span / length) if length else 0.0
+    normalized = [" ".join(str(row.get("text") or "").lower().split()) for row in lines]
+    unique_ratio = len(set(filter(None, normalized))) / max(1, line_count)
+    reasons: list[str] = []
+    if length >= 45 and (len(words) < 3 or chars < 12):
+        reasons.append("too_little_text")
+    if length >= 90 and span_ratio < .03 and len(words) < 8:
+        reasons.append("tiny_timed_span")
+    if length >= 90 and line_count >= 6 and unique_ratio <= .2:
+        reasons.append("mostly_repeated_lines")
+    lexical = min(1.0, len(words) / 48.0)
+    timing = min(1.0, span_ratio / .5) if length else min(1.0, span / 90.0)
+    score = round(min(1.0, lexical * .55 + timing * .3 + unique_ratio * .15), 3)
+    return {"score": score, "needs_recheck": bool(reasons), "reasons": reasons,
+            "line_count": line_count, "word_count": len(words), "span_sec": round(span, 3),
+            "span_ratio": round(span_ratio, 4), "leading_silence_sec": round(first, 3)}
+
+
+def _transcription_result(cleaned: list[dict], job: TranscriptionJob, worker: TranscriptionWorker,
+                          meta: dict, now: datetime, quality: dict) -> dict:
+    return {"status": "synced", "synced": True, "source": "pc_transcription", "lines": cleaned,
+            "text": "\n".join(item["text"] for item in cleaned), "quality": quality,
+            "language": str(meta.get("language") or job.language)[:8], "model": str(meta.get("model") or "")[:64],
+            "device": str(meta.get("device") or "")[:16], "worker": worker.source_name,
+            "elapsed_sec": round(_num(meta.get("elapsed_sec")), 1), "transcribed_at": now.isoformat()}
+
+
+def _finish(job: TranscriptionJob, worker: TranscriptionWorker, result: dict, now: datetime) -> dict:
+    job.result = result
     job.state = "done"
     job.error = ""
     job.progress = {"stage": "done", "fraction": 1.0}
     job.lease_expires_at = job.deadline_at = None
     job.finished_at = job.updated_at = now
     worker.last_seen_at = now
-    return {"accepted": True, "state": "done", "lines": len(cleaned)}
+    return {"accepted": True, "state": "done", "lines": len(result.get("lines") or []),
+            "quality": result.get("quality", {})}
+
+
+async def complete(session, worker: TranscriptionWorker, job: TranscriptionJob, *, lines: list, meta: dict, now: datetime) -> dict:
+    cleaned = clean_lines(lines, _num(job.duration))
+    previous = dict(job.result or {})
+    quality_candidate = previous.get("candidate") if previous.get("quality_recheck_requested") else None
+    owner_candidate = previous.get("owner_recheck_candidate") if previous.get("owner_recheck_used") else None
+    prior_candidate = quality_candidate if isinstance(quality_candidate, dict) else owner_candidate
+    if not cleaned:
+        # A second pass that hears nothing must not throw away the usable first
+        # pass. Keep the best authenticated result and stop retrying forever.
+        if isinstance(prior_candidate, dict) and prior_candidate.get("lines"):
+            chosen = dict(prior_candidate)
+            if isinstance(quality_candidate, dict):
+                chosen.update(quality_rechecked=True, quality_second_pass_empty=True)
+            if isinstance(owner_candidate, dict):
+                chosen.update(owner_recheck_used=True, owner_rechecked=True, owner_recheck_empty=True)
+            return _finish(job, worker, chosen, now)
+        _requeue(job, "empty_transcription", now, count_attempt=True)
+        await schedule(session, now)
+        return {"accepted": False, "state": job.state}
+    quality = transcript_quality(cleaned, _num(job.duration))
+    current = _transcription_result(cleaned, job, worker, meta, now, quality)
+    if isinstance(owner_candidate, dict):
+        current.update(owner_recheck_used=True, owner_rechecked=True)
+    if quality["needs_recheck"] and not isinstance(prior_candidate, dict):
+        # Exactly one automatic second pass. The first candidate stays private
+        # inside the job row and is available if the retry is worse or empty.
+        job.result = {"quality_recheck_requested": True, "candidate": current, "quality": quality}
+        _requeue(job, "low_confidence_transcript", now, count_attempt=True)
+        worker.last_seen_at = now
+        await schedule(session, now)
+        return {"accepted": False, "state": job.state, "quality_recheck": True, "quality": quality}
+    if isinstance(prior_candidate, dict):
+        prior_quality = prior_candidate.get("quality") if isinstance(prior_candidate.get("quality"), dict) else None
+        if prior_quality is None:
+            prior_quality = transcript_quality(prior_candidate.get("lines") or [], _num(job.duration))
+        prior_score = _num(prior_quality.get("score"), -1)
+        current_score = _num(quality.get("score"), -1)
+        chosen = dict(prior_candidate if prior_score > current_score else current)
+        chosen["quality"] = prior_quality if prior_score > current_score else quality
+        if isinstance(quality_candidate, dict):
+            chosen.update(quality_rechecked=True, quality_candidates=2)
+        if isinstance(owner_candidate, dict):
+            chosen.update(owner_recheck_used=True, owner_rechecked=True)
+        return _finish(job, worker, chosen, now)
+    return _finish(job, worker, current, now)
 
 
 async def fail(session, worker: TranscriptionWorker, job: TranscriptionJob, *, reason: str, now: datetime) -> str:
+    stored = dict(job.result or {})
+    candidate = (stored.get("candidate") if stored.get("quality_recheck_requested")
+                 else stored.get("owner_recheck_candidate") if stored.get("owner_recheck_used") else None)
     _requeue(job, reason or "worker_error", now, count_attempt=True)
     worker.last_seen_at = now
+    if job.state == "failed" and isinstance(candidate, dict) and candidate.get("lines"):
+        kept = dict(candidate)
+        if stored.get("quality_recheck_requested"):
+            kept.update(quality_rechecked=True, quality_retry_failed=True)
+        if stored.get("owner_recheck_used"):
+            kept.update(owner_recheck_used=True, owner_rechecked=True, owner_recheck_failed=True)
+        _finish(job, worker, kept, now)
+        return job.state
     await schedule(session, now)
     return job.state

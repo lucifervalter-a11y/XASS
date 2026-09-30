@@ -200,6 +200,17 @@ import UIKit
         if let pc = pcRemoteSource { return String(pc.dropFirst(6)) }
         return deviceLabel
     }
+    func pcTransportLabel(_ name: String) -> String? {
+        guard let transport = players.first(where: { $0.id == name })?.mediaTransport else { return nil }
+        switch transport {
+        case "lan_check": return "Проверяю локальную сеть…"
+        case "lan": return "Напрямую по локальной сети"
+        case "server_fallback": return "Через сервер · локальная сеть недоступна"
+        case "server": return "Через защищённый сервер"
+        case "local_file": return "Локальный файл на ПК"
+        default: return nil
+        }
+    }
     private func lyricsTrackChanged() {
         let list = queue.isEmpty ? tracks : queue
         let next = currentID.flatMap { id in list.firstIndex { $0.id == id } }.flatMap { list.indices.contains($0 + 1) ? list[$0 + 1].id : nil }
@@ -224,10 +235,12 @@ import UIKit
         }
         error = failure.localizedDescription
     }
-    private func libraryPath(offset: Int, query: String = "", favorite: Bool = false, playlist: Int? = nil) -> String {
+    private func libraryPath(offset: Int, query: String = "", favorite: Bool = false, playlist: Int? = nil,
+                             limit: Int? = nil) -> String {
         var parts = URLComponents()
         parts.path = "/api/mini/music/library"
-        parts.queryItems = [URLQueryItem(name: "limit", value: String(libraryPageSize)), URLQueryItem(name: "offset", value: String(offset))]
+        let boundedLimit = min(2000, max(1, limit ?? libraryPageSize))
+        parts.queryItems = [URLQueryItem(name: "limit", value: String(boundedLimit)), URLQueryItem(name: "offset", value: String(offset))]
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !search.isEmpty { parts.queryItems?.append(URLQueryItem(name: "q", value: search)) }
         if favorite { parts.queryItems?.append(URLQueryItem(name: "favorite", value: "true")) }
@@ -243,12 +256,17 @@ import UIKit
         remember(incoming)
         var seen = Set(append ? tracks.map(\.id) : [])
         let unique = incoming.filter { seen.insert($0.id).inserted }
-        tracks = append ? tracks + unique : unique
-        if let lists = page["playlists"] as? [[String: Any]] { playlists = lists.compactMap(LibraryPlaylist.init) }
+        let nextTracks = append ? tracks + unique : unique
+        if nextTracks != tracks { tracks = nextTracks }
+        if let lists = page["playlists"] as? [[String: Any]] {
+            let parsed = lists.compactMap(LibraryPlaylist.init)
+            if parsed != playlists { playlists = parsed }
+        }
         if let limit = NativeMusicImportPolicy.integer(page["max_upload_bytes"]), limit > 0, limit <= 256 * 1024 * 1024 { maxUpload = limit }
         if let limit = NativeMusicImportPolicy.integer(page["max_archive_upload_bytes"]), limit > 0, limit <= NativeMusicImportPolicy.maximumArchiveBytes { maxArchiveUpload = limit }
         else { maxArchiveUpload = maxUpload }
-        libraryHasMore = page["has_more"] as? Bool == true
+        let more = page["has_more"] as? Bool == true
+        if libraryHasMore != more { libraryHasMore = more }
         libraryNextOffset = page["next_offset"] as? Int
     }
     func refresh() async {
@@ -260,7 +278,12 @@ import UIKit
             try Task.checkCancellation()
             guard libraryRequest == request else { return }
             devices = (bootstrap["sources"] as? [[String: Any]] ?? []).compactMap(NativeDevice.init)
-            let library = try await api.request(libraryPath(offset: 0, query: libraryQuery, favorite: libraryFavorite), method: "GET", body: nil)
+            // Refresh every row already loaded instead of replacing a long
+            // library with page one. This also removes deleted tail rows and
+            // keeps has_more/next_offset aligned with the server.
+            let refreshLimit = min(2000, max(libraryPageSize, tracks.count))
+            let library = try await api.request(libraryPath(offset: 0, query: libraryQuery, favorite: libraryFavorite,
+                                                           limit: refreshLimit), method: "GET", body: nil)
             try Task.checkCancellation()
             guard libraryRequest == request else { return }
             applyLibraryPage(library, append: false)
@@ -490,7 +513,8 @@ import UIKit
     private func adoptPlayers(_ next: [RemotePlayer]) {
         let changed = next.count != players.count || zip(next, players).contains { lhs, rhs in
             lhs.id != rhs.id || lhs.online != rhs.online || lhs.available != rhs.available
-                || lhs.trackID != rhs.trackID || lhs.state != rhs.state || lhs.outputID != rhs.outputID || lhs.error != rhs.error
+                || lhs.trackID != rhs.trackID || lhs.state != rhs.state || lhs.outputID != rhs.outputID
+                || lhs.mediaTransport != rhs.mediaTransport || lhs.error != rhs.error
         }
         if changed { players = next }
         let source = changed ? next : players
@@ -542,21 +566,53 @@ import UIKit
         return parts.url!.absoluteString
     }
     func artwork(_ id: Int) async -> UIImage? {
-        if let image = imageCache.object(forKey: NSNumber(value: id)) { return image }
+        let key = NSNumber(value: id)
+        let revision = artworkRevision
+        if let image = imageCache.object(forKey: key) { return image }
         if missingArtwork.contains(id) { return nil }
         do {
-            guard let data = try await api.artwork(trackID: id), let image = UIImage(data: data) else { missingArtwork.insert(id); return nil }
-            imageCache.setObject(image, forKey: NSNumber(value: id), cost: data.count); return image
+            guard let data = try await api.artwork(trackID: id), let image = UIImage(data: data) else {
+                if artworkRevision == revision { missingArtwork.insert(id) }
+                return nil
+            }
+            // A cover invalidated mid-flight must not be written back as the new one.
+            guard artworkRevision == revision else { return imageCache.object(forKey: key) }
+            imageCache.setObject(image, forKey: key, cost: data.count)
+            return image
         } catch { return nil }
     }
+    func replaceArtwork(_ id: Int, jpeg: Data) async throws {
+        guard id > 0, !jpeg.isEmpty, jpeg.count <= NativeArtworkUploadPolicy.maximumUploadBytes,
+              let image = UIImage(data: jpeg) else { throw OwnerAPIError.invalidResponse }
+        let response = try await api.upload("/api/mini/music/tracks/\(id)/artwork", data: jpeg,
+                                            headers: ["Content-Type": "image/jpeg"])
+        guard let receipt = response["artwork"] as? [String: Any], receipt["source"] as? String == "owner",
+              receipt["content_type"] as? String == "image/jpeg" else { throw OwnerAPIError.invalidResponse }
+        imageCache.setObject(image, forKey: NSNumber(value: id), cost: jpeg.count)
+        missingArtwork.remove(id)
+        artworkRevision &+= 1
+        if currentID == id { audio.setNowPlayingArtwork(image, for: id) }
+        notice = "Обложка обновлена."
+    }
     func applyEnrichedTrack(_ response: [String: Any]) {
-        guard let value = response["track"] as? [String: Any], let track = LibraryTrack(value) else { return }
+        guard let value = response["track"] as? [String: Any], var track = LibraryTrack(value) else { return }
+        let previous = knownTracks[track.id] ?? tracks.first(where: { $0.id == track.id }) ?? queue.first(where: { $0.id == track.id })
+        if let previous {
+            // A partial payload must not replace the song the player is already showing.
+            if value["title"] as? String == nil { track.title = previous.title }
+            if value["artist"] as? String == nil { track.artist = previous.artist }
+            if value["album"] as? String == nil { track.album = previous.album }
+            if value["duration"] as? NSNumber == nil { track.duration = previous.duration }
+            if value["favorite"] as? Bool == nil { track.favorite = previous.favorite }
+            if value["mime"] as? String == nil { track.mime = previous.mime }
+            if value["filename"] as? String == nil { track.filename = previous.filename }
+        }
         knownTracks[track.id] = track
-        for index in tracks.indices where tracks[index].id == track.id { tracks[index] = track }
-        for index in queue.indices where queue[index].id == track.id { queue[index] = track }
-        for index in baseQueue.indices where baseQueue[index].id == track.id { baseQueue[index] = track }
+        if let index = tracks.firstIndex(where: { $0.id == track.id }), tracks[index] != track { tracks[index] = track }
+        if let index = queue.firstIndex(where: { $0.id == track.id }), queue[index] != track { queue[index] = track }
+        if let index = baseQueue.firstIndex(where: { $0.id == track.id }), baseQueue[index] != track { baseQueue[index] = track }
         imageCache.removeObject(forKey: NSNumber(value: track.id)); missingArtwork.remove(track.id)
-        artworkRevision += 1
+        artworkRevision &+= 1
     }
     func enrichTrack(_ id: Int, refresh: Bool = false) async throws -> [String: Any] {
         let response = try await api.request("/api/mini/music/tracks/\(id)/enrichment", method: "POST", body: ["refresh": refresh])
@@ -573,7 +629,23 @@ import UIKit
     // Only successful owner mutations call this. Applying a GET response must
     // not invalidate its own lyrics request and create a reload loop.
     func invalidateLyrics() { lyricsRevision &+= 1 }
-    func clearArtworkCache() { imageCache.removeAllObjects(); missingArtwork.removeAll(); artworkBytes = 0; notice = "Кэш обложек очищен. Скачанная музыка не затронута." }
+    /// Keeps watching a PC transcription after the song sheet closes, then refreshes lyrics once.
+    private var transcriptionFollow: PCTranscriptionModel?
+    func followPCTranscription(trackID: Int) {
+        transcriptionFollow?.stop()
+        let model = PCTranscriptionModel()
+        transcriptionFollow = model
+        model.start(api: api, trackID: trackID, notifyIfAlreadyDone: true) { [weak self] in
+            guard let self else { return }
+            self.lyrics.invalidate(trackID)
+            self.invalidateLyrics()
+        }
+    }
+    func clearArtworkCache() {
+        imageCache.removeAllObjects(); missingArtwork.removeAll(); artworkBytes = 0
+        artworkRevision &+= 1
+        notice = "Кэш обложек очищен. Скачанная музыка не затронута."
+    }
     func playOffline(_ track: DownloadedTrack) {
         var seen = Set<Int>()
         baseQueue = (audio.downloads + audio.cachedTracks.map(\.track)).filter { seen.insert($0.id).inserted }.map(LibraryTrack.init)
@@ -804,6 +876,7 @@ import UIKit
         if device.hasPrefix("agent:") {
             lanOffer?.stop()
             lanOffer = nil
+            transferStatus = "Проверяю локальную сеть…"; transferProgress = 0.03
             if let file = audio.analysisFile(chosenID) {
                 let offer = NativeLanOffer()
                 if let started = await offer.start(file: file, trackID: chosenID) {
@@ -811,7 +884,12 @@ import UIKit
                     body["lan_host"] = started.host
                     body["lan_port"] = started.port
                     body["lan_token"] = started.token
+                    transferStatus = "Локальная сеть найдена. Подключаю ПК…"; transferProgress = 0.06
+                } else {
+                    transferStatus = "Подключаю ПК через сервер…"; transferProgress = 0.06
                 }
+            } else {
+                transferStatus = "Трек не скачан на iPhone · подключаю через сервер…"; transferProgress = 0.06
             }
         }
         try Task.checkCancellation()

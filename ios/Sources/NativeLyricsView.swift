@@ -34,9 +34,12 @@ struct NativeLyrics: Equatable {
         sourceURL = Self.provenanceURL(value["source_url"] as? String, source: source)
         let enrichment = response["enrichment"] as? [String: Any] ?? [:]
         let statusValue = value["status"] as? String ?? enrichment["status"] as? String ?? ""
-        status = ["matched", "candidate", "ambiguous", "not_found", "insufficient_metadata", "unavailable", "rate_limited", "instrumental"].contains(statusValue) ? statusValue : ""
+        status = ["synced", "plain", "transcribed", "matched", "candidate", "ambiguous", "not_found", "insufficient_metadata", "unavailable", "rate_limited", "instrumental"].contains(statusValue) ? statusValue : ""
         let parsed = (value["lines"] as? [[String: Any]] ?? []).prefix(2000).compactMap { row -> (Double, String)? in
-            guard let number = row["time"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+            // The editing endpoint uses `time`; the canonical player endpoint
+            // uses `start`/`end`. Accept both so every lyrics surface renders
+            // the exact same verified server result.
+            guard let number = (row["time"] ?? row["start"]) as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
                   number.doubleValue.isFinite, number.doubleValue >= 0, number.doubleValue <= 86_400,
                   let text = row["text"] as? String else { return nil }
             return (number.doubleValue, String(text.prefix(2000)))
@@ -130,6 +133,7 @@ struct NativeLyricsFollowing: Equatable {
     @Environment(\.scenePhase) private var scenePhase
     @AccessibilityFocusState private var focusedLine: Int?
     @State private var lyrics: NativeLyrics?
+    @State private var lyricsTrackID: Int?
     @State private var error: String?
     @State private var retry = 0
     @State private var showInformation = false
@@ -152,13 +156,26 @@ struct NativeLyricsFollowing: Equatable {
                 ProgressView("Ищем текст песни…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }.task(id: "\(trackID)-\(retry)-\(store.lyricsRevision)") {
-            lyrics = nil; error = nil; following.resume(); focusedLine = nil; activeLine = nil
+            // A new song clears the previous text. A transcription refresh keeps
+            // the title, cover and lines already on screen until the new payload arrives.
+            let requested = trackID
+            if lyricsTrackID != requested {
+                lyrics = nil; error = nil; lyricsTrackID = requested
+                following.resume(); focusedLine = nil; activeLine = nil
+            } else if lyrics == nil {
+                // A retry must leave the error screen while the replacement
+                // request is in flight. Existing lyrics stay visible on refresh.
+                error = nil
+            }
             do {
-                let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "GET", body: nil)
-                try Task.checkCancellation(); lyrics = NativeLyrics(response)
+                let response = try await store.api.request("/api/mini/music/tracks/\(requested)/timed-lyrics", method: "GET", body: nil)
+                try Task.checkCancellation()
+                guard requested == trackID else { return }
+                lyrics = NativeLyrics(response)
+                error = nil
                 store.applyEnrichedTrack(response)
             } catch is CancellationError { }
-            catch { if !Task.isCancelled { self.error = error.localizedDescription } }
+            catch { if !Task.isCancelled && lyrics == nil { self.error = error.localizedDescription } }
         }.sheet(isPresented: $showInformation, onDismiss: { retry += 1 }) {
             NavigationStack {
                 NativeEnrichmentView(store: store, trackID: trackID).toolbar {

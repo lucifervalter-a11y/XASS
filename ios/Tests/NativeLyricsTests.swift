@@ -28,6 +28,14 @@ final class NativeLyricsTests: XCTestCase {
         XCTAssertNil(lyrics.activeLine(at: 1))
         XCTAssertNil(lyrics.activeLine(at: .nan))
     }
+    func testCanonicalTimedLyricsContractUsesStartAndKeepsStatus() {
+        let lyrics = NativeLyrics(["lyrics": ["status": "synced", "source": "lrclib", "synced": true,
+            "text": "First\nSecond", "lines": [["start": 1.25, "end": 3.0, "text": "First"],
+                                                    ["start": 3.0, "end": 6.0, "text": "Second"]]]])
+        XCTAssertEqual(lyrics.status, "synced")
+        XCTAssertEqual(lyrics.lines.map(\.time), [1.25, 3.0])
+        XCTAssertEqual(lyrics.activeLine(at: 3.5), 1)
+    }
     func testEmptyTimedMarkersEndVocalLinesWithoutRenderingOrSeekingBlankRows() {
         let lyrics = timed([["time": 0, "text": "Vocal"], ["time": 3, "text": " "],
                             ["time": 6, "text": "Next"], ["time": 6, "text": "Translation"],

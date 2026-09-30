@@ -3,13 +3,163 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#000000">
-  <title>XASS — нет связи</title>
+  <meta name="theme-color" content="#080b12">
+  <title>XASS — проверка подключения</title>
   <style>
-    :root{color-scheme:dark;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#000;color:#f4f7ff}
-    *{box-sizing:border-box}body{min-height:100dvh;margin:0;display:grid;place-items:center;padding:calc(28px + env(safe-area-inset-top)) 24px calc(28px + env(safe-area-inset-bottom));background:radial-gradient(circle at 50% 0,rgba(47,93,210,.2),transparent 42%),#000}
-    main{width:min(420px,100%);border:1px solid #25314a;border-radius:18px;padding:28px;background:#080b11;box-shadow:0 30px 90px rgba(0,0,0,.55)}img{width:72px;height:72px}h1{margin:22px 0 9px;font-size:30px;letter-spacing:-.045em}p{color:#9ca7ba;line-height:1.6}button{width:100%;margin-top:18px;border:1px solid #376dff;border-radius:11px;background:#376dff;color:#fff;min-height:46px;font-weight:650}
+    :root{color-scheme:dark;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#05070b;color:#f5f7ff}
+    *{box-sizing:border-box}
+    body{min-height:100dvh;margin:0;padding:calc(22px + env(safe-area-inset-top)) 18px calc(22px + env(safe-area-inset-bottom));display:grid;place-items:center;background:radial-gradient(circle at 50% -10%,rgba(69,102,255,.23),transparent 41%),#05070b}
+    main{width:min(460px,100%)}
+    .card{overflow:hidden;border:1px solid #27344b;border-radius:24px;background:linear-gradient(155deg,rgba(13,18,29,.98),rgba(6,9,15,.98));box-shadow:0 28px 90px rgba(0,0,0,.55)}
+    .content{padding:26px 26px 22px}
+    .brand{display:flex;align-items:center;gap:12px;margin-bottom:28px}.brand img{width:52px;height:52px;border-radius:14px}.brand strong{font-size:18px}.brand span{display:block;margin-top:3px;color:#77849a;font-size:12px}
+    .status-icon{width:48px;height:48px;margin-bottom:18px;display:grid;place-items:center;border:1px solid rgba(119,149,255,.28);border-radius:16px;background:rgba(73,108,255,.12);color:#86a3ff}.status-icon svg{width:24px;height:24px}
+    .eyebrow{margin:0 0 8px;color:#829fff;font-size:11px;font-weight:750;letter-spacing:.13em;text-transform:uppercase}
+    h1{margin:0;font-size:clamp(25px,7vw,34px);line-height:1.08;letter-spacing:-.04em;text-wrap:balance}
+    .summary{min-height:50px;margin:13px 0 0;color:#aab4c6;font-size:15px;line-height:1.55}
+    .advice{margin:20px 0 0;padding:15px 16px;border:1px solid #202c40;border-radius:15px;background:#0c111b;color:#bdc7d8;font-size:13px;line-height:1.5}.advice strong{color:#eef2ff}.advice[hidden]{display:none}
+    .host-row{display:flex;align-items:center;gap:10px;margin-top:20px;padding:11px 12px 11px 15px;border:1px solid #202c40;border-radius:14px;background:#090d14}.host-meta{min-width:0;flex:1}.host-meta span{display:block;margin-bottom:3px;color:#758197;font-size:11px}.host-meta code{display:block;overflow:hidden;color:#dce4f6;font:600 13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}
+    button{border:0;font:inherit;cursor:pointer}.copy-host{flex:0 0 auto;padding:8px 10px;border-radius:9px;background:#172033;color:#aebee5;font-size:12px;font-weight:650}.copy-host:hover{background:#202c43;color:#fff}
+    .actions{display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:20px}.retry{min-height:48px;padding:0 18px;border-radius:13px;background:#4c6fff;color:#fff;font-size:14px;font-weight:750;box-shadow:0 12px 32px rgba(76,111,255,.2)}.retry:hover{background:#5c7bff}.retry:active{transform:translateY(1px)}.copy-report{min-width:48px;padding:0 14px;border:1px solid #293650;border-radius:13px;background:#111725;color:#c9d4e9;font-size:13px;font-weight:650}
+    .feedback{min-height:18px;margin:11px 2px 0;color:#7f8da4;font-size:12px}
+    details{border-top:1px solid #1b2537;background:rgba(3,6,11,.32);color:#7f8ba0;font-size:12px}summary{padding:15px 26px;cursor:pointer;list-style:none}summary::-webkit-details-marker{display:none}summary::after{content:'+';float:right;color:#8998b1}details[open] summary::after{content:'−'}pre{max-height:136px;margin:0;padding:0 26px 18px;overflow:auto;color:#9aa8be;font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+    @media (max-width:380px){body{padding-inline:12px}.content{padding:22px 20px 18px}.actions{grid-template-columns:1fr}.copy-report{min-height:44px}summary,pre{padding-inline:20px}}
+    @media (prefers-reduced-motion:no-preference){.card{animation:appear .35s ease-out both}.status-icon{animation:pulse 2.4s ease-in-out infinite}@keyframes appear{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes pulse{50%{border-color:rgba(119,149,255,.5);background:rgba(73,108,255,.18)}}}
   </style>
 </head>
-<body><main><img src="/assets/xass-app-icon-192.png" alt="XASS"><h1>XASS сейчас без сети.</h1><p>Для входа и управления устройствами нужен интернет. Проверьте подключение и повторите попытку.</p><button type="button" onclick="location.reload()">Повторить подключение</button></main></body>
+<body>
+  <main>
+    <section class="card" aria-labelledby="connectionTitle">
+      <div class="content">
+        <div class="brand"><img src="/assets/xass-app-icon-192.png" alt=""><div><strong>XASS</strong><span>Центр управления</span></div></div>
+        <div class="status-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 8.5a11.5 11.5 0 0 1 16 0M7.4 12a6.7 6.7 0 0 1 9.2 0M10.6 15.5a2.2 2.2 0 0 1 2.8 0"/><circle cx="12" cy="19" r="1" fill="currentColor" stroke="none"/></svg></div>
+        <p class="eyebrow" id="connectionLabel">Проверка подключения</p>
+        <h1 id="connectionTitle">Проверяем связь с XASS</h1>
+        <p class="summary" id="connectionSummary">Определяем, пропал интернет или именно сервер недоступен с этого устройства.</p>
+        <div class="advice" id="desktopAdvice" hidden><strong>На ПК:</strong> временно отключите VPN или добавьте <span data-host>redvps.site</span> в обход VPN. Если сеть только что переключилась, переподключите VPN и повторите.</div>
+        <div class="host-row"><div class="host-meta"><span>Адрес сервера</span><code data-host>redvps.site</code></div><button class="copy-host" id="copyHost" type="button">Копировать</button></div>
+        <div class="actions"><button class="retry" id="retryConnection" type="button">Повторить подключение</button><button class="copy-report" id="copyReport" type="button" aria-label="Копировать диагностику">Диагностика</button></div>
+        <p class="feedback" id="copyFeedback" role="status" aria-live="polite"></p>
+      </div>
+      <details><summary>Технические сведения</summary><pre id="diagnosticPreview">Проверка ещё выполняется…</pre></details>
+    </section>
+  </main>
+  <script>
+    'use strict';
+    const byId = id => document.getElementById(id);
+    const serverHost = location.hostname || 'redvps.site';
+    const diagnosticState = {kind: 'checking', healthStatus: null, error: '', checkedAt: ''};
+
+    function classifyConnection({online, healthStatus = null, healthError = ''}) {
+      if (!online) return {
+        kind: 'offline', label: 'Нет подключения', title: 'На устройстве нет интернета',
+        summary: 'Подключитесь к Wi‑Fi или мобильной сети, затем повторите попытку.', desktopAdvice: false
+      };
+      if (healthStatus !== null && healthStatus >= 200 && healthStatus < 400) return {
+        kind: 'recovered', label: 'Связь восстановлена', title: 'XASS снова доступен',
+        summary: 'Сервер отвечает. Нажмите кнопку ниже, чтобы вернуться в приложение.', desktopAdvice: false
+      };
+      if (healthStatus !== null) return {
+        kind: 'server', label: 'Ошибка сервера', title: 'Сервер XASS временно недоступен',
+        summary: `Сервер доступен по сети, но вернул ошибку HTTP ${healthStatus}. Повторите попытку чуть позже.`, desktopAdvice: false
+      };
+      const isWindows = /Windows|Win32|Win64/i.test(`${navigator.userAgent || ''} ${navigator.platform || ''}`);
+      return {
+        kind: 'route', label: 'Сбой подключения', title: isWindows ? 'Этот ПК не может открыть XASS' : 'Не удаётся открыть XASS',
+        summary: isWindows
+          ? 'Windows видит сеть, но защищённое соединение с сервером не устанавливается. Обычно причина — VPN, DNS или проверка HTTPS.'
+          : 'Устройство видит сеть, но не получает ответ от XASS. Возможна проблема с VPN, DNS или защищённым соединением.',
+        desktopAdvice: isWindows && Boolean(healthError)
+      };
+    }
+
+    function cleanError(error) {
+      const value = String(error && (error.name || error.message) || 'connection_failed');
+      return value.replace(/[\r\n\t]+/g, ' ').slice(0, 120);
+    }
+
+    function diagnosticsText() {
+      return [
+        'XASS connection diagnostics',
+        `time_utc: ${diagnosticState.checkedAt || new Date().toISOString()}`,
+        `server: ${serverHost}`,
+        `page: ${location.pathname}`,
+        `browser_online: ${navigator.onLine !== false}`,
+        `result: ${diagnosticState.kind}`,
+        `health_status: ${diagnosticState.healthStatus === null ? 'no_response' : diagnosticState.healthStatus}`,
+        `error: ${diagnosticState.error || 'none'}`,
+        `platform: ${navigator.platform || 'unknown'}`,
+        `language: ${navigator.language || 'unknown'}`,
+        `user_agent: ${navigator.userAgent || 'unknown'}`
+      ].join('\n');
+    }
+
+    function renderConnection(result) {
+      diagnosticState.kind = result.kind;
+      byId('connectionLabel').textContent = result.label;
+      byId('connectionTitle').textContent = result.title;
+      byId('connectionSummary').textContent = result.summary;
+      byId('desktopAdvice').hidden = !result.desktopAdvice;
+      byId('retryConnection').textContent = result.kind === 'recovered' ? 'Вернуться в XASS' : 'Повторить подключение';
+      byId('diagnosticPreview').textContent = diagnosticsText();
+    }
+
+    async function diagnoseConnection() {
+      diagnosticState.checkedAt = new Date().toISOString();
+      diagnosticState.healthStatus = null;
+      diagnosticState.error = '';
+      if (navigator.onLine === false) {
+        renderConnection(classifyConnection({online: false}));
+        return diagnosticState.kind;
+      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6500);
+      try {
+        const response = await fetch(`/health?connectivity_check=${Date.now()}`, {
+          method: 'GET', cache: 'no-store', credentials: 'same-origin', headers: {'Accept': 'application/json'}, signal: controller.signal
+        });
+        diagnosticState.healthStatus = response.status;
+        renderConnection(classifyConnection({online: true, healthStatus: response.status}));
+      } catch (error) {
+        diagnosticState.error = cleanError(error);
+        renderConnection(classifyConnection({online: true, healthError: diagnosticState.error}));
+      } finally {
+        clearTimeout(timeout);
+      }
+      return diagnosticState.kind;
+    }
+
+    async function copyText(value) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+          return true;
+        }
+      } catch (error) {}
+      const field = document.createElement('textarea');
+      field.value = value;
+      field.setAttribute('readonly', '');
+      field.style.position = 'fixed';
+      field.style.opacity = '0';
+      document.body.appendChild(field);
+      field.select();
+      let copied = false;
+      try { copied = document.execCommand('copy'); } catch (error) {}
+      field.remove();
+      return copied;
+    }
+
+    function showCopyFeedback(message) {
+      byId('copyFeedback').textContent = message;
+    }
+
+    document.querySelectorAll('[data-host]').forEach(node => { node.textContent = serverHost; });
+    byId('retryConnection').addEventListener('click', () => location.reload());
+    byId('copyHost').addEventListener('click', async () => showCopyFeedback(await copyText(serverHost) ? `Адрес ${serverHost} скопирован.` : `Адрес сервера: ${serverHost}`));
+    byId('copyReport').addEventListener('click', async () => showCopyFeedback(await copyText(diagnosticsText()) ? 'Диагностика скопирована. Её можно отправить в поддержку.' : 'Не удалось скопировать. Раскройте технические сведения ниже.'));
+    window.addEventListener('online', diagnoseConnection);
+    window.addEventListener('offline', () => { diagnosticState.checkedAt = new Date().toISOString(); renderConnection(classifyConnection({online: false})); });
+    diagnoseConnection();
+  </script>
+</body>
 </html>

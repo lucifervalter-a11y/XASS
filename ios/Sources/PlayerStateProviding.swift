@@ -6,10 +6,35 @@ struct TimedLyricLine: Equatable {
     var start: TimeInterval
     var end: TimeInterval
     var text: String
+    /// Optional verified translation supplied with this exact timed row.
+    /// XASS never guesses that a simultaneous duet line is a translation.
+    var translation: String?
+    /// Optional provider pronunciation. When absent the UI may offer an
+    /// on-device Foundation transliteration without sending lyrics anywhere.
+    var pronunciation: String?
+
+    init(start: TimeInterval, end: TimeInterval, text: String,
+         translation: String? = nil, pronunciation: String? = nil) {
+        self.start = start; self.end = end; self.text = text
+        self.translation = translation; self.pronunciation = pronunciation
+    }
 }
 
 struct TimedLyrics: Equatable {
     var lines: [TimedLyricLine]
+
+    var hasTranslation: Bool {
+        lines.contains { $0.translation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+    }
+    var hasPronunciation: Bool {
+        lines.contains {
+            $0.pronunciation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+                $0.text.unicodeScalars.contains { scalar in
+                    guard CharacterSet.letters.contains(scalar) else { return false }
+                    return !(65...90).contains(scalar.value) && !(97...122).contains(scalar.value)
+                }
+        }
+    }
 
     init(lines: [TimedLyricLine]) { self.lines = lines }
 
@@ -32,6 +57,24 @@ struct TimedLyrics: Equatable {
             if lines[middle].start <= position { lower = middle + 1 } else { upper = middle }
         }
         return lower > 0 ? lower - 1 : nil
+    }
+
+    /// The vocal row immediately before a real instrumental gap. A gap is
+    /// deliberately separate from `index(at:)`: during it no lyric is marked
+    /// as sung and the player can show the familiar animated ellipsis.
+    func pauseAfterIndex(at position: TimeInterval, minimumGap: TimeInterval = 1.5) -> Int? {
+        guard position.isFinite, minimumGap.isFinite, minimumGap >= 0, lines.count > 1 else { return nil }
+        var lower = 0, upper = lines.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if lines[middle].start <= position { lower = middle + 1 } else { upper = middle }
+        }
+        let previous = lower - 1
+        guard lines.indices.contains(previous), lines.indices.contains(previous + 1) else { return nil }
+        let gapStart = max(lines[previous].start, lines[previous].end)
+        let gapEnd = lines[previous + 1].start
+        guard gapEnd - gapStart >= minimumGap, position >= gapStart, position < gapEnd else { return nil }
+        return previous
     }
 }
 

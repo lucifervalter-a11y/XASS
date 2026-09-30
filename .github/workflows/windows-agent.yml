@@ -4,24 +4,30 @@ permissions:
   contents: write
 
 on:
-  push:
+  workflow_run:
+    workflows: [Tests and interface contracts]
+    types: [completed]
     branches: [main]
-    paths:
-      - "pc_client/**"
-      - "app/services/agent_installer.py"
-      - ".github/workflows/windows-agent.yml"
   workflow_dispatch:
 
 concurrency:
-  group: xass-windows-agent
+  group: xass-windows-agent-${{ github.event_name == 'workflow_run' && 'main' || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -46,11 +52,18 @@ jobs:
 
   deploy-installer:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/download-artifact@v4
         with:
           name: xass-windows-installer
@@ -83,7 +96,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
-        run: bash deploy/github_ssh.sh upload '${{ github.sha }}'
+        run: bash deploy/github_ssh.sh upload '${{ github.event.workflow_run.head_sha }}'
       - name: Activate and verify immutable installer
         shell: bash
         env:
@@ -96,11 +109,11 @@ jobs:
             set -e
             cd /home/red/serverredus
             for attempt in $(seq 1 120); do
-              if test -f deploy/publish_installer.py && test "$(git rev-parse HEAD)" = '${{ github.sha }}'; then break; fi
+              if test -f deploy/publish_installer.py && test "$(git rev-parse HEAD)" = '${{ github.event.workflow_run.head_sha }}'; then break; fi
               sleep 2
             done
-            test "$(git rev-parse HEAD)" = '${{ github.sha }}' || { echo 'Matching backend revision is not deployed; installer kept in staging.'; exit 1; }
-            .venv/bin/python deploy/publish_installer.py --staging-dir 'data/releases/.incoming-${{ github.sha }}' --expected-revision '${{ github.sha }}'
+            test "$(git rev-parse HEAD)" = '${{ github.event.workflow_run.head_sha }}' || { echo 'Matching backend revision is not deployed; installer kept in staging.'; exit 1; }
+            .venv/bin/python deploy/publish_installer.py --staging-dir 'data/releases/.incoming-${{ github.event.workflow_run.head_sha }}' --expected-revision '${{ github.event.workflow_run.head_sha }}'
             .venv/bin/python - <<'PY'
             import hashlib, json, os, time, urllib.parse
             import httpx
@@ -139,9 +152,19 @@ jobs:
 
   publish-release:
     needs: [build, deploy-installer]
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: xass-windows-installer
@@ -150,6 +173,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: agent-latest
+          target_commitish: ${{ github.event.workflow_run.head_sha }}
           name: XASS for Windows — latest stable
           body: |
             Автоматически собранный стабильный установщик XASS для Windows.
@@ -159,3 +183,14 @@ jobs:
             release/XASS-Setup.json
           overwrite_files: true
           fail_on_unmatched_files: true
+      - name: Point the latest Windows tag at the verified release
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          git tag --force agent-latest "$RELEASE_SHA"
+          git push --force origin refs/tags/agent-latest
+          remote_sha="$(git ls-remote --refs origin refs/tags/agent-latest | awk '{print $1}')"
+          test "$remote_sha" = "$RELEASE_SHA"

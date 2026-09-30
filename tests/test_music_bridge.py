@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import httpx
@@ -101,6 +102,97 @@ class MusicBridgeTests(unittest.TestCase):
         self.assertEqual(self.player.calls[-1][1], {"volume": 15})
         with self.assertRaises(MusicError):
             music_bridge.send_command("music_play", root=self.root)
+
+    def test_lyrics_travel_in_status_and_cover_stays_a_local_jpeg(self):
+        import io
+        from PIL import Image
+        token, port = self.token_and_port()
+        response = httpx.post(
+            f"http://127.0.0.1:{port}/command",
+            headers={music_bridge.HEADER: token, "Content-Type": "application/json"},
+            content=b'{"command":"music_status"}',
+            trust_env=False, follow_redirects=False, timeout=2,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("lyrics", response.json()["player"])
+        music_bridge.stop_music_bridge()
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4), "#c495f4").save(buffer, format="JPEG")
+        picture = buffer.getvalue()
+        self.player.presentation = lambda: {"lyrics": "Куплет\nПрипев", "artwork": picture, "url": "http://secret.example/art"}
+        music_bridge.write_playback(self.player, self.root)
+        status = json.loads((self.root / music_bridge.STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(status["lyrics"], "Куплет\nПрипев")
+        self.assertEqual(status["cover_sha256"], music_bridge.hashlib.sha256(picture).hexdigest())
+        self.assertNotIn("artwork", status)
+        self.assertNotIn("url", status)
+        self.assertNotIn("token", json.dumps(status))
+        self.assertEqual(music_bridge.read_cover(self.root), picture)
+        self.player.presentation = lambda: {"lyrics": "е" * 9000, "artwork": b"GIF89a-not-a-jpeg"}
+        music_bridge.write_playback(self.player, self.root)
+        status = json.loads((self.root / music_bridge.STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(len(status["lyrics"]), 8000)
+        self.assertEqual(status["cover_sha256"], "")
+        self.assertEqual(music_bridge.read_cover(self.root), b"")
+
+    def test_cover_is_published_before_status_and_only_matching_digest_is_read(self):
+        import io
+        from PIL import Image
+
+        def jpeg(color: str) -> bytes:
+            buffer = io.BytesIO()
+            Image.new("RGB", (9, 7), color).save(buffer, format="JPEG", quality=91)
+            return buffer.getvalue()
+
+        first, second = jpeg("#829cff"), jpeg("#c495f4")
+        self.player.presentation = lambda: {"lyrics": "", "artwork": first}
+        events = []
+        real_cover = music_bridge._write_cover
+        real_status = music_bridge.atomic_write_json
+
+        def write_cover(*args, **kwargs):
+            events.append("cover")
+            return real_cover(*args, **kwargs)
+
+        def write_status(*args, **kwargs):
+            events.append("status")
+            return real_status(*args, **kwargs)
+
+        with patch.object(music_bridge, "_write_cover", side_effect=write_cover), patch.object(
+            music_bridge, "atomic_write_json", side_effect=write_status
+        ):
+            music_bridge.write_playback(self.player, self.root)
+        self.assertEqual(events, ["cover", "status"])
+
+        old_status = music_bridge.read_playback(self.root)
+        old_digest = old_status["cover_sha256"]
+        self.assertEqual(music_bridge.read_cover(self.root, expected_sha256=old_digest), first)
+
+        # This is the short publish window between the new cover and new status.
+        second_digest = music_bridge.hashlib.sha256(second).hexdigest()
+        music_bridge._write_cover(self.root, second, second_digest)
+        self.assertEqual(music_bridge.read_cover(self.root, expected_sha256=old_digest), b"")
+        self.assertEqual(music_bridge.read_cover(self.root, expected_sha256=second_digest), second)
+        self.assertEqual(music_bridge.read_cover(self.root, expected_sha256="not-a-digest"), b"")
+
+    def test_cover_writer_does_not_reuse_the_old_predictable_temporary_name(self):
+        import io
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4), "#829cff").save(buffer, format="JPEG")
+        picture = buffer.getvalue()
+        legacy = self.root / (
+            f".{music_bridge.COVER_NAME}.{music_bridge.os.getpid()}."
+            f"{music_bridge.threading.get_ident()}.tmp"
+        )
+        legacy.write_bytes(b"must-not-be-opened-or-replaced")
+
+        digest = music_bridge.hashlib.sha256(picture).hexdigest()
+        music_bridge._write_cover(self.root, picture, digest)
+
+        self.assertEqual(legacy.read_bytes(), b"must-not-be-opened-or-replaced")
+        self.assertEqual(music_bridge.read_cover(self.root, expected_sha256=digest), picture)
 
 
 if __name__ == "__main__":

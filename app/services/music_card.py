@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -299,6 +299,7 @@ async def _itunes_search(
     try:
         response = await client.get(
             ITUNES_SEARCH_URL,
+            headers={"Accept": "application/json", "Accept-Encoding": "identity"},
             params={
                 "term": clean_term,
                 "entity": entity,
@@ -306,6 +307,9 @@ async def _itunes_search(
             },
         )
         response.raise_for_status()
+        declared = response.headers.get("content-length")
+        if (declared and declared.isdigit() and int(declared) > 512 * 1024) or len(response.content) > 512 * 1024:
+            return []
         payload = response.json()
     except Exception:
         return []
@@ -315,6 +319,77 @@ async def _itunes_search(
     if not isinstance(results, list) or not results:
         return []
     return [item for item in results if isinstance(item, dict)]
+
+
+def _safe_catalog_url(value: Any, hosts: tuple[str, ...]) -> str:
+    raw = _clean_text(value)
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return ""
+    if not any(host == suffix or host.endswith("." + suffix) for suffix in hosts):
+        return ""
+    return raw[:2048]
+
+
+async def discover_music_catalog(query_text: str, *, limit: int = 20,
+                                 client: httpx.AsyncClient | None = None) -> dict:
+    """Search public catalog metadata without exposing preview/audio URLs.
+
+    Apple documents the iTunes Search API for this purpose. The response is
+    size-bounded, metadata-only and contains direct catalog/search links; XASS
+    never scrapes or attempts to download protected provider audio.
+    """
+    normalized = normalize_track_input(query_text)[:240]
+    count = max(1, min(30, int(limit)))
+    if not normalized:
+        return {"query": "", "items": [], "provider": "apple_music", "audio_import_supported": False}
+    owned = client is None
+    client = client or httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=2.0), trust_env=False,
+                                         follow_redirects=False)
+    try:
+        rows = await _itunes_search(client, term=normalized, entity="song", limit=count)
+    finally:
+        if owned:
+            await client.aclose()
+    parsed_artist, parsed_title = split_artist_title(normalized)
+    query_tokens = _tokenize(normalized)
+    ranked = sorted(rows, key=lambda row: _score_song_candidate(
+        candidate=row, query_text=normalized, query_tokens=query_tokens,
+        parsed_artist_tokens=_tokenize(parsed_artist), parsed_title_tokens=_tokenize(parsed_title),
+        artist_title_hints=[]), reverse=True)
+    items, seen = [], set()
+    for row in ranked:
+        title = _clean_text(row.get("trackName"))[:240]
+        artist = _clean_text(row.get("artistName"))[:240]
+        album = _clean_text(row.get("collectionName"))[:240]
+        provider_id = row.get("trackId")
+        if not title or not artist or type(provider_id) is not int or provider_id <= 0:
+            continue
+        key = (artist.casefold(), title.casefold(), album.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            duration = max(0.0, min(86400.0, float(row.get("trackTimeMillis") or 0) / 1000.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        card = MusicCard(query=f"{artist} - {title}", artist=artist, title=title, album=album,
+                         artwork_url="", album_url="")
+        artwork = _safe_catalog_url(_upgrade_artwork_size(row.get("artworkUrl100")), ("mzstatic.com",))
+        catalog_url = _safe_catalog_url(row.get("trackViewUrl") or row.get("collectionViewUrl"),
+                                        ("music.apple.com", "itunes.apple.com"))
+        items.append({"provider": "apple_music", "provider_id": provider_id, "title": title,
+                      "artist": artist, "album": album, "duration": round(duration, 3),
+                      "artwork_url": artwork, "catalog_url": catalog_url,
+                      "search_links": build_search_links(card), "audio_import_supported": False})
+        if len(items) >= count:
+            break
+    return {"query": normalized, "items": items, "provider": "apple_music",
+            "audio_import_supported": False}
 
 
 async def _deezer_search_first(

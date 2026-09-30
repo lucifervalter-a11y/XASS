@@ -21,7 +21,6 @@ import struct
 import tempfile
 import time
 import unicodedata
-from urllib.parse import quote
 import zipfile
 
 import httpx
@@ -605,12 +604,14 @@ class TelegramMusicIngest:
             if known_size > limit:
                 raise IngestError("Telegram разрешает боту скачивать до 20 МБ. Используйте Музыку в Mini App")
             _require_space(target.parent, known_size or limit, self.settings.music_min_free_bytes)
-            url = self.bot.file_url.rstrip("/") + "/" + quote(remote_path, safe="/")
             timeout = httpx.Timeout(30, connect=10)
-            async with self.bot.client.stream("GET", url, timeout=timeout, follow_redirects=False,
-                                              headers={"Accept-Encoding": "identity"}) as response:
-                if response.status_code != 200:
-                    raise IngestError("Telegram пока не отдал файл. Попробуйте отправить его повторно")
+            try:
+                response = await self.bot.open_file_stream(
+                    remote_path, timeout=timeout, headers={"Accept-Encoding": "identity"},
+                )
+            except Exception:
+                raise IngestError("Telegram пока не отдал файл. Попробуйте отправить его повторно") from None
+            try:
                 if response.headers.get("content-encoding", "identity").lower() != "identity":
                     raise IngestError("Telegram вернул неподдерживаемое сжатие файла")
                 declared = response.headers.get("content-length")
@@ -626,6 +627,8 @@ class TelegramMusicIngest:
                         outgoing.write(chunk)
                 if not count or (known_size and count != known_size) or (declared and count != int(declared)):
                     raise IngestError("Telegram передал неполный файл; отправьте его повторно")
+            finally:
+                await response.aclose()
 
     def _read_receipt(self, directory: Path, keys: list[str]):
         for key in keys:

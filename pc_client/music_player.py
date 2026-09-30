@@ -34,6 +34,7 @@ MUSIC_COMMANDS = frozenset({
 SUPPORTED_FORMATS = ("mp3", "wav", "flac", "ogg")
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 MAX_DOWNLOAD_SECONDS = 120
+MAX_SERVER_ARTWORK_BYTES = 512 * 1024
 SAMPLE_RATE = 44100
 
 
@@ -51,6 +52,15 @@ def _number(value: Any, name: str, lower: float, upper: float) -> float:
     if not math.isfinite(result) or not lower <= result <= upper:
         raise MusicError(f"{name}: допустимо от {lower:g} до {upper:g}")
     return result
+
+
+def _trusted_sha256(value: Any) -> str | None:
+    """Validate an optional catalog digest without weakening legacy server playback."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        raise MusicError("Контрольная сумма трека недействительна. Запустите трек снова")
+    return value.lower()
 
 
 def approved_media_url(server_url: str, value: Any, track_id: Any) -> tuple[str, int]:
@@ -77,6 +87,38 @@ def approved_media_url(server_url: str, value: Any, track_id: Any) -> tuple[str,
     except (TypeError, ValueError, OverflowError):
         raise MusicError("Ссылка должна вести на музыку привязанного сервера XASS") from None
     return raw, int(track_id)
+
+
+def approved_artwork_url(server_url: str, value: Any, track_id: Any, media_url: str) -> str:
+    """Require the media ticket again on the exact paired artwork route."""
+    identifier = str(track_id)
+    raw = str(value or "")
+    if (isinstance(track_id, bool) or not identifier.isascii() or not identifier.isdigit()
+            or len(identifier) > 19 or not 0 < int(identifier) < 2**63
+            or len(raw) > 8192 or any(ord(char) <= 32 or ord(char) == 127 for char in raw) or "\\" in raw):
+        raise MusicError("Недопустимая ссылка на обложку")
+    try:
+        base, target, media = urlsplit(server_url), urlsplit(raw), urlsplit(media_url)
+
+        def origin(parts):
+            if parts.scheme not in {"https", "http"} or not parts.hostname or parts.username is not None or parts.password is not None:
+                raise ValueError("origin")
+            return parts.scheme, parts.hostname.lower(), parts.port or (443 if parts.scheme == "https" else 80)
+
+        if origin(base) != origin(target) or origin(target) != origin(media) or target.fragment:
+            raise ValueError("origin")
+        expected = f"{base.path.rstrip('/')}/agent/music/tracks/{int(identifier)}/artwork"
+        if target.path != expected:
+            raise ValueError("path")
+        query = parse_qs(target.query, keep_blank_values=True, strict_parsing=True)
+        media_query = parse_qs(media.query, keep_blank_values=True, strict_parsing=True)
+        if (set(query) != {"ticket"} or set(media_query) != {"ticket"}
+                or len(query["ticket"]) != 1 or query["ticket"] != media_query["ticket"]
+                or not 8 <= len(query["ticket"][0]) <= 4096):
+            raise ValueError("ticket")
+    except (TypeError, ValueError, OverflowError):
+        raise MusicError("Обложка должна принадлежать текущему треку привязанного сервера XASS") from None
+    return raw
 
 
 _LAN_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,64}\Z")
@@ -167,6 +209,352 @@ def _audio_suffix(header: bytes) -> str:
     raise MusicError("Формат не поддерживается на ПК. Используйте MP3, WAV, FLAC или OGG Vorbis")
 
 
+_TAG_SCAN = 2 * 1024 * 1024
+_ART_SCAN = 8 * 1024 * 1024
+_LYRIC_LIMIT = 8000
+
+
+def _clean_lyrics(text: str) -> str:
+    cleaned = "".join(char for char in str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+                      if char in "\n\t" or ord(char) >= 32)
+    lines = [line for line in cleaned.splitlines() if line.strip()][:2000]
+    return "\n".join(lines).strip()[:_LYRIC_LIMIT]
+
+
+def _server_lyrics(value: Any) -> str:
+    """Accept a complete bounded server presentation or ignore it entirely."""
+    if not isinstance(value, str) or not value or len(value) > _LYRIC_LIMIT:
+        return ""
+    if any(ord(character) < 32 and character not in "\n\r\t" for character in value):
+        return ""
+    cleaned = _clean_lyrics(value)
+    return cleaned if cleaned and len(cleaned) <= _LYRIC_LIMIT else ""
+
+
+def _syncsafe(data: bytes) -> int:
+    value = 0
+    for byte in data:
+        if byte & 0x80:
+            raise ValueError("syncsafe")
+        value = (value << 7) | byte
+    return value
+
+
+def _decode_encoded(encoding: int, raw: bytes) -> str:
+    raw = raw.split(b"\x00\x00" if encoding in {1, 2} else b"\x00", 1)[0]
+    try:
+        if encoding == 0:
+            return raw.decode("latin-1")
+        if encoding == 1:
+            return raw.decode("utf-16")
+        if encoding == 2:
+            return raw.decode("utf-16-be")
+        if encoding == 3:
+            return raw.decode("utf-8")
+    except UnicodeError:
+        return ""
+    return ""
+
+
+def _split_encoded(encoding: int, data: bytes, start: int) -> int:
+    if encoding in {1, 2}:
+        index = start
+        while index + 1 < len(data):
+            if data[index] == 0 and data[index + 1] == 0:
+                return index + 2
+            index += 2
+        return len(data)
+    end = data.find(b"\x00", start)
+    return len(data) if end < 0 else end + 1
+
+
+def _uslt_text(data: bytes) -> str:
+    if len(data) < 5 or data[0] > 3:
+        return ""
+    return _decode_encoded(data[0], data[_split_encoded(data[0], data, 4):])
+
+
+def _apic_bytes(data: bytes) -> bytes:
+    if len(data) < 6 or data[0] > 3:
+        return b""
+    mime_end = data.find(b"\x00", 1)
+    if not 1 <= mime_end <= 80:
+        return b""
+    if data[1:mime_end] == b"-->":
+        return b""
+    image_at = _split_encoded(data[0], data, mime_end + 2)
+    blob = data[image_at:]
+    return blob if 32 <= len(blob) <= _ART_SCAN else b""
+
+
+def _id3_notes(tag: bytes) -> tuple[str, bytes]:
+    if len(tag) < 10 or tag[:3] != b"ID3" or tag[3] not in {3, 4} or tag[5] & 0x80:
+        return "", b""
+    try:
+        tag_size = _syncsafe(tag[6:10])
+    except ValueError:
+        return "", b""
+    if tag_size > _TAG_SCAN or len(tag) < 10 + tag_size:
+        return "", b""
+    body, offset = tag[10:10 + tag_size], 0
+    version = tag[3]
+    if tag[5] & 0x40:
+        if len(body) < 4:
+            return "", b""
+        try:
+            extended = _syncsafe(body[:4]) if version == 4 else int.from_bytes(body[:4], "big")
+        except ValueError:
+            return "", b""
+        # ID3v2.3 excludes the four-byte size field from its extended-header
+        # length; ID3v2.4 includes it. Treating both versions alike lands four
+        # bytes inside the header and silently loses every following USLT/APIC.
+        if version == 3:
+            if not 6 <= extended <= len(body) - 4:
+                return "", b""
+            offset = 4 + extended
+        else:
+            if not 6 <= extended <= len(body):
+                return "", b""
+            offset = extended
+    lyrics, artwork = "", b""
+    while offset + 10 <= len(body) and not (lyrics and artwork):
+        name = body[offset:offset + 4]
+        if name == b"\x00\x00\x00\x00" or not name.isalnum():
+            break
+        try:
+            size = _syncsafe(body[offset + 4:offset + 8]) if version == 4 else int.from_bytes(body[offset + 4:offset + 8], "big")
+        except ValueError:
+            break
+        flags = int.from_bytes(body[offset + 8:offset + 10], "big")
+        offset += 10
+        if size < 0 or offset + size > len(body):
+            break
+        frame, offset = body[offset:offset + size], offset + size
+        blocked = flags & (0x00E0 if version == 3 else 0x000E)
+        if blocked:
+            continue
+        if name == b"USLT" and not lyrics:
+            lyrics = _uslt_text(frame)
+        elif name == b"APIC" and not artwork:
+            artwork = _apic_bytes(frame)
+    return lyrics, artwork
+
+
+def _picture_bytes(block: bytes) -> bytes:
+    if len(block) < 32:
+        return b""
+    mime_len = int.from_bytes(block[4:8], "big")
+    if not 0 <= mime_len <= 80 or 32 + mime_len > len(block):
+        return b""
+    if block[8:8 + mime_len] == b"-->":
+        return b""
+    offset = 8 + mime_len
+    desc_len = int.from_bytes(block[offset:offset + 4], "big")
+    offset += 4 + desc_len
+    if desc_len < 0 or desc_len > _TAG_SCAN or offset + 20 > len(block):
+        return b""
+    data_len = int.from_bytes(block[offset + 16:offset + 20], "big")
+    start = offset + 20
+    if not 32 <= data_len <= _ART_SCAN or start + data_len > len(block):
+        return b""
+    return block[start:start + data_len]
+
+
+def _vorbis_comments(data: bytes) -> tuple[str, bytes]:
+    try:
+        if len(data) < 8:
+            return "", b""
+        vendor_len = int.from_bytes(data[:4], "little")
+        offset = 4 + vendor_len
+        if not 0 <= vendor_len <= _TAG_SCAN or offset + 4 > len(data):
+            return "", b""
+        count = int.from_bytes(data[offset:offset + 4], "little")
+        offset += 4
+        if not 0 <= count <= 256:
+            return "", b""
+        lyrics, artwork = "", b""
+        for _ in range(count):
+            if offset + 4 > len(data):
+                break
+            length = int.from_bytes(data[offset:offset + 4], "little")
+            offset += 4
+            if not 0 <= length <= _TAG_SCAN or offset + length > len(data):
+                break
+            raw, offset = data[offset:offset + length], offset + length
+            key, separator, value = raw.partition(b"=")
+            if not separator:
+                continue
+            name = key.decode("ascii", "ignore").lower()
+            if name in {"lyrics", "unsyncedlyrics"} and not lyrics:
+                lyrics = value.decode("utf-8", "replace")
+            elif name == "metadata_block_picture" and not artwork:
+                import base64
+                decoded = base64.b64decode(value, validate=True)
+                artwork = _picture_bytes(decoded)
+        return lyrics, artwork
+    except (ValueError, UnicodeError):
+        return "", b""
+
+
+def _flac_notes(source) -> tuple[str, bytes]:
+    lyrics, artwork = "", b""
+    for _ in range(64):
+        header = source.read(4)
+        if len(header) < 4:
+            break
+        kind, size = header[0] & 0x7F, int.from_bytes(header[1:], "big")
+        if size > ( _ART_SCAN if kind == 6 else _TAG_SCAN):
+            break
+        block = source.read(size)
+        if len(block) != size:
+            break
+        if kind == 4:
+            text, picture = _vorbis_comments(block)
+            lyrics = lyrics or text
+            artwork = artwork or picture
+        elif kind == 6:
+            artwork = artwork or _picture_bytes(block)
+        if header[0] & 0x80:
+            break
+    return lyrics, artwork
+
+
+def _ogg_notes(blob: bytes) -> tuple[str, bytes]:
+    """Reassemble bounded Ogg packets before parsing Vorbis comments.
+
+    A comment packet commonly crosses page boundaries. Scanning raw file bytes
+    feeds the next page header and lacing table into the comment payload, so a
+    perfectly valid long lyrics/artwork tag disappears.
+    """
+    lyrics, artwork = "", b""
+    offset, pages = 0, 0
+    packet = bytearray()
+    serial = None
+    orphan = False
+    while offset + 27 <= len(blob) and pages < 256 and not (lyrics and artwork):
+        if blob[offset:offset + 4] != b"OggS" or blob[offset + 4] != 0:
+            break
+        header_type = blob[offset + 5]
+        page_serial = blob[offset + 14:offset + 18]
+        count = blob[offset + 26]
+        table_at, data_at = offset + 27, offset + 27 + count
+        if data_at > len(blob):
+            break
+        laces = blob[table_at:data_at]
+        payload_size = sum(laces)
+        page_end = data_at + payload_size
+        if page_end > len(blob):
+            break
+        if serial is None:
+            serial = page_serial
+        elif page_serial != serial:
+            # Chained/logical streams are independent; do not splice packets.
+            packet.clear(); orphan = False; serial = page_serial
+        continued = bool(header_type & 0x01)
+        if not continued:
+            packet.clear(); orphan = False
+        elif not packet:
+            # The bounded scan began after the first part of this packet.
+            orphan = True
+        cursor = data_at
+        for length in laces:
+            segment = blob[cursor:cursor + length]
+            cursor += length
+            if not orphan:
+                if len(packet) + len(segment) > _TAG_SCAN:
+                    orphan = True; packet.clear()
+                else:
+                    packet.extend(segment)
+            if length < 255:
+                if not orphan and packet.startswith(b"\x03vorbis"):
+                    text, picture = _vorbis_comments(bytes(packet[7:]))
+                    lyrics = lyrics or text
+                    artwork = artwork or picture
+                packet.clear(); orphan = False
+        offset, pages = page_end, pages + 1
+    return lyrics, artwork
+
+
+def _wav_notes(source, size: int) -> tuple[str, bytes]:
+    source.seek(12)
+    scanned = 12
+    while scanned + 8 <= min(size, _TAG_SCAN):
+        chunk = source.read(8)
+        if len(chunk) < 8:
+            break
+        length = int.from_bytes(chunk[4:8], "little")
+        scanned += 8
+        if length < 0 or length > _TAG_SCAN or scanned + length > size:
+            break
+        if chunk[:3] == b"ID3" or chunk[:4] in {b"id3 ", b"ID3 "}:
+            return _id3_notes(source.read(length))
+        skip = length + (length & 1)
+        source.seek(skip, 1)
+        scanned += skip
+    return "", b""
+
+
+def _jpeg_artwork(data: bytes) -> bytes:
+    """Sanitized thumbnail only. External picture URLs and odd formats never leave the file."""
+    if not 32 <= len(data) <= _ART_SCAN:
+        return b""
+    try:
+        import io
+        import warnings
+        from PIL import Image, ImageOps
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data), formats=("JPEG", "PNG", "GIF")) as source:
+                width, height = source.size
+                if source.format not in {"JPEG", "PNG", "GIF"} or width < 1 or height < 1 or width * height > 20_000_000:
+                    return b""
+                source.draft("RGB", (512, 512))
+                source.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                image = ImageOps.exif_transpose(source)
+                if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                    rgba = image.convert("RGBA")
+                    flat = Image.new("RGB", rgba.size, "#202022")
+                    flat.paste(rgba, mask=rgba.getchannel("A"))
+                    image = flat
+                else:
+                    image = image.convert("RGB")
+                encoded = io.BytesIO()
+                image.save(encoded, format="JPEG", quality=85)
+                result = encoded.getvalue()
+                return result if result.startswith(b"\xff\xd8\xff") and len(result) <= 512 * 1024 else b""
+    except Exception:
+        return b""
+
+
+def embedded_notes(path: Path) -> dict[str, Any]:
+    """Lyrics and cover already stored in the audio file. No network and no transcription."""
+    empty = {"lyrics": "", "artwork": b""}
+    try:
+        if Path(path).is_symlink() or not Path(path).is_file():
+            return empty
+        size = Path(path).stat().st_size
+        if not 0 < size <= MAX_DOWNLOAD_BYTES:
+            return empty
+        with Path(path).open("rb") as source:
+            header = source.read(16)
+            if header.startswith(b"ID3"):
+                source.seek(0)
+                lyrics, artwork = _id3_notes(source.read(min(size, _TAG_SCAN + 10)))
+            elif header.startswith(b"fLaC"):
+                source.seek(4)
+                lyrics, artwork = _flac_notes(source)
+            elif header.startswith(b"OggS"):
+                source.seek(0)
+                lyrics, artwork = _ogg_notes(source.read(min(size, _TAG_SCAN)))
+            elif header.startswith(b"RIFF"):
+                lyrics, artwork = _wav_notes(source, size)
+            else:
+                return empty
+    except (OSError, ValueError):
+        return empty
+    return {"lyrics": _clean_lyrics(lyrics), "artwork": _jpeg_artwork(artwork)}
+
+
 class NativeAudio:
     """Small miniaudio/WASAPI adapter, imported lazily; no output opens on import."""
     def __init__(self):
@@ -239,8 +627,11 @@ class MusicPlayer:
         self._error = ""
         self._title = ""
         self._artist = ""
+        self._lyrics = ""
+        self._artwork = b""
         self._downloaded_bytes = 0
         self._total_bytes = 0
+        self._media_transport = ""
         self._reveal = 0
         self._reveal_listener = None
 
@@ -287,7 +678,13 @@ class MusicPlayer:
                     "duration_sec": round(self._duration, 2), "volume": round(self._volume),
                     "title": self._title, "artist": self._artist, "error": self._error,
                     "downloaded_bytes": self._downloaded_bytes, "total_bytes": self._total_bytes,
+                    "media_transport": self._media_transport,
                     "supported_formats": list(SUPPORTED_FORMATS)}
+
+    def presentation(self) -> dict[str, Any]:
+        """Cover and embedded lyrics for this window only. Heartbeats stay on snapshot()."""
+        with self._lock:
+            return {"lyrics": self._lyrics, "artwork": self._artwork}
 
     def _release_device(self):
         if self._device is not None:
@@ -302,6 +699,9 @@ class MusicPlayer:
         path, ephemeral = self._path, self._ephemeral
         self._path = None
         self._ephemeral = False
+        self._lyrics = ""
+        self._artwork = b""
+        self._media_transport = ""
         # Server downloads are temporary. A file the user opened must stay on disk.
         if path is not None and ephemeral:
             path.unlink(missing_ok=True)
@@ -367,6 +767,7 @@ class MusicPlayer:
             raise
         except Exception:
             raise MusicError("Не удалось прочитать трек. Поддерживаются MP3, WAV, FLAC и OGG Vorbis") from None
+        notes = embedded_notes(resolved)
         with self._condition:
             if self._closed:
                 raise MusicError("Музыкальный плеер завершает работу")
@@ -377,7 +778,9 @@ class MusicPlayer:
             self._title = (title.strip() or resolved.stem)[:256]
             self._artist = artist.strip()[:256]
             self._downloaded_bytes = self._total_bytes = resolved.stat().st_size
+            self._media_transport = "local_file"
             self._path, self._duration, self._ephemeral = resolved, duration, False
+            self._lyrics, self._artwork = notes["lyrics"], notes["artwork"]
             self._start_at(0)
             return self.snapshot()
 
@@ -408,8 +811,18 @@ class MusicPlayer:
                     # routes resolve ONLY against that agent's own configured base.
                     value = server_url.rstrip("/") + str(media_path) if media_path is not None else payload.get("url")
                     url, track_id = approved_media_url(server_url, value, payload.get("track_id"))
+                    expected_sha256 = _trusted_sha256(payload.get("sha256"))
+                    server_lyrics = _server_lyrics(payload.get("lyrics"))
+                    raw_artwork_path = payload.get("artwork_path")
+                    raw_artwork_url = (server_url.rstrip("/") + str(raw_artwork_path)
+                                       if raw_artwork_path is not None else payload.get("artwork_url"))
+                    artwork_url = (approved_artwork_url(server_url, raw_artwork_url, track_id, url)
+                                   if raw_artwork_url else None)
                     raw_lan = payload.get("lan_url")
-                    lan_url = approved_lan_url(raw_lan, track_id) if raw_lan else None
+                    offered_lan = approved_lan_url(raw_lan, track_id) if raw_lan else None
+                    # A private peer is an untrusted transport. Without the
+                    # catalog digest it must never be allowed to provide bytes.
+                    lan_url = offered_lan if expected_sha256 else None
                     position = _number(payload.get("position_sec", 0), "Позиция", 0, 24 * 3600)
                     volume = _number(payload.get("volume", self._volume), "Громкость", 0, 100)
                     output_id = str(payload.get("output_id") or "default")
@@ -422,8 +835,10 @@ class MusicPlayer:
                     self._title, self._artist = str(payload.get("title") or "")[:256], str(payload.get("artist") or "")[:256]
                     self._state, self._error, self._duration = "loading", "", 0.0
                     self._downloaded_bytes, self._total_bytes = 0, 0
+                    self._media_transport = "lan_check" if lan_url else "server"
                     self._progress = {"position": position, "ended": False, "error": ""}
-                    self._pending = (self._generation, url, dict(config), position, lan_url)
+                    self._pending = (self._generation, url, dict(config), position, lan_url, expected_sha256,
+                                     server_lyrics, artwork_url)
                     self._reveal += 1
                     reveal = True
                     if self._worker is None:
@@ -476,27 +891,38 @@ class MusicPlayer:
         with self._lock:
             return self._closed or generation != self._generation
 
-    def _download(self, generation, url, config, lan_url=None) -> Path | None:
+    def _download(self, generation, url, config, lan_url=None, expected_sha256=None) -> Path | None:
         if lan_url:
             if self._cancelled(generation):
                 return None
             try:
-                fetched = self._fetch(generation, lan_url, config, direct=True)
+                fetched = self._fetch(generation, lan_url, config, direct=True, expected_sha256=expected_sha256)
             except Exception:
                 fetched = None
                 if self._cancelled(generation):
                     return None
             else:
+                with self._lock:
+                    if not self._cancelled(generation):
+                        self._media_transport = "lan"
                 return fetched
             if self._cancelled(generation):
                 return None
-        return self._fetch(generation, url, config, direct=False)
+            with self._lock:
+                if not self._cancelled(generation):
+                    self._media_transport = "server_fallback"
+        else:
+            with self._lock:
+                if not self._cancelled(generation):
+                    self._media_transport = "server"
+        return self._fetch(generation, url, config, direct=False, expected_sha256=expected_sha256)
 
-    def _fetch(self, generation, url, config, *, direct: bool) -> Path | None:
+    def _fetch(self, generation, url, config, *, direct: bool, expected_sha256=None) -> Path | None:
         if self._tempdir is None:
             self._tempdir = tempfile.TemporaryDirectory(prefix="xass-music-", dir=self._cache_parent)
         target = Path(self._tempdir.name) / f"track-{generation}.part"
         started, total = time.monotonic(), 0
+        digest = hashlib.sha256()
         with self._lock:
             if self._cancelled(generation):
                 return None
@@ -536,11 +962,14 @@ class MusicPlayer:
                             if time.monotonic() - started > MAX_DOWNLOAD_SECONDS:
                                 raise MusicError("Загрузка музыки заняла слишком много времени")
                             output.write(chunk)
+                            digest.update(chunk)
                             with self._lock:
                                 if not self._cancelled(generation):
                                     self._downloaded_bytes = total
                     if not total or (length and int(length) != total):
                         raise MusicError("Аудиофайл загружен не полностью")
+                    if expected_sha256 and digest.hexdigest() != expected_sha256:
+                        raise MusicError("Аудиофайл не прошёл проверку целостности")
             with target.open("rb") as source:
                 suffix = _audio_suffix(source.read(16))
             final = target.with_suffix(suffix)
@@ -548,6 +977,41 @@ class MusicPlayer:
             return final
         finally:
             target.unlink(missing_ok=True)
+
+    def _fetch_artwork(self, generation, url: str, config: dict) -> bytes:
+        """Fetch one same-ticket JPEG; any failure keeps the embedded fallback."""
+        headers = {"Accept": "image/jpeg", "Accept-Encoding": "identity",
+                   "X-Api-Key": str(config.get("api_key") or "")}
+        try:
+            with self._client_factory(str(config["server_url"]), timeout=httpx.Timeout(5, connect=3),
+                                      trust_env=bool(config.get("trust_env_proxy", False)),
+                                      follow_redirects=False) as client:
+                with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
+                    if response.status_code != 200:
+                        return b""
+                    if response.headers.get("content-encoding", "identity").lower() not in {"identity", ""}:
+                        return b""
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if content_type != "image/jpeg":
+                        return b""
+                    length = response.headers.get("content-length", "")
+                    if length and (not length.isdigit() or not 0 < int(length) <= MAX_SERVER_ARTWORK_BYTES):
+                        return b""
+                    data = bytearray()
+                    for chunk in response.iter_bytes():
+                        if self._cancelled(generation):
+                            return b""
+                        data.extend(chunk)
+                        if len(data) > MAX_SERVER_ARTWORK_BYTES:
+                            return b""
+                    if (not data or not bytes(data).startswith(b"\xff\xd8\xff")
+                            or (length and len(data) != int(length))):
+                        return b""
+            # Re-decode and sanitize even though the paired route promises a
+            # JPEG.  A corrupt server/database cannot reach the desktop decoder.
+            return _jpeg_artwork(bytes(data))
+        except (OSError, ValueError, TypeError, httpx.HTTPError):
+            return b""
 
     def _download_loop(self):
         while True:
@@ -561,9 +1025,12 @@ class MusicPlayer:
                     continue
                 generation, url, config, position = pending[:4]
                 lan_url = pending[4] if len(pending) > 4 else None
+                expected_sha256 = pending[5] if len(pending) > 5 else None
+                server_lyrics = pending[6] if len(pending) > 6 else ""
+                artwork_url = pending[7] if len(pending) > 7 else None
             path = None
             try:
-                path = self._download(generation, url, config, lan_url)
+                path = self._download(generation, url, config, lan_url, expected_sha256)
                 if path is None:
                     continue
                 # MP3 duration inspection can scan a large file. Never hold the
@@ -572,14 +1039,23 @@ class MusicPlayer:
                     duration = self._engine().duration(path)
                 except Exception:
                     raise MusicError("Не удалось прочитать трек. Поддерживаются MP3, WAV, FLAC и OGG Vorbis") from None
+                notes = embedded_notes(path)
                 with self._lock:
                     if self._cancelled(generation):
                         continue
                     if position > duration:
                         raise MusicError("Начальная позиция больше длительности трека")
                     self._path, self._duration, self._ephemeral = path, duration, True
+                    self._lyrics = server_lyrics or notes["lyrics"]
+                    self._artwork = notes["artwork"]
                     path = None
                     self._start_at(position)
+                if artwork_url:
+                    artwork = self._fetch_artwork(generation, artwork_url, config)
+                    if artwork:
+                        with self._lock:
+                            if not self._cancelled(generation):
+                                self._artwork = artwork
             except Exception as exc:
                 with self._lock:
                     if not self._cancelled(generation):

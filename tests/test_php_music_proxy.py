@@ -302,7 +302,8 @@ class PhpMusicProxyTests(unittest.TestCase):
         sealed = b"XASS\x01" + bytes(range(12)) + bytes(range(256))
         response = self.client.post("/proxy.php", params={"_p": path}, content=sealed, headers={
             "Content-Type": "application/x-xass-sealed", "X-XASS-Cipher": "xass-sealed-v1",
-            "X-XASS-Inner-Type": "text/plain", "Cookie": "xass_pwa=fixture-session"})
+            "X-XASS-Inner-Type": "text/plain", "X-XASS-Action-Proof": "xna_fixture",
+            "Cookie": "xass_pwa=fixture-session"})
         self.assertEqual(response.json()["_s"], 401)
         request = self.backend.requests.get_nowait()
         self.assertEqual(request["path"], path)
@@ -310,6 +311,7 @@ class PhpMusicProxyTests(unittest.TestCase):
         self.assertEqual(request["headers"]["content-type"], "application/x-xass-sealed")
         self.assertEqual(request["headers"]["x-xass-cipher"], "xass-sealed-v1")
         self.assertEqual(request["headers"]["x-xass-inner-type"], "text/plain")
+        self.assertEqual(request["headers"]["x-xass-action-proof"], "xna_fixture")
         self.assertEqual(request["headers"]["cookie"], "xass_pwa=fixture-session")
 
     def test_encoded_traversal_and_control_bytes_never_reach_backend(self):

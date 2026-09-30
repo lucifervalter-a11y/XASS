@@ -15,10 +15,12 @@ import httpx
 from PIL import Image
 
 from app.services.music_enrichment import (MusicEnrichmentService, MAX_JSON_BYTES,
-    MAX_ARTWORK_BYTES, MAX_THUMBNAIL_BYTES, USER_AGENT, _artwork_redirect)
+    MAX_ARTWORK_BYTES, MAX_THUMBNAIL_BYTES, USER_AGENT, _artwork, _artwork_redirect)
 
 RECORDING = "11111111-2222-3333-4444-555555555555"
 RELEASE = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+GROUP = "12345678-1234-1234-1234-123456789abc"
+REISSUE = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 
 
 class Clock:
@@ -327,6 +329,118 @@ class MusicEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service().enrich(self.track)
         self.assertEqual(result["status"], "matched")
         self.assertEqual(result["artwork"]["status"], "not_found")
+
+    def grouped_releases(self, primary="Album"):
+        group = {"id": GROUP, "title": "Original Album", "primary-type": primary, "secondary-types": []}
+        return [
+            {"id": RELEASE, "title": "Original Album", "status": "Official", "release-group": deepcopy(group)},
+            {"id": REISSUE, "title": "Original Album Deluxe", "status": "Official", "release-group": deepcopy(group)},
+            {"id": RECORDING, "title": "Compilation", "status": "Official", "release-group": {
+                "id": RECORDING, "title": "Compilation", "primary-type": "Album", "secondary-types": ["Compilation"]}},
+        ]
+
+    def test_unique_primary_album_or_ep_group_covers_reissues_not_compilations(self):
+        for primary in ("Album", "EP"):
+            releases = self.grouped_releases(primary)
+            result = _artwork({"releases": releases}, "")
+            self.assertEqual(result["release_group_id"], GROUP)
+            self.assertEqual(result["release_ids"], [RELEASE, REISSUE])
+            self.assertEqual(result["url"], f"https://coverartarchive.org/release-group/{GROUP}/front-500")
+            self.assertEqual(result["source_url"], f"https://musicbrainz.org/release-group/{GROUP}")
+            # An explicitly known album still selects its own release, as before.
+            specific = _artwork({"releases": releases}, "Original Album")
+            self.assertEqual(specific["release_id"], RELEASE)
+            self.assertNotIn("release_group_id", specific)
+
+    def test_group_cover_keeps_multiple_primary_groups_and_incomplete_metadata_ambiguous(self):
+        for mutation in (
+            lambda rows: rows[2]["release-group"].update({"secondary-types": []}),
+            lambda rows: rows[2]["release-group"].update({"primary-type": "EP", "secondary-types": []}),
+            lambda rows: rows[1].pop("release-group"),
+            lambda rows: rows[1]["release-group"].update({"id": "../../private"}),
+            lambda rows: rows[1]["release-group"].update({"primary-type": None}),
+            lambda rows: rows[1]["release-group"].update({"primary-type": []}),
+            lambda rows: rows[1]["release-group"].update({"secondary-types": "Live"}),
+            lambda rows: rows[1]["release-group"].update({"secondary-types": [None]}),
+            lambda rows: rows[1]["release-group"].update({"title": "Conflicting group name"}),
+            lambda rows: rows[1]["release-group"].update({"secondary-types": ["Live"]}),
+        ):
+            releases = self.grouped_releases()
+            mutation(releases)
+            self.assertEqual(_artwork({"releases": releases}, "")["status"], "not_found")
+
+    def test_group_cover_excludes_live_remix_compilation_single_and_unofficial_releases(self):
+        for excluded in ("Compilation", "Live", "Remix"):
+            releases = self.grouped_releases()
+            releases[2]["release-group"]["secondary-types"] = [excluded]
+            self.assertEqual(_artwork({"releases": releases}, "")["release_group_id"], GROUP)
+            for row in releases[:2]:
+                row["release-group"]["secondary-types"] = [excluded]
+            self.assertEqual(_artwork({"releases": releases}, "")["status"], "not_found")
+        releases = self.grouped_releases()
+        releases[2]["release-group"].update({"primary-type": "Single", "secondary-types": []})
+        self.assertEqual(_artwork({"releases": releases}, "")["release_group_id"], GROUP)
+        releases[2].update({"status": "Bootleg", "release-group": {}})
+        self.assertEqual(_artwork({"releases": releases}, "")["release_group_id"], GROUP)
+
+    async def test_exact_match_and_duration_only_candidate_use_group_art_without_relaxing_lyrics(self):
+        self.track.album = self.lyric["albumName"] = ""
+        self.recording["releases"] = self.grouped_releases()
+        matched = await self.service().enrich(self.track)
+        self.assertEqual(matched["status"], "matched")
+        self.assertTrue(matched["lyrics"]["synced"])
+        self.assertEqual(matched["artwork"]["release_group_id"], GROUP)
+        self.track.duration = 99
+        candidate = await self.service().enrich(self.track)
+        self.assertEqual(candidate["status"], "candidate")
+        self.assertFalse(candidate["lyrics"]["text"])
+        self.assertEqual(candidate["artwork"]["release_group_id"], GROUP)
+
+    async def test_group_art_follows_only_known_member_release_to_sanitized_thumbnail(self):
+        descriptor = _artwork({"releases": self.grouped_releases()}, "")
+        buffer = io.BytesIO()
+        Image.new("RGB", (600, 600), "blue").save(buffer, "PNG")
+        member = f"https://coverartarchive.org/release/{REISSUE}/front-500"
+        target = f"https://archive.org/download/mbid-{REISSUE}/mbid-{REISSUE}-123_thumb500.jpg"
+        def handle(request):
+            if "/release-group/" in request.url.path:
+                return httpx.Response(307, headers={"Location": member})
+            if request.url.host == "coverartarchive.org":
+                return httpx.Response(307, headers={"Location": target})
+            return httpx.Response(200, content=buffer.getvalue())
+        result = await self.service(handler=handle).fetch_artwork(descriptor)
+        self.assertTrue(result.startswith(b"\xff\xd8\xff"))
+        self.assertLessEqual(len(result), MAX_THUMBNAIL_BYTES)
+        self.assertEqual(str(self.requests[0].url), descriptor["url"])
+        self.assertEqual(len(self.requests), 3)
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (512, 512))
+
+    async def test_group_art_invalid_descriptors_and_redirects_fail_closed(self):
+        descriptor = _artwork({"releases": self.grouped_releases()}, "")
+        for change in ({"release_group_id": "../../private"}, {"release_id": RELEASE},
+                {"release_ids": []}, {"release_ids": ["../../private"]}, {"release_ids": [RELEASE, RELEASE]},
+                {"release_ids": [RELEASE] * 101}, {"release_ids": "not-a-list"},
+                {"url": "https://evil.invalid/art"}):
+            service = self.service()
+            self.assertIsNone(await service.fetch_artwork({**descriptor, **change}))
+        self.assertEqual(self.requests, [])
+        for target in (f"https://archive.org/download/mbid-{RECORDING}/mbid-{RECORDING}-123-500.jpg",
+                f"https://coverartarchive.org/release/{RECORDING}/front-500",
+                "http://127.0.0.1/private", "https://evil.invalid/art",
+                f"https://user@archive.org/download/mbid-{RELEASE}/mbid-{RELEASE}-123-500.jpg",
+                f"https://coverartarchive.org/release/{RELEASE}/front-500?next=private"):
+            self.requests.clear()
+            service = self.service(handler=lambda request: httpx.Response(307, headers={"Location": target}))
+            self.assertIsNone(await service.fetch_artwork(descriptor))
+            self.assertEqual(len(self.requests), 1)
+
+    async def test_group_art_oversized_body_never_reaches_decoder(self):
+        descriptor = _artwork({"releases": self.grouped_releases()}, "")
+        service = self.service(handler=lambda request: httpx.Response(200, content=b"x" * (MAX_ARTWORK_BYTES + 1)))
+        with patch("app.services.music_enrichment._jpeg_thumbnail") as decode:
+            self.assertIsNone(await service.fetch_artwork(descriptor))
+            decode.assert_not_called()
 
     async def test_positive_negative_cache_coalescing_and_defensive_copies(self):
         service = self.service()

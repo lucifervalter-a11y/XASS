@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -132,6 +133,58 @@ class RenderWorkTests(unittest.TestCase):
             configure.assert_called_once_with(wraplength=468, justify="left")
             resize(SimpleNamespace(width=400))
             self.assertEqual(configure.call_count, 2)
+
+    def test_files_shell_is_ready_while_slow_directory_listing_runs_off_tk(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app.root = self.root
+        app.content = tk.Frame(self.root, bg=desktop_app.BG)
+        app.content.pack(fill="both", expand=True)
+        app.preview = False
+        app._closing = False
+        app.current_view = "files"
+        app._view_revision = 7
+        app._file_root = "desktop"
+        app._header = lambda title, subtitle, kicker="": tk.Label(
+            app.content, text=title, bg=desktop_app.BG,
+        ).pack(fill="x")
+        app._button = lambda parent, text, command, kind="secondary": tk.Button(
+            parent, text=text, command=command,
+        )
+        app._flow_actions = lambda _parent: None
+        app._card = lambda parent, padding=0: tk.Frame(parent, bg=desktop_app.CARD, padx=padding, pady=padding)
+        started, release = threading.Event(), threading.Event()
+        worker_ids = []
+
+        def slow_list(*_args):
+            worker_ids.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+            return {"entries": [{"name": "ready.mp3", "type": "file", "size": 12}]}
+
+        try:
+            with patch.object(desktop_app, "list_files", side_effect=slow_list):
+                app._build_files()
+                self.assertTrue(started.wait(1))
+                self.root.update_idletasks()
+                self.assertNotEqual(worker_ids, [threading.get_ident()])
+                self.assertIn("Загружаю файлы…", self._label_texts(app.content))
+                release.set()
+                deadline = time.monotonic() + 2
+                while "ready.mp3" not in self._label_texts(app.content) and time.monotonic() < deadline:
+                    self.root.update()
+                    time.sleep(0.01)
+                self.assertIn("ready.mp3", self._label_texts(app.content))
+        finally:
+            release.set()
+
+    @staticmethod
+    def _label_texts(widget):
+        rows = []
+        if isinstance(widget, tk.Label):
+            rows.append(str(widget.cget("text") or ""))
+        for child in widget.winfo_children():
+            rows.extend(RenderWorkTests._label_texts(child))
+        return rows
 
 
 class SystemSamplingTests(unittest.TestCase):

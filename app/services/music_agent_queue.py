@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import math
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import select
@@ -18,6 +19,9 @@ from app.services.agent_lifecycle import AgentDetachedError, ensure_agent_attach
 from app.services.control_status import source_is_online
 from app.services.music_library import issue_ticket
 from app.services.music_storage import ensure_restore_requested, managed_path
+
+
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
 def _number(value, default=0.0):
@@ -243,6 +247,10 @@ async def _prepare(session, settings, source, credential, meta, item, command, p
     target = await session.get(MusicTrack, item.track_id)
     if target is None or target.deleted or target.mime == "audio/mp4":
         return await _failed(session, meta, item, command, "queue_track_unavailable", "Следующий трек удалён или недоступен для ПК.")
+    trusted_sha256 = target.sha256.lower() if isinstance(target.sha256, str) and _SHA256_RE.fullmatch(target.sha256) else ""
+    if not trusted_sha256:
+        return await _failed(session, meta, item, command, "queue_track_checksum_invalid",
+            "Контрольная сумма следующего трека повреждена. Загрузите файл повторно.")
     if (now - aware(command.created_at)).total_seconds() > 900:
         return await _failed(session, meta, item, command, "queue_restore_timeout", "Восстановление следующего трека не завершено. Проверьте хранилище.")
     if not managed_path(settings, target).is_file():
@@ -272,8 +280,16 @@ async def _prepare(session, settings, source, credential, meta, item, command, p
         return await _failed(session, meta, item, command, "queue_origin_invalid", "Проверьте публичный адрес сервера для воспроизведения на ПК.")
     ticket = issue_ticket(settings, target.id, purpose="agent", binding=credential.api_key_hash, ttl=600)
     media_path = f"/agent/music/tracks/{target.id}/stream?ticket={ticket}"
+    from app.services.music_agent_presentation import stored_agent_presentation
+    presentation = await stored_agent_presentation(session, target)
     command.payload = {**command.payload, "url": origin + media_path, "media_path": media_path,
+                       "sha256": trusted_sha256,
                        "expires_at": int(now.timestamp()) + 120}
+    if presentation["lyrics"]:
+        command.payload["lyrics"] = presentation["lyrics"]
+    if presentation["catalog_artwork"]:
+        artwork_path = f"/agent/music/tracks/{target.id}/artwork?ticket={ticket}"
+        command.payload.update(artwork_path=artwork_path, artwork_url=origin + artwork_path)
     command.status = "pending"; command.result = {}
     await session.commit()
     return {"status": "waiting", "command_id": command.id}

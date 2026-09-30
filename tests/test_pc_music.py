@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import sys
 import tempfile
 import threading
@@ -21,6 +22,7 @@ import music_player as mp
 
 CONFIG = {"server_url": "https://music.example", "api_key": "not-a-real-key"}
 URL = "https://music.example/agent/music/tracks/7/stream?ticket=test-ticket"
+ART_URL = "https://music.example/agent/music/tracks/7/artwork?ticket=test-ticket"
 
 
 def silent_wav():
@@ -101,6 +103,22 @@ class ApprovedMusicUrlTests(unittest.TestCase):
             with self.subTest(track_id=value), self.assertRaises(mp.MusicError):
                 mp.approved_media_url(CONFIG["server_url"], URL, value)
 
+    def test_artwork_requires_exact_paired_route_and_the_audio_ticket(self):
+        self.assertEqual(mp.approved_artwork_url(CONFIG["server_url"], ART_URL, 7, URL), ART_URL)
+        nested = "https://music.example/api/agent/music/tracks/7/artwork?ticket=test-ticket"
+        media = "https://music.example/api/agent/music/tracks/7/stream?ticket=test-ticket"
+        self.assertEqual(mp.approved_artwork_url("https://music.example/api", nested, 7, media), nested)
+        for value in (
+            ART_URL.replace("artwork", "other"),
+            ART_URL.replace("tracks/7", "tracks/8"),
+            ART_URL.replace("test-ticket", "other-ticket"),
+            ART_URL.replace("music.example", "evil.example"),
+            ART_URL + "&ticket=second",
+            ART_URL + "#fragment",
+        ):
+            with self.subTest(value=value), self.assertRaises(mp.MusicError):
+                mp.approved_artwork_url(CONFIG["server_url"], value, 7, URL)
+
 
 class MusicPlayerTests(unittest.TestCase):
     def setUp(self):
@@ -178,6 +196,119 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertFalse(saved.exists())
         self.assertFalse(self.audio.devices[-1].running)
 
+    def test_embedded_lyrics_and_cover_stay_out_of_the_heartbeat_snapshot(self):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        lyrics = "Припев\nВторая строка"
+        uslt = b"\x03rus\x00" + lyrics.encode("utf-8")
+        uslt = b"USLT" + len(uslt).to_bytes(4, "big") + b"\x00\x00" + uslt
+        apic = b"\x00image/png\x00\x03\x00" + png
+        apic = b"APIC" + len(apic).to_bytes(4, "big") + b"\x00\x00" + apic
+        frames = uslt + apic
+        sync = bytes(((len(frames) >> 21) & 0x7F, (len(frames) >> 14) & 0x7F, (len(frames) >> 7) & 0x7F, len(frames) & 0x7F))
+        path = Path(self.directory.name) / "night.mp3"
+        path.write_bytes(b"ID3" + bytes((3, 0, 0)) + sync + frames + b"\xff\xfb\x90\x00")
+        snapshot = self.player.play_local(path, title="Ночь", artist="red!")
+        self.assertEqual(snapshot["state"], "playing")
+        self.assertNotIn("lyrics", snapshot)
+        self.assertNotIn("artwork", snapshot)
+        notes = self.player.presentation()
+        self.assertEqual(notes["lyrics"], lyrics)
+        self.assertTrue(notes["artwork"].startswith(b"\xff\xd8\xff"))
+        self.assertEqual(self.player.command("music_stop", {}, CONFIG)["state"], "stopped")
+        self.assertEqual(self.player.presentation(), {"lyrics": "", "artwork": b""})
+        self.assertTrue(path.is_file())
+
+    def test_stored_server_lyrics_and_same_ticket_artwork_override_local_empty_metadata(self):
+        from PIL import Image
+        encoded = io.BytesIO()
+        Image.new("RGB", (4, 4), (35, 80, 170)).save(encoded, format="JPEG")
+        picture = encoded.getvalue()
+
+        def handler(request):
+            if request.url.path.endswith("/artwork"):
+                return httpx.Response(200, content=picture, headers={"Content-Type": "image/jpeg"})
+            return httpx.Response(200, content=silent_wav())
+
+        self.handler = handler
+        self.play(lyrics="[00:01.25]Первая строка\n[00:04.00]Вторая",
+                  artwork_path="/agent/music/tracks/7/artwork?ticket=test-ticket")
+        self.wait_state("playing")
+        deadline = time.monotonic() + 1
+        while not self.player.presentation()["artwork"] and time.monotonic() < deadline:
+            time.sleep(0.005)
+        notes = self.player.presentation()
+        self.assertEqual(notes["lyrics"], "[00:01.25]Первая строка\n[00:04.00]Вторая")
+        self.assertTrue(notes["artwork"].startswith(b"\xff\xd8\xff"))
+        self.assertEqual([request.url.path for request in self.requests],
+                         ["/agent/music/tracks/7/stream", "/agent/music/tracks/7/artwork"])
+        self.assertEqual(self.requests[-1].headers["X-Api-Key"], CONFIG["api_key"])
+        self.assertNotIn("lyrics", self.player.snapshot())
+        self.assertNotIn("artwork", self.player.snapshot())
+
+    def test_invalid_server_presentation_never_replaces_embedded_fallback(self):
+        def handler(request):
+            if request.url.path.endswith("/artwork"):
+                return httpx.Response(200, content=b"not-a-jpeg", headers={"Content-Type": "image/jpeg"})
+            return httpx.Response(200, content=silent_wav())
+
+        self.handler = handler
+        self.play(lyrics="bad\x00lyrics", artwork_path="/agent/music/tracks/7/artwork?ticket=test-ticket")
+        self.wait_state("playing")
+        deadline = time.monotonic() + 1
+        while len(self.requests) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(self.player.presentation(), {"lyrics": "", "artwork": b""})
+
+    def test_artwork_with_a_different_ticket_is_rejected_before_network(self):
+        with self.assertRaises(mp.MusicError):
+            self.play(artwork_path="/agent/music/tracks/7/artwork?ticket=another-ticket")
+        self.assertEqual(self.requests, [])
+
+    def test_id3v23_extended_header_keeps_embedded_lyrics(self):
+        lyrics = "Строка после расширенного заголовка"
+        uslt_data = b"\x03rus\x00" + lyrics.encode("utf-8")
+        frame = b"USLT" + len(uslt_data).to_bytes(4, "big") + b"\x00\x00" + uslt_data
+        # v2.3 size is six bytes *after* this size field: flags + padding size.
+        extended = (6).to_bytes(4, "big") + b"\x00\x00" + (0).to_bytes(4, "big")
+        body = extended + frame
+        sync = bytes(((len(body) >> 21) & 0x7F, (len(body) >> 14) & 0x7F,
+                      (len(body) >> 7) & 0x7F, len(body) & 0x7F))
+        path = Path(self.directory.name) / "extended.mp3"
+        path.write_bytes(b"ID3" + bytes((3, 0, 0x40)) + sync + body + b"\xff\xfb\x90\x00")
+        self.player.play_local(path)
+        self.assertEqual(self.player.presentation()["lyrics"], lyrics)
+
+    def test_ogg_comment_packet_split_across_pages_keeps_lyrics(self):
+        lyrics = "Длинный комментарий Vorbis"
+        vendor = b"x" * 240
+        comment = b"LYRICS=" + lyrics.encode("utf-8")
+        packet = (b"\x03vorbis" + len(vendor).to_bytes(4, "little") + vendor
+                  + (1).to_bytes(4, "little") + len(comment).to_bytes(4, "little") + comment + b"\x01")
+
+        def page(sequence, header_type, chunks):
+            table = bytes(len(chunk) for chunk in chunks)
+            header = (b"OggS\x00" + bytes((header_type,)) + b"\x00" * 8
+                      + b"XASS" + int(sequence).to_bytes(4, "little") + b"\x00" * 4 + bytes((len(chunks),)))
+            return header + table + b"".join(chunks)
+
+        first, second = packet[:255], packet[255:]
+        blob = page(0, 0, [first]) + page(1, 1, [second])
+        self.assertEqual(mp._ogg_notes(blob)[0], lyrics)
+
+    def test_flac_comment_and_rejected_picture_url_do_not_break_playback(self):
+        comment = "LYRICS=Только текст".encode()
+        vendor = b"xass"
+        block = len(vendor).to_bytes(4, "little") + vendor + (1).to_bytes(4, "little") + len(comment).to_bytes(4, "little") + comment
+        path = Path(self.directory.name) / "voice.flac"
+        path.write_bytes(b"fLaC" + bytes([0x84]) + len(block).to_bytes(3, "big") + block)
+        self.assertEqual(self.player.play_local(path)["title"], "voice")
+        self.assertEqual(self.player.presentation()["lyrics"], "Только текст")
+        self.assertEqual(self.player.presentation()["artwork"], b"")
+        self.assertEqual(mp._apic_bytes(b"\x00-->\x00\x03\x00http://evil.example/a.jpg"), b"")
+
     def test_local_file_plays_without_network_and_stop_keeps_it(self):
         path = Path(self.directory.name) / "night.wav"
         path.write_bytes(silent_wav())
@@ -185,6 +316,7 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertEqual(snapshot["state"], "playing")
         self.assertEqual(snapshot["title"], "Ночь")
         self.assertEqual(snapshot["artist"], "red!")
+        self.assertEqual(snapshot["media_transport"], "local_file")
         self.assertEqual(self.requests, [])
         self.assertEqual(self.player.command("music_pause", {}, CONFIG)["state"], "paused")
         self.assertEqual(self.player.command("music_stop", {}, CONFIG)["state"], "stopped")
@@ -383,12 +515,14 @@ class MusicPlayerTests(unittest.TestCase):
 
 
     def test_private_lan_download_does_not_touch_the_server_or_send_the_api_key(self):
-        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}",
+                  sha256=hashlib.sha256(silent_wav()).hexdigest())
         self.wait_state("playing")
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0].url.host, "192.168.1.20")
         self.assertEqual(self.requests[0].url.path, "/xass-lan/7")
         self.assertIsNone(self.requests[0].headers.get("X-Api-Key"))
+        self.assertEqual(self.player.snapshot()["media_transport"], "lan")
 
     def test_lan_failure_falls_back_to_the_paired_server(self):
         def handler(request):
@@ -396,11 +530,13 @@ class MusicPlayerTests(unittest.TestCase):
                 return httpx.Response(503)
             return httpx.Response(200, content=silent_wav())
         self.handler = handler
-        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}",
+                  sha256=hashlib.sha256(silent_wav()).hexdigest())
         self.wait_state("playing")
         self.assertEqual([item.url.host for item in self.requests], ["192.168.1.20", "music.example"])
         self.assertEqual(self.requests[1].headers.get("X-Api-Key"), CONFIG["api_key"])
         self.assertIsNone(self.requests[0].headers.get("X-Api-Key"))
+        self.assertEqual(self.player.snapshot()["media_transport"], "server_fallback")
 
     def test_cancelled_lan_download_does_not_fall_back(self):
         entered = threading.Event()
@@ -409,7 +545,8 @@ class MusicPlayerTests(unittest.TestCase):
             self.release.wait(2)
             return httpx.Response(200, content=silent_wav())
         self.handler = blocked
-        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}",
+                  sha256=hashlib.sha256(silent_wav()).hexdigest())
         self.assertTrue(entered.wait(1))
         self.assertEqual(self.command("music_stop")["state"], "stopped")
         self.release.set()
@@ -417,6 +554,43 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertEqual(self.player.snapshot()["state"], "stopped")
         self.assertEqual({request.url.host for request in self.requests}, {"192.168.1.20"})
         self.assertEqual(len(self.audio.devices), 0)
+
+    def test_lan_checksum_mismatch_falls_back_to_verified_server_bytes(self):
+        trusted = silent_wav()
+        substituted = bytearray(trusted)
+        substituted[-1] = 1
+
+        def handler(request):
+            content = bytes(substituted) if request.url.host == "192.168.1.20" else trusted
+            return httpx.Response(200, content=content)
+
+        self.handler = handler
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}",
+                  sha256=hashlib.sha256(trusted).hexdigest())
+        self.wait_state("playing")
+        self.assertEqual([item.url.host for item in self.requests], ["192.168.1.20", "music.example"])
+        self.assertIsNone(self.requests[0].headers.get("X-Api-Key"))
+        self.assertEqual(self.requests[1].headers.get("X-Api-Key"), CONFIG["api_key"])
+        self.assertEqual(self.player.snapshot()["media_transport"], "server_fallback")
+
+    def test_server_checksum_mismatch_is_terminal_and_never_starts_audio(self):
+        self.play(sha256="0" * 64)
+        result = self.wait_state("error")
+        self.assertIn("целостности", result["error"])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.audio.devices, [])
+
+    def test_lan_without_trusted_checksum_is_ignored_for_legacy_server_playback(self):
+        self.play(lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.wait_state("playing")
+        self.assertEqual([item.url.host for item in self.requests], ["music.example"])
+        self.assertEqual(self.player.snapshot()["media_transport"], "server")
+
+    def test_malformed_checksum_is_rejected_before_network_or_playback(self):
+        with self.assertRaises(mp.MusicError):
+            self.play(sha256="not-a-sha", lan_url=f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}")
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.audio.devices, [])
 
     def test_public_and_rewritten_lan_urls_are_rejected_before_any_request(self):
         lan = f"http://192.168.1.20:8765/xass-lan/7?token={'a' * 43}"

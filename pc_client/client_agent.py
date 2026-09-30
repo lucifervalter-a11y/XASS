@@ -1,5 +1,6 @@
 ﻿import argparse
 import ctypes
+import ipaddress
 import json
 import os
 import platform
@@ -46,7 +47,18 @@ from remote_tools import (
     receive_uploaded_file,
     upload_requested_file,
 )
-from network_client import create_http_client
+from network_client import (
+    activate_physical_fallback,
+    create_http_client,
+    invalidate_network_state,
+    network_signature,
+    preferred_connection,
+    require_secure_transport,
+)
+try:
+    from agent_command_worker import CommandExecutor
+except ModuleNotFoundError:
+    from pc_client.agent_command_worker import CommandExecutor
 from music_player import MUSIC_COMMANDS, handle_music_command, music_snapshot
 from music_storage import storage_tick, storage_snapshot
 try:
@@ -67,6 +79,98 @@ _last_heartbeat_error = ""
 _last_heartbeat_error_at = ""
 _last_server_version = ""
 COMMAND_POLL_INTERVAL_SEC = 5.0
+_executor: CommandExecutor | None = None
+
+
+class _HeartbeatClient:
+    """Rebuild the HTTP pool after a route/VPN failure without restarting XASS."""
+
+    def __init__(self, server_url: str, *, timeout: float, trust_env: bool) -> None:
+        self.server_url = server_url
+        parsed = urlsplit(server_url)
+        self._origin = (parsed.scheme.casefold(), str(parsed.hostname or "").casefold(),
+                        parsed.port or (443 if parsed.scheme.casefold() == "https" else 80))
+        self._https = self._origin[0] == "https"
+        self.timeout = timeout
+        self.trust_env = trust_env
+        self.prefer_system_dns = False
+        self.local_address = ""
+        self._network_signature = network_signature()
+        self._context = None
+        self._client = None
+
+    def __enter__(self):
+        self._open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._close(exc_type, exc, traceback)
+
+    def _open(self) -> None:
+        self._context = create_http_client(
+            self.server_url,
+            timeout=self.timeout,
+            trust_env=self.trust_env,
+            prefer_system_dns=self.prefer_system_dns,
+            local_address=self.local_address,
+        )
+        self._client = self._context.__enter__()
+
+    def _close(self, exc_type=None, exc=None, traceback=None) -> None:
+        context, self._context, self._client = self._context, None, None
+        if context is not None:
+            context.__exit__(exc_type, exc, traceback)
+
+    def post(self, *args, **kwargs):
+        target = args[0] if args else kwargs.get("url", "")
+        parsed = urlsplit(str(target or ""))
+        target_origin = (parsed.scheme.casefold(), str(parsed.hostname or "").casefold(),
+                         parsed.port or (443 if parsed.scheme.casefold() == "https" else 80))
+        if target_origin != self._origin:
+            raise ValueError("heartbeat target must use the configured server origin")
+        signature = network_signature()
+        if signature and self._network_signature and signature != self._network_signature:
+            # A route/adapter changed between heartbeats.  Avoid reusing a TLS
+            # socket tied to the old NIC.  When a physical LAN address exists,
+            # bind only this XASS client to it; global Windows routes stay
+            # untouched and certificate/SNI verification still uses the
+            # configured HTTPS hostname.
+            self._close()
+            invalidate_network_state(str(urlsplit(self.server_url).hostname or ""))
+            self.local_address = activate_physical_fallback(
+                self.server_url, trust_env=self.trust_env,
+            ) if self._https else ""
+            if self.local_address:
+                self.prefer_system_dns, self.local_address = preferred_connection(
+                    self.server_url, trust_env=self.trust_env,
+                )
+            else:
+                self.prefer_system_dns = False
+            self._network_signature = signature
+            self._open()
+        try:
+            return self._client.post(*args, **kwargs)
+        except httpx.TransportError as exc:
+            # A keep-alive socket and its DoH fallback belong to the old
+            # adapter.  Close both before the next heartbeat and alternate to
+            # Windows DNS, which is important for split-tunnel VPNs.
+            self._close(type(exc), exc, exc.__traceback__)
+            invalidate_network_state(str(urlsplit(self.server_url).hostname or ""))
+            selected = activate_physical_fallback(
+                self.server_url, trust_env=self.trust_env,
+            ) if self._https else ""
+            # Keep retrying through the currently verified physical adapter.
+            # Clearing it on every second failure made persistent VPN routes
+            # alternate between a working bound pool and a broken unbound one.
+            if selected:
+                self.prefer_system_dns, self.local_address = preferred_connection(
+                    self.server_url, trust_env=self.trust_env,
+                )
+            else:
+                self.local_address, self.prefer_system_dns = "", False
+            self._network_signature = network_signature()
+            self._open()
+            raise
 
 
 class _ArchiveSyncWorker:
@@ -116,9 +220,47 @@ def normalize_server_url(value: str) -> str:
         return "http://127.0.0.1:8001"
     if raw.startswith("http://") or raw.startswith("https://"):
         return raw.rstrip("/")
-    if ":" in raw:
-        return f"http://{raw}".rstrip("/")
-    return f"http://{raw}:8001".rstrip("/")
+    # A bare public host used to become HTTP, exposing the one-time pair code
+    # and the issued long-lived API key to every network hop.  Bare remote
+    # addresses are HTTPS now; plaintext stays convenient only on loopback.
+    loopback = False
+    has_port = False
+    try:
+        address = ipaddress.ip_address(raw.strip("[]"))
+        loopback = address.is_loopback
+        raw = f"[{address}]" if address.version == 6 else str(address)
+    except ValueError:
+        try:
+            parsed = urlsplit(f"//{raw}")
+            host = str(parsed.hostname or "")
+            has_port = parsed.port is not None
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = host.casefold() in {"localhost", "localhost.localdomain"}
+        except ValueError:
+            loopback = False
+    if loopback:
+        return f"http://{raw}{'' if has_port else ':8001'}".rstrip("/")
+    return f"https://{raw}".rstrip("/")
+
+
+def _allow_insecure_http(config: dict[str, Any] | None = None) -> bool:
+    value = (config or {}).get("allow_insecure_http", False)
+    if isinstance(value, str):
+        value = value.strip().casefold() in {"1", "true", "yes", "on"}
+    env = os.getenv("XASS_ALLOW_INSECURE_HTTP", "").strip().casefold()
+    return bool(value) or env in {"1", "true", "yes", "on"}
+
+
+def require_secret_transport(server_url: str, *, allow_insecure_http: bool = False) -> str:
+    """Reject credentials over remote plaintext unless development opted in."""
+
+    normalized = normalize_server_url(server_url)
+    return require_secure_transport(
+        normalized,
+        allow_insecure_http=bool(allow_insecure_http) or _allow_insecure_http(),
+    )
 
 
 def _response_preview(text: str, limit: int = 220) -> str:
@@ -136,26 +278,74 @@ def _parse_json_body(response: httpx.Response) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _build_server_candidates(value: str) -> list[str]:
+def _is_loopback_server(host: str) -> bool:
+    normalized = str(host or "").strip().strip("[]").casefold()
+    if normalized in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _secure_legacy_candidates(parsed: Any) -> list[str]:
+    """Build HTTPS-only replacements for an old public HTTP endpoint.
+
+    Versions before 0.21 commonly saved ``http://host:8000`` while nginx
+    exposed the same XASS instance at the canonical HTTPS origin.  The health
+    check is intentionally unauthenticated; no pair code or agent key is ever
+    attached to these probes.
+    """
+
+    host = str(parsed.hostname or "")
+    if not host:
+        return []
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    path = str(parsed.path or "").rstrip("/")
+    canonical = f"https://{display_host}{path}"
+    candidates = [canonical]
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        candidates.append(f"https://{display_host}:8001{path}")
+    elif port != 443:
+        # Canonical 443 is tried first.  Keeping the old numeric port as a
+        # TLS-only fallback supports installations that terminate TLS there.
+        candidates.append(f"https://{display_host}:{port}{path}")
+    return candidates
+
+
+def _build_server_candidates(value: str, *, allow_insecure_http: bool = False) -> list[str]:
     normalized = normalize_server_url(value)
     parsed = urlsplit(normalized)
     if not parsed.hostname:
         return [normalized]
 
     base_path = parsed.path.rstrip("/")
+    if (
+        parsed.scheme.casefold() == "http"
+        and not _is_loopback_server(str(parsed.hostname or ""))
+        and not allow_insecure_http
+    ):
+        # This is a one-way upgrade probe.  If none of the HTTPS candidates is
+        # healthy, discover_backend_url returns the original value and the
+        # secret-transport guard rejects it before credentials can be sent.
+        candidates = _secure_legacy_candidates(parsed)
+        return list(dict.fromkeys(item.rstrip("/") for item in candidates)) or [normalized]
+
     if parsed.port is not None or base_path:
         return [normalized]
 
     host = parsed.hostname
     candidates = [normalized]
     if parsed.scheme == "https":
-        candidates.extend(
-            [
-                f"https://{host}:8001",
-                f"http://{host}:8001",
-                f"http://{host}:8000",
-            ]
-        )
+        # Never turn a verified public origin into a plaintext API endpoint.
+        # VPN recovery is handled by binding the HTTPS socket to a physical
+        # adapter; changing the scheme would expose the paired agent key and
+        # command traffic on the network.
+        candidates.append(f"https://{host}:8001")
     else:
         candidates.extend(
             [
@@ -175,20 +365,29 @@ def _build_server_candidates(value: str) -> list[str]:
     return unique
 
 
-def discover_backend_url(server_url: str) -> str:
-    candidates = _build_server_candidates(server_url)
-    with create_http_client(server_url, timeout=8, trust_env=False) as client:
-        for candidate in candidates:
-            health_url = f"{candidate}/health"
-            try:
+def discover_backend_url(server_url: str, *, allow_insecure_http: bool = False) -> str:
+    """Find a healthy backend without ever downgrading a public endpoint.
+
+    Each candidate owns its adaptive client so TLS SNI/certificate validation
+    and VPN route recovery are anchored to the exact origin being tested.
+    """
+
+    candidates = _build_server_candidates(
+        server_url, allow_insecure_http=allow_insecure_http,
+    )
+    for candidate in candidates:
+        try:
+            client_context = create_http_client(candidate, timeout=8, trust_env=False)
+            with client_context as client:
+                health_url = f"{candidate}/health"
                 response = client.get(health_url)
-            except Exception:
-                continue
-            if response.status_code >= 400:
-                continue
-            payload = _parse_json_body(response)
-            if isinstance(payload, dict) and str(payload.get("status") or "").lower() == "ok":
-                return candidate
+        except Exception:
+            continue
+        if response.status_code >= 400:
+            continue
+        payload = _parse_json_body(response)
+        if isinstance(payload, dict) and str(payload.get("status") or "").lower() == "ok":
+            return candidate
     return normalize_server_url(server_url)
 
 
@@ -328,7 +527,9 @@ def claim_pair_code(
     source_name: str,
     source_type: str,
     e2e_public_jwk: dict[str, Any] | None = None,
+    allow_insecure_http: bool = False,
 ) -> dict[str, Any]:
+    server_url = require_secret_transport(server_url, allow_insecure_http=allow_insecure_http)
     endpoint = f"{server_url.rstrip('/')}/agent/pair/claim"
     payload = {
         "pair_code": pair_code.strip(),
@@ -384,7 +585,9 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
     pair_code = input("Код привязки (из /agents), Enter если хотите ввести AGENT_API_KEY: ").strip()
     api_key = ""
     if pair_code:
-        discovered_url = discover_backend_url(server_url)
+        discovered_url = discover_backend_url(
+            server_url, allow_insecure_http=_allow_insecure_http(existing),
+        )
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             server_url = discovered_url
@@ -396,6 +599,7 @@ def setup_wizard(existing: dict[str, Any] | None = None) -> dict[str, Any]:
             source_name=source_name,
             source_type=source_type,
             e2e_public_jwk=staging.get("e2e_public_jwk"),
+            allow_insecure_http=_allow_insecure_http(existing),
         )
         api_key = str(result.get("agent_api_key") or "").strip()
         source_name = str(result.get("source_name") or source_name)
@@ -448,6 +652,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-only", action="store_true")
     parser.add_argument("--no-auto-update", action="store_true")
     parser.add_argument("--desktop-managed", action="store_true")
+    parser.add_argument("--allow-insecure-http", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -487,11 +692,16 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
         updated = True
     if args.desktop_managed:
         config["desktop_managed"] = True
+    if args.allow_insecure_http:
+        config["allow_insecure_http"] = True
+        updated = True
 
     pair_code = (args.pair_code or "").strip()
     if pair_code:
         server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
-        discovered_url = discover_backend_url(server_url)
+        discovered_url = discover_backend_url(
+            server_url, allow_insecure_http=_allow_insecure_http(config),
+        )
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             server_url = discovered_url
@@ -504,6 +714,7 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> tup
             source_name=source_name,
             source_type=source_type,
             e2e_public_jwk=config.get("e2e_public_jwk"),
+            allow_insecure_http=_allow_insecure_http(config),
         )
         config["server_url"] = server_url
         config["api_key"] = str(result.get("agent_api_key") or "").strip()
@@ -680,7 +891,6 @@ def _handle_workspace_command(
         return True
     except Exception as exc:
         store_command_result(command_id, False, f"{command_name}: {exc}")
-        print(f"[pc-client] {command_name} failed: {exc}", flush=True)
         return True
 
 
@@ -697,6 +907,7 @@ def _apply_update(config: dict[str, Any], manifest: dict[str, Any], command_id: 
                 manifest,
                 api_key=str(config.get("api_key") or ""),
                 trust_env=bool(config.get("trust_env_proxy", False)),
+                allow_insecure_http=_allow_insecure_http(config),
                 progress=report,
             )
             operation.phase("verifying", "Пакет проверен")
@@ -731,6 +942,7 @@ def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], co
                 manifest,
                 api_key=str(config.get("api_key") or ""),
                 trust_env=bool(config.get("trust_env_proxy", False)),
+                allow_insecure_http=_allow_insecure_http(config),
                 progress=report,
             )
             operation.phase("verifying", "Установщик проверен")
@@ -751,9 +963,132 @@ def _apply_installer_update(config: dict[str, Any], manifest: dict[str, Any], co
         return None
 
 
+def _log_command(command_id: int, attempt: int, duration_ms: float, name: str) -> None:
+    print(
+        f"[pc-client] command id={command_id} attempt={attempt} dur_ms={duration_ms:.0f} name={name}",
+        flush=True,
+    )
+
+
+def _dispatch_agent_command(
+    job: dict[str, Any],
+    client: httpx.Client,
+    *,
+    config: dict[str, Any],
+    source_name: str,
+    archive_busy: bool,
+) -> str | None:
+    if job.get("kind") == "auto":
+        manifest = job.get("manifest") if isinstance(job.get("manifest"), dict) else {}
+        if job.get("installer"):
+            return _apply_installer_update(config, manifest, None)
+        return _apply_update(config, manifest, None)
+
+    command_id = int(job["id"])
+    command_name = str(job.get("command") or "")
+    command_payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    manifest = job.get("manifest") if isinstance(job.get("manifest"), dict) else None
+    installer_manifest = job.get("installer_manifest") if isinstance(job.get("installer_manifest"), dict) else None
+    started = time.perf_counter()
+    stop: str | None = None
+    try:
+        if command_name == "music_storage_sync":
+            storage_tick(config, DATA_ROOT, force=True)
+            store_command_result(command_id, True, "Синхронизация хранилища запрошена", storage_snapshot())
+        elif command_name in MUSIC_COMMANDS:
+            try:
+                music_details = handle_music_command(command_name, command_payload, config)
+                store_command_result(command_id, True, "Музыкальный плеер: команда принята", music_details)
+            except Exception as exc:
+                from music_player import MusicError
+                message = str(exc) if isinstance(exc, MusicError) else "Не удалось выполнить музыкальную команду. Проверьте аудиовыход Windows"
+                store_command_result(command_id, False, message, music_snapshot())
+        elif command_name == "lock":
+            _lock_workstation(command_id)
+        elif command_name == "sleep":
+            _sleep_workstation(command_id)
+        elif command_name in {"reboot", "shutdown"}:
+            _power_command(
+                command_id,
+                reboot=command_name == "reboot",
+                delay_sec=int(command_payload.get("delay_sec") or 0),
+            )
+        elif command_name == "ping":
+            latency = float(job.get("latency_ms") or 0)
+            store_command_result(
+                command_id,
+                True,
+                f"Соединение активно, задержка {latency:.0f} мс",
+                {"latency_ms": round(latency, 1)},
+            )
+        elif command_name == "open_archive":
+            _open_archive_folder(config, command_id)
+        elif command_name == "cleanup_archive":
+            if archive_busy:
+                store_command_result(command_id, False, "Архив ещё синхронизируется. Повторите очистку после завершения синхронизации.")
+            else:
+                result = cleanup_archive(config, force=True)
+                store_command_result(
+                    command_id,
+                    True,
+                    f"Локальный архив очищен: {result['removed_files']} файлов",
+                    result,
+                )
+        elif _handle_workspace_command(
+            command_name,
+            command_payload,
+            command_id=command_id,
+            config=config,
+            source_name=source_name,
+            client=client,
+        ):
+            pass
+        elif command_name == "check_update":
+            update_info = installer_manifest if is_installer_build() else manifest
+            available = bool(update_info and update_info.get("available"))
+            version = str((update_info or {}).get("version") or current_version())
+            store_command_result(
+                command_id,
+                True,
+                f"Доступно обновление {version}" if available else "Версия уже актуальна",
+                {"available": available, "version": version},
+            )
+        elif command_name == "restart":
+            stop = _restart_agent(config, command_id)
+        elif command_name == "update":
+            if is_installer_build() and installer_manifest and installer_manifest.get("available"):
+                stop = _apply_installer_update(config, installer_manifest, command_id)
+            elif not is_installer_build() and manifest and manifest.get("available"):
+                stop = _apply_update(config, manifest, command_id)
+            else:
+                store_command_result(command_id, True, "Версия уже актуальна")
+        else:
+            store_command_result(command_id, False, f"Неизвестная команда агента: {command_name or 'empty'}")
+    except Exception:
+        store_command_result(command_id, False, "Команда агента не выполнена")
+    finally:
+        try:
+            attempt = max(1, int(job.get("attempt") or 1))
+        except (TypeError, ValueError):
+            attempt = 1
+        _log_command(command_id, attempt, (time.perf_counter() - started) * 1000, command_name)
+    return stop
+
+
+def wait_for_agent_commands(timeout: float = 2.0) -> bool:
+    executor = _executor
+    if executor is None:
+        return True
+    return executor.wait(timeout)
+
+
 def run_agent(config: dict[str, Any]) -> str:
     global _last_heartbeat_error, _last_heartbeat_error_at, _last_heartbeat_latency_ms, _last_server_version
-    endpoint = f"{config['server_url'].rstrip('/')}/agent/heartbeat"
+    server_url = require_secret_transport(
+        str(config.get("server_url") or ""), allow_insecure_http=_allow_insecure_http(config),
+    )
+    config["server_url"] = server_url
+    endpoint = f"{server_url.rstrip('/')}/agent/heartbeat"
     headers = {"X-Api-Key": config["api_key"]}
     interval_sec = max(1, int(config.get("interval_sec", 30)))
     source_name = str(config.get("source_name") or socket.gethostname())
@@ -781,234 +1116,198 @@ def run_agent(config: dict[str, Any]) -> str:
         flush=True,
     )
 
-    failed_auto_revision = ""
     consecutive_failures = 0
     sleep_seconds = 0.0
     telemetry: dict[str, Any] | None = None
     telemetry_collected_at = 0.0
     last_successful_heartbeat_at = 0.0
     archive_worker = _ArchiveSyncWorker()
-    with create_http_client(
-        str(config["server_url"]),
-        timeout=20,
-        trust_env=trust_env_proxy,
-    ) as client:
-        while True:
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
-            if telemetry is None or time.monotonic() - telemetry_collected_at >= interval_sec:
-                telemetry = build_payload({**config, "source_name": source_name, "source_type": source_type})
-                telemetry_collected_at = time.monotonic()
-            payload = {
-                **telemetry,
-                "command_results": load_command_results(),
-                "archive_cursor": archive_cursor(config),
-                "last_error": _last_heartbeat_error,
-                "last_error_at": _last_heartbeat_error_at,
-                "server_version_seen": _last_server_version,
-                "music_player": music_snapshot(),
-                "music_storage": storage_snapshot(),
-            }
-            sent_result_ids = [
-                int(item.get("id"))
-                for item in payload.get("command_results", [])
-                if str(item.get("id", "")).isdigit()
-            ]
-            try:
-                heartbeat_started = time.perf_counter()
-                response = client.post(endpoint, headers=headers, json=payload)
-                _last_heartbeat_latency_ms = (time.perf_counter() - heartbeat_started) * 1000
-                response.raise_for_status()
-                body = _parse_json_body(response)
-                if not isinstance(body, dict):
-                    content_type = response.headers.get("content-type", "")
-                    preview = _response_preview(response.text)
-                    raise RuntimeError(
-                        "heartbeat failed: backend returned non-JSON response. "
-                        f"Check server URL ({config['server_url']}). "
-                        f"content-type={content_type!r}, body={preview!r}"
+
+    def handler(job: dict[str, Any], command_client: httpx.Client) -> str | None:
+        return _dispatch_agent_command(
+            job,
+            command_client,
+            config=config,
+            source_name=source_name,
+            archive_busy=archive_worker.busy,
+        )
+
+    executor = CommandExecutor(handler, server_url=str(config["server_url"]), trust_env=trust_env_proxy)
+    global _executor
+    _executor = executor
+    try:
+        with _HeartbeatClient(
+            str(config["server_url"]),
+            timeout=20,
+            trust_env=trust_env_proxy,
+        ) as client:
+            while True:
+                if executor.stop_reason:
+                    return executor.stop_reason
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+                if executor.stop_reason:
+                    return executor.stop_reason
+                if telemetry is None or time.monotonic() - telemetry_collected_at >= interval_sec:
+                    telemetry = build_payload({**config, "source_name": source_name, "source_type": source_type})
+                    telemetry_collected_at = time.monotonic()
+                payload = {
+                    **telemetry,
+                    "command_results": load_command_results(),
+                    "archive_cursor": archive_cursor(config),
+                    "last_error": _last_heartbeat_error,
+                    "last_error_at": _last_heartbeat_error_at,
+                    "server_version_seen": _last_server_version,
+                    "music_player": music_snapshot(),
+                    "music_storage": storage_snapshot(),
+                }
+                sent_result_ids = [
+                    int(item.get("id"))
+                    for item in payload.get("command_results", [])
+                    if str(item.get("id", "")).isdigit()
+                ]
+                try:
+                    heartbeat_started = time.perf_counter()
+                    response = client.post(endpoint, headers=headers, json=payload)
+                    _last_heartbeat_latency_ms = (time.perf_counter() - heartbeat_started) * 1000
+                    response.raise_for_status()
+                    body = _parse_json_body(response)
+                    if not isinstance(body, dict):
+                        content_type = response.headers.get("content-type", "")
+                        preview = _response_preview(response.text)
+                        raise RuntimeError(
+                            "heartbeat failed: backend returned non-JSON response. "
+                            f"Check server URL ({config['server_url']}). "
+                            f"content-type={content_type!r}, body={preview!r}"
+                        )
+                    _last_server_version = str(body.get("server_version") or "")[:32]
+                    msg = (
+                        f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')} "
+                        f"latency={_last_heartbeat_latency_ms:.0f}ms"
                     )
-                _last_server_version = str(body.get("server_version") or "")[:32]
-                msg = (
-                    f"[pc-client] ok recovered={body.get('recovered')} at {body.get('server_time')} "
-                    f"latency={_last_heartbeat_latency_ms:.0f}ms"
-                )
-                if body.get("new_source"):
-                    msg += " | новый агент зарегистрирован"
-                last_successful_heartbeat_at = time.time()
-                write_agent_status(
-                    "online",
-                    detail=msg,
-                    server_time=str(body.get("server_time") or ""),
-                    latency_ms=round(_last_heartbeat_latency_ms, 1),
-                    agent_version=current_version(),
-                    server_version=_last_server_version,
-                    last_error="",
-                    heartbeat_at=last_successful_heartbeat_at,
-                )
-                print(msg, flush=True)
-                consecutive_failures = 0
-                _last_heartbeat_error = ""
-                _last_heartbeat_error_at = ""
-                sleep_seconds = min(float(interval_sec), COMMAND_POLL_INTERVAL_SEC)
-                commands = body.get("commands") if isinstance(body.get("commands"), list) else []
-                if sent_result_ids:
-                    still_pending = {
-                        int(command.get("id"))
-                        for command in commands
-                        if isinstance(command, dict) and str(command.get("id", "")).isdigit()
-                    }
-                    clear_command_results([item for item in sent_result_ids if item not in still_pending])
+                    if body.get("new_source"):
+                        msg += " | новый агент зарегистрирован"
+                    last_successful_heartbeat_at = time.time()
+                    write_agent_status(
+                        "online",
+                        detail=msg,
+                        server_time=str(body.get("server_time") or ""),
+                        latency_ms=round(_last_heartbeat_latency_ms, 1),
+                        agent_version=current_version(),
+                        server_version=_last_server_version,
+                        last_error="",
+                        heartbeat_at=last_successful_heartbeat_at,
+                    )
+                    print(msg, flush=True)
+                    consecutive_failures = 0
+                    _last_heartbeat_error = ""
+                    _last_heartbeat_error_at = ""
+                    sleep_seconds = min(float(interval_sec), COMMAND_POLL_INTERVAL_SEC)
+                    commands = body.get("commands") if isinstance(body.get("commands"), list) else []
+                    if sent_result_ids:
+                        still_pending = {
+                            int(command.get("id"))
+                            for command in commands
+                            if isinstance(command, dict) and str(command.get("id", "")).isdigit()
+                        }
+                        clear_command_results([item for item in sent_result_ids if item not in still_pending])
 
-                manifest = body.get("update") if isinstance(body.get("update"), dict) else None
-                installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
-                config["archive_enabled"] = bool(body.get("archive_enabled"))
-                storage_tick(config, DATA_ROOT)
-                update_command_id: int | None = None
-                for command in commands:
-                    if not isinstance(command, dict):
-                        continue
-                    try:
-                        command_id = int(command.get("id"))
-                    except (TypeError, ValueError):
-                        continue
-                    command_name = str(command.get("command") or "").strip().lower()
-                    command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-                    if not _command_needs_execution(command_id):
-                        continue
-                    # Persist before execution. If the process dies after a power or
-                    # lock command, the same server delivery cannot execute it twice.
-                    mark_command_processed(command_id, command_name)
-                    if command_name == "music_storage_sync":
-                        storage_tick(config, DATA_ROOT, force=True)
-                        store_command_result(command_id, True, "Синхронизация хранилища запрошена", storage_snapshot())
-                        continue
-                    if command_name in MUSIC_COMMANDS:
-                        try:
-                            music_details = handle_music_command(command_name, command_payload, config)
-                            store_command_result(command_id, True, "Музыкальный плеер: команда принята", music_details)
-                        except Exception as exc:
-                            from music_player import MusicError
-                            message = str(exc) if isinstance(exc, MusicError) else "Не удалось выполнить музыкальную команду. Проверьте аудиовыход Windows"
-                            store_command_result(command_id, False, message, music_snapshot())
-                        continue
-                    if command_name == "lock":
-                        _lock_workstation(command_id)
-                        continue
-                    if command_name == "sleep":
-                        _sleep_workstation(command_id)
-                        continue
-                    if command_name in {"reboot", "shutdown"}:
-                        _power_command(
-                            command_id,
-                            reboot=command_name == "reboot",
-                            delay_sec=int(command_payload.get("delay_sec") or 0),
-                        )
-                        continue
-                    if command_name == "ping":
-                        store_command_result(
-                            command_id,
-                            True,
-                            f"Соединение активно, задержка {_last_heartbeat_latency_ms:.0f} мс",
-                            {"latency_ms": round(_last_heartbeat_latency_ms, 1)},
-                        )
-                        continue
-                    if command_name == "open_archive":
-                        _open_archive_folder(config, command_id)
-                        continue
-                    if command_name == "cleanup_archive":
-                        if archive_worker.busy:
-                            store_command_result(command_id, False, "Архив ещё синхронизируется. Повторите очистку после завершения синхронизации.")
+                    manifest = body.get("update") if isinstance(body.get("update"), dict) else None
+                    installer_manifest = body.get("installer_update") if isinstance(body.get("installer_update"), dict) else None
+                    config["archive_enabled"] = bool(body.get("archive_enabled"))
+                    storage_tick(config, DATA_ROOT)
+                    batch = executor.next_batch()
+                    accepted = False
+                    chosen_update: dict[str, Any] | None = None
+                    duplicate_updates: list[dict[str, Any]] = []
+                    for command in commands:
+                        if not isinstance(command, dict):
                             continue
-                        result = cleanup_archive(config, force=True)
-                        store_command_result(
-                            command_id,
-                            True,
-                            f"Локальный архив очищен: {result['removed_files']} файлов",
-                            result,
-                        )
-                        continue
-                    if _handle_workspace_command(
-                        command_name,
-                        command_payload,
-                        command_id=command_id,
-                        config=config,
-                        source_name=source_name,
-                        client=client,
-                    ):
-                        continue
-                    if command_name == "check_update":
-                        update_info = installer_manifest if is_installer_build() else manifest
-                        available = bool(update_info and update_info.get("available"))
-                        version = str((update_info or {}).get("version") or current_version())
-                        store_command_result(
-                            command_id,
-                            True,
-                            f"Доступно обновление {version}" if available else "Версия уже актуальна",
-                            {"available": available, "version": version},
-                        )
-                        continue
-                    if command_name == "restart":
-                        return _restart_agent(config, command_id)
-                    if command_name == "update":
-                        if update_command_id is None:
-                            update_command_id = command_id
+                        try:
+                            command_id = int(command.get("id"))
+                        except (TypeError, ValueError):
+                            continue
+                        command_name = str(command.get("command") or "").strip().lower()
+                        command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+                        try:
+                            attempt = max(1, int(command.get("attempt")))
+                        except (TypeError, ValueError):
+                            attempt = 1
+                        job = {
+                            "kind": "command",
+                            "id": command_id,
+                            "command": command_name,
+                            "payload": command_payload,
+                            "attempt": attempt,
+                            "batch": batch,
+                            "manifest": manifest,
+                            "installer_manifest": installer_manifest,
+                            "latency_ms": _last_heartbeat_latency_ms,
+                        }
+                        # Update runs after the other commands from this response, on the worker.
+                        if command_name == "update":
+                            if chosen_update is None:
+                                chosen_update = job
+                            else:
+                                duplicate_updates.append(job)
+                            continue
+                        if executor.accept(job) == "queued":
+                            accepted = True
+                    saw_update = False
+                    if chosen_update is not None:
+                        outcome = executor.accept(chosen_update)
+                        if outcome == "skipped":
+                            for duplicate in duplicate_updates:
+                                outcome = executor.accept(duplicate)
+                                if outcome == "queued":
+                                    accepted = True
+                                if outcome != "skipped":
+                                    chosen_update = duplicate
+                                    saw_update = True
+                                    break
+                            duplicate_updates = duplicate_updates[duplicate_updates.index(chosen_update) + 1:] if saw_update else []
                         else:
-                            store_command_result(
-                                command_id,
-                                False,
-                                f"Повторный запрос обновления отменён: выполняется команда №{update_command_id}.",
-                                {"duplicate_of": update_command_id},
-                            )
-                        continue
-                    store_command_result(command_id, False, f"Неизвестная команда агента: {command_name or 'empty'}")
-
-                if update_command_id is not None:
-                    if is_installer_build() and installer_manifest and installer_manifest.get("available"):
-                        update_result = _apply_installer_update(config, installer_manifest, update_command_id)
-                        if update_result:
-                            return update_result
-                    elif not is_installer_build() and manifest and manifest.get("available"):
-                        update_result = _apply_update(config, manifest, update_command_id)
-                        if update_result:
-                            return update_result
-                    else:
-                        store_command_result(update_command_id, True, "Версия уже актуальна")
-                elif is_installer_build() and installer_manifest and installer_manifest.get("available") and bool(config.get("auto_update", True)):
-                    revision = str(installer_manifest.get("revision") or "")
-                    if revision and revision != failed_auto_revision:
-                        update_result = _apply_installer_update(config, installer_manifest, None)
-                        if update_result:
-                            return update_result
-                        failed_auto_revision = revision
-                elif manifest and manifest.get("available") and bool(config.get("auto_update", True)):
-                    revision = str(manifest.get("revision") or "")
-                    if revision and revision != failed_auto_revision:
-                        update_result = _apply_update(config, manifest, None)
-                        if update_result:
-                            return update_result
-                        failed_auto_revision = revision
-                archive_worker.submit(config, body, headers)
-                if load_command_results():
-                    # Acknowledge promptly instead of waiting another telemetry interval.
-                    sleep_seconds = 0.1
-            except Exception as exc:
-                error = f"[pc-client] heartbeat failed: {exc}"
-                _last_heartbeat_error = str(exc)[:1000]
-                _last_heartbeat_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                write_agent_status(
-                    "offline",
-                    detail=error,
-                    latency_ms=round(_last_heartbeat_latency_ms, 1),
-                    agent_version=current_version(),
-                    server_version=_last_server_version,
-                    last_error=str(exc)[:1000],
-                    heartbeat_at=last_successful_heartbeat_at,
-                )
-                print(error, flush=True)
-                consecutive_failures += 1
-                base_delay = min(90.0, 3.0 * (2 ** min(consecutive_failures - 1, 5)))
-                sleep_seconds = base_delay + random.uniform(0.0, min(3.0, base_delay * 0.2))
+                            saw_update = True
+                            if outcome == "queued":
+                                accepted = True
+                        if saw_update and chosen_update is not None:
+                            for duplicate in duplicate_updates:
+                                executor.complete_duplicate(duplicate, int(chosen_update["id"]))
+                    if not saw_update and is_installer_build() and installer_manifest and installer_manifest.get("available") and bool(config.get("auto_update", True)):
+                        revision = str(installer_manifest.get("revision") or "")
+                        if revision:
+                            executor.submit_auto({"manifest": installer_manifest, "installer": True, "revision": revision})
+                    elif not saw_update and manifest and manifest.get("available") and bool(config.get("auto_update", True)):
+                        revision = str(manifest.get("revision") or "")
+                        if revision:
+                            executor.submit_auto({"manifest": manifest, "installer": False, "revision": revision})
+                    archive_worker.submit(config, body, headers)
+                    if load_command_results() or accepted:
+                        # Acknowledge promptly instead of waiting another telemetry interval.
+                        sleep_seconds = 0.1
+                except Exception as exc:
+                    error = f"[pc-client] heartbeat failed: {exc}"
+                    _last_heartbeat_error = str(exc)[:1000]
+                    _last_heartbeat_error_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    write_agent_status(
+                        "offline",
+                        detail=error,
+                        latency_ms=round(_last_heartbeat_latency_ms, 1),
+                        agent_version=current_version(),
+                        server_version=_last_server_version,
+                        last_error=str(exc)[:1000],
+                        heartbeat_at=last_successful_heartbeat_at,
+                    )
+                    print(error, flush=True)
+                    consecutive_failures += 1
+                    # Adapter/VPN switches are usually brief.  Long 48–90 s
+                    # sleeps made the healthy agent look permanently offline
+                    # after the network was already back.
+                    base_delay = min(15.0, 1.0 * (2 ** min(consecutive_failures - 1, 4)))
+                    sleep_seconds = base_delay + random.uniform(0.0, min(1.0, base_delay * 0.15))
+    finally:
+        executor.close()
+        _executor = None
 
 
 def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
@@ -1030,6 +1329,8 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
         config["auto_update"] = True
     if "desktop_managed" not in config:
         config["desktop_managed"] = False
+    if "allow_insecure_http" not in config:
+        config["allow_insecure_http"] = False
     if "archive_folder" not in config:
         config["archive_folder"] = ""
     if "archive_enabled" not in config:
@@ -1056,7 +1357,9 @@ def _run_main() -> None:
             print(f"Используется конфиг: {CONFIG_PATH}")
 
         server_url = normalize_server_url(str(config.get("server_url") or "http://127.0.0.1:8001"))
-        discovered_url = discover_backend_url(server_url)
+        discovered_url = discover_backend_url(
+            server_url, allow_insecure_http=_allow_insecure_http(config),
+        )
         if discovered_url != server_url:
             print(f"[pc-client] backend autodetect: {server_url} -> {discovered_url}")
             config["server_url"] = discovered_url

@@ -44,7 +44,10 @@ import UIKit
     nonisolated static func timedLyrics(from value: SyncedLyrics?, currentID: Int?) -> TimedLyrics? {
         guard let value = value, let currentID = currentID, value.trackID == currentID,
               value.synced, !value.lines.isEmpty else { return nil }
-        return TimedLyrics(lines: value.lines.map { TimedLyricLine(start: $0.start, end: $0.end, text: $0.text) })
+        return TimedLyrics(lines: value.lines.map {
+            TimedLyricLine(start: $0.start, end: $0.end, text: $0.text,
+                           translation: $0.translation, pronunciation: $0.pronunciation)
+        })
     }
 
     private func syncLyrics() {
@@ -91,11 +94,18 @@ import UIKit
             return
         }
         let id = String(current.id)
+        let artworkForThisTrack = track?.id == id ? track?.artworkImage : nil
         // Keep the previous image (even of the previous song) until the new one is
         // decoded: the UI never flashes a placeholder between two covers.
         let next = PlayerTrack(id: id, title: current.title, artist: current.artist.isEmpty ? "Моя коллекция" : current.artist,
                                artworkImage: track?.artworkImage)
         if next != track { track = next }
+        // A same-track handoff from PC to this iPhone does not change the
+        // artwork cache key. Re-attach its already decoded cover to the newly
+        // created AVPlayer item; never attach the previous song's transition art.
+        if store.audio.trackID == current.id, let artworkForThisTrack {
+            store.audio.setNowPlayingArtwork(artworkForThisTrack, for: current.id)
+        }
         let key = "\(current.id)-\(store.artworkRevision)"
         if key != artworkKey { artworkKey = key; loadArtwork(trackID: current.id, key: key) }
         if duration <= 0, current.duration > 0 { duration = current.duration }
@@ -120,6 +130,9 @@ import UIKit
             guard !Task.isCancelled, self.artworkKey == key, var updated = self.track, updated.id == String(trackID) else { return }
             updated.artworkImage = image
             if updated != self.track { self.track = updated }
+            // Lock Screen / Dynamic Island metadata is owned by AudioController,
+            // but it must receive the same authenticated, decoded cover as the app.
+            self.store.audio.setNowPlayingArtwork(image, for: trackID)
         }
     }
 

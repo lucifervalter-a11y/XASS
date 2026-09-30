@@ -1,35 +1,29 @@
-# Security boundaries in 0.19
+# Security boundaries in 0.21
 
 These are targeted mitigations, not a claim that every dependency or deployment has been audited.
 
-## File response Range parsing
+## Dependency baseline and file ranges
 
-The current `fastapi==0.116.1` pin constrains Starlette to `<0.48.0`. This includes
-[GHSA-7f5h-v6xp-fcq8](https://github.com/Kludex/starlette/security/advisories/GHSA-7f5h-v6xp-fcq8),
-whose upstream fix starts at Starlette 0.49.1.
+XASS 0.21 pins `fastapi==0.142.2`, `starlette==1.7.0` and
+`Pillow==12.3.0`. The release dependency audit reports no known advisories for
+the locked backend or Windows-agent requirements. That result is a snapshot of
+the advisory database at release time, not a promise that future advisories do
+not exist.
 
-XASS now rejects malformed, duplicate, multiple and oversized HTTP `Range`
+XASS still rejects malformed, duplicate, multiple and oversized HTTP `Range`
 headers in ASGI middleware before authentication, route execution or the
-vulnerable file-response parser. Only one `bytes=start-end`, `bytes=start-` or
+file-response parser. Only one `bytes=start-end`, `bytes=start-` or
 `bytes=-suffix` range is supported, with at most 20 digits per number and 48
 header bytes. Rejected ranges return HTTP 416 with `Cache-Control: no-store`.
 Ordinary 206 audio seeking, resumed downloads, HEAD and If-Range remain supported.
 Installer/media tickets and owner/agent authorization are still required.
 
-This bounds the affected regex/merge workload; it does not patch Starlette
-itself or address unrelated upstream advisories. A coordinated FastAPI/Starlette
-upgrade still needs dependency-resolution and regression testing. Do not force
-an incompatible Starlette version into the existing FastAPI constraint.
-
 ## Embedded image decoders
 
-The `Pillow==11.3.0` pin also has newer upstream advisories, including
-[PSD memory corruption](https://github.com/python-pillow/Pillow/security/advisories/GHSA-pwv6-vv43-88gr).
 Embedded music artwork invokes only JPEG, PNG and GIF plugins via
 `Image.open(..., formats=...)`; disallowed plugins are never used for sniffing or
 decoding. Byte/pixel budgets and private sanitized JPEG output remain enforced.
 This narrows that endpoint's attack surface, not every possible Pillow call.
-A tested Pillow upgrade remains required; no package pins were changed here.
 
 WebP embedded covers are temporarily excluded, independently of those
 advisories. Pillow's WebP plugin creates a native animation decoder during
@@ -38,6 +32,19 @@ The application's later pixel limit cannot prevent that initial allocation.
 Such covers use the existing no-artwork fallback; audio playback is unaffected.
 Profile/project WebP uploads are still accepted because those routes store
 bytes without invoking Pillow. This is not a complete bundled-C-library audit.
+
+## Agent transport and sensitive actions
+
+Public agent origins must use HTTPS. Pairing codes, issued device keys, update
+requests and server-backed music are rejected over remote plain HTTP; loopback
+is reserved for local development. HTTPS probing never silently downgrades to
+HTTP and keeps the original hostname for TLS/SNI validation.
+
+Screenshots, clipboard reads, file downloads and file uploads require a fresh
+owner action proof bound to the device, command and normalized parameters. File
+upload approval is checked before the request body is read. Telegram API errors
+are sanitized inside the client so a bot token is not copied into tracebacks,
+diagnostics, database records or backups.
 
 ## Browser approvals and uploads
 

@@ -69,6 +69,8 @@ class ServerStartupTests(unittest.IsolatedAsyncioTestCase):
         bot = _SlowBot()
         fake_settings = SimpleNamespace(
             use_polling=False,
+            agent_api_key="",
+            agent_api_key_enabled=False,
             profile_public_url="https://xass.example",
             profile_json_path="profile.json",
             projects_json_path="projects.json",
@@ -254,7 +256,7 @@ class UpdateStatusTests(unittest.TestCase):
         publish_step = windows_workflow.split("- name: Publish installer to XASS server", maxsplit=1)[1]
         publication = publish_step.split("publish-release:", maxsplit=1)[0]
         self.assertNotIn("continue-on-error: true", publication)
-        self.assertIn(".incoming-${{ github.sha }}", publication)
+        self.assertIn(".incoming-${{ github.event.workflow_run.head_sha }}", publication)
         self.assertIn("deploy/publish_installer.py", publication)
         self.assertIn("verify_manifest", publication)
         self.assertIn("Downloaded installer checksum mismatch", publication)
@@ -267,7 +269,47 @@ class UpdateStatusTests(unittest.TestCase):
         self.assertIn("deploy/predeploy_backup.py", workflow)
         self.assertIn("set -euo pipefail", workflow)
         self.assertNotIn("create_snapshot", workflow)
-        self.assertIn("umask 022\n            bash deploy/update.sh", workflow)
+        self.assertIn("git show '${{ github.event.workflow_run.head_sha }}:deploy/update.sh'", workflow)
+        self.assertIn("bash \"$verified_update\" '${{ github.event.workflow_run.head_sha }}'", workflow)
+        self.assertIn("test \"$(git rev-parse HEAD)\" = '${{ github.event.workflow_run.head_sha }}'", workflow)
+
+    def test_production_and_release_workflows_require_successful_main_checks(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflows = {
+            name: (root / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            for name in ("deploy.yml", "windows-agent.yml", "ios.yml")
+        }
+        for name, workflow in workflows.items():
+            with self.subTest(workflow=name):
+                self.assertIn("workflows: [Tests and interface contracts]", workflow)
+                self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
+                self.assertIn("github.event.workflow_run.event == 'push'", workflow)
+                self.assertIn("github.event.workflow_run.head_branch == 'main'", workflow)
+                self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", workflow)
+                self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
+
+        self.assertNotIn("branches: [main]\n    paths:", workflows["windows-agent.yml"])
+        self.assertIn("git tag --force agent-latest \"$RELEASE_SHA\"", workflows["windows-agent.yml"])
+        self.assertIn("git tag --force ios-latest \"$RELEASE_SHA\"", workflows["ios.yml"])
+
+        update_script = (root / "deploy" / "update.sh").read_text(encoding="utf-8")
+        self.assertIn('target_revision="${1:-origin/main}"', update_script)
+        self.assertIn('git merge --ff-only "$target_revision"', update_script)
+        self.assertIn("Target revision is not on origin/main", update_script)
+
+    def test_current_release_documentation_does_not_present_old_ui_or_dependency_pins_as_current(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        ios_readme = (root / "ios" / "README.md").read_text(encoding="utf-8")
+        security = (root / "docs" / "SECURITY_MITIGATIONS.md").read_text(encoding="utf-8")
+
+        self.assertIn("Предыдущий интерфейс XASS для Windows 0.15", readme)
+        self.assertIn("Архивный пример браузерного музыкального интерфейса 0.16", readme)
+        self.assertIn("XASS 0.21", ios_readme)
+        self.assertIn("# Security boundaries in 0.21", security)
+        for requirement in ("fastapi==0.142.2", "starlette==1.7.0", "Pillow==12.3.0"):
+            self.assertIn(requirement, security)
+        self.assertNotIn("A tested Pillow upgrade remains required", security)
 
 
 if __name__ == "__main__":
