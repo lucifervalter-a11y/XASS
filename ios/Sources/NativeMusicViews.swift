@@ -298,12 +298,14 @@ private struct NativeLibraryBrowser: View, Equatable {
                 // secondary metadata action. Keep it first so it remains both
                 // visible and reachable when Dynamic Type makes every row tall.
                 if track.id == store.currentID {
-                    Section("Трансляция") {
+                    Section {
                         Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
                             Label(store.shareSaving ? "Сохраняю…" : "Показывать на сайте", systemImage: "dot.radiowaves.left.and.right")
                         }
                         .disabled(store.shareSaving || store.busy)
                         .accessibilityIdentifier("nativeShareSite")
+                    } header: {
+                        Text("Трансляция")
                     } footer: {
                         Text("Показывает текущий трек в музыкальном блоке вашего сайта.")
                     }
