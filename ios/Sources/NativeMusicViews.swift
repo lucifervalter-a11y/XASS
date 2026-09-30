@@ -293,41 +293,57 @@ private struct NativeLibraryBrowser: View, Equatable {
     private var current: LibraryTrack { store.resolvedTrack(track) }
     var body: some View {
         NavigationStack {
-            List {
-                // Sharing is a state of the currently playing track, not a
-                // secondary metadata action. Keep it first so it remains both
-                // visible and reachable when Dynamic Type makes every row tall.
-                if track.id == store.currentID {
-                    Section {
+            VStack(spacing: 0) {
+                // List virtualises rows outside its visible viewport. At the
+                // accessibility text sizes that made essential actions vanish
+                // from both VoiceOver and keyboard navigation until the list
+                // was scrolled. Keep the two playback actions in a real,
+                // non-lazy primary-action card above the scrolling content.
+                VStack(spacing: 0) {
+                    if track.id == store.currentID {
                         Toggle(isOn: Binding(get: { store.shareSite }, set: { desired in store.run { try await store.setSharing(desired) } })) {
                             Label(store.shareSaving ? "Сохраняю…" : "Показывать на сайте", systemImage: "dot.radiowaves.left.and.right")
                         }
+                        .padding(16)
                         .disabled(store.shareSaving || store.busy)
                         .accessibilityIdentifier("nativeShareSite")
-                    } header: {
-                        Text("Трансляция")
-                    } footer: {
-                        Text("Показывает текущий трек в музыкальном блоке вашего сайта.")
+                        Divider().padding(.leading, 52)
                     }
+                    Button { perform { try await store.download(track) } } label: {
+                        Label("Сохранить на iPhone", systemImage: "arrow.down.circle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .padding(16)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.audio.downloadIDs.contains(track.id))
+                    .accessibilityIdentifier("nativeDownload")
                 }
-                Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
-                Button { perform { try await store.download(track) } } label: { Label("Сохранить на iPhone", systemImage: "arrow.down.circle") }.disabled(store.audio.downloadIDs.contains(track.id)).accessibilityIdentifier("nativeDownload")
-                NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
-                    Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
-                }.accessibilityIdentifier("nativeTrackInformation")
-                NavigationLink { NativePCTranscriptionView(store: store, trackID: track.id) } label: {
-                    Label("Текст и таймкоды на ПК", systemImage: "desktopcomputer.and.arrow.down")
-                }.accessibilityIdentifier("nativeTrackPCTranscription")
-                Section("Обложка") {
-                    NativeArtworkPicker(store: store, trackID: track.id)
+                .background(XASSStyle.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                List {
+                    Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
+                    NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
+                        Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
+                    }.accessibilityIdentifier("nativeTrackInformation")
+                    NavigationLink { NativePCTranscriptionView(store: store, trackID: track.id) } label: {
+                        Label("Текст и таймкоды на ПК", systemImage: "desktopcomputer.and.arrow.down")
+                    }.accessibilityIdentifier("nativeTrackPCTranscription")
+                    Section("Обложка") {
+                        NativeArtworkPicker(store: store, trackID: track.id)
+                    }
+                    Section("Добавить в плейлист") {
+                        if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
+                        ForEach(store.playlists) { playlist in Button(playlist.name) { perform { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) } } }
+                    }
+                    Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
+                    NativeMessage(store: store)
                 }
-                Section("Добавить в плейлист") {
-                    if store.playlists.isEmpty { Text("Создайте плейлист на вкладке «Плейлисты».").foregroundStyle(.secondary) }
-                    ForEach(store.playlists) { playlist in Button(playlist.name) { perform { try await store.savePlaylist(id: playlist.id, name: playlist.name, trackIDs: playlist.trackIDs.contains(track.id) ? playlist.trackIDs : playlist.trackIDs + [track.id]) } } }
-                }
-                Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
-                NativeMessage(store: store)
-            }.disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }
+            }
+            .background(XASSStyle.background)
+            .disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }
                 .confirmationDialog("Убрать трек из библиотеки? Файл останется на сервере для восстановления.", isPresented: $confirmDelete, titleVisibility: .visible) { Button("Убрать трек", role: .destructive) { perform { try await store.deleteTrack(track); onDelete?(track.id) } } }
         }
         .presentationDetents([.medium, .large], selection: $selectedDetent)

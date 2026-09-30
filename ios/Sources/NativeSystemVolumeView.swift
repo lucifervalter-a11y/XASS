@@ -42,6 +42,33 @@ private final class BoundedMPVolumeView: MPVolumeView {
         return CGRect(x: minimumX, y: stock.minY,
                       width: maximumX - minimumX, height: stock.height)
     }
+
+    override func volumeThumbRect(
+        forBounds bounds: CGRect,
+        volumeSliderRect rect: CGRect,
+        value: Float
+    ) -> CGRect {
+        var thumb = super.volumeThumbRect(
+            forBounds: bounds,
+            volumeSliderRect: rect,
+            value: value
+        )
+
+        // MPVolumeView's stock geometry is allowed to centre the thumb on a
+        // track edge.  Depending on the iOS version and content scale, that
+        // can leave part of a custom thumb outside either the horizontal or
+        // vertical bounds even when volumeSliderRect itself is inset.  Clamp
+        // the public thumb geometry, rather than finding/moving Apple's
+        // private UISlider subview, so rendering and hit testing keep using
+        // the supported MPVolumeView appearance hooks.
+        guard thumb.width.isFinite, thumb.height.isFinite,
+              bounds.width >= thumb.width, bounds.height >= thumb.height else {
+            return thumb
+        }
+        thumb.origin.x = min(max(thumb.minX, bounds.minX), bounds.maxX - thumb.width)
+        thumb.origin.y = min(max(thumb.minY, bounds.minY), bounds.maxY - thumb.height)
+        return thumb
+    }
 }
 
 /// A visible, interactive system control. No hidden slider, subview lookup,
