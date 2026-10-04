@@ -1,0 +1,191 @@
+name: Publish verified native Windows test installer
+
+on:
+  push:
+    branches: [test]
+    paths:
+      - '.github/workflows/publish-native-test-verified.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-publish-native-test-194c13676ddaa2744d267780dde8c23772e4d38a
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # One authorized publication after the exact app commit, not a standing publisher.
+    if: >-
+      github.repository == 'lucifervalter-a11y/XASS' &&
+      github.ref == 'refs/heads/test' &&
+      github.event.before == '194c13676ddaa2744d267780dde8c23772e4d38a'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: '194c13676ddaa2744d267780dde8c23772e4d38a'
+      SOURCE_RUN_ID: '37217747284'
+      SOURCE_RUN_ATTEMPT: '1'
+    steps:
+      # No checkout and no repository code/executables run with the write token.
+      - name: Verify exact completed build and both required jobs
+        shell: python
+        run: |
+          import json, os, subprocess
+          repo = 'lucifervalter-a11y/XASS'
+          def get(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+          run_id, attempt, sha = os.environ['SOURCE_RUN_ID'], int(os.environ['SOURCE_RUN_ATTEMPT']), os.environ['SOURCE_SHA']
+          run = get(f'repos/{repo}/actions/runs/{run_id}')
+          if (run['status'] != 'completed' or run['conclusion'] != 'success'
+              or run['head_sha'] != sha or run['head_branch'] != 'test' or run['event'] != 'push'
+              or run['run_attempt'] != attempt or run['head_repository']['full_name'] != repo
+              or run['path'] != '.github/workflows/windows-test-release.yml'):
+              raise SystemExit('Source build identity or conclusion does not match the authorized installer')
+          jobs = get(f'repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')['jobs']
+          required = {'build', 'regressions'}
+          if not required <= {job['name'] for job in jobs}:
+              raise SystemExit('Required source jobs are missing')
+          if any(job['status'] != 'completed' or job['conclusion'] != 'success' for job in jobs if job['name'] in required):
+              raise SystemExit('Required source jobs did not both pass')
+          build = next(job for job in jobs if job['name'] == 'build')
+          gates = {'Verify voice child-process lifecycle without microphone',
+                   'Build complete native installer and validate bundled runtime',
+                   'Verify fresh install, same-version upgrade and uninstall',
+                   'Verify exact delivery set and immutable revision'}
+          if not gates <= {step['name'] for step in build['steps'] if step.get('conclusion') == 'success'}:
+              raise SystemExit('Required Windows acceptance gates were not successful')
+          artifacts = get(f'repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100')['artifacts']
+          names = {f'xass-native-test-installer-{run_id}-{attempt}', f'xass-native-test-smoke-{run_id}-{attempt}'}
+          selected = [artifact for artifact in artifacts if artifact['name'] in names]
+          if len(selected) != 2 or {artifact['name'] for artifact in selected} != names:
+              raise SystemExit('Expected exact build and smoke artifacts are missing or ambiguous')
+          if any(artifact['expired'] or artifact['size_in_bytes'] <= 0
+                 or artifact['workflow_run']['head_sha'] != sha for artifact in selected):
+              raise SystemExit('Source artifact provenance failed')
+          print('Exact app commit, parallel regressions, Windows build and installed recovery gates verified')
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: '37217747284'
+          name: xass-native-test-installer-37217747284-1
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: '37217747284'
+          name: xass-native-test-smoke-37217747284-1
+          path: smoke
+      - name: Publish new test prerelease and verify all downloaded assets
+        shell: python
+        run: |
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          repo = 'lucifervalter-a11y/XASS'
+          sha, run_id, attempt = os.environ['SOURCE_SHA'], os.environ['SOURCE_RUN_ID'], os.environ['SOURCE_RUN_ATTEMPT']
+          if os.environ['GITHUB_REPOSITORY'] != repo or os.environ['GITHUB_REF'] != 'refs/heads/test':
+              raise SystemExit('Only the authorized repository test branch may publish')
+          if not re.fullmatch(r'[0-9a-f]{40}', sha) or not run_id.isdigit() or not attempt.isdigit():
+              raise SystemExit('Invalid immutable source identity')
+          tag = f'native-test-{run_id}-{attempt}'
+          root = Path('release')
+          expected = {'XASS-Native-Test-Setup.exe', 'XASS-Native-Test-Setup.exe.sha256',
+                      'XASS-Native-Test-Setup.json', 'native-test-update.json', 'payload-manifest.json'}
+          if {p.name for p in root.iterdir()} != expected or any(not p.is_file() or p.is_symlink() for p in root.iterdir()):
+              raise SystemExit('Unexpected downloaded installer artifact content')
+          def digest(path):
+              with path.open('rb') as source:
+                  return hashlib.file_digest(source, 'sha256').hexdigest()
+          installer = root / 'XASS-Native-Test-Setup.exe'
+          checksum = root / 'XASS-Native-Test-Setup.exe.sha256'
+          update_manifest = root / 'native-test-update.json'
+          checksum_value, size = digest(installer), installer.stat().st_size
+          if size < 1024 or checksum.read_text(encoding='ascii').strip() != f'{checksum_value}  {installer.name}':
+              raise SystemExit('Installer checksum or size validation failed')
+          metadata = json.loads((root / 'XASS-Native-Test-Setup.json').read_text())
+          update = json.loads(update_manifest.read_text())
+          payload = json.loads((root / 'payload-manifest.json').read_text())
+          if any(value.get('revision') != sha for value in (metadata, update, payload)):
+              raise SystemExit('Manifest revision does not match tested commit')
+          if (metadata.get('sha256') != checksum_value or metadata.get('bytes') != size
+              or metadata.get('distribution') != 'native-test' or metadata.get('python_bundled') is not True
+              or metadata.get('whisper_runtime_bundled') is not True or metadata.get('whisper_model_bundled') is not False):
+              raise SystemExit('Installer metadata is inconsistent')
+          if (update.get('sha256') != checksum_value or update.get('size') != size
+              or update.get('distribution') != 'native-test' or update.get('filename') != installer.name
+              or update.get('version') != metadata.get('version')):
+              raise SystemExit('Native updater manifest is inconsistent')
+          if (payload.get('python_bundled') is not True or payload.get('whisper_model_bundled') is not False
+              or not isinstance(payload.get('files'), list) or not payload['files']):
+              raise SystemExit('Payload manifest is incomplete')
+          smoke_root = Path('smoke')
+          if {p.name for p in smoke_root.iterdir()} != {'windows-native-smoke.json'}:
+              raise SystemExit('Unexpected smoke artifact content')
+          proof = json.loads((smoke_root / 'windows-native-smoke.json').read_text())
+          if (proof.get('revision') != sha or proof.get('same_version') is not True
+              or proof.get('verified_install_and_native_readiness') != 'passed'
+              or proof.get('injected_failure_and_actual_rollback') != 'passed'):
+              raise SystemExit('Real installed update/recovery smoke did not establish the expected result')
+          existing = subprocess.run(['gh', 'api', f'repos/{repo}/git/ref/tags/{tag}'], capture_output=True, text=True)
+          if existing.returncode == 0:
+              raise SystemExit('Tag already exists; never reuse, replace or blindly retry a release')
+          if '(HTTP 404)' not in existing.stderr:
+              raise SystemExit('Cannot establish that the immutable release tag is unused')
+          notes = Path(os.environ['RUNNER_TEMP']) / 'native-test-release-notes.txt'
+          notes.write_text(
+              'Тестовая XASS Native / WinUI 3 для Windows x64.\n\n'
+              'Скачайте XASS-Native-Test-Setup.exe из Assets и запустите установку. '
+              'Это один установочный EXE со встроенными Python 3.12, .NET и Windows App SDK. '
+              'Тестовая программа устанавливается отдельно от стабильной XASS; папки пользовательских данных сохраняются.\n\n'
+              'Добавлены нативные страницы клиента, локальная и серверная музыка, тема и акцент, '
+              'локальные голосовые ответы Windows и явно включаемый фоновый микрофон. '
+              'Модель Whisper не включена: приложение ищет уже имеющуюся полную локальную модель, '
+              'либо её папку можно указать в настройках. Русский женский голос зависит от установленных голосов Windows.\n\n'
+              'Перед запуском закройте старое приложение XASS полностью. При обнаружении несовместимого '
+              'старого агента нативная версия показывает предупреждение и блокирует локальное воспроизведение.\n\n'
+              'Проверены автоматические регрессии, Windows-сборка, установка, повторная установка, '
+              'запуск встроенных служб, обновление тем же пакетом, восстановление после искусственного '
+              'сбоя проверки запуска, удаление и сохранность данных. '
+              'Реальный микрофон, качество распознавания, пользовательские сценарии на тестовом ПК '
+              'и обновление между разными версиями ещё требуют ручной проверки. '
+              'Автоматический вход в голосовой Discord пока требует отдельной OAuth/RPC-интеграции.\n\n'
+              'Неподписанный тестовый prerelease. Рабочий сервер и ветка main этим выпуском не обновляются.\n\n'
+              f'Исходный commit: {sha}\n'
+              f'Проверенная сборка: https://github.com/{repo}/actions/runs/{run_id}\n'
+              f'SHA-256 установщика: {checksum_value}\n', encoding='utf-8')
+          files = (installer, update_manifest, checksum)
+          subprocess.run(['gh', 'release', 'create', tag, *(str(file) for file in files),
+                          '--repo', repo, '--target', sha, '--prerelease', '--latest=false',
+                          '--title', f'XASS Native: Windows x64 test ({sha[:7]})', '--notes-file', str(notes)], check=True)
+          def get(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+          release = get(f'repos/{repo}/releases/tags/{tag}')
+          reference = get(f'repos/{repo}/git/ref/tags/{tag}')
+          if (release['tag_name'] != tag or not release['prerelease'] or release['draft']
+              or reference['object']['type'] != 'commit' or reference['object']['sha'] != sha):
+              raise SystemExit('Created release/tag verification failed; inspect before retrying')
+          assets = {asset['name']: asset for asset in release['assets']}
+          if set(assets) != {file.name for file in files}:
+              raise SystemExit('Published asset set differs; inspect before retrying')
+          for file in files:
+              asset = assets[file.name]
+              if asset['state'] != 'uploaded' or asset['size'] != file.stat().st_size:
+                  raise SystemExit('Published asset state/size failed; inspect before retrying')
+              if asset.get('digest') not in (None, 'sha256:' + digest(file)):
+                  raise SystemExit('Published asset digest failed; inspect before retrying')
+          verification = Path(os.environ['RUNNER_TEMP']) / ('verify-' + tag)
+          command = ['gh', 'release', 'download', tag, '--repo', repo, '--dir', str(verification)]
+          for file in files:
+              command += ['--pattern', file.name]
+          subprocess.run(command, check=True)
+          for file in files:
+              if digest(verification / file.name) != digest(file):
+                  raise SystemExit('Read-back bytes differ from the tested artifact; inspect before retrying')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f'Verified test prerelease: {release["html_url"]}\n\n'
+                            f'Source commit: {sha}\n\nInstaller SHA256: {checksum_value}\n')
+          print(f'Verified test prerelease: {release["html_url"]}')
