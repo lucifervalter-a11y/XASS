@@ -16,7 +16,7 @@ class NativeProjectContracts(unittest.TestCase):
 
     def test_all_declared_xaml_events_have_code_handlers(self):
         root = ET.parse(PROJECT / "MainWindow.xaml").getroot()
-        code = (PROJECT / "MainWindow.xaml.cs").read_text()
+        code = (PROJECT / "MainWindow.xaml.cs").read_text(encoding="utf-8")
         names = []
         for element in root.iter():
             name = element.get(XAML_NS + "Name")
@@ -41,7 +41,7 @@ class NativeProjectContracts(unittest.TestCase):
         self.assertEqual(adapter.get("CopyToPublishDirectory"), "PreserveNewest")
 
     def test_process_launch_is_shell_free_isolated_and_bounded(self):
-        code = (PROJECT / "Services/AgentClient.cs").read_text()
+        code = (PROJECT / "Services/AgentClient.cs").read_text(encoding="utf-8")
         for contract in ("UseShellExecute = false", 'ArgumentList.Add("-I")', 'ArgumentList.Add("-B")',
                          "Path.IsPathFullyQualified", "CancelAfter(TimeSpan.FromSeconds(20))",
                          "Kill(entireProcessTree: true)", "MaxOutput", "ThrowIfCancellationRequested"):
@@ -51,7 +51,7 @@ class NativeProjectContracts(unittest.TestCase):
         self.assertNotIn("HttpClient", code)
 
     def test_closing_shell_cancels_requests_without_stopping_agent(self):
-        code = (PROJECT / "MainWindow.xaml.cs").read_text()
+        code = (PROJECT / "MainWindow.xaml.cs").read_text(encoding="utf-8")
         self.assertIn("timer.Stop()", code)
         self.assertIn("lifetime.Cancel()", code)
         self.assertNotIn("stop_agent", code)
@@ -77,7 +77,7 @@ class NativeProjectContracts(unittest.TestCase):
         self.assertEqual(rows[2].get("Height"), "*")
 
     def test_catalog_updates_are_batched_and_latest_search_is_serialized(self):
-        code = (PROJECT / "MainWindow.xaml.cs").read_text()
+        code = (PROJECT / "MainWindow.xaml.cs").read_text(encoding="utf-8")
         self.assertIn("TrackList.ItemsSource = loaded", code)
         self.assertNotIn("ObservableCollection", code)
         self.assertNotIn("tracks.Add", code)
@@ -85,11 +85,11 @@ class NativeProjectContracts(unittest.TestCase):
         self.assertIn("closed || pendingSearch is not null", code)
         self.assertIn("connected && !busy && activeWindow", code)
         self.assertNotIn("SearchBox.IsEnabled = !busy", code)
-        client = (PROJECT / "Services/AgentClient.cs").read_text()
+        client = (PROJECT / "Services/AgentClient.cs").read_text(encoding="utf-8")
         self.assertIn("Task.Run(() => RequestCoreAsync", client)
 
     def test_material_has_themed_fallback_and_compact_viewport(self):
-        code = (PROJECT / "MainWindow.xaml.cs").read_text()
+        code = (PROJECT / "MainWindow.xaml.cs").read_text(encoding="utf-8")
         self.assertIn("MicaController.IsSupported()", code)
         self.assertIn("new MicaBackdrop()", code)
         self.assertIn("PlayerScroller.MaxHeight = Math.Clamp", code)

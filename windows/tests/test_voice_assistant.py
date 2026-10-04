@@ -175,7 +175,7 @@ class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.exe = self.root / "TLauncher.exe"
         self.exe.write_bytes(b"fixture")
         self.properties = self.root / "tlauncher-2.0.properties"
