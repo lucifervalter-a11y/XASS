@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "pc_client_sources": [
+    "background_voice.py",
+    "agent_command_worker.py",
+    "archive_store.py",
+    "client_agent.py",
+    "client_update.py",
+    "connection_file.py",
+    "discord_presence.py",
+    "e2e_crypto.py",
+    "music_bridge.py",
+    "music_player.py",
+    "music_storage.py",
+    "network_client.py",
+    "now_playing.py",
+    "remote_tools.py",
+    "runtime_state.py",
+    "secret_store.py",
+    "transcribe_runner.py",
+    "transcription_worker.py",
+    "updater_helper.py",
+    "voice_assistant.py",
+    "voice_capture.py",
+    "native_music_ownership.py"
+  ],
+  "required_native_files": [
+    "Xass.Native.exe",
+    "Xass.Native.dll",
+    "Xass.Native.deps.json",
+    "Xass.Native.runtimeconfig.json",
+    "Xass.Native.pri",
+    "coreclr.dll",
+    "hostfxr.dll",
+    "hostpolicy.dll",
+    "Microsoft.ui.xaml.dll",
+    "Microsoft.WindowsAppRuntime.dll",
+    "background_voice_bridge.py",
+    "background_voice.py",
+    "bridge.py",
+    "assistant_bridge.py",
+    "voice_assistant.py",
+    "voice_capture.py",
+    "desktop_bridge.py",
+    "background_agent.py",
+    "desktop_music_service.py"
+  ],
+  "required_companion_files": [
+    "XASS.NativeHelper.exe",
+    "_internal/python312.dll",
+    "_internal/build-info.json"
+  ]
+}

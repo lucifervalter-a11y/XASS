@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-MAX_REQUEST = 8192
+MAX_REQUEST = 96 * 1024
 MAX_RESPONSE = 512 * 1024
 ACTIONS = frozenset({"snapshot", "catalog", "play", "pause", "resume", "stop", "seek", "volume"})
 DEVICE_STATES = frozenset({"online", "connecting", "offline", "error", "stale"})
@@ -168,7 +168,9 @@ class AgentAdapter:
                 raise ValueError("Invalid catalog track")
             rows.append({"id": track["id"], "title": label(track.get("title"), "Без названия"),
                          "artist": label(track.get("artist"), "Неизвестный исполнитель"),
-                         "album": label(track.get("album"))})
+                         "album": label(track.get("album")),
+                         "duration": number(track.get("duration") or track.get("duration_sec") or 0, 0, 86400),
+                         "favorite": track.get("favorite") is True})
         if type(body.get("has_more")) is not bool:
             raise ValueError("Invalid pagination flag")
         next_offset = body.get("next_offset") if body.get("has_more") else None
@@ -188,11 +190,16 @@ def main() -> None:
     try:
         raw = sys.stdin.read(MAX_REQUEST + 1)
         request = json.loads(raw) if len(raw) <= MAX_REQUEST else None
-        if not isinstance(request, dict) or request.get("action") not in ACTIONS:
+        if (not isinstance(request, dict) or not isinstance(request.get("action"), str)
+                or (request["action"] not in ACTIONS and not request["action"].startswith("desktop_"))):
             raise ValueError("Invalid request")
         # Dependencies must not accidentally contaminate the JSON protocol.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = AgentAdapter(args.source, args.data).request(request["action"], request)
+            if request["action"].startswith("desktop_"):
+                from desktop_bridge import DesktopService
+                result = DesktopService(args.source, args.data).request(request["action"], request)
+            else:
+                result = AgentAdapter(args.source, args.data).request(request["action"], request)
         response = {"ok": True, "result": result}
     except Exception:
         # No exception text, URLs, headers, tokens, server bodies or traceback.

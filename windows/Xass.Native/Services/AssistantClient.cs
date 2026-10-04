@@ -10,18 +10,7 @@ public sealed class AssistantClient
     public Task<JsonElement> RequestAsync(string python, object request, IProgress<string> progress,
         CancellationToken cancellation) => Task.Run(async () =>
     {
-        if (!Path.IsPathFullyQualified(python) || !File.Exists(python))
-            throw new InvalidOperationException("Укажите полный путь к Python для голосового помощника.");
-        string script = Path.Combine(AppContext.BaseDirectory, "assistant_bridge.py");
-        if (!File.Exists(script)) throw new InvalidOperationException("В сборке отсутствует assistant_bridge.py.");
-        var start = new ProcessStartInfo
-        {
-            FileName = python, UseShellExecute = false, CreateNoWindow = true,
-            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
-            StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8, WorkingDirectory = AppContext.BaseDirectory
-        };
-        start.ArgumentList.Add("-I"); start.ArgumentList.Add("-B"); start.ArgumentList.Add(script);
+        var start = AssistantProcessStart.Create(python, background: false);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         timeout.CancelAfter(TimeSpan.FromSeconds(180));
         using var process = new Process { StartInfo = start };
@@ -71,6 +60,8 @@ public sealed class AssistantClient
             try { if (!process.HasExited) process.Kill(); }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
+            try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(3)); }
+            catch { if (!process.HasExited) throw new VoiceShutdownException(); }
         }
     }, cancellation);
 

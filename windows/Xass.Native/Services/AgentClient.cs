@@ -21,26 +21,39 @@ public sealed class AgentClient
     private async Task<JsonElement> RequestCoreAsync(object request, CancellationToken cancellation)
     {
         cancellation.ThrowIfCancellationRequested();
-        if (!Path.IsPathFullyQualified(PythonPath) || !File.Exists(PythonPath)
+        string helper = Path.Combine(AppContext.BaseDirectory, "runtime", "XASS.NativeHelper.exe");
+        bool bundled = File.Exists(helper);
+        if ((!bundled && (!Path.IsPathFullyQualified(PythonPath) || !File.Exists(PythonPath)))
             || !Path.IsPathFullyQualified(SourcePath) || !Directory.Exists(SourcePath)
             || !Path.IsPathFullyQualified(DataPath) || !Directory.Exists(DataPath))
             throw new InvalidOperationException("Укажите существующие абсолютные пути к Python, pc_client и данным агента.");
         string adapter = Path.Combine(AppContext.BaseDirectory, "bridge.py");
-        if (!File.Exists(adapter)) throw new InvalidOperationException("В сборке отсутствует bridge.py.");
+        if (!bundled && !File.Exists(adapter)) throw new InvalidOperationException("В сборке отсутствует bridge.py.");
         var start = new ProcessStartInfo
         {
-            FileName = PythonPath, UseShellExecute = false, CreateNoWindow = true,
+            FileName = bundled ? helper : PythonPath, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
+            StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
             WorkingDirectory = SourcePath
         };
-        start.ArgumentList.Add("-I"); // Ignore PYTHONPATH and user-site startup hooks.
-        start.ArgumentList.Add("-B"); // Adapter must not write bytecode into the checkout.
-        start.ArgumentList.Add(adapter);
+        if (bundled)
+        {
+            start.ArgumentList.Add("--role"); start.ArgumentList.Add("agent-bridge");
+        }
+        else
+        {
+            start.ArgumentList.Add("-I"); // Ignore PYTHONPATH and user-site startup hooks.
+            start.ArgumentList.Add("-B"); // Adapter must not write bytecode into the checkout.
+            start.ArgumentList.Add(adapter);
+        }
+        start.Environment["XASS_DATA_ROOT"] = DataPath;
         start.ArgumentList.Add("--source"); start.ArgumentList.Add(SourcePath);
         start.ArgumentList.Add("--data"); start.ArgumentList.Add(DataPath);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        timeout.CancelAfter(TimeSpan.FromSeconds(20));
+        string requestAction = JsonSerializer.SerializeToElement(request).TryGetProperty("action", out var requestedAction)
+            ? requestedAction.GetString() ?? "" : "";
+        if (requestAction == "desktop_pair") timeout.CancelAfter(TimeSpan.FromSeconds(90));
+        else timeout.CancelAfter(TimeSpan.FromSeconds(20));
         using var process = new Process { StartInfo = start };
         cancellation.ThrowIfCancellationRequested();
         process.Start();
@@ -67,7 +80,7 @@ public sealed class AgentClient
         }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
         {
-            throw new TimeoutException("Агент не ответил за 20 секунд. Повторите действие.");
+            throw new TimeoutException("Служба не ответила вовремя. Проверьте состояние перед повторной привязкой.");
         }
         finally
         {

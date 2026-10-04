@@ -4,6 +4,19 @@
  <Application.Resources><ResourceDictionary><ResourceDictionary.MergedDictionaries>
   <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
  </ResourceDictionary.MergedDictionaries>
+  <!-- Mutable shared brushes let open controls update without rebuilding pages.
+       Windows contrast colors are applied by MainWindow.Appearance.cs. -->
+  <SolidColorBrush x:Key="XassAccentFillBrush" Color="#005FB8"/>
+  <SolidColorBrush x:Key="XassAccentForegroundBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="AccentButtonBackground" Color="#005FB8"/>
+  <SolidColorBrush x:Key="AccentButtonBackgroundPointerOver" Color="#005FB8"/>
+  <SolidColorBrush x:Key="AccentButtonBackgroundPressed" Color="#005FB8"/>
+  <SolidColorBrush x:Key="AccentButtonForeground" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="AccentButtonForegroundPointerOver" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="AccentButtonForegroundPressed" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="AccentButtonBorderBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="AccentButtonBorderBrushPointerOver" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="AccentButtonBorderBrushPressed" Color="#FFFFFF"/>
   <Style x:Key="XassCard" TargetType="Border">
    <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}"/>
    <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}"/>

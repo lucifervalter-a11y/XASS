@@ -401,6 +401,10 @@ def start_music_bridge(player=None, root: Path | None = None) -> bool:
             player = music_player()
         folder = root or DATA_ROOT
         folder.mkdir(parents=True, exist_ok=True)
+        # The gate is inert without another audio owner; no network surface.
+        if callable(getattr(player, "set_ownership", None)):
+            from native_music_ownership import AudioOwnership
+            player.set_ownership(AudioOwnership(folder, local=False))
         stop = threading.Event()
         writer = threading.Thread(target=_publish_loop, args=(player, folder, stop), name="xass-music-status", daemon=True)
         try:

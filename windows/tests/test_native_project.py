@@ -16,7 +16,7 @@ class NativeProjectContracts(unittest.TestCase):
 
     def test_all_declared_xaml_events_have_code_handlers(self):
         root = ET.parse(PROJECT / "MainWindow.xaml").getroot()
-        code = (PROJECT / "MainWindow.xaml.cs").read_text(encoding="utf-8")
+        code = "\n".join(path.read_text(encoding="utf-8") for path in PROJECT.glob("MainWindow*.cs"))
         names = []
         for element in root.iter():
             name = element.get(XAML_NS + "Name")
@@ -36,7 +36,7 @@ class NativeProjectContracts(unittest.TestCase):
             self.assertEqual(project.findtext("PropertyGroup/" + key), value)
         packages = {node.get("Include"): node.get("Version") for node in project.findall("ItemGroup/PackageReference")}
         self.assertEqual(packages["Microsoft.WindowsAppSDK"], "1.8.260921001")
-        adapter = project.find("ItemGroup/Content")
+        adapter = next(node for node in project.findall("ItemGroup/Content") if node.get("Link") == "bridge.py")
         self.assertEqual(adapter.get("Link"), "bridge.py")
         self.assertEqual(adapter.get("CopyToPublishDirectory"), "PreserveNewest")
 

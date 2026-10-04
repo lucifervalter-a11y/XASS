@@ -1,26 +1,29 @@
-name: Publish native Windows test prerelease
+name: Validate native Windows test installer
 
 on:
   push:
     branches: [test]
     paths:
+      - 'windows/**'
+      - 'pc_client/**'
+      - 'tests/**'
+      - 'requirements.txt'
       - '.github/workflows/windows-test-release.yml'
+  workflow_dispatch:
 
+# Build artifacts only. The owner reviews this exact commit and its checks before
+# a separate, explicitly authorized test prerelease is created. No server deploy.
 permissions:
   contents: read
 
 concurrency:
-  group: xass-native-test-release
+  group: xass-native-test-installer-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    # Bound this publication to the requested update of the verified test commit.
-    if: >-
-      github.repository == 'lucifervalter-a11y/XASS' &&
-      github.ref == 'refs/heads/test' &&
-      github.event.before == '2db6ac8a1c539a7f05f87c31c1e2e3ebc50d331a'
-    runs-on: windows-latest
+  regressions:
+    if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -30,189 +33,99 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pc_client/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install headless desktop and PHP test support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk
+      - name: Install complete pinned test dependencies
+        run: python -m pip install -r requirements.txt -r pc_client/requirements.txt
+      - name: Existing Python regression suite
+        env:
+          PYTHONUTF8: '1'
+          XASS_TEST_PHP: /usr/bin/php
+        run: xvfb-run -a python -X utf8 -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Browser and PHP contracts
+        run: |
+          node --test tests/*.cjs tests/*.js
+          php -l proxy.php
+          php -l index.php
+          php -l miniapp.php
+          php -l profile.php
+
+  build:
+    needs: regressions
+    if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            pc_client/requirements.txt
+            pc_client/voice-requirements.txt
+            pc_client/build-requirements.txt
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Test native bridge and assistant contracts
-        run: python -X utf8 -B -m unittest discover -s windows/tests -v
-      - name: Publish complete self-contained WinUI application
-        run: dotnet publish windows/Xass.Native/Xass.Native.csproj -c Release -r win-x64 -p:RuntimeIdentifiers=win-x64 -p:Platform=x64 -o artifacts/windows-native
-      - name: Validate companions and package the complete application
+      - name: Install Inno Setup from standard runner package source
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Verify voice child-process lifecycle without microphone
+        shell: pwsh
+        run: |
+          dotnet run --project windows/VoiceLifecycle.Tests/VoiceLifecycle.Tests.csproj -c Release -- (Get-Command python).Source
+          if ($LASTEXITCODE -ne 0) { throw 'Voice lifecycle tests failed.' }
+      - name: Build complete native installer and validate bundled runtime
+        shell: pwsh
+        run: ./windows/build_installer.ps1 -Revision '${{ github.sha }}' -OutputDirectory artifacts/windows-installer
+      - name: Verify fresh install, same-version upgrade and uninstall
+        shell: pwsh
+        run: ./windows/test_installer.ps1 -Installer artifacts/windows-installer/XASS-Native-Test-Setup.exe -PayloadManifest artifacts/windows-installer/payload-manifest.json
+      - name: Verify exact delivery set and immutable revision
         shell: python
         run: |
-          import hashlib
-          import json
-          import os
+          import hashlib, json, os
           from pathlib import Path
-          import shutil
-          import struct
-          import zipfile
-
-          root = Path('artifacts/windows-native')
-          required = {
-              'Xass.Native.exe', 'Xass.Native.dll', 'Xass.Native.deps.json',
-              'Xass.Native.runtimeconfig.json', 'Xass.Native.pri',
-              'coreclr.dll', 'hostfxr.dll', 'hostpolicy.dll',
-              'Microsoft.ui.xaml.dll', 'Microsoft.WindowsAppRuntime.dll',
-              'bridge.py', 'assistant_bridge.py', 'voice_assistant.py', 'voice_capture.py',
-          }
-          for name in sorted(required):
-              file = root / name
-              if not file.is_file() or file.stat().st_size == 0:
-                  raise SystemExit(f'Missing or empty required companion: {name}')
-          executable = (root / 'Xass.Native.exe').read_bytes()
-          if executable[:2] != b'MZ' or len(executable) < 64:
-              raise SystemExit('Native executable is not a Windows PE file')
-          pe = struct.unpack_from('<I', executable, 0x3c)[0]
-          if executable[pe:pe + 4] != b'PE\0\0' or struct.unpack_from('<H', executable, pe + 4)[0] != 0x8664:
-              raise SystemExit('Native executable is not an x64 Windows PE file')
-          for name in ('Xass.Native.deps.json', 'Xass.Native.runtimeconfig.json'):
-              json.loads((root / name).read_text(encoding='utf-8'))
-          shutil.copyfile('pc_client/voice-requirements.txt', root / 'voice-requirements.txt')
-          (root / 'README-FIRST.txt').write_text(
-              'XASS Native: Windows x64 test build\n\n'
-              '1. Extract the entire ZIP to a normal folder.\n'
-              '2. Run Xass.Native.exe from that folder; keep all adjacent files.\n'
-              '3. Open the Assistant page and check the Python/model paths.\n\n'
-              '.NET and Windows App SDK runtime files are included. Python and the\n'
-              'Whisper model are NOT included. Text commands require an existing\n'
-              'trusted Python 3.12 installation; recording additionally requires\n'
-              'the packages in voice-requirements.txt and an existing local\n'
-              'faster-whisper model folder. XASS does not download them.\n'
-              'Music controls require an existing paired agent and its matching\n'
-              'pc_client source/environment. Discord voice joining is not enabled.\n\n'
-              'This unsigned prerelease passed automated contracts and build checks;\n'
-              'interactive UI, microphone, and real application actions still need\n'
-              'validation on the test PC. It does not replace the stable installer.\n\n'
-              f'Commit: {os.environ["GITHUB_SHA"]}\n', encoding='utf-8')
-          delivery = Path('release')
-          delivery.mkdir()
-          archive = delivery / 'XASS-Windows-Voice-test-win-x64.zip'
-          files = sorted(p for p in root.rglob('*') if p.is_file())
-          expected = {p.relative_to(root).as_posix() for p in files}
-          if any(p.is_symlink() for p in root.rglob('*')):
-              raise SystemExit('Unexpected symlink in publish output')
-          with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
-              for file in files:
-                  bundle.write(file, file.relative_to(root).as_posix())
-          with zipfile.ZipFile(archive) as bundle:
-              if set(bundle.namelist()) != expected or not required <= set(bundle.namelist()):
-                  raise SystemExit('ZIP contents do not match the complete publish folder')
-              if bundle.testzip() is not None:
-                  raise SystemExit('ZIP integrity verification failed')
-          with archive.open('rb') as stream:
-              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-          (delivery / (archive.name + '.sha256')).write_text(
-              f'{digest}  {archive.name}\n', encoding='ascii')
-          print(f'Complete x64 bundle: {len(files)} files, {archive.stat().st_size} bytes, SHA256 {digest}')
+          root = Path('artifacts/windows-installer')
+          required = {'XASS-Native-Test-Setup.exe', 'XASS-Native-Test-Setup.exe.sha256',
+                      'XASS-Native-Test-Setup.json', 'native-test-update.json', 'payload-manifest.json'}
+          if {p.name for p in root.iterdir()} != required:
+              raise SystemExit('Installer delivery set differs from expected files')
+          installer = root / 'XASS-Native-Test-Setup.exe'
+          with installer.open('rb') as source:
+              digest = hashlib.file_digest(source, 'sha256').hexdigest()
+          if (root / (installer.name + '.sha256')).read_text().strip() != f'{digest}  {installer.name}':
+              raise SystemExit('Installer checksum mismatch')
+          for name in ('XASS-Native-Test-Setup.json', 'native-test-update.json', 'payload-manifest.json'):
+              data = json.loads((root / name).read_text())
+              if data['revision'] != os.environ['GITHUB_SHA']:
+                  raise SystemExit('Installer manifest revision mismatch')
+              if name != 'payload-manifest.json' and data['sha256'] != digest:
+                  raise SystemExit('Installer manifest digest mismatch')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('Validated test installer artifact only. No release or server deployment.\n\n'
+                            f'Commit: {os.environ["GITHUB_SHA"]}\n\nSHA256: {digest}\n\n'
+                            'Python 3.12, CPU speech dependencies, .NET and Windows App SDK are bundled. '
+                            'A local Whisper model is required separately. Real microphone, voices and '
+                            'interactive WinUI acceptance are not established by CI.\n')
       - uses: actions/upload-artifact@v4
         with:
-          name: xass-native-test-release-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release/*
+          name: xass-native-test-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/windows-installer/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
-
-  publish:
-    needs: build
-    if: >-
-      github.repository == 'lucifervalter-a11y/XASS' &&
-      github.ref == 'refs/heads/test' &&
-      github.event.before == '2db6ac8a1c539a7f05f87c31c1e2e3ebc50d331a'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Only this job can create the new test tag/release. No PAT or repository secret.
-    permissions:
-      contents: write
-    steps:
-      # No checkout or repository-supplied code is executed with the write token.
-      - uses: actions/download-artifact@v4
-        with:
-          name: xass-native-test-release-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release
-      - name: Create a new immutable-name test prerelease and verify assets
-        shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import re
-          import subprocess
-
-          repo = os.environ['GITHUB_REPOSITORY']
-          revision = os.environ['GITHUB_SHA']
-          run = os.environ['GITHUB_RUN_ID']
-          attempt = os.environ['GITHUB_RUN_ATTEMPT']
-          if repo != 'lucifervalter-a11y/XASS' or os.environ['GITHUB_REF'] != 'refs/heads/test':
-              raise SystemExit('Publication is restricted to the test branch')
-          if not re.fullmatch(r'[0-9a-f]{40}', revision) or not run.isdigit() or not attempt.isdigit():
-              raise SystemExit('Invalid immutable publication identity')
-          tag = f'test-voice-{run}-{attempt}'
-          archive = Path('release/XASS-Windows-Voice-test-win-x64.zip')
-          checksum = archive.with_name(archive.name + '.sha256')
-          if set(p.name for p in archive.parent.iterdir()) != {archive.name, checksum.name}:
-              raise SystemExit('Unexpected release artifact contents')
-          with archive.open('rb') as stream:
-              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-          if checksum.read_text(encoding='ascii') != f'{digest}  {archive.name}\n':
-              raise SystemExit('Downloaded artifact checksum mismatch')
-          existing = subprocess.run(
-              ['gh', 'api', f'repos/{repo}/git/ref/tags/{tag}'], capture_output=True, text=True)
-          if existing.returncode == 0:
-              raise SystemExit('Tag already exists; never reuse or replace a tag')
-          if '(HTTP 404)' not in existing.stderr:
-              raise SystemExit('Cannot verify that the new tag is unused; publication stopped')
-          notes = Path(os.environ['RUNNER_TEMP']) / 'xass-test-release-notes.txt'
-          notes.write_text(
-              'Тестовая сборка XASS Native / WinUI 3 для Windows x64 из ветки test.\n\n'
-              'Скачайте XASS-Windows-Voice-test-win-x64.zip из Assets, распакуйте всю\n'
-              'папку и запустите Xass.Native.exe. Соседние DLL, PRI и Python-файлы\n'
-              'обязательны. Файлы Source code для запуска не нужны.\n\n'
-              '.NET и Windows App SDK включены. Python, зависимости голосового\n'
-              'режима и модель Whisper не включены: используйте существующую\n'
-              'среду и проверьте пути на странице «Помощник». Подробности внутри\n'
-              'README-FIRST.txt; voice-requirements.txt прилагается.\n\n'
-              'Это неподписанный prerelease для проверки. Автоматические тесты,\n'
-              'сборка и целостность архива проверены; интерактивная работа UI,\n'
-              'микрофона и запуск приложений требуют проверки на тестовом ПК.\n'
-              'Вход в голосовой Discord в этом MVP не реализован.\n\n'
-              f'Commit: {revision}\nSHA256: {digest}\n'
-              f'Build: https://github.com/{repo}/actions/runs/{run}\n', encoding='utf-8')
-          subprocess.run([
-              'gh', 'release', 'create', tag, str(archive), str(checksum),
-              '--repo', repo, '--target', revision, '--prerelease', '--latest=false',
-              '--title', f'XASS Native Voice: test Windows x64 ({revision[:7]})',
-              '--notes-file', str(notes),
-          ], check=True)
-          release = json.loads(subprocess.check_output(
-              ['gh', 'api', f'repos/{repo}/releases/tags/{tag}'], text=True))
-          remote_tag = json.loads(subprocess.check_output(
-              ['gh', 'api', f'repos/{repo}/git/ref/tags/{tag}'], text=True))
-          if release['tag_name'] != tag or not release['prerelease'] or release['draft']:
-              raise SystemExit('Release state verification failed; inspect before retrying')
-          if remote_tag['object']['type'] != 'commit' or remote_tag['object']['sha'] != revision:
-              raise SystemExit('Tag does not point to the tested commit; inspect before retrying')
-          assets = {asset['name']: asset for asset in release['assets']}
-          if set(assets) != {archive.name, checksum.name}:
-              raise SystemExit('Release asset set differs; inspect before retrying')
-          for file in (archive, checksum):
-              if assets[file.name]['state'] != 'uploaded' or assets[file.name]['size'] != file.stat().st_size:
-                  raise SystemExit('Release asset upload verification failed; inspect before retrying')
-          if assets[archive.name].get('digest') not in (None, f'sha256:{digest}'):
-              raise SystemExit('Release asset digest mismatch; inspect before retrying')
-          # Read the published bytes back before reporting successful delivery.
-          verification = Path(os.environ['RUNNER_TEMP']) / f'xass-verify-{tag}'
-          subprocess.run([
-              'gh', 'release', 'download', tag, '--repo', repo,
-              '--pattern', archive.name, '--dir', str(verification),
-          ], check=True)
-          with (verification / archive.name).open('rb') as stream:
-              if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
-                  raise SystemExit('Published download checksum mismatch; inspect before retrying')
-          url = release['html_url']
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write(f'Test prerelease: {url}\n\nSHA256: {digest}\n')
-          print(f'Verified test prerelease: {url}')

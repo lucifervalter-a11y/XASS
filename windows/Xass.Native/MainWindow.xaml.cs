@@ -67,14 +67,22 @@ public sealed partial class MainWindow : Window
         timer.Start();
         Closed += (_, _) =>
         {
+            DisposeDesktop();
+            DisposeDesktopMusic();
             closed = true;
             timer.Stop();
+            DisposeVoice();
+            DisposeAppearance();
             lifetime.Cancel();
             pendingSearch = null;
             Application.Current.Exit();
         };
         UpdateControls();
         InitializeAssistant();
+        InitializeVoice();
+        InitializeDesktop();
+        InitializeDesktopMusic();
+        InitializeAppearance();
     }
 
     private void Navigate(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -86,7 +94,10 @@ public sealed partial class MainWindow : Window
         MusicPage.Visibility = page == "music" ? Visibility.Visible : Visibility.Collapsed;
         ConnectionPage.Visibility = page == "connection" ? Visibility.Visible : Visibility.Collapsed;
         AssistantPage.Visibility = page == "assistant" ? Visibility.Visible : Visibility.Collapsed;
+        AppearancePage.Visibility = page == "appearance" ? Visibility.Visible : Visibility.Collapsed;
         PageTitle.Text = item.Content?.ToString() ?? "XASS";
+        OnDesktopNavigated(page);
+        OnDesktopMusicNavigated(page);
     }
 
     private void InitializeAssistant()
@@ -102,8 +113,8 @@ public sealed partial class MainWindow : Window
         AssistantMinecraft.Text = Path.Combine(roaming, ".minecraft");
         foreach (var field in new[] { AssistantText, AssistantPython, AssistantModelPath, AssistantLauncher,
                                       AssistantMinecraft, AssistantLauncherProperties, AssistantChannel, AssistantOllamaModel })
-            field.TextChanged += (_, _) => InvalidateAssistantPlan();
-        AssistantPlanner.SelectionChanged += (_, _) => InvalidateAssistantPlan();
+            field.TextChanged += (_, _) => { InvalidateAssistantPlan(); AssistantDraftChanged(); };
+        AssistantPlanner.SelectionChanged += (_, _) => { InvalidateAssistantPlan(); AssistantDraftChanged(); };
     }
 
     private void InvalidateAssistantPlan()
@@ -153,6 +164,8 @@ public sealed partial class MainWindow : Window
         AssistantState.Text = "Подготовка…";
         try
         {
+            await PrepareAssistantAudioAsync();
+            cancel.Token.ThrowIfCancellationRequested();
             bool confirmed = false;
             if (operation == "execute" && plan!.Value.GetProperty("action").GetString() == "join_discord_voice")
             {
@@ -169,12 +182,22 @@ public sealed partial class MainWindow : Window
             var progress = new System.Progress<string>(phase =>
             {
                 if (!closed && ReferenceEquals(assistantRequest, cancel) && !cancel.IsCancellationRequested)
+                {
                     AssistantState.Text = AssistantPhase(phase);
+                    if (phase == "recording") SetMicrophoneStatus("● Микрофон включён: запись 6 секунд");
+                    else if (operation == "record") SetMicrophoneStatus("Микрофон выключен. " + AssistantPhase(phase));
+                }
             });
             var result = await assistantClient.RequestAsync(AssistantPython.Text.Trim(),
                 new { operation, settings = AssistantSettings(), text, plan, confirmed }, progress, cancel.Token);
             if (closed || cancel.IsCancellationRequested) return;
-            if (result.TryGetProperty("text", out var recognized)) AssistantText.Text = recognized.GetString() ?? "";
+            if (result.TryGetProperty("text", out var recognized))
+            {
+                applyingRecognizedText = true;
+                try { AssistantText.Text = recognized.GetString() ?? ""; }
+                finally { applyingRecognizedText = false; }
+                assistantDraftPending = !string.IsNullOrWhiteSpace(AssistantText.Text);
+            }
             string state = result.GetProperty("state").GetString() ?? "failed";
             AssistantState.Text = AssistantPhase(state) + " " + result.GetProperty("message").GetString();
             if (state == "ready")
@@ -183,6 +206,10 @@ public sealed partial class MainWindow : Window
                 assistantPlannedText = AssistantText.Text;
                 AssistantPreview.Text = result.GetProperty("label").GetString();
             }
+            if (operation == "execute") assistantDraftPending = false;
+            await SpeakAssistantAsync(state == "ready"
+                ? "Команда готова: " + AssistantPreview.Text + ". Проверьте её и нажмите Выполнить."
+                : AssistantState.Text);
         }
         catch (OperationCanceledException)
         {
@@ -192,6 +219,12 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception error)
         {
+            if (error is VoiceShutdownException)
+            {
+                microphoneShutdownFailed = true;
+                BackgroundListening.IsOn = false;
+                backgroundVoice?.Stop();
+            }
             if (!closed) AssistantState.Text = error is InvalidOperationException or TimeoutException
                 ? error.Message : "Помощник не выполнил действие. Проверьте Python, модель и настройки.";
         }
@@ -203,8 +236,10 @@ public sealed partial class MainWindow : Window
                 AssistantRecord.IsEnabled = AssistantPlanButton.IsEnabled = true;
                 AssistantSettingsPanel.IsEnabled = AssistantText.IsEnabled = true;
                 AssistantExecute.IsEnabled = assistantPlan is not null;
-                AssistantCancel.IsEnabled = assistantPlan is not null;
+                AssistantCancel.IsEnabled = assistantPlan is not null || assistantDraftPending;
                 AssistantProgress.Visibility = Visibility.Collapsed;
+                await RefreshBackgroundSafelyAsync();
+                if (!BackgroundListening.IsOn) SetMicrophoneStatus("Микрофон выключен");
             }
         }
     }
@@ -214,8 +249,16 @@ public sealed partial class MainWindow : Window
     private async void AssistantExecuteClick(object sender, RoutedEventArgs args) => await RunAssistantAsync("execute");
     private void AssistantCancelClick(object sender, RoutedEventArgs args)
     {
+        InvalidateAssistantPlan();
+        assistantDraftPending = false;
+        StopAssistantSpeech();
         if (assistantRequest is not null) assistantRequest.Cancel();
-        else { InvalidateAssistantPlan(); AssistantState.Text = "Команда отменена. Микрофон выключен."; }
+        else
+        {
+            AssistantCancel.IsEnabled = false;
+            AssistantState.Text = "Команда отменена.";
+            _ = RefreshBackgroundSafelyAsync();
+        }
     }
 
     private async Task RunAsync(Func<Task> action, bool quiet = false)
@@ -280,7 +323,7 @@ public sealed partial class MainWindow : Window
         PlayButton.IsEnabled = connected && !busy && TrackList.SelectedItem is Track;
         PauseButton.IsEnabled = !busy && playerState == "playing";
         ResumeButton.IsEnabled = !busy && playerState == "paused";
-        StopButton.IsEnabled = !busy && playerState is "playing" or "paused" or "loading";
+        StopButton.IsEnabled = !busy && playerState is "playing" or "paused" or "loading" or "error" or "stopping";
         SeekButton.IsEnabled = SeekSlider.IsEnabled = !busy && playerState is "playing" or "paused";
         VolumeButton.IsEnabled = connected && !busy && playerState is "playing" or "paused";
     }
@@ -310,6 +353,7 @@ public sealed partial class MainWindow : Window
 
     private async Task RefreshAsync()
     {
+        if (desktopReady) { await RefreshDesktopAsync(); return; }
         JsonElement result;
         try
         {
@@ -406,8 +450,8 @@ public sealed partial class MainWindow : Window
         if (previousOffsets.Count > 0) await RunAsync(() => LoadCatalogAsync(previousOffsets.Peek(), query, "previous"));
     }
     private void TrackSelected(object sender, SelectionChangedEventArgs args) => UpdateControls();
-    private void OpenMusicClick(object sender, RoutedEventArgs args) => Navigation.SelectedItem = Navigation.MenuItems[2];
-    private void OpenConnectionClick(object sender, RoutedEventArgs args) => Navigation.SelectedItem = Navigation.MenuItems[3];
+    private void OpenMusicClick(object sender, RoutedEventArgs args) => SelectDesktopPage("music");
+    private void OpenConnectionClick(object sender, RoutedEventArgs args) => SelectDesktopPage("connection");
     private async void PlayClick(object sender, RoutedEventArgs args)
     {
         if (TrackList.SelectedItem is Track track)

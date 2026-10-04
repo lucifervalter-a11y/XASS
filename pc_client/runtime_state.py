@@ -11,7 +11,9 @@ from typing import Any, TextIO
 
 
 def data_root() -> Path:
-    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "XASS"
+    root = Path(os.environ["XASS_DATA_ROOT"]) if os.environ.get("XASS_DATA_ROOT") else Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "XASS"
+    if not root.is_absolute():
+        raise ValueError("XASS_DATA_ROOT must be absolute")
     root.mkdir(parents=True, exist_ok=True)
     return root
 

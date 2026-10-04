@@ -34,6 +34,13 @@ DATA_ROOT = (
     if getattr(sys, "frozen", False)
     else CLIENT_ROOT
 )
+# A native runtime explicitly binds its durable data root before imports.
+# Source launches without this contract keep their historical behavior.
+if os.environ.get("XASS_DATA_ROOT"):
+    explicit_root = Path(os.environ["XASS_DATA_ROOT"])
+    if not explicit_root.is_absolute():
+        raise ValueError("XASS_DATA_ROOT must be absolute")
+    DATA_ROOT = explicit_root.resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 VERSION_PATH = RESOURCE_ROOT / "version.json"
 BUILD_INFO_PATH = RESOURCE_ROOT / "build-info.json"

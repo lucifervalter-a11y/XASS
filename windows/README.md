@@ -5,6 +5,13 @@ remain intact. This is **not feature parity, a replacement installer, or a
 Windows-tested release**. A Windows build and runtime acceptance pass are
 required before distributing it to users.
 
+## Test installer and appearance
+
+The source now includes a persistent appearance page and a separate single-download
+Inno installer build with a frozen Python companion. See [INSTALLER-THEME.md](INSTALLER-THEME.md)
+for the build, bundled/external dependencies, verification and upgrade boundaries.
+A plain `dotnet publish` folder below still does not contain the frozen companion.
+
 ## Implemented scope
 
 - Adaptive native NavigationView, system-theme controls, status/error/progress states.
@@ -77,7 +84,7 @@ Tools with Windows SDK/MSBuild support. The project targets Windows SDK
 10.0.19041.0, minimum 10.0.17763.0. NuGet references are pinned:
 
 - Microsoft.WindowsAppSDK `1.8.260921001` (1.8.12)
-- Microsoft.Windows.SDK.BuildTools `10.0.26100.3916`
+- Microsoft.Windows.SDK.BuildTools `10.0.26100.4654`
 
 From the repository root:
 

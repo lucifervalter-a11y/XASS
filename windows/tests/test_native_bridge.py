@@ -166,7 +166,7 @@ class AdapterContractTests(unittest.TestCase):
                                        "api_key": PRIVATE, "url": PRIVATE, "path": PRIVATE,
                                        "credentials": {"token": PRIVATE}, "lyrics": PRIVATE,
                                        "artwork_url": PRIVATE}], api_key=PRIVATE, server_url=PRIVATE)
-        self.assertEqual(result, {"tracks": [{"id": 5, "title": "Track", "artist": "Artist", "album": "Album"}],
+        self.assertEqual(result, {"tracks": [{"id": 5, "title": "Track", "artist": "Artist", "album": "Album", "duration": 0.0, "favorite": False}],
                                   "total": 1, "next_offset": None})
         self.assertNotIn(PRIVATE, json.dumps(result))
 
