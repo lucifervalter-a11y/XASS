@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: xass-publish-native-test-194c13676ddaa2744d267780dde8c23772e4d38a
+  group: xass-publish-native-test-acd6cb069156d4e606027cfcdbad48299ccec0c3
   cancel-in-progress: false
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
     if: >-
       github.repository == 'lucifervalter-a11y/XASS' &&
       github.ref == 'refs/heads/test' &&
-      github.event.before == '194c13676ddaa2744d267780dde8c23772e4d38a'
+      github.event.before == 'acd6cb069156d4e606027cfcdbad48299ccec0c3'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -27,8 +27,8 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      SOURCE_SHA: '194c13676ddaa2744d267780dde8c23772e4d38a'
-      SOURCE_RUN_ID: '37217747284'
+      SOURCE_SHA: 'acd6cb069156d4e606027cfcdbad48299ccec0c3'
+      SOURCE_RUN_ID: '37220341061'
       SOURCE_RUN_ATTEMPT: '1'
     steps:
       # No checkout and no repository code/executables run with the write token.
@@ -71,14 +71,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: '37217747284'
-          name: xass-native-test-installer-37217747284-1
+          run-id: '37220341061'
+          name: xass-native-test-installer-37220341061-1
           path: release
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: '37217747284'
-          name: xass-native-test-smoke-37217747284-1
+          run-id: '37220341061'
+          name: xass-native-test-smoke-37220341061-1
           path: smoke
       - name: Publish new test prerelease and verify all downloaded assets
         shell: python
@@ -138,6 +138,9 @@ jobs:
           notes = Path(os.environ['RUNNER_TEMP']) / 'native-test-release-notes.txt'
           notes.write_text(
               'Тестовая XASS Native / WinUI 3 для Windows x64.\n\n'
+              'Исправлена привязка: отменённый или неудачный импорт больше не подменяет введённые вручную данные. '
+              'Импорт требует отдельного подтверждения; повторная попытка читает новый файл или JSON. '
+              'Реальная привязка к пользовательскому серверу во время проверки не выполнялась.\n\n'
               'Скачайте XASS-Native-Test-Setup.exe из Assets и запустите установку. '
               'Это один установочный EXE со встроенными Python 3.12, .NET и Windows App SDK. '
               'Тестовая программа устанавливается отдельно от стабильной XASS; папки пользовательских данных сохраняются.\n\n'
