@@ -295,6 +295,17 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result["state"], "ready")
         record.assert_called_once_with()
 
+    def test_capture_cleanup_failure_never_announces_transcribing_or_uses_audio(self):
+        import voice_capture
+        transcriber = Mock()
+        events = []
+        with patch.object(voice_capture, "WhisperTranscriber", return_value=transcriber), \
+             patch.object(voice_capture, "record_pcm", side_effect=va.AssistantError("cleanup not confirmed")):
+            with self.assertRaises(va.AssistantError):
+                bridge.handle({"operation": "record"}, progress=events.append)
+        self.assertEqual(events, ["loading_model", "recording"])
+        transcriber.transcribe.assert_not_called()
+
     def test_model_error_does_not_open_microphone(self):
         import voice_capture
         with patch.object(voice_capture, "WhisperTranscriber", side_effect=va.AssistantError("no model")), \

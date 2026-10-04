@@ -15,9 +15,32 @@ except ModuleNotFoundError:
 
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 6
+# At most one failed capture is retained until this one-shot process exits.
+_UNRELEASED_CAPTURE_REFERENCES: list[tuple] = []
+
+
+def _release_capture(api, handle, header, prepared: bool) -> None:
+    # Always attempt every release operation, even after a failed driver call.
+    # A failed release must not return PCM or emit a transcribing/mic-off phase.
+    # The one-shot parent verifies process exit before reporting the mic stopped.
+    calls = [(api.waveInReset, (handle,))]
+    if prepared:
+        calls.append((api.waveInUnprepareHeader, (handle, ctypes.byref(header), ctypes.sizeof(header))))
+    calls.append((api.waveInClose, (handle,)))
+    failed = False
+    for function, arguments in calls:
+        try:
+            if function(*arguments) != 0:
+                failed = True
+        except Exception:
+            failed = True
+    if failed:
+        raise AssistantError("Не удалось подтвердить штатное закрытие устройства записи. Обработка записи отменена.")
 
 
 def record_pcm(seconds: int = RECORD_SECONDS) -> bytes:
+    if _UNRELEASED_CAPTURE_REFERENCES:
+        raise AssistantError("Запись заблокирована после ошибки закрытия устройства. Перезапустите помощник.")
     if os.name != "nt" or type(seconds) is not int or not 1 <= seconds <= 10:
         raise AssistantError("Короткая запись доступна только на Windows (1–10 секунд).")
 
@@ -61,10 +84,13 @@ def record_pcm(seconds: int = RECORD_SECONDS) -> bytes:
             time.sleep(0.03)
         return buffer.raw[:header.recorded]
     finally:
-        api.waveInReset(handle)
-        if prepared:
-            api.waveInUnprepareHeader(handle, ctypes.byref(header), ctypes.sizeof(header))
-        api.waveInClose(handle)
+        try:
+            _release_capture(api, handle, header, prepared)
+        except AssistantError:
+            # Do not free driver-referenced memory after a failed close. The
+            # parent ends/verifies this process; no further capture is allowed.
+            _UNRELEASED_CAPTURE_REFERENCES.append((handle, header, buffer))
+            raise
 
 
 class WhisperTranscriber:

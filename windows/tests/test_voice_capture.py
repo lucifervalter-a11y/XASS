@@ -57,6 +57,17 @@ class CaptureTests(unittest.TestCase):
         self.api.waveInUnprepareHeader.assert_called_once()
         self.api.waveInClose.assert_called_once()
 
+    def test_failed_close_retains_buffer_and_blocks_reuse_until_process_exit(self):
+        self.api.waveInClose.return_value = 7
+        with patch.object(vc, "_UNRELEASED_CAPTURE_REFERENCES", []):
+            with self.assertRaises(vc.AssistantError):
+                vc.record_pcm(1)
+            self.assertEqual(len(vc._UNRELEASED_CAPTURE_REFERENCES), 1)
+            self.api.waveInOpen.reset_mock()
+            with self.assertRaisesRegex(vc.AssistantError, "Запись заблокирована"):
+                vc.record_pcm(1)
+            self.api.waveInOpen.assert_not_called()
+
     def test_duration_is_bounded_before_native_call(self):
         for seconds in (-1, 0, 11, True, 1.5):
             with self.assertRaises(vc.AssistantError):
@@ -70,6 +81,38 @@ class CaptureTests(unittest.TestCase):
                 vc.record_pcm(1)
         self.api.waveInReset.assert_called_once()
         self.api.waveInClose.assert_called_once()
+
+
+class CaptureCleanupTests(unittest.TestCase):
+    def test_each_driver_cleanup_error_rejects_recording(self):
+        for failed in ("waveInReset", "waveInUnprepareHeader", "waveInClose"):
+            with self.subTest(failed=failed):
+                api = Mock()
+                for name in ("waveInReset", "waveInUnprepareHeader", "waveInClose"):
+                    getattr(api, name).return_value = 0
+                getattr(api, failed).return_value = 33
+                with self.assertRaisesRegex(vc.AssistantError, "Обработка записи отменена"):
+                    vc._release_capture(api, object(), ctypes.c_int(), True)
+                api.waveInReset.assert_called_once()
+                api.waveInUnprepareHeader.assert_called_once()
+                api.waveInClose.assert_called_once()
+
+    def test_cleanup_continues_after_native_exception(self):
+        api = Mock()
+        api.waveInReset.side_effect = OSError("driver failure")
+        api.waveInUnprepareHeader.return_value = 33
+        api.waveInClose.return_value = 0
+        with self.assertRaises(vc.AssistantError):
+            vc._release_capture(api, object(), ctypes.c_int(), True)
+        api.waveInUnprepareHeader.assert_called_once()
+        api.waveInClose.assert_called_once()
+
+    def test_successful_cleanup_and_unprepared_buffer(self):
+        api = Mock()
+        api.waveInReset.return_value = api.waveInClose.return_value = 0
+        vc._release_capture(api, object(), ctypes.c_int(), False)
+        api.waveInUnprepareHeader.assert_not_called()
+        api.waveInClose.assert_called_once()
 
 
 class LocalModelValidationTests(unittest.TestCase):
