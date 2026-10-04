@@ -47,7 +47,7 @@ class FakeAudio:
 
 class MusicServiceTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
+        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name).resolve()
         self.env = patch.dict(os.environ, {"XASS_DATA_ROOT": str(self.root)})
         self.env.start(); self.addCleanup(self.env.stop)
         self.audio = FakeAudio(); self.player = mp.MusicPlayer(audio_factory=lambda: self.audio)

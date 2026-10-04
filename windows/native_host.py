@@ -19,6 +19,7 @@ ROLES = {
     "assistant": "assistant_bridge",
     "listener": "background_voice_bridge",
     "background-agent": "background_agent",
+    "native-updater": "native_updater",
 }
 HEALTH_IMPORTS = ("httpx", "psutil", "cryptography", "miniaudio", "numpy", "faster_whisper")
 

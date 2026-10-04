@@ -95,7 +95,7 @@ def redact(value: Any, secrets: tuple[str, ...] = ()) -> str:
 def safe_url(value: str) -> str:
     try:
         p = urlsplit(value)
-        if p.scheme not in {"https", "http"} or not p.hostname or p.username or p.password:
+        if p.scheme not in {"https", "http"} or not p.hostname or p.username is not None or p.password is not None:
             return "[invalid-url]"
         return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
     except ValueError:
@@ -324,7 +324,7 @@ class DesktopService:
             if any(c.isspace() or ord(c) < 32 or c == "\\" for c in origin):
                 raise ValueError("Invalid Mini App origin")
             p = urlsplit(origin)
-            if p.scheme not in {"http", "https"} or not p.hostname or p.username or p.password or p.netloc.endswith(":") or p.port == 0:
+            if p.scheme not in {"http", "https"} or not p.hostname or p.username is not None or p.password is not None or p.netloc.endswith(":") or p.port == 0:
                 raise ValueError("Invalid Mini App origin")
             return {"url": urlunsplit((p.scheme, p.netloc, "/miniapp.php", "standalone=1", ""))}
         if action == "desktop_transcription":
@@ -371,7 +371,8 @@ class DesktopService:
         result = {"name": str(raw.get("source_name") or socket.gethostname())[:128],
                   "owner_name": str(raw.get("owner_name") or "")[:128], "paired": bool(raw.get("api_key") or raw.get("sealed")),
                   "server": safe_url(str(raw.get("server_url") or "")), "state": "stopped", "pid": 0,
-                  "age": None, "latency_ms": 0, "version": str(report.get("version") or "")[:64],
+                  "age": None, "latency_ms": 0, "version": str(report.get("agent_version") or report.get("version") or "")[:64],
+                  "server_version": str(report.get("server_version") or "")[:64],
                   "detail": "Агент сообщил об ошибке. Откройте журнал для диагностики." if report.get("state") == "error" else "", "auto_update": raw.get("auto_update", True) is True}
         try:
             import psutil

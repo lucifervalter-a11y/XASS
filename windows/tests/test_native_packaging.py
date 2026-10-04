@@ -26,7 +26,7 @@ host = load('native_host', ROOT / 'windows/native_host.py')
 
 class PackagingTests(unittest.TestCase):
     def test_frozen_dispatch_is_allowlisted_and_does_not_accept_script_paths(self):
-        self.assertEqual(set(host.ROLES), {'assistant', 'listener', 'agent-bridge', 'background-agent', 'desktop-music'})
+        self.assertEqual(set(host.ROLES), {'assistant', 'listener', 'agent-bridge', 'background-agent', 'desktop-music', 'native-updater'})
         self.assertEqual(host.ROLES['listener'], 'background_voice_bridge')
         self.assertEqual(host.ROLES['background-agent'], 'background_agent')
         for args in (['--role', 'unknown'], ['--role', 'assistant', 'arbitrary.py'], ['--health-check', 'extra']):
@@ -101,7 +101,7 @@ class PackagingTests(unittest.TestCase):
             (native / 'extra-required.dll').write_bytes(b'keep complete native folder')
             (companion / 'XASS.NativeHelper.exe').write_bytes(image)
             (companion / '_internal/python312.dll').write_bytes(b'python fixture')
-            (companion / '_internal/build-info.json').write_text(json.dumps({'revision': 'a' * 40, 'distribution': 'native-test'}))
+            (companion / '_internal/build-info.json').write_text(json.dumps({'revision': 'a' * 40, 'distribution': 'native-test', 'version': '1.0.0'}))
             for name in ('module.py', 'requirements.txt', 'voice-requirements.txt', 'version.json'):
                 (source / 'pc_client' / name).write_text('fixture')
             (licenses / 'python-LICENSE.txt').write_text('license fixture')
@@ -123,6 +123,10 @@ class PackagingTests(unittest.TestCase):
             self.assertFalse(result['whisper_model_bundled'])
             self.assertTrue((destination / 'payload-manifest.json').is_file())
             self.assertEqual(json.loads((destination / 'build-info.json').read_text())['revision'], 'a' * 40)
+            marker = json.loads((destination / 'native-install.json').read_text())
+            self.assertEqual(marker['revision'], 'a' * 40)
+            self.assertEqual(marker['distribution'], 'native-test')
+            self.assertIn('native-install.json', indexed)
             self.assertEqual((destination / 'build-info.json').read_bytes(), (destination / 'pc_client/build-info.json').read_bytes())
 
     def test_manifest_allowlists_source_and_complete_runtime(self):

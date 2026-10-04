@@ -100,6 +100,10 @@ def stage(native: Path, companion: Path, destination: Path, revision: str, licen
     # as the frozen helper; a missing identity would offer the current release again.
     shutil.copyfile(build_info, destination / "build-info.json")
     shutil.copyfile(build_info, source_output / "build-info.json")
+    (destination / "native-install.json").write_text(json.dumps({
+        "schema": 1, "app_id": "B4D7E8B9-9C58-4C36-A432-D114393006D8", "distribution": "native-test",
+        "version": identity["version"], "revision": revision
+    }, indent=2) + "\n", encoding="utf-8")
     for name in sources:
         shutil.copyfile(ROOT / "pc_client" / name, source_output / name)
     for name in ("requirements.txt", "voice-requirements.txt", "version.json"):

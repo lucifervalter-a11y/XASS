@@ -197,7 +197,7 @@ class DesktopHost:
                 config = self.service.config(); root = archive_root(config).resolve()
                 database = root / DB_FILE
                 if database.exists():
-                    with sqlite3.connect(database) as conn:
+                    with contextlib.closing(sqlite3.connect(database)) as conn:
                         for (filename,) in conn.execute("SELECT local_path FROM media WHERE saved=1 AND local_path<>''"):
                             if not Path(filename).resolve().is_relative_to(root):
                                 raise ValueError("Archive contains out-of-root media")
@@ -211,8 +211,11 @@ class DesktopHost:
     def _move_archive(self, target: Path, copy: bool):
         from archive_store import archive_root, DB_FILE
         from runtime_state import atomic_write_json
-        stage = target / (".xass-transfer-" + uuid.uuid4().hex)
+        stage = None
         try:
+            # Windows may hand us a short (8.3) alias; compare only canonical roots.
+            target = target.resolve(strict=True)
+            stage = target / (".xass-transfer-" + uuid.uuid4().hex)
             self.stop()
             with config_lock(self.data):
                 config = self.service.config(); source = archive_root(config).resolve()
@@ -241,7 +244,7 @@ class DesktopHost:
                                 self.job.update(progress=int(done * 90 / max(1, total)))
                             dst.flush(); os.fsync(dst.fileno())
                     if (source / DB_FILE).exists():
-                        with sqlite3.connect(source / DB_FILE) as src, sqlite3.connect(stage / DB_FILE) as dst:
+                        with contextlib.closing(sqlite3.connect(source / DB_FILE)) as src, contextlib.closing(sqlite3.connect(stage / DB_FILE)) as dst:
                             src.backup(dst)
                             for row_id, filename in dst.execute("SELECT asset_id,local_path FROM media WHERE local_path<>''").fetchall():
                                 old = Path(filename).resolve()
@@ -260,7 +263,7 @@ class DesktopHost:
         except Exception:
             self.job = {"state": "error", "progress": 0, "message": "Не удалось перенести архив. Исходный архив и настройка сохранены; проверьте пустую папку и свободное место."}
         finally:
-            if stage.exists(): shutil.rmtree(stage, ignore_errors=True)
+            if stage is not None and stage.exists(): shutil.rmtree(stage, ignore_errors=True)
             atomic_write_json(self.data / ".native-archive-job.json", self.job)
             if not self.stop_event.is_set():
                 try: self.start()

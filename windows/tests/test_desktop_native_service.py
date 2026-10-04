@@ -173,7 +173,7 @@ class NativeArchiveHostTests(unittest.TestCase):
         import threading
         from background_agent import DesktopHost
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name); self.source = self.root / "old"; self.source.mkdir(); self.target = self.root / "new"; self.target.mkdir()
+        self.root = Path(self.tmp.name).resolve(); self.source = self.root / "old"; self.source.mkdir(); self.target = self.root / "new"; self.target.mkdir()
         self.env = patch.dict(os.environ, {"XASS_DATA_ROOT": str(self.root), "LOCALAPPDATA": str(self.root)})
         self.env.start(); self.addCleanup(self.env.stop)
         self.host = DesktopHost.__new__(DesktopHost)
@@ -186,15 +186,36 @@ class NativeArchiveHostTests(unittest.TestCase):
     def test_consistent_archive_copy_rewrites_paths_preserves_source_and_commits_last(self):
         from archive_store import DB_FILE, _connect
         media = self.source / "media"; media.mkdir(); (media / "file.jpg").write_bytes(b"fixture-media")
-        with _connect(self.source) as db:
+        with contextlib.closing(_connect(self.source)) as db, db:
             db.execute("INSERT INTO media (asset_id, message_id, local_path, saved) VALUES (1,1,?,1)", (str(media / "file.jpg"),))
         self.host._move_archive(self.target, True)
         self.assertEqual(self.host.job["state"], "completed")
         self.assertEqual((media / "file.jpg").read_bytes(), b"fixture-media")
         self.assertEqual((self.target / "media/file.jpg").read_bytes(), b"fixture-media")
-        with sqlite3.connect(self.target / DB_FILE) as db:
+        with contextlib.closing(sqlite3.connect(self.target / DB_FILE)) as db:
             self.assertEqual(db.execute("SELECT local_path FROM media").fetchone()[0], str(self.target / "media/file.jpg"))
         self.assertEqual(self.host.service.save.call_args.args[0]["archive_folder"], str(self.target))
+    def test_archive_copy_closes_all_database_handles_before_return(self):
+        from archive_store import _connect
+        with contextlib.closing(_connect(self.source)) as db, db:
+            db.execute("SELECT 1")
+        opened = []
+        class TrackedConnection(sqlite3.Connection):
+            closed = False
+            def close(self):
+                self.closed = True
+                super().close()
+        connect = sqlite3.connect
+        def tracked(*args, **kwargs):
+            connection = connect(*args, factory=TrackedConnection, **kwargs)
+            opened.append(connection)
+            return connection
+        with patch("background_agent.sqlite3.connect", side_effect=tracked):
+            self.host._move_archive(self.target, True)
+        self.assertEqual(self.host.job["state"], "completed")
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(connection.closed for connection in opened))
+
     def test_archive_cancel_keeps_config_source_and_no_staging(self):
         (self.source / "fixture.txt").write_text("safe")
         self.host.job_cancel.set(); self.host._move_archive(self.target, True)
@@ -218,7 +239,7 @@ class NativeArchiveHostTests(unittest.TestCase):
     def test_cleanup_rejects_external_paths_even_with_confirm(self):
         from archive_store import _connect
         outside = self.root / "personal.txt"; outside.write_text("keep")
-        with _connect(self.source) as db:
+        with contextlib.closing(_connect(self.source)) as db, db:
             db.execute("INSERT INTO media (asset_id,message_id,local_path,saved) VALUES (1,1,?,1)",(str(outside),))
         with self.assertRaises(ValueError): self.host.request("host_archive_cleanup", {"confirmed": True})
         self.assertEqual(outside.read_text(), "keep")

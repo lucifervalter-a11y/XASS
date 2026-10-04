@@ -41,7 +41,8 @@ or interactive acceptance.
    recognition, minimize, close-to-tray and final quit. Ambient speech must never
    execute an action; execution requires its explicit button.
 
-The initial native test updater accepts only native-test installer manifests and
-verified SHA-256 downloads. Automatic installation and automatic rollback are not
-part of this initial integration. Discord automatic voice-channel joining also
-remains unavailable without the separate OAuth/RPC integration.
+The native updater accepts only native-test installer manifests and verified
+SHA-256 downloads. Explicitly opted-in automatic updates, verified backup and
+health-checked rollback are implemented with failure-injection tests. Real
+cross-version Windows update/rollback acceptance remains required. Discord
+automatic voice-channel joining remains unavailable without its OAuth/RPC integration.

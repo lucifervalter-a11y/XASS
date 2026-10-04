@@ -43,7 +43,8 @@
     "voice_capture.py",
     "desktop_bridge.py",
     "background_agent.py",
-    "desktop_music_service.py"
+    "desktop_music_service.py",
+    "native_updater.py"
   ],
   "required_companion_files": [
     "XASS.NativeHelper.exe",

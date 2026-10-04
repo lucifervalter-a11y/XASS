@@ -62,7 +62,7 @@ $FreezeArguments = @(
     '--add-data', "$(Join-Path $RepoRoot 'pc_client\assets\xass.ico');assets",
     '--add-data', "$(Join-Path $RepoRoot 'pc_client\assets\xass-icon.png');assets"
 )
-foreach ($Module in @('bridge', 'desktop_bridge', 'desktop_music_service', 'background_agent', 'assistant_bridge', 'background_voice_bridge', 'background_voice', 'native_music_ownership', 'voice_capture', 'voice_assistant', 'client_agent')) {
+foreach ($Module in @('bridge', 'desktop_bridge', 'desktop_music_service', 'background_agent', 'native_updater', 'assistant_bridge', 'background_voice_bridge', 'background_voice', 'native_music_ownership', 'voice_capture', 'voice_assistant', 'client_agent')) {
     $FreezeArguments += @('--hidden-import', $Module)
 }
 foreach ($Module in @('cryptography', 'miniaudio', 'faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'numpy')) {
