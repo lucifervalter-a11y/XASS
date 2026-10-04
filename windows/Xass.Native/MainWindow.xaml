@@ -1,0 +1,162 @@
+<Window x:Class="Xass.Native.MainWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="XASS">
+ <Grid x:Name="RootGrid" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+  <NavigationView x:Name="Navigation" PaneTitle="XASS" IsBackButtonVisible="Collapsed"
+   IsSettingsVisible="False" SelectionChanged="Navigate" PaneDisplayMode="Auto" OpenPaneLength="236" CompactModeThresholdWidth="720" ExpandedModeThresholdWidth="1100">
+   <NavigationView.MenuItems>
+    <NavigationViewItem Content="Обзор" Tag="overview" Icon="Home" />
+    <NavigationViewItem Content="Этот компьютер" Tag="device" Icon="AllApps" />
+    <NavigationViewItem Content="Музыка" Tag="music" Icon="Audio" />
+    <NavigationViewItem Content="Помощник" Tag="assistant" Icon="Microphone" />
+    <NavigationViewItem Content="Подключение" Tag="connection" Icon="Setting" />
+   </NavigationView.MenuItems>
+   <Grid x:Name="PageLayout" Padding="28" RowSpacing="16">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <TextBlock x:Name="PageTitle" Text="Обзор" Style="{ThemeResource TitleTextBlockStyle}" />
+    <StackPanel Grid.Row="1" Spacing="8">
+     <InfoBar x:Name="Notice" IsOpen="True" IsClosable="True" Severity="Informational"
+      Title="Нативный Windows-клиент · предварительная версия"
+      Message="Подключите существующий агент в разделе «Подключение». Привязка и фоновая работа остаются в установленном XASS." />
+     <ProgressBar x:Name="Progress" IsIndeterminate="True" Visibility="Collapsed" />
+    </StackPanel>
+    <Grid Grid.Row="2">
+     <ScrollViewer x:Name="OverviewPage" HorizontalScrollBarVisibility="Disabled"><StackPanel Spacing="20" MaxWidth="960">
+      <Border CornerRadius="20" Padding="28" Background="{ThemeResource AccentFillColorDefaultBrush}">
+       <StackPanel Spacing="16">
+        <TextBlock Text="XASS / WINDOWS" Style="{StaticResource XassEyebrow}" Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}"/>
+        <TextBlock Text="Всё под рукой." FontSize="36" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}"/>
+        <TextBlock Text="Ваша музыка. Ваш компьютер. Один спокойный центр управления." FontSize="16" MaxWidth="580" HorizontalAlignment="Left" TextWrapping="Wrap" Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}"/>
+        <Button Content="Открыть музыку  →" Click="OpenMusicClick" Margin="0,8,0,0" Padding="20,12"/>
+       </StackPanel>
+      </Border>
+      <Border Style="{StaticResource XassCard}">
+       <StackPanel Spacing="16">
+        <TextBlock Text="НА ЭТОМ КОМПЬЮТЕРЕ" Style="{StaticResource XassEyebrow}"/>
+        <TextBlock x:Name="OverviewStatus" Text="Давайте подключимся" FontSize="22" FontWeight="SemiBold" TextWrapping="Wrap"/>
+        <TextBlock x:Name="OverviewTrack" Text="Выберите существующий агент, и здесь появятся его состояние и музыка." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="2">
+         <Button Content="Подключить агент" Click="OpenConnectionClick" Margin="0,0,12,8"/>
+         <Button Content="Обновить состояние" Click="RefreshClick" Margin="0,0,0,8"/>
+        </VariableSizedWrapGrid>
+       </StackPanel>
+      </Border>
+      <TextBlock Text="Предварительная нативная версия. Привязка ПК, обновления, архив и системные команды пока остаются в существующем XASS." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" Margin="4,0,4,12"/>
+     </StackPanel></ScrollViewer>
+     <ScrollViewer x:Name="DevicePage" Visibility="Collapsed"><Border Style="{StaticResource XassCard}" MaxWidth="900" VerticalAlignment="Top"><StackPanel Spacing="18">
+      <FontIcon Glyph="&#xE7F4;" FontSize="36" HorizontalAlignment="Left" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/>
+      <TextBlock Text="Подключённый локальный ПК" Style="{ThemeResource SubtitleTextBlockStyle}"/>
+      <TextBlock x:Name="DeviceName" Text="Не выбран" FontSize="24"/>
+      <TextBlock x:Name="DeviceState" Text="Нет данных"/>
+      <Button Content="Обновить" Click="RefreshClick" />
+      <InfoBar IsOpen="True" IsClosable="False" Severity="Informational" Title="Доступ этого агента"
+       Message="Ключ ПК даёт доступ только к этому компьютеру. Другие устройства и удалённые команды доступны в Mini App или приложении iPhone." />
+     </StackPanel></Border></ScrollViewer>
+     <Grid x:Name="MusicPage" Visibility="Collapsed" RowSpacing="12">
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+      <Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+       <TextBox x:Name="SearchBox" PlaceholderText="Название, исполнитель или альбом" MaxLength="120" KeyDown="SearchKeyDown" AutomationProperties.Name="Поиск музыки"/>
+       <Button Grid.Column="1" x:Name="SearchButton" Content="Найти" Click="SearchClick" Style="{StaticResource AccentButtonStyle}"/>
+      </Grid>
+      <Grid Grid.Row="1" ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+       <Button x:Name="PreviousPage" Content="Назад" IsEnabled="False" Click="PreviousClick"/>
+       <Button Grid.Column="1" x:Name="NextPage" Content="Далее" IsEnabled="False" Click="NextClick"/>
+       <TextBlock Grid.Column="2" x:Name="CatalogCount" Text="Нажмите «Найти», чтобы загрузить библиотеку" VerticalAlignment="Center" TextWrapping="Wrap"/>
+      </Grid>
+      <Grid Grid.Row="2">
+      <ListView x:Name="TrackList" SelectionMode="Single" SelectionChanged="TrackSelected" AutomationProperties.Name="Музыкальная библиотека">
+       <ListView.ItemsPanel><ItemsPanelTemplate><ItemsStackPanel/></ItemsPanelTemplate></ListView.ItemsPanel>
+       <ListView.ItemContainerStyle><Style TargetType="ListViewItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="12,4"/></Style></ListView.ItemContainerStyle>
+       <ListView.ItemTemplate><DataTemplate><Grid Padding="4,10" ColumnSpacing="14"><Grid.ColumnDefinitions><ColumnDefinition Width="40"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <Border Width="40" Height="40" CornerRadius="10" Background="{ThemeResource SubtleFillColorSecondaryBrush}"><FontIcon Glyph="&#xE8D6;" FontSize="18" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/></Border>
+        <StackPanel Grid.Column="1" Spacing="3">
+        <TextBlock Text="{Binding Title}" FontSize="16" TextTrimming="CharacterEllipsis"/>
+        <TextBlock Text="{Binding Detail}" Opacity="0.65" TextTrimming="CharacterEllipsis"/>
+       </StackPanel></Grid></DataTemplate></ListView.ItemTemplate>
+      </ListView>
+      <StackPanel x:Name="EmptyLibrary" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12" MaxWidth="360" IsHitTestVisible="False" Margin="20">
+       <FontIcon Glyph="&#xE8D6;" FontSize="44" Foreground="{ThemeResource TextFillColorTertiaryBrush}"/>
+       <TextBlock x:Name="EmptyLibraryTitle" Text="Ваша музыка, здесь" FontSize="20" FontWeight="SemiBold" TextAlignment="Center" TextWrapping="Wrap"/>
+       <TextBlock x:Name="EmptyLibraryDetail" Text="Подключите агент и нажмите «Найти», чтобы открыть библиотеку сервера." TextAlignment="Center" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+      </StackPanel>
+      </Grid>
+      <Border Grid.Row="3" Style="{StaticResource XassCard}" Padding="20">
+      <ScrollViewer x:Name="PlayerScroller" MaxHeight="260" VerticalScrollBarVisibility="Auto">
+       <StackPanel x:Name="PlayerControls" Spacing="10">
+        <TextBlock Text="ПЛЕЕР · ЭТОТ ПК" Style="{StaticResource XassEyebrow}"/>
+        <TextBlock x:Name="NowPlaying" Text="Ничего не играет" TextWrapping="Wrap" FontSize="18"/>
+        <TextBlock x:Name="PlaybackState" Text="" Opacity="0.65"/>
+        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="4">
+         <Button x:Name="PlayButton" Content="Включить выбранный" Style="{StaticResource AccentButtonStyle}" IsEnabled="False" Click="PlayClick" Margin="0,0,8,8"/>
+         <Button x:Name="PauseButton" Content="Пауза" IsEnabled="False" Click="PauseClick" Margin="0,0,8,8"/>
+         <Button x:Name="ResumeButton" Content="Продолжить" IsEnabled="False" Click="ResumeClick" Margin="0,0,8,8"/>
+         <Button x:Name="StopButton" Content="Стоп" IsEnabled="False" Click="StopClick" Margin="0,0,8,8"/>
+        </VariableSizedWrapGrid>
+        <Expander Header="Громкость и перемотка" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+         <StackPanel Spacing="12">
+        <Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+         <Slider x:Name="SeekSlider" Minimum="0" Maximum="1" IsEnabled="False" AutomationProperties.Name="Позиция воспроизведения в секундах"/>
+         <Button Grid.Column="1" x:Name="SeekButton" Content="Перемотать" IsEnabled="False" Click="SeekClick"/>
+        </Grid>
+        <Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+         <Slider x:Name="VolumeSlider" Minimum="0" Maximum="100" Value="70" Header="Громкость этого ПК" AutomationProperties.Name="Громкость этого компьютера"/>
+         <Button Grid.Column="1" x:Name="VolumeButton" Content="Применить" Click="VolumeClick" VerticalAlignment="Bottom"/>
+        </Grid>
+         </StackPanel>
+        </Expander>
+       </StackPanel>
+      </ScrollViewer>
+      </Border>
+     </Grid>
+     <ScrollViewer x:Name="AssistantPage" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Spacing="16" MaxWidth="840" Padding="0,0,0,20">
+       <Border Style="{StaticResource XassCard}"><StackPanel Spacing="12">
+        <TextBlock Text="Голосовой помощник" Style="{ThemeResource SubtitleTextBlockStyle}"/>
+        <TextBlock Text="Нажмите кнопку, дождитесь «Говорите» и произнесите одну команду. Запись длится 6 секунд. Проверьте распознанный текст перед выполнением." TextWrapping="Wrap"/>
+        <TextBlock Text="Примеры: «запусти майнкрафт», «открой ютуб», «открой дискорд», «перейди к каналу Шаурма классическая»." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+        <TextBox x:Name="AssistantText" Header="Команда" PlaceholderText="Джарвис, открой ютуб" MaxLength="512" AcceptsReturn="False"/>
+        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="3">
+         <Button x:Name="AssistantRecord" Content="Записать 6 секунд" Click="AssistantRecordClick" Style="{StaticResource AccentButtonStyle}" Margin="0,0,8,8"/>
+         <Button x:Name="AssistantPlanButton" Content="Разобрать текст" Click="AssistantPlanClick" Margin="0,0,8,8"/>
+         <Button x:Name="AssistantCancel" Content="Отменить" Click="AssistantCancelClick" IsEnabled="False" Margin="0,0,8,8"/>
+        </VariableSizedWrapGrid>
+        <ProgressBar x:Name="AssistantProgress" IsIndeterminate="True" Visibility="Collapsed"/>
+        <TextBlock x:Name="AssistantState" Text="Готов. Микрофон выключен." TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+        <TextBlock x:Name="AssistantPreview" Text="Здесь появится действие для проверки." FontWeight="SemiBold" TextWrapping="Wrap"/>
+        <Button x:Name="AssistantExecute" Content="Выполнить" Click="AssistantExecuteClick" IsEnabled="False"/>
+       </StackPanel></Border>
+       <Expander x:Name="AssistantSettingsPanel" Header="Настройки помощника" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+        <StackPanel Spacing="12">
+         <TextBox x:Name="AssistantPython" Header="Python с faster-whisper (для текста достаточно обычного Python)"/>
+         <TextBox x:Name="AssistantModelPath" Header="Локальная папка модели faster-whisper"/>
+         <TextBox x:Name="AssistantLauncher" Header="Путь к TLauncher.exe"/>
+         <TextBox x:Name="AssistantLauncherProperties" Header="Файл настроек TLauncher (tlauncher-2.0.properties)"/>
+         <TextBox x:Name="AssistantMinecraft" Header="Папка Minecraft"/>
+         <TextBox x:Name="AssistantChannel" Header="Ссылка на канал «Шаурма классическая»" PlaceholderText="https://discord.com/channels/сервер/канал"/>
+         <ComboBox x:Name="AssistantPlanner" Header="Понимание команд" SelectedIndex="0" HorizontalAlignment="Stretch">
+          <ComboBoxItem Content="Точные команды — без LLM"/>
+          <ComboBoxItem Content="Локальная модель Ollama — должна быть запущена"/>
+         </ComboBox>
+         <TextBox x:Name="AssistantOllamaModel" Header="Имя уже установленной модели Ollama (необязательно)"/>
+         <TextBlock Text="Аудио обрабатывается локально и не сохраняется. Автозагрузка моделей и постоянное прослушивание отключены. Настройки действуют до закрытия окна." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+        </StackPanel>
+       </Expander>
+       <InfoBar IsOpen="True" IsClosable="False" Severity="Informational" Title="Discord: вход в голос ещё требует интеграции"
+        Message="Переход открывает страницу настроенного канала. Автоматический вход доступен только с разрешённым OAuth/RPC-коннектором; в этой сборке он не настроен. Ссылки не считаются подтверждением подключения."/>
+      </StackPanel>
+     </ScrollViewer>
+     <ScrollViewer x:Name="ConnectionPage" Visibility="Collapsed"><StackPanel Spacing="16" MaxWidth="840" HorizontalAlignment="Stretch">
+      <TextBlock Text="Использовать существующий агент" Style="{ThemeResource SubtitleTextBlockStyle}"/>
+      <TextBlock Text="Для этой предварительной сборки нужен Python с зависимостями pc_client и исходники XASS. Агент должен быть уже привязан и запущен. Укажите абсолютные локальные пути; они хранятся только до закрытия этого окна." TextWrapping="Wrap"/>
+      <TextBox x:Name="PythonPath" Header="Python из окружения XASS" PlaceholderText="C:\XASS\pc_client\.venv\Scripts\python.exe"/>
+      <TextBox x:Name="SourcePath" Header="Папка исходников pc_client" PlaceholderText="C:\XASS\pc_client"/>
+      <TextBox x:Name="DataPath" Header="Папка данных работающего агента" PlaceholderText="C:\Users\имя\AppData\Local\XASS"/>
+      <Button x:Name="ConnectButton" Content="Использовать агент" Click="ConnectClick" Style="{StaticResource AccentButtonStyle}" Padding="20,12"/>
+      <TextBlock Text="Установленный агент хранит данные в %LOCALAPPDATA%\XASS. При запуске из исходников выберите папку pc_client. Используйте только доверенные исходники и Python. Ключи не копируются и не вводятся в этом окне." TextWrapping="Wrap" Opacity="0.65"/>
+     </StackPanel></ScrollViewer>
+    </Grid>
+   </Grid>
+  </NavigationView>
+ </Grid>
+</Window>

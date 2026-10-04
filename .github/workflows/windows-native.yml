@@ -1,0 +1,58 @@
+name: Validate native Windows shell
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'windows/**'
+      - 'pc_client/**'
+      - '.github/workflows/windows-native.yml'
+  push:
+    branches: ['codex/**']
+    paths:
+      - 'windows/**'
+      - 'pc_client/**'
+      - '.github/workflows/windows-native.yml'
+
+# Validation only: this workflow cannot publish releases or deploy an installer.
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-windows-native-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Test native bridge and source contracts
+        run: python -m unittest discover -s windows/tests -v
+      - name: Publish unpackaged native shell to artifact folder
+        run: dotnet publish windows/Xass.Native/Xass.Native.csproj -c Release -r win-x64 -p:Platform=x64 -o artifacts/windows-native
+      - name: Verify complete native artifact
+        shell: pwsh
+        run: |
+          if (!(Test-Path artifacts/windows-native/Xass.Native.exe)) {
+            throw 'Native executable was not produced.'
+          }
+          if (!(Test-Path artifacts/windows-native/bridge.py)) {
+            throw 'Native bridge was not included.'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XASS-Windows-native-validation-${{ github.sha }}
+          # Keep the complete folder: the executable needs adjacent runtime files.
+          path: artifacts/windows-native/
+          if-no-files-found: error
+          retention-days: 14
