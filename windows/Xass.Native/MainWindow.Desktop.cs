@@ -18,10 +18,12 @@ public sealed partial class MainWindow
     private readonly DispatcherTimer desktopTimer = new() { Interval = TimeSpan.FromSeconds(5) };
     private readonly SemaphoreSlim desktopStartGate = new(1, 1);
     private WindowsTray? desktopTray;
-    private bool desktopReady, desktopPolling, desktopPairing, desktopQuitting;
+    private bool desktopReady, desktopPolling, desktopQuitting, desktopPairingUi, desktopRuntimeChanging;
+    private readonly DesktopPairingFlow desktopPairingFlow = new();
+    private CancellationTokenSource? desktopPairingCancellation;
+    private bool desktopPairing => desktopPairingUi || desktopPairingFlow.IsBusy;
     private string desktopPage = "overview", fileRelative = "", archivePath = "";
     private int fileGeneration;
-    private string? pendingProfilePath, pendingProfileText;
     private TextBlock desktopGreeting = new(), desktopSummary = new(), desktopMetrics = new(), desktopEvents = new();
     private TextBlock processStatus = new(), fileStatus = new(), archiveStatus = new(), archiveJob = new(), updateStatus = new(), pairingStatus = new(), settingsStatus = new(), transcriptStatus = new();
     private ListView processList = new(), fileList = new(), archiveList = new();
@@ -144,19 +146,25 @@ public sealed partial class MainWindow
     }
     private async Task SaveDesktopPathsAsync()
     {
-        string python = PythonPath.Text.Trim(), source = SourcePath.Text.Trim(), data = DataPath.Text.Trim();
-        if (!Path.IsPathFullyQualified(python) || !File.Exists(python) || !Path.IsPathFullyQualified(source) || !Directory.Exists(source)
-            || !Path.IsPathFullyQualified(data) || !Directory.Exists(data)) throw new InvalidOperationException("Проверьте абсолютные пути среды и папки данных.");
-        if (desktopHost.IsRunning) await desktopHost.CloseAsync();
-        client.PythonPath = python; client.SourcePath = source; client.DataPath = data;
-        await Task.Run(() =>
+        if (desktopPairing || desktopRuntimeChanging) throw new InvalidOperationException("Дождитесь окончания подключения или сохранения путей.");
+        desktopRuntimeChanging = true;
+        try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(runtimePreferences)!);
-            string temp = runtimePreferences + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(new { version = 1, python, source, data }));
-            File.Move(temp, runtimePreferences, true);
-        });
-        await EnsureDesktopHostAsync(); await RefreshDesktopAsync();
+            string python = PythonPath.Text.Trim(), source = SourcePath.Text.Trim(), data = DataPath.Text.Trim();
+            if (!Path.IsPathFullyQualified(python) || !File.Exists(python) || !Path.IsPathFullyQualified(source) || !Directory.Exists(source)
+                || !Path.IsPathFullyQualified(data) || !Directory.Exists(data)) throw new InvalidOperationException("Проверьте абсолютные пути среды и папки данных.");
+            if (desktopHost.IsRunning) await desktopHost.CloseAsync();
+            client.PythonPath = python; client.SourcePath = source; client.DataPath = data;
+            await Task.Run(() =>
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(runtimePreferences)!);
+                string temp = runtimePreferences + ".tmp";
+                File.WriteAllText(temp, JsonSerializer.Serialize(new { version = 1, python, source, data }));
+                File.Move(temp, runtimePreferences, true);
+            });
+            await EnsureDesktopHostAsync(); await RefreshDesktopAsync();
+        }
+        finally { desktopRuntimeChanging = false; }
     }
     private async Task EnsureDesktopHostAsync()
     {
@@ -251,38 +259,77 @@ public sealed partial class MainWindow
         var picker = new FileOpenPicker(); WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
         foreach (string extension in extensions) picker.FileTypeFilter.Add(extension); return picker;
     }
-    private async Task PickConnectionAsync()
-    { var file = await DesktopOpenPicker(".xass", ".xass-connect", ".json").PickSingleFileAsync(); if (file is not null) await ImportConnectionAsync(file.Path, null); }
-    private async Task PasteConnectionAsync()
+    private Task PickConnectionAsync() => ImportConnectionSourceAsync(async cancellation =>
     {
-        var clipboard = Clipboard.GetContent(); if (!clipboard.Contains(StandardDataFormats.Text)) throw new InvalidOperationException("Буфер не содержит JSON подключения.");
-        string value = await clipboard.GetTextAsync(); if (value.Length > 65536) throw new InvalidOperationException("Файл подключения слишком большой.");
-        await ImportConnectionAsync(null, value);
-    }
-    private async Task ImportConnectionAsync(string? path, string? content)
+        var file = await DesktopOpenPicker(".xass", ".xass-connect", ".json").PickSingleFileAsync();
+        return file is null ? null : await DesktopPairingFlow.ReadProfileFileAsync(file.Path, cancellation);
+    });
+    private Task PasteConnectionAsync() => ImportConnectionSourceAsync(async cancellation =>
     {
-        if (desktopPairing) return;
-        JsonElement profile = await client.RequestAsync(new { action = "desktop_profile", path, text = content }, lifetime.Token);
-        pendingProfilePath = path; pendingProfileText = content;
-        pairServer.Text = DValue(profile, "server"); pairName.Text = DValue(profile, "name", Environment.MachineName);
-        pairingStatus.Text = "Файл проверен. Срок действия: " + DValue(profile, "expires_at");
-        if (await DesktopConfirmAsync("Привязать компьютер?", $"Сервер: {pairServer.Text}\nКомпьютер: {pairName.Text}\nКлюч агента будет сохранён в зашифрованном виде для этой учётной записи Windows.", "Подключить"))
-            await PairDesktopAsync();
-    }
-    private async Task PairDesktopAsync()
+        var clipboard = Clipboard.GetContent();
+        if (!clipboard.Contains(StandardDataFormats.Text)) throw new InvalidOperationException("Буфер не содержит JSON подключения.");
+        string value = await clipboard.GetTextAsync();
+        cancellation.ThrowIfCancellationRequested();
+        return value;
+    });
+    private Task ImportConnectionAsync(string? path, string? content) => ImportConnectionSourceAsync(async cancellation =>
     {
-        if (desktopPairing) return;
-        desktopPairing = true; pairButton.IsEnabled = saveSettings.IsEnabled = false; pairingStatus.Text = "Подключение…";
+        if ((path is null) == (content is null)) throw new InvalidOperationException("Выберите один источник подключения.");
+        return path is null ? content : await DesktopPairingFlow.ReadProfileFileAsync(path, cancellation);
+    });
+    private Task ImportConnectionSourceAsync(Func<CancellationToken, Task<string?>> readSource) => RunDesktopPairingAsync(operationCancellation =>
+        desktopPairingFlow.ImportAsync(readSource, client.RequestAsync, async (profile, cancellation) =>
+        {
+            // Preview only in the confirmation dialog. Cancelling preserves the manual form.
+            string previewName = DValue(profile, "name");
+            if (string.IsNullOrWhiteSpace(previewName)) previewName = Environment.MachineName;
+            bool accepted = await DesktopConfirmAsync("Привязать компьютер?",
+                $"Сервер: {DValue(profile, "server")}\nКомпьютер: {previewName}\nСрок действия: {DValue(profile, "expires_at")}\nКлюч агента будет сохранён в зашифрованном виде для этой учётной записи Windows.", "Подключить");
+            cancellation.ThrowIfCancellationRequested();
+            return accepted;
+        }, operationCancellation));
+    private Task PairDesktopAsync() => RunDesktopPairingAsync(cancellation => desktopPairingFlow.PairManualAsync(
+        pairServer.Text, pairName.Text, pairCode.Password, client.RequestAsync, cancellation));
+    private async Task RunDesktopPairingAsync(Func<CancellationToken, Task<JsonElement?>> operation)
+    {
+        if (desktopPairing || desktopQuitting || closed) return;
+        if (desktopRuntimeChanging) throw new InvalidOperationException("Дождитесь сохранения путей среды.");
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        desktopPairingCancellation = cancellation;
+        desktopPairingUi = true;
+        pairButton.IsEnabled = saveSettings.IsEnabled = false;
+        pairServer.IsEnabled = pairName.IsEnabled = pairCode.IsEnabled = false;
+        pairingStatus.Text = "Подготовка подключения…";
+        bool paired = false;
         try
         {
-            JsonElement result = await client.RequestAsync(new { action = "desktop_pair", server = pairServer.Text.Trim(), name = pairName.Text.Trim(),
-                code = pairCode.Password, path = pendingProfilePath, text = pendingProfileText }, lifetime.Token);
-            pairCode.Password = ""; pendingProfilePath = pendingProfileText = null;
+            JsonElement? result = await operation(cancellation.Token);
+            if (result is null)
+            { pairingStatus.Text = "Подключение отменено. Можно ввести данные вручную или импортировать новый файл."; return; }
+            paired = true;
+            pairCode.Password = "";
+            pairServer.Text = DValue(result.Value, "server"); pairName.Text = DValue(result.Value, "name", Environment.MachineName);
             pairingStatus.Text = "Компьютер подключён. Персональный ключ сохранён зашифрованно.";
+            // A completed claim can win a cancellation race. Keep its success, but
+            // never restart a background agent after application shutdown began.
+            if (closed || desktopQuitting || cancellation.IsCancellationRequested) return;
             await RestartDesktopAgentAsync(); SelectDesktopPage("overview");
         }
-        catch { pairingStatus.Text = "Не удалось подключиться. Проверьте адрес, срок действия кода и повторите."; throw; }
-        finally { desktopPairing = false; pairButton.IsEnabled = saveSettings.IsEnabled = true; }
+        catch (OperationCanceledException)
+        { pairingStatus.Text = "Подключение отменено. Можно повторить с новыми данными."; throw; }
+        catch
+        {
+            pairingStatus.Text = paired ? "Компьютер подключён, но агент не удалось перезапустить. Повторите запуск агента."
+                : "Не удалось подключиться. Проверьте адрес и срок действия кода. Для импорта выберите файл или JSON заново.";
+            throw;
+        }
+        finally
+        {
+            desktopPairingCancellation = null;
+            desktopPairingUi = false;
+            pairButton.IsEnabled = saveSettings.IsEnabled = true;
+            pairServer.IsEnabled = pairName.IsEnabled = pairCode.IsEnabled = true;
+        }
     }
 
     private void BuildComputerPanels()
@@ -684,6 +731,7 @@ public sealed partial class MainWindow
     {
         if (desktopQuitting) return;
         desktopQuitting = true;
+        desktopPairingCancellation?.Cancel();
         if (!nativeUpdateCommitAuthorized)
         {
             nativeUpdateCancellation?.Cancel();

@@ -49,6 +49,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Native updater HTTP deadline tests failed.' }
 & dotnet run --project (Join-Path $PSScriptRoot 'AutomaticUpdate.Tests\AutomaticUpdate.Tests.csproj') -c Release
 if ($LASTEXITCODE -ne 0) { throw 'Automatic updater consent and rejection safety tests failed.' }
 
+& dotnet run --project (Join-Path $PSScriptRoot 'PairingFlow.Tests\PairingFlow.Tests.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Pairing import isolation and cancellation tests failed.' }
+
 $Native = Join-Path $BuildRoot 'native'
 & dotnet publish (Join-Path $PSScriptRoot 'Xass.Native\Xass.Native.csproj') -c Release -r win-x64 -p:RuntimeIdentifiers=win-x64 -p:Platform=x64 -o $Native
 if ($LASTEXITCODE -ne 0) { throw 'WinUI publish failed.' }

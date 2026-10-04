@@ -52,7 +52,7 @@ public sealed class AgentClient
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         string requestAction = JsonSerializer.SerializeToElement(request).TryGetProperty("action", out var requestedAction)
             ? requestedAction.GetString() ?? "" : "";
-        if (requestAction == "desktop_pair") timeout.CancelAfter(TimeSpan.FromSeconds(90));
+        if (requestAction is "desktop_pair" or "desktop_pair_profile") timeout.CancelAfter(TimeSpan.FromSeconds(90));
         else timeout.CancelAfter(TimeSpan.FromSeconds(20));
         using var process = new Process { StartInfo = start };
         cancellation.ThrowIfCancellationRequested();

@@ -367,6 +367,27 @@ class ProtocolContractTests(unittest.TestCase):
                 self.assertEqual(set(result), {"ok", "error"})
                 constructor.assert_not_called()
 
+    def test_full_size_unicode_profile_fits_bounded_escaped_envelope(self):
+        profile = json.dumps({"format": "xass-connect", "version": 1,
+            "server_url": "https://fixture.invalid", "source_name": "Fixture PC",
+            "pair_code": "synthetic-code", "expires_at": "2099-01-01T00:00:00Z",
+            "padding": "Я" * 32000}, ensure_ascii=False)
+        self.assertLessEqual(len(profile.encode("utf-8")), 65536)
+        payload = {"action": "desktop_pair_profile", "text": profile, "confirmed": True}
+        encoded = json.dumps(payload, ensure_ascii=True)
+        self.assertGreater(len(encoded), 96 * 1024)
+        self.assertLess(len(encoded), bridge.MAX_REQUEST)
+        service = Mock()
+        service.request.return_value = {"paired": True}
+        module = Mock()
+        module.DesktopService.return_value = service
+        with patch.dict(bridge.sys.modules, {"desktop_bridge": module}):
+            result, constructor = self.run_main(encoded)
+        constructor.assert_not_called()
+        service.request.assert_called_once_with("desktop_pair_profile", payload)
+        self.assertEqual(result, {"ok": True, "result": {"paired": True}})
+        self.assertNotIn("synthetic-code", json.dumps(result))
+
     def test_errors_do_not_expose_exception_details(self):
         result, _ = self.run_main('{"action":"snapshot"}', error=RuntimeError(PRIVATE))
         self.assertIs(result["ok"], False)

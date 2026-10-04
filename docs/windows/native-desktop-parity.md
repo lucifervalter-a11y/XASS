@@ -78,3 +78,25 @@ Automatic preparation never reserves permission to interrupt later work. After d
 Explicit rejected installer SHA-256 values from rollback state are persisted in a bounded 32-entry history separate from the replaceable last-result record, while preserving the user's auto-update setting. The same rejected SHA is never retried automatically; a different SHA is eligible. An explicit manual install can retry without erasing the failure history. A timeout or pre-install preparation failure is not a rejected installer. Corrupt/oversized state fails closed for automatic installation. Network errors and cancellation reset progress/running controls and leave a useful retry status.
 
 Verification: `dotnet run --project windows/AutomaticUpdate.Tests` executes 37 portable checks, including activity/opt-out during preparation, failed final probes, durable cancellation before user Quit, rejection persistence, manual retry, newer-SHA eligibility, corrupt/oversized state and network-failure exclusion. These tests use temporary fixtures only and do not launch a real installer. Six Python source-contract checks cover the actual WinUI hooks. Real Windows update smoke remains a separate release gate.
+
+
+## Pairing import isolation correction
+
+Manual pairing sends only the currently visible server, computer name and code.
+Imported profiles use a separate `desktop_pair_profile` action that requires an
+explicit boolean confirmation and rejects manual fields or filesystem paths.
+The import workflow snapshots a bounded UTF-8 file/clipboard value once, previews
+it without changing the manual form, and sends that exact snapshot only after
+acceptance. There is no retained pending profile. Cancel, Close, Escape, failed
+preview/pairing and cancelled picker all release the operation; a retry must read
+a fresh file or JSON. Concurrent imports/manual clicks cannot replace an ongoing
+selection or confirmation. Runtime-path edits are blocked during pairing.
+
+`dotnet run --project windows/PairingFlow.Tests -c Release` executes the actual
+portable coordinator with synthetic transports and dialogs, including interrupted
+flows, failure/retry, competing clicks, immutable file snapshots, UTF-8 limits and
+large escaped JSON envelopes. The installer build runs this gate before WinUI
+publish. Python tests verify the distinct schemas, strict confirmation, fresh
+profile validation, preservation of saved configuration on failure and secret-free
+protocol output. These tests do not pair a live account; actual WinUI interaction
+and live pairing remain separate acceptance checks.

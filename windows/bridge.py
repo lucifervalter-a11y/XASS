@@ -15,7 +15,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-MAX_REQUEST = 96 * 1024
+# A <=64 KiB profile can expand through the C# JSON envelope (Unicode/control
+# escaping). Keep that envelope bounded without lowering the profile byte limit.
+MAX_REQUEST = 512 * 1024
 MAX_RESPONSE = 512 * 1024
 ACTIONS = frozenset({"snapshot", "catalog", "play", "pause", "resume", "stop", "seek", "volume"})
 DEVICE_STATES = frozenset({"online", "connecting", "offline", "error", "stale"})
