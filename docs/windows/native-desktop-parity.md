@@ -16,7 +16,7 @@ This is a source-level migration to native WinUI controls and typed local servic
 
 | Audit IDs | Native path / implementation | Status and evidence |
 |---|---|---|
-| A01 | Overview, PC, Connection, Files, Music, Archive, Journal, Updates, Settings and Commands; Appearance/Assistant are added by their workstreams | Implemented native pages; Windows navigation/DPI/Narrator pending |
+| A01 | Overview, PC, Connection, Files, Music, Archive, Journal, Updates, Settings and Commands; Appearance/Assistant are added by their native modules | Implemented native pages; Windows navigation/DPI/Narrator pending |
 | A02 | Time/owner greeting, connection summary, CPU/RAM/disk, initial/reloaded recent events and quick actions | Implemented; metrics and diagnostics read off dispatcher. Continuous event streaming is replaced by bounded refresh |
 | A03 | Mini App discovery via canonical `/api/pwa/config` fields and credential-free browser URL | Implemented; strict scheme/authority/port checks |
 | A04–A06 | Connection picker, drop, clipboard JSON, profile expiry preview, manual pairing, sealed key save, agent restart | Implemented; expired/oversized profile fixtures and atomic configuration tests. Real pairing pending |
@@ -35,9 +35,9 @@ This is a source-level migration to native WinUI controls and typed local servic
 | B09 | Irreversible media cleanup confirmation, agent stopped, root-safe DB paths, text retained, freed counts | Implemented; unconfirmed and out-of-root cleanup rejected by fixtures |
 | B10–B12 | Read-only diagnostics, redacted bounded log tail, JSON Save picker, recent-event view | Implemented. Paths, archive state, runtime/agent/update versions and encryption status included; raw credentials excluded |
 | B13–B15 | Native-test update discovery, progress, verified installer, explicit/manual or separately opted-in background application, backup/health/rollback state machine | Source and failure-injection tests implemented; real cross-version installer rollback remains a required Windows gate |
-| B16 | One per-user native test installer with companion runtime | Owned by installer workstream; fresh install/upgrade/uninstall/source migration acceptance belongs to combined release |
-| M01–M16 | Local queue/server library/player/artwork/lyrics/cast arbitration/reveal/keyboard | Implemented by music workstream; see separate detailed matrix |
-| C01–C04 | Appearance, TTS, background microphone, original assistant actions | Owned by theme/voice workstreams and combined acceptance |
+| B16 | One per-user native test installer with companion runtime | Implemented by the native installer; fresh install/upgrade/uninstall/source migration acceptance belongs to combined release |
+| M01–M16 | Local queue/server library/player/artwork/lyrics/cast arbitration/reveal/keyboard | Implemented by the native music module; see separate detailed matrix |
+| C01–C04 | Appearance, TTS, background microphone, original assistant actions | Implemented by the appearance/voice modules; combined acceptance remains required |
 | C05 | Actual Discord voice join | Still requires authorized Discord integration. Navigation must not be labelled a successful join |
 | C06 | Single ready-to-run test installer | Combined packaging/release gate; bundled speech-model presence must be reported separately and honestly |
 
@@ -70,3 +70,11 @@ No test above ran a real installer, paired a real account, changed system settin
 4. Real cross-version update success plus intentionally bad installer/health rollback, registry and shortcut identity, enough-space/locked-file/cancel and interrupted-process recovery.
 5. Native keyboard/Narrator, 100/150/200% DPI, narrow/large windows, light/dark/high-contrast; long-running resource measurements.
 6. Exact release commit, final CI and downloaded installer/manifest checksum read-back. Source fixture passes alone do not close these gates.
+
+## Automatic-update safety corrections
+
+Automatic preparation never reserves permission to interrupt later work. After download and after backup, the native UI rechecks the live agent archive state and player snapshot. Immediately before the Quit call, one synchronous dispatcher step rechecks saved opt-in, window visibility, pairing, pending music/archive/settings/assistant activity, and cancellation. A changed or unverifiable guard durably cancels the prepared updater job and keeps the UI and agent running. An ordinary user Quit also cancels any pending update job unless the update commit gate specifically authorized that shutdown.
+
+Explicit rejected installer SHA-256 values from rollback state are persisted in a bounded 32-entry history separate from the replaceable last-result record, while preserving the user's auto-update setting. The same rejected SHA is never retried automatically; a different SHA is eligible. An explicit manual install can retry without erasing the failure history. A timeout or pre-install preparation failure is not a rejected installer. Corrupt/oversized state fails closed for automatic installation. Network errors and cancellation reset progress/running controls and leave a useful retry status.
+
+Verification: `dotnet run --project windows/AutomaticUpdate.Tests` executes 37 portable checks, including activity/opt-out during preparation, failed final probes, durable cancellation before user Quit, rejection persistence, manual retry, newer-SHA eligibility, corrupt/oversized state and network-failure exclusion. These tests use temporary fixtures only and do not launch a real installer. Six Python source-contract checks cover the actual WinUI hooks. Real Windows update smoke remains a separate release gate.

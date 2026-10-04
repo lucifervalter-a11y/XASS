@@ -13,6 +13,7 @@ on:
 
 # Build artifacts only. The owner reviews this exact commit and its checks before
 # a separate, explicitly authorized test prerelease is created. No server deploy.
+# Ubuntu regressions and Windows build run in parallel; both must pass for release.
 permissions:
   contents: read
 
@@ -60,7 +61,6 @@ jobs:
           php -l profile.php
 
   build:
-    needs: regressions
     if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
     runs-on: windows-latest
     timeout-minutes: 50
@@ -92,6 +92,8 @@ jobs:
       - name: Build complete native installer and validate bundled runtime
         shell: pwsh
         run: ./windows/build_installer.ps1 -Revision '${{ github.sha }}' -OutputDirectory artifacts/windows-installer
+      - name: Install minimal process inspection for real updater smoke
+        run: python -m pip install psutil==7.0.0
       - name: Verify fresh install, same-version upgrade and uninstall
         shell: pwsh
         run: ./windows/test_installer.ps1 -Installer artifacts/windows-installer/XASS-Native-Test-Setup.exe -PayloadManifest artifacts/windows-installer/payload-manifest.json
@@ -128,4 +130,10 @@ jobs:
           path: artifacts/windows-installer/*
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-native-test-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/windows-native-smoke.json
+          if-no-files-found: error
           retention-days: 14

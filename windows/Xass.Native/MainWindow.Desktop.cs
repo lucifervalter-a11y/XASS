@@ -36,6 +36,8 @@ public sealed partial class MainWindow
     private readonly CheckBox nativeAutomatic = new() { Content = "Автоматически обновлять нативную тестовую версию после закрытия окна в трей" };
     private readonly DispatcherTimer automaticUpdateTimer = new() { Interval = TimeSpan.FromMinutes(30) };
     private bool nativeUpdateRunning;
+    private bool nativeUpdateCommitAuthorized;
+    private int desktopArchiveMutationPending;
     private CancellationTokenSource? nativeUpdateCancellation;
     private ProgressBar updateProgress = new() { Minimum = 0, Maximum = 100, Visibility = Visibility.Collapsed };
     private readonly string runtimePreferences = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "runtime.json");
@@ -76,7 +78,7 @@ public sealed partial class MainWindow
         BuildConnectionPanel(); BuildComputerPanels(); BuildFilesPanel(); BuildArchivePanel(); BuildJournalPanel(); BuildUpdatesPanel(); BuildSettingsPanel();
         Notice.Title = "XASS · нативный тестовый клиент";
         Notice.Message = "Привяжите компьютер или импортируйте файл подключения. Приложение управляет агентом, музыкой и локальными данными.";
-        var commands = AddDesktopPage("commands", "Команды", Symbol.CommandPrompt);
+        var commands = AddDesktopPage("commands", "Команды", Symbol.More);
         commands.Children.Add(DLabel("Локальные действия", 24));
         commands.Children.Add(DActions(DButton("Проверить связь", CheckDesktopHealthAsync), DButton("Перезапустить агент", RestartDesktopAgentAsync),
             DButton("Проверить обновление", CheckNativeUpdateAsync), DButton("Снимок экранов", ScreenshotDesktopAsync),
@@ -123,15 +125,21 @@ public sealed partial class MainWindow
         {
             if (File.Exists(runtimePreferences))
             {
+                if (new FileInfo(runtimePreferences).Length > 256 * 1024) throw new InvalidDataException();
                 using var doc = JsonDocument.Parse(File.ReadAllText(runtimePreferences));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object
+                    || !doc.RootElement.TryGetProperty("version", out var version)
+                    || !version.TryGetInt32(out int schema) || schema != 1) throw new InvalidDataException();
                 string savedPython = DValue(doc.RootElement, "python"), savedSource = DValue(doc.RootElement, "source"), savedData = DValue(doc.RootElement, "data");
                 if (!File.Exists(helper) && Path.IsPathFullyQualified(savedPython) && File.Exists(savedPython)) PythonPath.Text = savedPython;
                 if (!Directory.Exists(source) && Path.IsPathFullyQualified(savedSource) && Directory.Exists(savedSource)) SourcePath.Text = savedSource;
                 if (Path.IsPathFullyQualified(savedData)) DataPath.Text = savedData;
             }
         }
-        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
-        Directory.CreateDirectory(DataPath.Text);
+        catch (Exception e) when (e is IOException or InvalidDataException or InvalidOperationException or JsonException or UnauthorizedAccessException) { }
+        try { Directory.CreateDirectory(DataPath.Text); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { DesktopError(new InvalidOperationException("Папка данных недоступна. Исправьте путь на странице подключения.")); }
         client.PythonPath = PythonPath.Text; client.SourcePath = SourcePath.Text; client.DataPath = DataPath.Text;
     }
     private async Task SaveDesktopPathsAsync()
@@ -296,6 +304,8 @@ public sealed partial class MainWindow
         var result = await DesktopRequestAsync("desktop_status"); if (closed) return;
         DeviceName.Text = DValue(result, "name", Environment.MachineName); DeviceState.Text = StateLabel(DValue(result, "state"));
         OverviewStatus.Text = DeviceName.Text + " · " + DeviceState.Text;
+        if (result.TryGetProperty("legacy_agent", out var legacy) && legacy.GetBoolean())
+        { Notice.IsOpen = true; Notice.Severity = InfoBarSeverity.Warning; Notice.Title = "Прежний агент XASS"; Notice.Message = DValue(result, "compatibility_notice"); }
         string greeting = DateTime.Now.Hour < 6 ? "Доброй ночи" : DateTime.Now.Hour < 12 ? "Доброе утро" : DateTime.Now.Hour < 18 ? "Добрый день" : "Добрый вечер";
         desktopGreeting.Text = greeting + (string.IsNullOrWhiteSpace(DValue(result, "owner_name")) ? "!" : ", " + DValue(result, "owner_name") + "!"); desktopGreeting.FontSize = 24;
         desktopSummary.Text = $"{DValue(result, "server")}\nPID: {DValue(result, "pid")} · последний ответ: {DValue(result, "age", "нет")} с · задержка: {DValue(result, "latency_ms")} мс · агент: {DValue(result, "version")}\n{DValue(result, "detail")}";
@@ -410,13 +420,18 @@ public sealed partial class MainWindow
             Content = DStack(DLabel($"Новая пустая папка: {folder}\nАгент временно остановится. Исходный архив сохранится на месте. Копирование можно отменить."), copy),
             PrimaryButtonText = "Изменить папку", CloseButtonText = "Отмена", DefaultButton = ContentDialogButton.Close };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-        await DesktopHostRequestAsync(new { action = "host_archive_move", path = folder, copy = copy.IsChecked == true, confirmed = true });
+        desktopArchiveMutationPending++;
+        try { await DesktopHostRequestAsync(new { action = "host_archive_move", path = folder, copy = copy.IsChecked == true, confirmed = true }); }
+        finally { desktopArchiveMutationPending--; }
         archiveJob.Text = "Копирование начато. Исходный архив сохранён.";
     }
     private async Task CleanupDesktopArchiveAsync()
     {
         if (!await DesktopConfirmAsync("Безвозвратно удалить локальные медиа?", "Будут удалены локально сохранённые фото, видео и файлы архива. Текст сообщений и центральный сервер останутся без изменений. Удаление нельзя отменить.", "Удалить медиа")) return;
-        var result = await DesktopHostRequestAsync(new { action = "host_archive_cleanup", confirmed = true });
+        JsonElement result;
+        desktopArchiveMutationPending++;
+        try { result = await DesktopHostRequestAsync(new { action = "host_archive_cleanup", confirmed = true }); }
+        finally { desktopArchiveMutationPending--; }
         DesktopNotice($"Удалено файлов: {DValue(result, "removed_files")} · освобождено: {Bytes(result, "freed_bytes")}"); await LoadDesktopArchiveAsync();
     }
 
@@ -509,11 +524,18 @@ public sealed partial class MainWindow
     }
     private async Task CheckNativeUpdateAsync()
     {
+        availableNativeUpdate = null; installUpdate.IsEnabled = false;
         updateStatus.Text = "Проверка официальных native-test выпусков…";
-        availableNativeUpdate = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);
-        installUpdate.IsEnabled = availableNativeUpdate is not null;
-        updateStatus.Text = availableNativeUpdate is null ? "Новых совместимых нативных тестовых выпусков не найдено." : $"Доступна {availableNativeUpdate.Version}\n{availableNativeUpdate.Revision}\n{availableNativeUpdate.Size / 1048576.0:F1} МБ";
-        SelectDesktopPage("updates");
+        try
+        {
+            availableNativeUpdate = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);
+            installUpdate.IsEnabled = availableNativeUpdate is not null;
+            updateStatus.Text = availableNativeUpdate is null ? "Новых совместимых нативных тестовых выпусков не найдено." : $"Доступна {availableNativeUpdate.Version}\n{availableNativeUpdate.Revision}\n{availableNativeUpdate.Size / 1048576.0:F1} МБ";
+            SelectDesktopPage("updates");
+        }
+        catch (OperationCanceledException) { updateStatus.Text = "Проверка обновления отменена. Можно повторить."; throw; }
+        catch (TimeoutException) { updateStatus.Text = "Сервер обновлений не ответил вовремя. Нажмите «Проверить» для повторной попытки."; throw; }
+        catch { updateStatus.Text = "Не удалось проверить обновление. Проверьте сеть и повторите."; throw; }
     }
     private async Task InstallNativeUpdateAsync()
     {
@@ -521,43 +543,102 @@ public sealed partial class MainWindow
         if (!await DesktopConfirmAsync("Установить тестовое обновление?", $"XASS {update.Version}, ревизия {update.Revision}\nЗагрузка: {update.Size / 1048576.0:F1} МБ. После проверки SHA-256 и резервного копирования XASS, агент и микрофоны завершатся. Если проверка новой версии не пройдёт, предыдущая версия будет восстановлена. Данные сохраняются.", "Скачать и установить")) return;
         await ApplyNativeUpdateAsync(update, automatic: false);
     }
+    private bool AutomaticNativeGuardsAllow(CancellationToken token) => NativeAutomaticUpdatePolicy.AllowsShutdown(new(
+        Closed: closed, Quitting: desktopQuitting, Pairing: desktopPairing, Enabled: NativeUpdatePreferences.Load(),
+        WindowVisible: AppWindow.IsVisible, MusicBusy: musicBusy, MusicState: musicState,
+        ArchiveBusy: desktopArchiveMutationPending != 0, SettingsBusy: !saveSettings.IsEnabled,
+        AssistantBusy: assistantRequest is not null, CancellationRequested: token.IsCancellationRequested));
+
+    private async Task<bool> FreshAutomaticNativeGuardsAllowAsync(CancellationToken token)
+    {
+        if (!AutomaticNativeGuardsAllow(token) || !desktopHost.IsRunning) return false;
+        var context = MusicContext();
+        Task<JsonElement> hostTask = desktopHost.RequestAsync(new { action = "host_status" }, lifetime.Token);
+        Task<JsonElement> musicTask = nativeMusic.RequestAsync(new { action = "snapshot" }, context.Python, context.Source, context.Data, lifetime.Token);
+        await Task.WhenAll(hostTask, musicTask);
+        string archive = DValue((await hostTask).GetProperty("job"), "state");
+        string playback = DValue(await musicTask, "state");
+        return archive is not ("copying" or "committing" or "cleaning")
+            && playback is not ("playing" or "paused" or "loading" or "stopping") && AutomaticNativeGuardsAllow(token);
+    }
+    private static async Task<bool> IsAutomaticNativeUpdateRejectedAsync(NativeUpdate update, CancellationToken token)
+    {
+        string? rejected = await NativeAutomaticUpdatePolicy.ReadRejectedStateAsync(
+            Path.Combine(NativeUpdateCoordinator.UpdatesRoot, "last-result.json"), token);
+        if (rejected is not null) NativeUpdatePreferences.RememberRejected(rejected);
+        return NativeUpdatePreferences.IsRejected(update.Sha256);
+    }
     private async Task ApplyNativeUpdateAsync(NativeUpdate update, bool automatic)
     {
         if (nativeUpdateRunning) return;
-        nativeUpdateRunning = true;
+        if (!NativeAutomaticUpdatePolicy.MayAttemptRelease(update.Sha256, automatic, NativeUpdatePreferences.IsRejected))
+        { updateStatus.Text = "Этот пакет ранее не прошёл проверку. Автоповтор отключён; доступен явный повтор установки или новый выпуск."; return; }
+        nativeUpdateRunning = true; nativeUpdateCommitAuthorized = false;
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         nativeUpdateCancellation = cancel;
+        PreparedNativeUpdate? prepared = null;
         try
         {
-            updateProgress.Visibility = Visibility.Visible; updateStatus.Text = "Загрузка проверяемого установщика…";
+            updateProgress.Value = 0; updateProgress.Visibility = Visibility.Visible;
+            updateStatus.Text = "Загрузка проверяемого установщика…";
             string installer = await nativeUpdates.DownloadAsync(update, new System.Progress<double>(p => updateProgress.Value = p), cancel.Token);
-            await updateCoordinator.PrepareAsync(update, installer, new System.Progress<string>(message => updateStatus.Text = message), cancel.Token, automatic);
+            if (automatic && (!await FreshAutomaticNativeGuardsAllowAsync(cancel.Token) || await IsAutomaticNativeUpdateRejectedAsync(update, cancel.Token)))
+            { updateStatus.Text = "Автообновление отложено. XASS продолжает работать."; return; }
+            prepared = await updateCoordinator.PrepareAsync(update, installer, new System.Progress<string>(message => updateStatus.Text = message), cancel.Token, automatic);
+            if (automatic)
+            {
+                // Recheck after the long download/backup, including an authoritative
+                // host/player read and a final synchronous UI/opt-in check at commit.
+                bool committed = await NativeAutomaticUpdatePolicy.FinishPreparationAsync(
+                    async () => await FreshAutomaticNativeGuardsAllowAsync(cancel.Token)
+                        && !await IsAutomaticNativeUpdateRejectedAsync(update, cancel.Token),
+                    () => AutomaticNativeGuardsAllow(cancel.Token),
+                    () => NativeUpdateCoordinator.CancelPreparedAsync(prepared!),
+                    () => { nativeUpdateCommitAuthorized = true; updateStatus.Text = "Резервная копия проверена. Завершение для установки…"; return QuitDesktopAsync(); });
+                prepared = null;
+                if (!committed) updateStatus.Text = "Автообновление отложено: состояние изменилось. XASS продолжает работать.";
+                return;
+            }
             updateStatus.Text = "Резервная копия проверена. Завершение для установки…";
-            StopAllMicrophones();
-            await QuitDesktopAsync();
+            nativeUpdateCommitAuthorized = true;
+            await QuitDesktopAsync(); prepared = null;
+        }
+        catch (OperationCanceledException)
+        {
+            if (prepared is not null) await NativeUpdateCoordinator.CancelPreparedAsync(prepared);
+            if (!closed) updateStatus.Text = "Подготовка обновления отменена. XASS продолжает работать; можно повторить позже.";
+        }
+        catch (TimeoutException)
+        {
+            if (prepared is not null) await NativeUpdateCoordinator.CancelPreparedAsync(prepared);
+            updateStatus.Text = "Загрузка или подготовка не завершилась вовремя. Текущая версия сохранена; можно повторить.";
+            throw;
+        }
+        catch
+        {
+            if (prepared is not null) await NativeUpdateCoordinator.CancelPreparedAsync(prepared);
+            updateStatus.Text = "Обновление не началось. Текущая версия сохранена; проверьте состояние и повторите.";
+            throw;
         }
         finally
         {
-            nativeUpdateCancellation = null; nativeUpdateRunning = false;
-            if (!closed) updateProgress.Visibility = Visibility.Collapsed;
+            nativeUpdateCancellation = null; nativeUpdateRunning = false; nativeUpdateCommitAuthorized = false;
+            if (!closed) { updateProgress.Value = 0; updateProgress.Visibility = Visibility.Collapsed; }
         }
     }
     private async Task CheckAutomaticNativeUpdateAsync()
     {
-        if (closed || desktopQuitting || nativeUpdateRunning || desktopPairing || !NativeUpdatePreferences.Load()
-            || AppWindow.IsVisible || musicState is "playing" or "paused" or "loading") return;
+        if (nativeUpdateRunning || !AutomaticNativeGuardsAllow(lifetime.Token)) return;
         try
         {
-            if (desktopHost.IsRunning)
-            {
-                var status = await desktopHost.RequestAsync(new { action = "host_status" }, lifetime.Token);
-                string phase = DValue(status.GetProperty("job"), "state");
-                if (phase is "copying" or "committing" or "cleaning") return;
-            }
+            if (!await FreshAutomaticNativeGuardsAllowAsync(lifetime.Token)) return;
             NativeUpdate? update = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);
-            if (update is not null) await ApplyNativeUpdateAsync(update, automatic: true);
+            if (update is null || await IsAutomaticNativeUpdateRejectedAsync(update, lifetime.Token)) return;
+            await ApplyNativeUpdateAsync(update, automatic: true);
         }
-        catch { /* A future timer retries; the updater persists actionable failure state. */ }
+        catch (OperationCanceledException) { if (!closed) updateStatus.Text = "Автоматическая проверка отменена."; }
+        catch (TimeoutException) { if (!closed) updateStatus.Text = "Автоматическая проверка не дождалась сети. Можно проверить обновление вручную или дождаться следующей попытки."; }
+        catch { if (!closed) updateStatus.Text = "Автообновление отложено. Проверьте состояние или повторите проверку вручную."; }
     }
 
     public void AcceptDesktopActivation(string[] arguments)
@@ -602,7 +683,14 @@ public sealed partial class MainWindow
     private async Task QuitDesktopAsync()
     {
         if (desktopQuitting) return;
-        desktopQuitting = true; desktopTimer.Stop(); automaticUpdateTimer.Stop(); StopAllMicrophones(); DisposeVoice(); DisposeDesktopMusic();
+        desktopQuitting = true;
+        if (!nativeUpdateCommitAuthorized)
+        {
+            nativeUpdateCancellation?.Cancel();
+            try { await updateCoordinator.CancelPendingAsync(); }
+            catch (Exception error) { desktopQuitting = false; DesktopError(error); return; }
+        }
+        desktopTimer.Stop(); automaticUpdateTimer.Stop(); StopAllMicrophones(); DisposeVoice(); DisposeDesktopMusic();
         await nativeMusic.DisposeAsync();
         await desktopHost.CloseAsync(); desktopTray?.Dispose(); desktopTray = null;
         lifetime.Cancel(); Close();

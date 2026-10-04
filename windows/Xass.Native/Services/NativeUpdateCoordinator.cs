@@ -6,6 +6,7 @@ namespace Xass.Native.Services;
 public sealed record PreparedNativeUpdate(string JobFolder);
 public sealed class NativeUpdateCoordinator
 {
+    internal PreparedNativeUpdate? PendingJob { get; private set; }
     public static string UpdatesRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "updates");
     public async Task<PreparedNativeUpdate> PrepareAsync(NativeUpdate update, string installer, IProgress<string> progress, CancellationToken token, bool automatic = false)
     {
@@ -19,9 +20,18 @@ public sealed class NativeUpdateCoordinator
                 throw new InvalidOperationException("Неизвестная установка XASS. Обновление остановлено.");
         string job = Path.Combine(UpdatesRoot, "job-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(job);
+        PendingJob = new PreparedNativeUpdate(job);
         progress.Report("Подготовка независимого помощника обновления…");
         string helperRoot = Path.Combine(job, "helper-runtime");
-        await Task.Run(() => CopyRuntime(runtime, helperRoot, token), token);
+        try { await Task.Run(() => CopyRuntime(runtime, helperRoot, token), token); }
+        catch
+        {
+            // Only this just-created temporary helper copy exists at this stage.
+            // No backup or installer has started, so cancellation leaves no large orphan.
+            try { Directory.Delete(job, true); } catch { }
+            PendingJob = null;
+            throw;
+        }
         string request = Path.Combine(job, "request.json");
         using var self = Process.GetCurrentProcess();
         double created = new DateTimeOffset(self.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0;
@@ -58,10 +68,27 @@ public sealed class NativeUpdateCoordinator
         }
         catch
         {
-            await File.WriteAllTextAsync(Path.Combine(job, "cancel"), "cancel", CancellationToken.None);
+            await CancelPreparedAsync(new PreparedNativeUpdate(job));
             throw;
         }
     }
+    public Task CancelPendingAsync() => CancelPendingAsync(UpdatesRoot);
+    internal Task CancelPendingAsync(string updatesRoot) => PendingJob is { } pending
+        ? CancelPreparedAsync(pending, updatesRoot) : Task.CompletedTask;
+
+    public static Task CancelPreparedAsync(PreparedNativeUpdate prepared) => CancelPreparedAsync(prepared, UpdatesRoot);
+    internal static Task CancelPreparedAsync(PreparedNativeUpdate prepared, string updatesRoot)
+    {
+        string job = Path.GetFullPath(prepared.JobFolder);
+        if (!System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(job), "^job-[a-f0-9]{32}$")
+            || !string.Equals(Path.GetDirectoryName(job), Path.GetFullPath(updatesRoot), StringComparison.OrdinalIgnoreCase)
+            || !Directory.Exists(job) || (File.GetAttributes(job) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Нельзя отменить неизвестную операцию обновления.");
+        using var stream = new FileStream(Path.Combine(job, "cancel"), FileMode.Create, FileAccess.Write, FileShare.Read);
+        stream.WriteByte(1); stream.Flush(flushToDisk: true);
+        return Task.CompletedTask;
+    }
+
     private static void CopyRuntime(string source, string destination, CancellationToken token)
     {
         Directory.CreateDirectory(destination);

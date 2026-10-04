@@ -38,7 +38,8 @@ class NativeServiceTests(unittest.TestCase):
         for action in SCHEMAS:
             with self.subTest(action=action), self.assertRaises(ValueError): self.service.request(action, {"untrusted": 1})
     def test_protocol_version_rejected(self):
-        with self.assertRaises(ValueError): self.service.request("desktop_settings", {"version": 2})
+        for value in (2, True, "1"):
+            with self.assertRaises(ValueError): self.service.request("desktop_settings", {"version": value})
     def test_numeric_limits_reject_bool_nan_and_strings(self):
         for value in [True, "5", float("nan"), float("inf"), -1, 999999]:
             with self.subTest(value=value), self.assertRaises(ValueError): number(value, 5, 86400, integer=True)
@@ -143,6 +144,15 @@ class NativeServiceTests(unittest.TestCase):
             detail = self.service.request("desktop_archive_detail", {"id": 42})
         self.assertEqual(result["rows"][0]["text"], "hello"); self.assertEqual(detail["text"], "hello")
         self.assertEqual(result["rows"][0]["forwarded_from"], "name"); self.assertNotIn("api_key", result["rows"][0])
+    def test_500_unicode_archive_previews_fit_bounded_desktop_envelope(self):
+        rows = [{"id":i,"text_content":"😀"*1000,"chat_title":"Я"*240,"forwarded_from":"Я"*240,
+                 "from_username":"Я"*240,"message_date":"2026-10-04","direction":"incoming","media_count":1} for i in range(500)]
+        with patch.object(self.service,"config",return_value=self.config), patch("archive_store.conversation_rows",return_value=rows):
+            result=self.service.request("desktop_archive_rows",{})
+        self.assertEqual(len(result["rows"]),500)
+        self.assertLess(len(json.dumps({"ok":True,"result":result},ensure_ascii=True)),4*1024*1024)
+        self.assertEqual(len(result["rows"][0]["text"]),256)
+
     def test_runtime_binding_rejects_relative_paths(self):
         with self.assertRaises(ValueError): bind_runtime(Path("pc_client"), self.root)
 

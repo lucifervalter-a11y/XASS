@@ -81,6 +81,7 @@ public sealed partial class MainWindow : Window
         InitializeAssistant();
         InitializeVoice();
         InitializeDesktop();
+        _ = DiscoverAssistantModelAsync();
         InitializeDesktopMusic();
         InitializeAppearance();
     }

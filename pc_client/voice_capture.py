@@ -70,8 +70,17 @@ def record_pcm(seconds: int = RECORD_SECONDS) -> bytes:
 class WhisperTranscriber:
     def __init__(self, model_path: str):
         path = Path(model_path)
-        if not path.is_absolute() or not (path / "model.bin").is_file():
-            raise AssistantError("Укажите существующую локальную папку модели faster-whisper. Автозагрузка отключена.")
+        # local_files_only guards model download, but faster-whisper can fetch a fallback
+        # tokenizer when tokenizer.json is absent. Reject incomplete explicit folders first.
+        required = ("model.bin", "config.json", "tokenizer.json")
+        try:
+            complete = path.is_absolute() and all(
+                (path / name).is_file() and (path / name).stat().st_size > 0 for name in required)
+        except OSError:
+            complete = False
+        if not complete:
+            raise AssistantError("Укажите полную существующую локальную папку faster-whisper с model.bin, "
+                                 "config.json и tokenizer.json. Автозагрузка отключена.")
         try:
             import numpy as np
             from faster_whisper import WhisperModel

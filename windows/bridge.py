@@ -187,6 +187,7 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     args = parser.parse_args()
+    request = None
     try:
         raw = sys.stdin.read(MAX_REQUEST + 1)
         request = json.loads(raw) if len(raw) <= MAX_REQUEST else None
@@ -204,7 +205,11 @@ def main() -> None:
     except Exception:
         # No exception text, URLs, headers, tokens, server bodies or traceback.
         response = {"ok": False, "error": "Не удалось выполнить действие. Проверьте папки, привязку, агент и сеть."}
-    sys.stdout.write(json.dumps(response, ensure_ascii=True, allow_nan=False) + "\n")
+    encoded = json.dumps(response, ensure_ascii=True, allow_nan=False)
+    response_limit = 4 * 1024 * 1024 if isinstance(request, dict) and str(request.get("action", "")).startswith("desktop_") else MAX_RESPONSE
+    if len(encoded) > response_limit:
+        encoded = '{"ok":false,"error":"Ответ превышает допустимый размер"}'
+    sys.stdout.write(encoded + "\n")
 
 
 if __name__ == "__main__":

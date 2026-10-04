@@ -296,7 +296,8 @@ public sealed partial class MainWindow
         OverviewTrack.Text = musicTitle.Text;
         double position = snap.GetProperty("position").GetDouble(), duration = snap.GetProperty("duration").GetDouble();
         musicStatus.Text = $"{(musicOwner == "agent" ? "Трансляция" : "На компьютере")} · {StateLabel(musicState)} · {Clock(position)} / {Clock(duration)}";
-        musicError.Text = snap.GetProperty("error").GetString(); musicError.Visibility = string.IsNullOrWhiteSpace(musicError.Text) ? Visibility.Collapsed : Visibility.Visible;
+        musicError.Text = snap.TryGetProperty("compatibility_notice", out var compatibility) && !string.IsNullOrWhiteSpace(compatibility.GetString())
+            ? compatibility.GetString() : snap.GetProperty("error").GetString(); musicError.Visibility = string.IsNullOrWhiteSpace(musicError.Text) ? Visibility.Collapsed : Visibility.Visible;
         musicUpdating = true;
         musicSeek.Maximum = Math.Max(1, duration); if (!musicSeekDirty) musicSeek.Value = Math.Clamp(position, 0, musicSeek.Maximum);
         if (!musicVolumeDirty) musicVolume.Value = snap.GetProperty("volume").GetDouble();

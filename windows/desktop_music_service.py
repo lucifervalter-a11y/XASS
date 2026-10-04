@@ -112,6 +112,8 @@ class MusicService:
         self.pending_open = None
         self.stop_event = threading.Event()
         self.closed = False
+        self.identity_checked = 0.0
+        self.identity = {"active": False, "compatible": True, "reason": ""}
         self.agent_override = None
         self.cover_digest = ""
         self.cover_bytes = b""
@@ -125,6 +127,17 @@ class MusicService:
         self.opener.start()
         self.watcher = threading.Thread(target=self._watch, name="xass-native-music-owner", daemon=True)
         self.watcher.start()
+
+    def _identity(self, *, force=False):
+        if force or time.monotonic() - self.identity_checked >= 1:
+            from native_agent_identity import probe_agent
+            self.identity = probe_agent(self.data, self.source)
+            self.identity_checked = time.monotonic()
+        return self.identity
+
+    def _legacy_blocked(self, *, force=False):
+        identity = self._identity(force=force)
+        return identity["active"] and not identity["compatible"]
 
     def _agent(self):
         path = self.data / "music-playback.json"
@@ -145,7 +158,7 @@ class MusicService:
             try:
                 agent = self._agent()
                 cast = agent.get("state") in CAST_STATES and type(agent.get("track_id")) is int
-                if self.ownership.cast_pending() or cast:
+                if self.ownership.cast_pending() or cast or self._legacy_blocked():
                     with self.guard:
                         active = self.loading or self.player.snapshot().get("state") in {"playing", "paused", "loading", "ended", "error"}
                         if active:
@@ -182,6 +195,8 @@ class MusicService:
         return _local_audio_file(safe_path(Path(value)))
 
     def _start(self, index):
+        if self._legacy_blocked(force=True):
+            raise ValueError(self.identity["reason"])
         if self.ownership.cast_pending() or self._cast_live():
             raise ValueError("Сначала остановите трансляцию с телефона")
         path = self._validate_file(self.queue[index])
@@ -206,7 +221,7 @@ class MusicService:
             try:
                 self.player.play_local(path, cancelled=lambda: generation != self.generation or self.stop_event.is_set())
                 with self.guard:
-                    if generation == self.generation and (self.stop_event.is_set() or self.ownership.cast_pending() or self._cast_live()):
+                    if generation == self.generation and (self.stop_event.is_set() or self.ownership.cast_pending() or self._cast_live() or self._legacy_blocked(force=True)):
                         self.player.command("music_stop", {}, {})
             except Exception as exc:
                 with self.guard:
@@ -271,7 +286,8 @@ class MusicService:
                       "position": bounded("position_sec", 86400), "duration": bounded("duration_sec", 86400),
                       "volume": bounded("volume", 100), "error": safe_error(snap.get("error")) if cast else self.error or safe_error(snap.get("error")),
                       "reveal": agent.get("reveal") if type(agent.get("reveal")) is int and 0 <= agent["reveal"] <= 2**31-1 else 0,
-                      "local_available": not self._cast_live() and not self.ownership.cast_pending(),
+                      "local_available": not self._cast_live() and not self.ownership.cast_pending() and not self._legacy_blocked(),
+                      "compatibility_notice": self.identity.get("reason", ""),
                       "current_index": self.current, "queue": [{"index": i, "path": p, "title": Path(p).stem,
                           "exists": Path(p).is_file()} for i, p in enumerate(self.queue)]}
             result.update(self._presentation(snap, cast))

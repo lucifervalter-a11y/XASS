@@ -22,7 +22,8 @@
     "updater_helper.py",
     "voice_assistant.py",
     "voice_capture.py",
-    "native_music_ownership.py"
+    "native_music_ownership.py",
+    "native_agent_identity.py"
   ],
   "required_native_files": [
     "Xass.Native.exe",
@@ -44,7 +45,8 @@
     "desktop_bridge.py",
     "background_agent.py",
     "desktop_music_service.py",
-    "native_updater.py"
+    "native_updater.py",
+    "installer_process.py"
   ],
   "required_companion_files": [
     "XASS.NativeHelper.exe",

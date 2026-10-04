@@ -65,3 +65,17 @@ class VoiceUiContractTests(unittest.TestCase):
         files = {node.get("Link") for node in project.findall("ItemGroup/Content")}
         self.assertTrue({"background_voice.py", "background_voice_bridge.py", "voice_capture.py",
                          "assistant_bridge.py", "voice_assistant.py"} <= files)
+
+    def test_model_discovery_is_async_one_shot_and_respects_manual_edits(self):
+        window = (ROOT / "MainWindow.xaml.cs").read_text()
+        discovery = (ROOT / "MainWindow.ModelDiscovery.cs").read_text()
+        self.assertEqual(window.count("_ = DiscoverAssistantModelAsync();"), 1)
+        self.assertIn('Environment.GetEnvironmentVariable("XASS_ASSISTANT_MODEL")', discovery)
+        self.assertIn("bool edited = false", discovery)
+        self.assertIn("=> edited = true", discovery)
+        self.assertIn("AssistantModelPath.TextChanged += MarkEdited", discovery)
+        self.assertIn("AssistantModelPath.TextChanged -= MarkEdited", discovery)
+        self.assertIn("await Task.Run", discovery)
+        self.assertIn("closed || edited || assistantRequest is not null || BackgroundListening.IsOn", discovery)
+        self.assertIn("AssistantModelPath.Text = discovered.Path", discovery)
+        self.assertNotIn("BackgroundListening.IsOn = true", discovery)

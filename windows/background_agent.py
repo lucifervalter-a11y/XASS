@@ -29,6 +29,15 @@ HOST_SCHEMA = {
 }
 
 
+@contextlib.contextmanager
+def paused_agent_lease():
+    from runtime_state import acquire_single_instance
+    lease = acquire_single_instance("XASS-background-agent")
+    if lease is None: raise RuntimeError("Another agent is still writing the archive")
+    try: yield
+    finally: lease.close()
+
+
 class DesktopHost:
     def __init__(self, source: Path, data: Path):
         self.source, self.data = bind_runtime(source, data)
@@ -118,6 +127,11 @@ class DesktopHost:
                     process.kill(); process.wait(timeout=3)
             elif identity:
                 try:
+                    from native_agent_identity import probe_agent
+                    compatible = probe_agent(self.data, self.source)
+                    if not compatible["active"] or not compatible["compatible"]:
+                        self.state = "legacy-external" if compatible["active"] else "stopped"
+                        return
                     p = psutil.Process(identity[0])
                     if abs(p.create_time() - identity[1]) < 0.01 and self._agent_identity() is not None:
                         p.terminate()
@@ -159,9 +173,14 @@ class DesktopHost:
     def request(self, action: str, request: dict):
         if action not in HOST_SCHEMA or set(request) - (HOST_SCHEMA[action] | {"id", "action", "version"}):
             raise ValueError("Unsupported host schema")
-        if request.get("version", 1) != 1:
+        if type(request.get("version", 1)) is not int or request.get("version", 1) != 1:
             raise ValueError("Unsupported version")
         if action == "host_status": return self.status()
+        if action in {"host_restart", "host_stop", "host_archive_move", "host_archive_cleanup"}:
+            from native_agent_identity import probe_agent, INCOMPATIBLE
+            identity = probe_agent(self.data, self.source)
+            if identity["active"] and not identity["compatible"]:
+                raise ValueError(INCOMPATIBLE)
         if action in {"host_start", "host_restart"}:
             if self.job.get("state") in {"copying", "committing", "cleaning"}:
                 raise ValueError("Archive operation active")
@@ -201,7 +220,7 @@ class DesktopHost:
                         for (filename,) in conn.execute("SELECT local_path FROM media WHERE saved=1 AND local_path<>''"):
                             if not Path(filename).resolve().is_relative_to(root):
                                 raise ValueError("Archive contains out-of-root media")
-                with config_lock(self.data):
+                with paused_agent_lease(), config_lock(self.data):
                     result = cleanup_archive(config, force=True)
                 return result
             finally:
@@ -217,7 +236,7 @@ class DesktopHost:
             target = target.resolve(strict=True)
             stage = target / (".xass-transfer-" + uuid.uuid4().hex)
             self.stop()
-            with config_lock(self.data):
+            with paused_agent_lease(), config_lock(self.data):
                 config = self.service.config(); source = archive_root(config).resolve()
                 if source == target or target.is_relative_to(source) or source.is_relative_to(target):
                     raise ValueError("Archive target overlaps source")
@@ -295,6 +314,14 @@ def agent_child(source: Path, data: Path):
             raise RuntimeError("Use the native test updater for this installation")
         client_agent._apply_update = reject_legacy
         client_agent._apply_installer_update = reject_legacy
+        revision = str(read_json(source / "build-info.json").get("revision") or "development")
+        original_status = client_agent.write_agent_status
+        def native_status(state, **details):
+            details["native_audio_ownership"] = 1
+            details["native_agent_revision"] = revision
+            original_status(state, **details)
+        client_agent.write_agent_status = native_status
+        native_status("connecting", process_id=os.getpid())
         reason = client_agent.run_agent(config)
         if reason in {"restart", "update"}: raise SystemExit(75)
         if reason == "installer_update": raise SystemExit(76)

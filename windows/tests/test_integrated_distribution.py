@@ -54,7 +54,7 @@ class IntegratedDistributionTests(unittest.TestCase):
         self.assertNotIn('gh release', workflow)
         self.assertNotIn('secrets.', workflow)
         for token in ('VoiceLifecycle.Tests', 'build_installer.ps1', 'test_installer.ps1',
-                      'requirements.txt', 'needs: regressions'):
+                      'requirements.txt', 'both must pass for release'):
             with self.subTest(token=token):
                 self.assertIn(token, workflow)
 

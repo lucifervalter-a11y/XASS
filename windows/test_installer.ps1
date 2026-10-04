@@ -43,6 +43,8 @@ try {
             $App.Dispose()
         }
     }
+    & python -I -X utf8 -B (Join-Path $PSScriptRoot 'test_installed_updater.py') --installed $InstallDir --installer $Installer --report (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\windows-native-smoke.json')
+    if ($LASTEXITCODE -ne 0) { throw 'Real installed updater/rollback smoke failed.' }
     $Uninstaller = Join-Path $InstallDir 'unins000.exe'
     $Process = Start-Process -FilePath $Uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
     if ($Process.ExitCode -ne 0) { throw 'Native test uninstall failed.' }

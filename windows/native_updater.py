@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from installer_process import InstallerProcessError, run_installer
 
 APP_ID = "B4D7E8B9-9C58-4C36-A432-D114393006D8"
 REQUEST_KEYS = {"schema", "job_id", "install_root", "installer", "sha256", "size", "version", "revision", "parent_pid", "parent_created", "automatic"}
@@ -84,7 +85,7 @@ def verify_tree(root: Path, inventory: dict):
 
 
 class NativeUpdater:
-    def __init__(self, request_path: Path, *, popen=subprocess.Popen, run=subprocess.run, sleep=time.sleep, clock=time.monotonic):
+    def __init__(self, request_path: Path, *, popen=subprocess.Popen, run=subprocess.run, sleep=time.sleep, clock=time.monotonic, installer_run=None):
         self.request_path = request_path.resolve(strict=True); self.job = self.request_path.parent
         root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "XASS.Native" / "updates"
         if self.job.parent.resolve() != root.resolve() or not re.fullmatch(r"job-[a-f0-9]{32}", self.job.name):
@@ -124,14 +125,18 @@ class NativeUpdater:
         self.backup = self.job / "backup"
         self.inventory = {}
         self.popen, self.run, self.sleep, self.clock = popen, run, sleep, clock
+        # Preserve the existing explicit test-runner injection. Production always
+        # supervises the installer tree; subprocess.run remains for health checks.
+        self.installer_run = installer_run if installer_run is not None else (run_installer if run is subprocess.run else run)
+        self.installer_shutdown_confirmed = True
         self.applied = False
         self.registry = {}
 
     def state(self, phase: str, message: str, **extra):
         write_json(self.job / "state.json", {"phase":phase,"message":message,"updated_at":time.time(),"pid":os.getpid(),
-            "version":self.request["version"],"revision":self.request["revision"], **extra})
+            "version":self.request["version"],"revision":self.request["revision"],"sha256":self.request["sha256"], **extra})
         write_json(self.job.parent / "last-result.json", {"phase":phase,"message":message,"updated_at":time.time(),
-            "version":self.request["version"],"revision":self.request["revision"],"job_id":self.job.name, **extra})
+            "version":self.request["version"],"revision":self.request["revision"],"sha256":self.request["sha256"],"job_id":self.job.name, **extra})
     def check_cancel(self):
         if (self.job / "cancel").exists(): raise InterruptedError("Update cancelled before installation")
 
@@ -212,10 +217,17 @@ class NativeUpdater:
         self.state("installing", "Установка проверенного нативного пакета")
         self.stop_install_processes()
         self.applied = True
-        result = self.run([str(self.installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CLOSEAPPLICATIONS",
-                           "/DIR=" + str(self.install), "/LOG=" + str(self.job / "installer.log")],
-                          cwd=self.installer.parent, timeout=900, capture_output=True,
-                          creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        self.installer_shutdown_confirmed = False
+        try:
+            result = self.installer_run([str(self.installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CLOSEAPPLICATIONS",
+                                       "/DIR=" + str(self.install), "/LOG=" + str(self.job / "installer.log")],
+                                      cwd=self.installer.parent, timeout=900)
+        except InstallerProcessError as error:
+            self.installer_shutdown_confirmed = error.shutdown_confirmed is True
+            raise
+        # Returning from the supervisor establishes that every job process exited,
+        # including temporary Setup children outside the installation directory.
+        self.installer_shutdown_confirmed = True
         if result.returncode != 0: raise RuntimeError("Installer failed")
 
     def verify_installed(self, revision: str):
@@ -252,6 +264,8 @@ class NativeUpdater:
         raise TimeoutError("Native UI did not acknowledge readiness")
 
     def restore(self):
+        if not self.installer_shutdown_confirmed:
+            raise InstallerProcessError("Cannot restore while installer shutdown is unconfirmed")
         self.state("rolling-back", "Проверка резервной копии и восстановление предыдущей версии")
         verify_tree(self.backup, self.inventory)
         self.stop_install_processes()
@@ -281,12 +295,16 @@ class NativeUpdater:
             return 2
         except Exception:
             if self.applied:
+                if not self.installer_shutdown_confirmed:
+                    self.state("rollback-failed", "Остановка установщика не подтверждена. Восстановление и запуск заблокированы; проверенная резервная копия сохранена", ok=False, rollback_ok=False,
+                               rollback_blocked=True, installer_shutdown_confirmed=False, rejected_sha256=self.request["sha256"])
+                    return 4
                 try:
                     self.restore()
-                    self.state("rolled-back", "Обновление не прошло проверку. Предыдущая версия восстановлена и запущена", ok=False, rollback_ok=True)
+                    self.state("rolled-back", "Обновление не прошло проверку. Предыдущая версия восстановлена и запущена", ok=False, rollback_ok=True, rejected_sha256=self.request["sha256"])
                     return 3
                 except Exception:
-                    self.state("rollback-failed", "Автоматическое восстановление не завершено. Проверенная резервная копия сохранена; требуется ручное восстановление", ok=False, rollback_ok=False)
+                    self.state("rollback-failed", "Автоматическое восстановление не завершено. Проверенная резервная копия сохранена; требуется ручное восстановление", ok=False, rollback_ok=False, rejected_sha256=self.request["sha256"])
                     return 4
             self.state("failed", "Обновление не началось. Установленная версия и данные сохранены", ok=False)
             return 1

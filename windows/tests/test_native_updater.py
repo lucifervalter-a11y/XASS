@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from native_updater import NativeUpdater, APP_ID, digest, copy_tree_verified, verify_tree, write_json, update_lock
+from installer_process import InstallerProcessError, InstallerTimeoutError, run_installer
 
 OLD = "1" * 40; NEW = "2" * 40
 
@@ -64,7 +65,10 @@ class NativeUpdaterTests(unittest.TestCase):
         with patch("native_updater.copy_tree_verified", side_effect=OSError("disk full")):
             code = self.updater.execute()
         self.assertEqual(code,1); self.updater.run.assert_not_called(); self.assertFalse(self.updater.applied)
-        self.assertEqual(json.loads((self.job / "state.json").read_text())["phase"], "failed")
+        state = json.loads((self.job / "state.json").read_text())
+        self.assertEqual(state["phase"], "failed")
+        self.assertNotIn("rejected_sha256", state)
+        self.assertEqual(state["sha256"], self.request["sha256"])
     def test_cancel_before_install_preserves_current_runtime(self):
         (self.job / "cancel").touch(); original=(self.install / "Xass.Native.exe").read_bytes()
         self.assertEqual(self.updater.execute(),2); self.updater.run.assert_not_called()
@@ -89,6 +93,54 @@ class NativeUpdaterTests(unittest.TestCase):
         self.updater.run.return_value=SimpleNamespace(returncode=1)
         self.assertEqual(self.updater.execute(),3)
         state=json.loads((self.job / "state.json").read_text()); self.assertEqual(state["phase"],"rolled-back");self.assertTrue(state["rollback_ok"])
+        self.assertEqual(state["rejected_sha256"], self.request["sha256"])
+        self.assertEqual(json.loads((self.updates / "last-result.json").read_text())["rejected_sha256"], self.request["sha256"])
+    def test_default_installer_uses_process_tree_supervisor(self):
+        updater = NativeUpdater(self.job / "request.json")
+        self.assertIs(updater.installer_run, run_installer)
+        self.assertIs(updater.run, subprocess.run)
+    def test_confirmed_installer_timeout_allows_rollback(self):
+        self.updater.wait_for_parent=Mock(); self.updater.stop_install_processes=Mock(); self.updater.verify_installed=Mock()
+        self.updater.installer_run = Mock(side_effect=InstallerTimeoutError("timed out", shutdown_confirmed=True))
+        self.assertEqual(self.updater.execute(), 3)
+        self.assertTrue(self.updater.installer_shutdown_confirmed)
+        self.updater.verify_installed.assert_called_once_with(OLD)
+    def test_unconfirmed_installer_shutdown_blocks_all_rollback_mutation_and_launch(self):
+        self.updater.wait_for_parent=Mock(); self.updater.stop_install_processes=Mock()
+        self.updater.verify_installed=Mock(); self.updater.popen=Mock()
+        self.updater.restore=Mock(wraps=self.updater.restore)
+        def stranded_installer(*args, **kwargs):
+            (self.install / "Xass.Native.exe").write_bytes(b"partially replaced")
+            raise InstallerProcessError("descendant did not stop")
+        self.updater.installer_run = stranded_installer
+        original = (self.install / "Xass.Native.exe").read_bytes()
+        self.assertEqual(self.updater.execute(), 4)
+        self.assertEqual((self.install / "Xass.Native.exe").read_bytes(), b"partially replaced")
+        self.assertEqual((self.job / "backup/Xass.Native.exe").read_bytes(), original)
+        self.assertEqual(list(self.install.parent.glob("*.restore-*")), [])
+        self.assertEqual(list(self.install.parent.glob("*.failed-*")), [])
+        self.updater.restore.assert_not_called(); self.updater.verify_installed.assert_not_called()
+        self.updater.popen.assert_not_called(); self.updater.restore_uninstall_registration.assert_not_called()
+        self.updater.stop_install_processes.assert_called_once()
+        state = json.loads((self.job / "state.json").read_text())
+        self.assertEqual(state["phase"], "rollback-failed")
+        self.assertTrue(state["rollback_blocked"])
+        self.assertFalse(state["installer_shutdown_confirmed"])
+        self.assertEqual(state["rejected_sha256"], self.request["sha256"])
+    def test_unclassified_runner_failure_cannot_claim_shutdown(self):
+        self.updater.wait_for_parent=Mock(); self.updater.stop_install_processes=Mock()
+        self.updater.restore=Mock(); self.updater.verify_installed=Mock()
+        # subprocess.run's exception only establishes parent termination, if that.
+        self.updater.installer_run=Mock(side_effect=subprocess.TimeoutExpired("loader.exe", 900))
+        self.assertEqual(self.updater.execute(), 4)
+        self.updater.restore.assert_not_called(); self.updater.verify_installed.assert_not_called()
+        self.assertTrue((self.job / "backup").is_dir())
+    def test_direct_restore_refuses_unconfirmed_shutdown_before_any_filesystem_work(self):
+        self.updater.prepare(); self.updater.installer_shutdown_confirmed=False
+        with patch("native_updater.copy_tree_verified") as copy, patch("native_updater.verify_tree") as verify:
+            with self.assertRaises(InstallerProcessError): self.updater.restore()
+        copy.assert_not_called(); verify.assert_not_called()
+        self.updater.restore_uninstall_registration.assert_not_called()
     def test_failed_health_is_rolled_back(self):
         self.updater.wait_for_parent=Mock(); self.updater.stop_install_processes=Mock()
         self.updater.verify_installed=Mock(side_effect=[RuntimeError("unhealthy new"),None])
@@ -138,7 +190,9 @@ class NativeUpdaterUiContracts(unittest.TestCase):
         self.assertIn("automatic_enabled",preferences);self.assertIn("return false",preferences)
         window=(root/"MainWindow.Desktop.cs").read_text()
         self.assertIn("Включить нативное автообновление?",window)
-        self.assertIn("AppWindow.IsVisible",window);self.assertIn('musicState is "playing"',window)
+        self.assertIn("AppWindow.IsVisible",window)
+        policy=(root/"Services/NativeAutomaticUpdatePolicy.cs").read_text()
+        self.assertIn('"playing" or "paused" or "loading"',policy)
     def test_ui_health_is_backend_acknowledged_before_file_write(self):
         root=Path(__file__).resolve().parents[1]/"Xass.Native"
         window=(root/"MainWindow.Desktop.cs").read_text()

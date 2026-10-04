@@ -42,6 +42,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime/build dependencies could not be
 if ($LASTEXITCODE -ne 0) { throw 'Native bridge source tests failed.' }
 & dotnet run --project (Join-Path $PSScriptRoot 'Appearance.Tests\Appearance.Tests.csproj') -c Release
 if ($LASTEXITCODE -ne 0) { throw 'Appearance persistence/contrast tests failed.' }
+& dotnet run --project (Join-Path $PSScriptRoot 'ModelDiscovery.Tests\ModelDiscovery.Tests.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Local model discovery tests failed.' }
+& dotnet run --project (Join-Path $PSScriptRoot 'NativeUpdate.Tests\NativeUpdate.Tests.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Native updater HTTP deadline tests failed.' }
+& dotnet run --project (Join-Path $PSScriptRoot 'AutomaticUpdate.Tests\AutomaticUpdate.Tests.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Automatic updater consent and rejection safety tests failed.' }
 
 $Native = Join-Path $BuildRoot 'native'
 & dotnet publish (Join-Path $PSScriptRoot 'Xass.Native\Xass.Native.csproj') -c Release -r win-x64 -p:RuntimeIdentifiers=win-x64 -p:Platform=x64 -o $Native
@@ -62,7 +68,7 @@ $FreezeArguments = @(
     '--add-data', "$(Join-Path $RepoRoot 'pc_client\assets\xass.ico');assets",
     '--add-data', "$(Join-Path $RepoRoot 'pc_client\assets\xass-icon.png');assets"
 )
-foreach ($Module in @('bridge', 'desktop_bridge', 'desktop_music_service', 'background_agent', 'native_updater', 'assistant_bridge', 'background_voice_bridge', 'background_voice', 'native_music_ownership', 'voice_capture', 'voice_assistant', 'client_agent')) {
+foreach ($Module in @('bridge', 'desktop_bridge', 'desktop_music_service', 'background_agent', 'native_updater', 'installer_process', 'assistant_bridge', 'background_voice_bridge', 'background_voice', 'native_music_ownership', 'native_agent_identity', 'voice_capture', 'voice_assistant', 'client_agent')) {
     $FreezeArguments += @('--hidden-import', $Module)
 }
 foreach ($Module in @('cryptography', 'miniaudio', 'faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'numpy')) {

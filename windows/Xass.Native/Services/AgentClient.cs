@@ -65,7 +65,8 @@ public sealed class AgentClient
         });
         try
         {
-            Task<string> output = ReadBoundedAsync(process.StandardOutput, timeout.Token);
+            Task<string> output = ReadBoundedAsync(process.StandardOutput, timeout.Token,
+                requestAction.StartsWith("desktop_", StringComparison.Ordinal) ? 4 * 1024 * 1024 : MaxOutput);
             Task<string> errors = ReadBoundedAsync(process.StandardError, timeout.Token);
             await process.StandardInput.WriteAsync(JsonSerializer.Serialize(request).AsMemory(), timeout.Token);
             process.StandardInput.Close();
@@ -90,14 +91,14 @@ public sealed class AgentClient
         }
     }
 
-    private static async Task<string> ReadBoundedAsync(StreamReader reader, CancellationToken token)
+    private static async Task<string> ReadBoundedAsync(StreamReader reader, CancellationToken token, int maximum = MaxOutput)
     {
         var text = new StringBuilder();
         char[] buffer = new char[4096];
         int count;
         while ((count = await reader.ReadAsync(buffer.AsMemory(), token)) != 0)
         {
-            if (text.Length + count > MaxOutput) throw new InvalidOperationException("Ответ агента превышает допустимый размер.");
+            if (text.Length + count > maximum) throw new InvalidOperationException("Ответ агента превышает допустимый размер.");
             text.Append(buffer, 0, count);
         }
         return text.ToString();

@@ -202,7 +202,7 @@ class DesktopService:
     def request(self, action: str, request: dict) -> dict:
         if action not in SCHEMAS or set(request) - (SCHEMAS[action] | {"action", "version"}):
             raise ValueError("Unsupported desktop schema")
-        if request.get("version", VERSION) != VERSION:
+        if type(request.get("version", VERSION)) is not int or request.get("version", VERSION) != VERSION:
             raise ValueError("Unsupported protocol version")
         if action == "desktop_settings":
             return self.settings()
@@ -287,8 +287,8 @@ class DesktopService:
                 return {"id": wanted, "text": str(row.get("text_content") or "")[:32000]}
             allowed = {"id", "created_at", "chat_id", "chat_title", "sender_name", "direction",
                        "deleted", "forwarded_from", "reply_to_message_id", "media_count", "message_date", "from_username"}
-            return {"rows": [{**{k: (str(v)[:240] if isinstance(v, str) else v) for k, v in row.items() if k in allowed},
-                             "text": str(row.get("text_content") or "")[:512]} for row in rows]}
+            return {"rows": [{**{k: (str(v)[:80] if isinstance(v, str) else v) for k, v in row.items() if k in allowed},
+                             "text": str(row.get("text_content") or "")[:256]} for row in rows]}
         if action == "desktop_archive_probe":
             path = Path(text(request.get("path"), 32760, empty=False))
             if not path.is_absolute() or not path.is_dir():
@@ -371,7 +371,7 @@ class DesktopService:
         result = {"name": str(raw.get("source_name") or socket.gethostname())[:128],
                   "owner_name": str(raw.get("owner_name") or "")[:128], "paired": bool(raw.get("api_key") or raw.get("sealed")),
                   "server": safe_url(str(raw.get("server_url") or "")), "state": "stopped", "pid": 0,
-                  "age": None, "latency_ms": 0, "version": str(report.get("agent_version") or report.get("version") or "")[:64],
+                  "age": None, "latency_ms": 0, "legacy_agent": False, "compatibility_notice": "", "version": str(report.get("agent_version") or report.get("version") or "")[:64],
                   "server_version": str(report.get("server_version") or "")[:64],
                   "detail": "Агент сообщил об ошибке. Откройте журнал для диагностики." if report.get("state") == "error" else "", "auto_update": raw.get("auto_update", True) is True}
         try:
@@ -392,6 +392,10 @@ class DesktopService:
                           latency_ms=number(report.get("latency_ms", 0) or 0, 0, 600000))
         except (ValueError, TypeError, OSError, psutil.Error):
             pass
+        from native_agent_identity import probe_agent
+        identity = probe_agent(self.data, self.source)
+        result["legacy_agent"] = identity["active"] and not identity["compatible"]
+        result["compatibility_notice"] = identity["reason"]
         return result
 
     def updates(self) -> dict:
