@@ -24,7 +24,8 @@ MAX_TEXT = 65536
 SCHEMAS = {
     "desktop_status": set(), "desktop_metrics": set(), "desktop_processes": set(),
     "desktop_settings": set(), "desktop_save_settings": {"settings"},
-    "desktop_profile": {"path", "text"}, "desktop_pair": {"server", "name", "code", "path", "text"},
+    "desktop_profile": {"path", "text"}, "desktop_pair": {"server", "name", "code"},
+    "desktop_pair_profile": {"text", "confirmed"},
     "desktop_health": set(), "desktop_miniapp": set(),
     "desktop_files": {"root", "path"}, "desktop_archive": set(),
     "desktop_archive_rows": set(), "desktop_archive_detail": {"id"},
@@ -216,8 +217,14 @@ class DesktopService:
             p = self.profile(request)
             return {"server": p.server_url, "name": p.source_name,
                     "expires_at": p.expires_at.isoformat(), "auto_update": p.auto_update}
-        if action == "desktop_pair":
-            profile = self.profile(request) if request.get("path") or request.get("text") else None
+        if action in {"desktop_pair", "desktop_pair_profile"}:
+            # Manual pairing never consults an imported profile. Import confirmation
+            # carries the reviewed text snapshot, not a path that may have changed.
+            profile = None
+            if action == "desktop_pair_profile":
+                if request.get("confirmed") is not True:
+                    raise ValueError("Explicit profile pairing confirmation required")
+                profile = self.profile(request)
             server = profile.server_url if profile else text(request.get("server"), 2048, empty=False)
             code = profile.pair_code if profile else text(request.get("code"), 64, empty=False)
             name = (profile.source_name if profile else text(request.get("name"), 128)) or socket.gethostname()

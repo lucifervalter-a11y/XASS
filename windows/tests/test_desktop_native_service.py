@@ -1,13 +1,16 @@
 """Synthetic-data and mocked-process native parity contracts; no live PC actions."""
 from __future__ import annotations
 import contextlib
+from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -32,6 +35,33 @@ class NativeServiceTests(unittest.TestCase):
     def settings(self):
         return {"owner_name": "Name", "interval_sec": 15, "auto_update": False, "transcription_enabled": False,
                 "archive_folder": "", "archive_max_gb": 3.5, "archive_retention_days": 30}
+    def profile_payload(self, **changes):
+        return {"format": "xass-connect", "version": 1, "pair_code": "profile-code-fixture",
+                "server_url": "https://profile.invalid", "source_name": "Profile PC",
+                "expires_at": "2099-01-01T00:00:00Z", "auto_update": False, **changes}
+    @contextlib.contextmanager
+    def pairing_dependencies(self):
+        # All mutation dependencies are synthetic, including key generation and
+        # both discovery/claim network entry points. No live pairing is exercised.
+        public = {"kty": "EC", "crv": "P-256", "x": "fixture-x", "y": "fixture-y"}
+        def keys(config):
+            config.update(e2e_public_jwk=public, e2e_private_jwk={**public, "d": "fixture-private-key"})
+        with contextlib.ExitStack() as stack:
+            def mock(target, **kwargs):
+                return stack.enter_context(patch(target, **kwargs))
+            yield SimpleNamespace(
+                config=stack.enter_context(patch.object(self.service, "config", return_value=dict(self.config))),
+                save=stack.enter_context(patch.object(self.service, "save")),
+                normalize=mock("client_agent.normalize_server_url", side_effect=lambda value: value),
+                discover=mock("client_agent.discover_backend_url", side_effect=lambda value: value),
+                claim=mock("client_agent.claim_pair_code", return_value={"agent_api_key": "ag_new_fixture_secret"}),
+                keys=mock("e2e_crypto.ensure_agent_keys", side_effect=keys), public=public)
+    def assert_pairing_untouched(self, dependencies):
+        for operation in (dependencies.config, dependencies.save, dependencies.normalize,
+                          dependencies.discover, dependencies.claim, dependencies.keys):
+            operation.assert_not_called()
+        self.assertFalse((self.root / ".native-config.lock").exists())
+        self.assertEqual(read_json(self.root / "config.json"), self.config)
     def test_exact_operations_and_unknown_fields_rejected_before_io(self):
         for action in ["exec", "reboot", "shutdown", "delete_file", "desktop_exec"]:
             with self.assertRaises(ValueError): self.service.request(action, {})
@@ -90,6 +120,140 @@ class NativeServiceTests(unittest.TestCase):
         self.assertEqual(result["name"], "Fixture"); self.assertNotIn("123456", json.dumps(result))
     def test_profile_rejects_oversized_input(self):
         with self.assertRaises(ValueError): self.service.request("desktop_profile", {"text": "x" * 65537})
+    def test_manual_pair_uses_only_exact_manual_values_after_profile_preview(self):
+        manual = {"server": "https://manual.invalid/custom", "name": "Manual PC", "code": "manual-code-fixture"}
+        with self.pairing_dependencies() as dependencies:
+            self.service.request("desktop_profile", {"text": json.dumps(self.profile_payload())})
+            with patch.object(self.service, "profile", side_effect=AssertionError("Manual pairing read a profile")):
+                result = self.service.request("desktop_pair", manual)
+        dependencies.normalize.assert_called_once_with(manual["server"])
+        dependencies.discover.assert_called_once_with(manual["server"])
+        dependencies.claim.assert_called_once_with(server_url=manual["server"], pair_code=manual["code"],
+            source_name=manual["name"], source_type="PC_AGENT", e2e_public_jwk=dependencies.public, allow_insecure_http=False)
+        saved = dependencies.save.call_args.args[0]
+        self.assertEqual(saved["server_url"], manual["server"])
+        self.assertEqual(saved["source_name"], manual["name"])
+        self.assertEqual(saved["auto_update"], self.config["auto_update"])
+        self.assertEqual(result, {"paired": True, "name": manual["name"], "server": manual["server"]})
+        for secret in (manual["code"], self.config["api_key"], "ag_new_fixture_secret", "fixture-private-key"):
+            self.assertNotIn(secret, json.dumps(result))
+    def test_manual_pair_rejects_legacy_profile_keys_even_when_empty_before_io(self):
+        manual = {"server": "https://manual.invalid", "name": "Manual PC", "code": "manual-code-fixture"}
+        for extra in ({"path": "profile.xass"}, {"text": json.dumps(self.profile_payload())},
+                      {"path": ""}, {"text": ""}, {"path": None, "text": None}):
+            with self.subTest(extra=extra), self.pairing_dependencies() as dependencies:
+                with patch.object(self.service, "profile") as profile, self.assertRaises(ValueError):
+                    self.service.request("desktop_pair", {**manual, **extra})
+                profile.assert_not_called()
+                self.assert_pairing_untouched(dependencies)
+    def test_profile_pair_requires_boolean_confirmation_before_parsing_or_io(self):
+        for confirmation in ({}, {"confirmed": False}, {"confirmed": None}, {"confirmed": 1}, {"confirmed": "true"}):
+            with self.subTest(confirmation=confirmation), self.pairing_dependencies() as dependencies:
+                with patch.object(self.service, "profile") as profile, self.assertRaises(ValueError):
+                    self.service.request("desktop_pair_profile", {"text": json.dumps(self.profile_payload()), **confirmation})
+                profile.assert_not_called()
+                self.assert_pairing_untouched(dependencies)
+    def test_profile_pair_rejects_paths_manual_fields_and_missing_text_before_io(self):
+        for fields in ({"path": str(self.root / "profile.xass")}, {"path": ""}, {"server": "https://manual.invalid"},
+                       {"name": "Manual PC"}, {"code": "manual-code-fixture"}):
+            with self.subTest(fields=fields), self.pairing_dependencies() as dependencies:
+                with self.assertRaises(ValueError):
+                    self.service.request("desktop_pair_profile", {"text": json.dumps(self.profile_payload()), "confirmed": True, **fields})
+                self.assert_pairing_untouched(dependencies)
+        with self.pairing_dependencies() as dependencies, self.assertRaises(ValueError):
+            self.service.request("desktop_pair_profile", {"confirmed": True})
+        self.assert_pairing_untouched(dependencies)
+    def test_file_and_json_profile_preview_never_write_or_project_credentials(self):
+        payload = self.profile_payload(e2e_public_jwk={"kty": "EC", "crv": "P-256", "x": "fixture-x", "y": "fixture-y"})
+        self.write("profile.xass", payload)
+        original = (self.root / "config.json").read_bytes()
+        for source in ({"path": str(self.root / "profile.xass")}, {"text": json.dumps(payload)}):
+            with self.subTest(source=next(iter(source))), self.pairing_dependencies() as dependencies:
+                result = self.service.request("desktop_profile", source)
+                self.assertEqual(set(result), {"server", "name", "expires_at", "auto_update"})
+                self.assertEqual(result["server"], payload["server_url"])
+                self.assertEqual(result["name"], payload["source_name"])
+                for secret in (payload["pair_code"], "ag_", "fixture-x", "fixture-y"):
+                    self.assertNotIn(secret, json.dumps(result))
+                self.assert_pairing_untouched(dependencies)
+                self.assertEqual((self.root / "config.json").read_bytes(), original)
+                self.assertEqual({path.name for path in self.root.iterdir()}, {"config.json", "profile.xass"})
+    def test_profile_pair_uses_confirmed_text_snapshot_when_original_file_changes(self):
+        payload = self.profile_payload()
+        snapshot = json.dumps(payload)
+        self.write("profile.xass", payload)
+        with self.pairing_dependencies() as dependencies:
+            self.service.request("desktop_profile", {"path": str(self.root / "profile.xass")})
+            self.write("profile.xass", self.profile_payload(server_url="https://changed.invalid", pair_code="changed-code-fixture"))
+            with patch("connection_file.load_connection_file", side_effect=AssertionError("Import reread a mutable file")):
+                result = self.service.request("desktop_pair_profile", {"text": snapshot, "confirmed": True})
+        self.assertEqual(dependencies.claim.call_args.kwargs["server_url"], payload["server_url"])
+        self.assertEqual(dependencies.claim.call_args.kwargs["pair_code"], payload["pair_code"])
+        self.assertFalse(dependencies.save.call_args.args[0]["auto_update"])
+        self.assertEqual(set(result), {"paired", "name", "server"})
+        for secret in (payload["pair_code"], "ag_new_fixture_secret", "fixture-private-key"):
+            self.assertNotIn(secret, json.dumps(result))
+    def test_failed_profile_pair_can_retry_with_fresh_profile_without_stale_credentials(self):
+        first = self.profile_payload()
+        fresh = self.profile_payload(server_url="https://fresh.invalid", pair_code="fresh-code-fixture", source_name="Fresh PC", auto_update=True)
+        original = (self.root / "config.json").read_bytes()
+        with self.pairing_dependencies() as dependencies:
+            dependencies.claim.side_effect = [RuntimeError("Synthetic claim rejected"), {"agent_api_key": "ag_new_fixture_secret"}]
+            with self.assertRaisesRegex(RuntimeError, "Synthetic claim rejected"):
+                self.service.request("desktop_pair_profile", {"text": json.dumps(first), "confirmed": True})
+            dependencies.save.assert_not_called()
+            self.assertEqual(dependencies.config.return_value, self.config)
+            self.assertEqual((self.root / "config.json").read_bytes(), original)
+            result = self.service.request("desktop_pair_profile", {"text": json.dumps(fresh), "confirmed": True})
+        self.assertEqual([call.kwargs["pair_code"] for call in dependencies.claim.call_args_list], [first["pair_code"], fresh["pair_code"]])
+        self.assertEqual([call.kwargs["server_url"] for call in dependencies.claim.call_args_list], [first["server_url"], fresh["server_url"]])
+        dependencies.save.assert_called_once()
+        saved = dependencies.save.call_args.args[0]
+        self.assertEqual((saved["server_url"], saved["source_name"], saved["auto_update"]), (fresh["server_url"], fresh["source_name"], True))
+        self.assertEqual(dependencies.config.return_value, self.config)
+        for secret in (first["pair_code"], fresh["pair_code"], "ag_new_fixture_secret", "fixture-private-key"):
+            self.assertNotIn(secret, json.dumps(result))
+    def test_profile_expiring_after_preview_is_revalidated_and_saved_config_is_preserved(self):
+        from connection_file import parse_connection_text
+        snapshot = json.dumps(self.profile_payload())
+        original = (self.root / "config.json").read_bytes()
+        now = datetime(2098, 1, 1, tzinfo=timezone.utc)
+        with self.pairing_dependencies() as dependencies, patch("connection_file.parse_connection_text", side_effect=lambda value: parse_connection_text(value, now=now)):
+            self.service.request("desktop_profile", {"text": snapshot})
+            now = datetime(2100, 1, 1, tzinfo=timezone.utc)
+            with self.assertRaises(ValueError):
+                self.service.request("desktop_pair_profile", {"text": snapshot, "confirmed": True})
+            self.assert_pairing_untouched(dependencies)
+        self.assertEqual((self.root / "config.json").read_bytes(), original)
+    def test_pairing_protocol_never_emits_secrets_on_success_or_failure(self):
+        spec = importlib.util.spec_from_file_location("pairing_bridge_fixture", WINDOWS / "bridge.py")
+        bridge = importlib.util.module_from_spec(spec); spec.loader.exec_module(bridge)
+        payload = self.profile_payload()
+        request = {"action": "desktop_pair_profile", "text": json.dumps(payload), "confirmed": True}
+        secrets = (payload["pair_code"], self.config["api_key"], "ag_new_fixture_secret", "fixture-private-key")
+        for failed in (False, True):
+            with self.subTest(failed=failed), self.pairing_dependencies() as dependencies:
+                def claim(**kwargs):
+                    # Even accidental dependency output and exception details must
+                    # remain inside the bridge's private protocol boundary.
+                    print(" ".join(secrets))
+                    print(" ".join(secrets), file=sys.stderr)
+                    if failed:
+                        raise RuntimeError(" ".join(secrets))
+                    return {"agent_api_key": "ag_new_fixture_secret"}
+                dependencies.claim.side_effect = claim
+                output, errors = io.StringIO(), io.StringIO()
+                with patch("desktop_bridge.DesktopService", return_value=self.service), \
+                        patch.object(sys, "argv", ["bridge.py", "--source", str(SOURCE), "--data", str(self.root)]), \
+                        patch.object(sys, "stdin", io.StringIO(json.dumps(request))), \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    bridge.main()
+                self.assertEqual(json.loads(output.getvalue())["ok"], not failed)
+                self.assertEqual(errors.getvalue(), "")
+                for secret in secrets:
+                    self.assertNotIn(secret, output.getvalue())
+                if failed:
+                    dependencies.save.assert_not_called()
     def test_files_allowlist_nested_navigation_truncation_and_traversal(self):
         home = self.root / "home"; home.mkdir()
         with patch.dict(os.environ, {"USERPROFILE": str(home)}):
@@ -157,13 +321,51 @@ class NativeServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError): bind_runtime(Path("pc_client"), self.root)
 
 class NativeUiContracts(unittest.TestCase):
+    def test_pairing_ui_reads_current_manual_controls_without_pending_profile_fields(self):
+        code = (WINDOWS / "Xass.Native/MainWindow.Desktop.cs").read_text()
+        for field in ("pendingProfilePath", "pendingProfileText", "pendingProfile", "pendingConnectionPath", "pendingConnectionText"):
+            self.assertNotIn(field, code)
+        manual = code.split("private Task PairDesktopAsync()", 1)[1].split("private async Task RunDesktopPairingAsync", 1)[0]
+        self.assertIn("desktopPairingFlow.PairManualAsync(", manual)
+        self.assertIn("pairServer.Text, pairName.Text, pairCode.Password, client.RequestAsync, cancellation", manual)
+        preview = code.split("private Task ImportConnectionSourceAsync", 1)[1].split("private Task PairDesktopAsync()", 1)[0]
+        self.assertIn("desktopPairingFlow.ImportAsync(readSource", preview)
+        self.assertIn("operationCancellation", preview)
+        self.assertNotIn("pairServer.Text =", preview)
+        self.assertNotIn("pairName.Text =", preview)
+        self.assertNotIn("pairCode.Password =", preview)
+    def test_pairing_runtime_guard_covers_path_save_lifecycle_and_pairing_start(self):
+        code = (WINDOWS / "Xass.Native/MainWindow.Desktop.cs").read_text()
+        paths = code.split("private async Task SaveDesktopPathsAsync()", 1)[1].split("private async Task EnsureDesktopHostAsync()", 1)[0]
+        self.assertIn("if (desktopPairing || desktopRuntimeChanging)", paths)
+        self.assertLess(paths.index("desktopRuntimeChanging = true;"), paths.index("await "))
+        self.assertIn("finally { desktopRuntimeChanging = false; }", paths)
+        self.assertLess(paths.index("client.DataPath = data;"), paths.index("finally"))
+        pairing = code.split("private async Task RunDesktopPairingAsync", 1)[1].split("private void BuildComputerPanels()", 1)[0]
+        self.assertIn("if (desktopPairing || desktopQuitting || closed) return;", pairing)
+        self.assertLess(pairing.index("if (desktopRuntimeChanging)"), pairing.index("await operation("))
+    def test_pairing_quit_cancels_operation_before_asynchronous_shutdown(self):
+        code = (WINDOWS / "Xass.Native/MainWindow.Desktop.cs").read_text()
+        pairing = code.split("private async Task RunDesktopPairingAsync", 1)[1].split("private void BuildComputerPanels()", 1)[0]
+        self.assertIn("CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token)", pairing)
+        self.assertIn("desktopPairingCancellation = cancellation;", pairing)
+        self.assertIn("await operation(cancellation.Token)", pairing)
+        self.assertIn("desktopPairingCancellation = null;", pairing.split("finally", 1)[1])
+        self.assertLess(pairing.index("if (closed || desktopQuitting || cancellation.IsCancellationRequested) return;"),
+                        pairing.index("await RestartDesktopAgentAsync();"))
+        quit_code = code.split("private async Task QuitDesktopAsync()", 1)[1].split("private void DisposeDesktop()", 1)[0]
+        self.assertLess(quit_code.index("desktopPairingCancellation?.Cancel();"), quit_code.index("await "))
     def test_all_legacy_destinations_exist_without_tk_fallback(self):
         code = (WINDOWS / "Xass.Native/MainWindow.Desktop.cs").read_text()
         for tag in ["files", "archive", "journal", "updates", "settings", "commands"]:
             self.assertIn(f'AddDesktopPage("{tag}"', code)
         self.assertNotIn("desktop_app", code)
-        for action in ["desktop_pair", "desktop_files", "desktop_archive_rows", "desktop_save_settings", "desktop_screenshot", "desktop_lock"]:
+        for action in ["desktop_files", "desktop_archive_rows", "desktop_save_settings", "desktop_screenshot", "desktop_lock"]:
             self.assertIn(action, code)
+        self.assertIn("DesktopPairingFlow", code)
+        pairing = (WINDOWS / "Xass.Native/Services/DesktopPairingFlow.cs").read_text()
+        for action in ["desktop_pair", "desktop_pair_profile", "desktop_profile"]:
+            self.assertIn(f'action = "{action}"', pairing)
     def test_lifecycle_direct_host_no_bridge_spawn_and_close_mutes(self):
         code = (WINDOWS / "Xass.Native/Services/DesktopHostClient.cs").read_text()
         self.assertIn('ArgumentList.Add("background-agent")', code)
