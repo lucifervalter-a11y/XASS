@@ -75,8 +75,16 @@ foreach ($Module in @('cryptography', 'miniaudio', 'faster_whisper', 'ctranslate
     $FreezeArguments += @('--collect-all', $Module)
 }
 $FreezeArguments += (Join-Path $PSScriptRoot 'native_host.py')
-& $Python @FreezeArguments
-if ($LASTEXITCODE -ne 0) { throw 'Frozen native companion build failed.' }
+$PreviousHubOffline, $PreviousHubTelemetry = $env:HF_HUB_OFFLINE, $env:HF_HUB_DISABLE_TELEMETRY
+try {
+    # Dependency import analysis needs no remote model/CLI catalogs.
+    $env:HF_HUB_OFFLINE = '1'; $env:HF_HUB_DISABLE_TELEMETRY = '1'
+    & $Python @FreezeArguments
+    $FreezeExitCode = $LASTEXITCODE
+} finally {
+    $env:HF_HUB_OFFLINE = $PreviousHubOffline; $env:HF_HUB_DISABLE_TELEMETRY = $PreviousHubTelemetry
+}
+if ($FreezeExitCode -ne 0) { throw 'Frozen native companion build failed.' }
 $Companion = Join-Path $Dist 'XASS.NativeHelper'
 & (Join-Path $Companion 'XASS.NativeHelper.exe') --health-check
 if ($LASTEXITCODE -ne 0) { throw 'Bundled Python/runtime health check failed; refusing to package.' }

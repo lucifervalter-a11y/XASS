@@ -68,6 +68,13 @@ def copy_tree(source: Path, destination: Path) -> None:
         shutil.copy2(file, target)
 
 
+def validate_source_allowlist(sources: list[str]) -> None:
+    if not isinstance(sources, list) or not sources or any(
+        not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*\.py", name) for name in sources
+    ) or len(sources) != len(set(sources)):
+        raise ValueError("Invalid helper source allowlist")
+
+
 def stage(native: Path, companion: Path, destination: Path, revision: str, licenses: Path) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}|local-build", revision):
         raise ValueError("Revision must be a full immutable SHA or local-build")
@@ -85,8 +92,7 @@ def stage(native: Path, companion: Path, destination: Path, revision: str, licen
     for filename in ("Xass.Native.deps.json", "Xass.Native.runtimeconfig.json"):
         json.loads((native / filename).read_text(encoding="utf-8"))
     sources = manifest["pc_client_sources"]
-    if len(sources) != len(set(sources)) or any(not re.fullmatch(r"[a-z_]+\.py", x) for x in sources):
-        raise ValueError("Invalid helper source allowlist")
+    validate_source_allowlist(sources)
     for name in sources:
         if not (ROOT / "pc_client" / name).is_file():
             raise ValueError(f"Required allowlisted source missing: {name}")

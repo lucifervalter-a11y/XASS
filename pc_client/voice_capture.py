@@ -81,6 +81,9 @@ class WhisperTranscriber:
         if not complete:
             raise AssistantError("Укажите полную существующую локальную папку faster-whisper с model.bin, "
                                  "config.json и tokenizer.json. Автозагрузка отключена.")
+        # Set before importing HF-backed libraries, including external-Python fallback.
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
         try:
             import numpy as np
             from faster_whisper import WhisperModel

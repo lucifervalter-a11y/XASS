@@ -2,6 +2,7 @@
 from __future__ import annotations
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -32,6 +33,12 @@ class PackagingTests(unittest.TestCase):
         for args in (['--role', 'unknown'], ['--role', 'assistant', 'arbitrary.py'], ['--health-check', 'extra']):
             with self.subTest(args=args), self.assertRaises(SystemExit), patch('sys.stderr'):
                 host.main(args)
+
+    def test_local_voice_and_health_environment_is_offline(self):
+        with patch.dict(os.environ, {"HF_HUB_OFFLINE": "0", "HF_HUB_DISABLE_TELEMETRY": "0"}):
+            host.local_model_environment()
+            self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+            self.assertEqual(os.environ["HF_HUB_DISABLE_TELEMETRY"], "1")
 
     def test_health_check_never_imports_application_roles(self):
         with patch.object(host.importlib, 'import_module') as imported, patch.object(host.importlib.util, 'find_spec', return_value=object()):
@@ -128,6 +135,14 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(marker['distribution'], 'native-test')
             self.assertIn('native-install.json', indexed)
             self.assertEqual((destination / 'build-info.json').read_bytes(), (destination / 'pc_client/build-info.json').read_bytes())
+
+    def test_source_allowlist_accepts_real_numeric_module_and_rejects_paths(self):
+        real = json.loads(package.MANIFEST.read_text())["pc_client_sources"]
+        package.validate_source_allowlist(real)
+        self.assertIn("e2e_crypto.py", real)
+        for values in ([], ["a.py", "a.py"], ["../key.py"], ["dir/file.py"], [".env"], ["a-b.py"], [1]):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                package.validate_source_allowlist(values)
 
     def test_manifest_allowlists_source_and_complete_runtime(self):
         manifest = json.loads(package.MANIFEST.read_text())

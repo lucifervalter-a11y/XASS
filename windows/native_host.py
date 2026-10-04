@@ -10,6 +10,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -24,7 +25,14 @@ ROLES = {
 HEALTH_IMPORTS = ("httpx", "psutil", "cryptography", "miniaudio", "numpy", "faster_whisper")
 
 
+def local_model_environment() -> None:
+    # Voice and health probes never need Hugging Face network access or telemetry.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+
 def health_check() -> dict:
+    local_model_environment()
     for module in HEALTH_IMPORTS:
         importlib.import_module(module)
     for module in ROLES.values():
@@ -53,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     if args.role in {"assistant", "listener"} and remaining:
         parser.error("Assistant roles accept their request through standard input only")
+    if args.role in {"assistant", "listener"}:
+        local_model_environment()
     sys.argv = [sys.argv[0], *remaining]
     module = importlib.import_module(ROLES[args.role])
     module.main()
