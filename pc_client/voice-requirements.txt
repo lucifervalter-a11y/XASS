@@ -1,0 +1,2 @@
+# Optional isolated voice environment. Not installed by XASS automatically.
+faster-whisper==1.2.1
