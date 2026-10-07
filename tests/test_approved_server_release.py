@@ -1,6 +1,7 @@
 from contextlib import closing
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy/approved_server_release.py"
 spec = importlib.util.spec_from_file_location("approved_release", SCRIPT)
@@ -146,6 +149,49 @@ class ApprovedReleaseTests(unittest.TestCase):
         (destination / "database/sqlite.db").write_bytes(b"corrupt database")
         with self.assertRaises(sqlite3.DatabaseError):
             release.verify_backup(destination, self.root, self.base)
+
+
+class PublicApiChecksTests(unittest.TestCase):
+    def response(self, request, *, broken_auth=False, invalid_json=False, **_kwargs):
+        url = urlparse(request.full_url)
+        public = url.hostname == "redvps.site"
+        if public and url.path != "/health":
+            self.assertEqual(url.path, "/proxy.php")
+            path = parse_qs(url.query)["_p"][0]
+        else:
+            path = url.path
+        status = 401 if path in {"/api/mini/music/storage", "/api/mini/weather"} else 200
+        if public and broken_auth and status == 401:
+            status = 200
+        data = {"status": "ok"} if path == "/health" else {"ok": status == 200}
+        payload = json.dumps(data)
+        if public and url.path == "/proxy.php":
+            payload = "<html>profile</html>" if invalid_json else json.dumps({"_s": status, "_b": payload})
+            status = 200
+        if status >= 400:
+            raise release.urllib.error.HTTPError(request.full_url, status, "Unauthorized", {}, None)
+        response = io.BytesIO(payload.encode())
+        response.status = status
+        response.url = request.full_url
+        return response
+
+    def test_public_api_uses_frontend_proxy_and_checks_inner_status(self):
+        with patch.object(release.urllib.request, "urlopen", side_effect=self.response):
+            checked = release.api_checks(8000)
+        self.assertEqual(len(checked), 8)
+        self.assertEqual(checked["public_ping"], 200)
+        self.assertEqual(checked["public_music_auth"], 401)
+        self.assertEqual(checked["public_weather_auth"], 401)
+
+    def test_proxy_http_200_does_not_hide_broken_authentication(self):
+        with patch.object(release.urllib.request, "urlopen", side_effect=lambda request, **kw: self.response(request, broken_auth=True)):
+            with self.assertRaisesRegex(release.Stop, "not rejecting unauthenticated"):
+                release.api_checks(8000)
+
+    def test_public_html_is_rejected(self):
+        with patch.object(release.urllib.request, "urlopen", side_effect=lambda request, **kw: self.response(request, invalid_json=True)):
+            with self.assertRaisesRegex(release.Stop, "invalid JSON"):
+                release.api_checks(8000)
 
 
 if __name__ == "__main__":

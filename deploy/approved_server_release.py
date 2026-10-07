@@ -21,6 +21,7 @@ import sys
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = "822ac05d4a53dd5475312834065501b9af063b1a"
@@ -128,17 +129,30 @@ def api_checks(port, *, public=True):
     for label, origin in origins:
         for path, key in [("/health", "health"), ("/api/mini/ping", "ping"),
                           ("/api/mini/music/storage", "music_auth"), ("/api/mini/weather", "weather_auth")]:
-            request = urllib.request.Request(origin + path, headers={"User-Agent": "XASS-approved-release-check"})
+            # The PHP frontend routes /api through this envelope, as miniapp.php
+            # does. Direct public /api URLs intentionally serve the profile page.
+            envelope_mode = label == "public" and path.startswith("/api/")
+            url = origin + ("/proxy.php?" + urllib.parse.urlencode({"_p": path}) if envelope_mode else path)
+            request = urllib.request.Request(url, headers={"User-Agent": "XASS-approved-release-check"})
             try:
                 with urllib.request.urlopen(request, timeout=10) as response:
                     status, body = response.status, response.read(65537)
-                    require(response.url == origin + path, "API request unexpectedly redirected.")
+                    require(response.url == url, "API request unexpectedly redirected.")
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, b""
             except urllib.error.URLError as exc:
                 reason = type(exc.reason).__name__
                 verification = getattr(exc.reason, "verify_code", None)
                 raise Stop(f"{label}_{key}: transport failed ({reason}, TLS verify code {verification}).") from None
+            if envelope_mode:
+                require(status == 200 and len(body) <= 65536, "Public API proxy transport failed.")
+                try:
+                    envelope = json.loads(body)
+                except (ValueError, UnicodeError):
+                    raise Stop("Public API proxy returned invalid JSON.") from None
+                require(isinstance(envelope, dict) and type(envelope.get("_s")) is int
+                        and isinstance(envelope.get("_b"), str), "Public API proxy envelope is invalid.")
+                status, body = envelope["_s"], envelope["_b"].encode("utf-8")
             if key.endswith("_auth"):
                 require(status in {401, 403}, "Protected API is not rejecting unauthenticated requests.")
             else:
