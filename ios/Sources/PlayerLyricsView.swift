@@ -118,11 +118,13 @@ import UIKit
                           systemImage: showPronunciation ? "checkmark" : "character.bubble")
                 }
                 .disabled(!lyrics.hasPronunciation)
+                .accessibilityIdentifier("lyricsPronunciationToggle")
                 Button { showTranslation.toggle() } label: {
                     Label(showTranslation ? "Скрыть перевод" : "Показать перевод",
                           systemImage: showTranslation ? "checkmark" : "captions.bubble")
                 }
                 .disabled(!lyrics.hasTranslation)
+                .accessibilityIdentifier("lyricsTranslationToggle")
                 if !lyrics.hasTranslation {
                     Text("Перевод появится, когда его вернёт ваш XASS")
                 }

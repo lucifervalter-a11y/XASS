@@ -114,8 +114,11 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         let tools = app.buttons["nowPlayingLyricsTools"]
         XCTAssertTrue(tools.waitForExistence(timeout: 10))
         app.buttons["nowPlayingLyricsLanguage"].tap()
-        XCTAssertTrue(app.buttons["Показать перевод"].waitForExistence(timeout: 3))
-        XCTAssertFalse(app.buttons["Найти текст или расшифровать"].exists, "Language menu contains only distinct language actions")
+        XCTAssertTrue(app.buttons["lyricsTranslationToggle"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["lyricsPronunciationToggle"].exists)
+        let duplicateTextAction = NSPredicate(format: "label == %@ AND identifier != %@",
+                                             "Найти текст или расшифровать", "nowPlayingLyricsTools")
+        XCTAssertEqual(app.buttons.matching(duplicateTextAction).count, 0, "Language menu contains only distinct language actions")
         app.tap() // Cancel the language menu without changing playback.
         tools.tap()
         XCTAssertTrue(app.buttons["phoneTranscriptionDisclosure"].waitForExistence(timeout: 5))
