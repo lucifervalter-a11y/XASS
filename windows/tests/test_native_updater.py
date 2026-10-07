@@ -35,13 +35,53 @@ class NativeUpdaterTests(unittest.TestCase):
         # Unit fixtures must never inspect or rewrite a real user's installed registry.
         self.updater.read_uninstall_registration = Mock(return_value={})
         self.updater.restore_uninstall_registration = Mock()
-    def make_install(self, revision):
+    def make_install(self, revision, distribution="native-test"):
         (self.install / "runtime").mkdir(exist_ok=True)
         (self.install / "Xass.Native.exe").write_bytes(("native"+revision).encode())
         (self.install / "runtime/XASS.NativeHelper.exe").write_bytes(b"helper")
-        write_json(self.install / "native-install.json", {"app_id":APP_ID,"distribution":"native-test","revision":revision,"version":"1.0.0"})
+        write_json(self.install / "native-install.json", {"app_id":APP_ID,"distribution":distribution,"revision":revision,"version":"1.0.0"})
         files = [{"path":p.relative_to(self.install).as_posix(),"bytes":p.stat().st_size,"sha256":digest(p)} for p in self.install.rglob("*") if p.is_file() and p.name != "payload-manifest.json"]
         write_json(self.install / "payload-manifest.json", {"schema":1,"revision":revision,"files":files})
+    def stable_request(self):
+        stable = self.updates / ("XASS-Native-" + NEW + ".exe")
+        self.installer.rename(stable)
+        self.request["installer"] = str(stable)
+        write_json(self.job / "request.json", self.request)
+        updater = NativeUpdater(self.job / "request.json", run=self.updater.run)
+        updater.read_uninstall_registration = Mock(return_value={})
+        updater.restore_uninstall_registration = Mock()
+        return updater
+
+    def test_stable_migration_accepts_new_identity_and_preserves_test_rollback(self):
+        updater = self.stable_request()
+        self.assertEqual(updater.release_distribution, "native")
+        updater.prepare()
+        self.make_install(NEW, "native")
+        def launch(*args, **kwargs):
+            command = args[0]
+            write_json(self.job / ("health-" + command[-1] + ".json"),
+                       {"ready": True, "nonce": command[-1], "pid": 99,
+                        "revision": json.loads((self.install / "native-install.json").read_text())["revision"]})
+            return Mock(pid=99, poll=Mock(return_value=None))
+        updater.popen = launch
+        updater.verify_installed(NEW)
+        updater.stop_install_processes = Mock()
+        updater.restore()
+        self.assertEqual(json.loads((self.install / "native-install.json").read_text())["distribution"], "native-test")
+        updater.verify_installed(OLD)
+
+    def test_stable_installation_rejects_test_channel_before_backup(self):
+        self.make_install(OLD, "native")
+        with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+        self.assertFalse((self.job / "backup").exists())
+
+    def test_stable_migration_rejects_wrong_installed_channel_before_launch(self):
+        updater = self.stable_request()
+        self.make_install(NEW, "native-test")
+        updater.popen = Mock()
+        with self.assertRaises(ValueError): updater.verify_installed(NEW)
+        updater.popen.assert_not_called()
+
     def test_rejects_tampered_installer_before_mutation(self):
         self.installer.write_bytes(b"tampered")
         with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")

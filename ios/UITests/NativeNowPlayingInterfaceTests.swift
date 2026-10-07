@@ -137,8 +137,19 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         XCTAssertTrue(app.buttons["nativeTrackInformation"].waitForExistence(timeout: 3))
         XCTAssertFalse(app.buttons["nativeTrackPCTranscription"].exists)
         app.buttons["nativeTrackInformation"].tap()
-        XCTAssertTrue(app.buttons["phoneTranscriptionDisclosure"].waitForExistence(timeout: 3))
-        app.navigationBars.buttons.firstMatch.tap()
+        let informationBar = app.navigationBars["Информация о песне"]
+        XCTAssertTrue(informationBar.waitForExistence(timeout: 3))
+        let information = app.collectionViews["nativeEnrichment"]
+        XCTAssertTrue(information.waitForExistence(timeout: 3))
+        let phoneTranscription = app.buttons["phoneTranscriptionDisclosure"]
+        // More opens a medium-height sheet. Form materializes rows as they
+        // enter the viewport; reach the phone tools through a real scroll.
+        for _ in 0..<5 {
+            if phoneTranscription.exists && phoneTranscription.isHittable { break }
+            information.swipeUp()
+        }
+        XCTAssertTrue(phoneTranscription.exists && phoneTranscription.isHittable)
+        informationBar.buttons.firstMatch.tap()
         XCTAssertTrue(app.buttons["nativeTrackInformation"].waitForExistence(timeout: 3))
         app.buttons["Готово"].tap()
         XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 3))

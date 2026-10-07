@@ -514,7 +514,7 @@ public sealed partial class MainWindow
         var result = await DesktopRequestAsync("desktop_updates");
         string nativeResult = "Ещё нет";
         try { nativeResult = await File.ReadAllTextAsync(Path.Combine(NativeUpdateCoordinator.UpdatesRoot, "last-result.json")); } catch (IOException) { }
-        updateStatus.Text = $"Версия: {DValue(result, "version")}\nРевизия: {DValue(result, "revision")}\nКанал: native-test\nСохранённое автообновление: {DValue(result, "auto_update")}\nПоследний результат: {DValue(result, "result")}\nСостояние: {DValue(result, "state")}\nНативное обновление: {nativeResult}";
+        updateStatus.Text = $"Версия: {DValue(result, "version")}\nРевизия: {DValue(result, "revision")}\nКанал: {DValue(result, "distribution")}\nСохранённое автообновление: {DValue(result, "auto_update")}\nПоследний результат: {DValue(result, "result")}\nСостояние: {DValue(result, "state")}\nНативное обновление: {nativeResult}";
     }
     private string InstalledNativeRevision()
     {
@@ -525,7 +525,7 @@ public sealed partial class MainWindow
     private async Task CheckNativeUpdateAsync()
     {
         availableNativeUpdate = null; installUpdate.IsEnabled = false;
-        updateStatus.Text = "Проверка официальных native-test выпусков…";
+        updateStatus.Text = "Проверка официальных выпусков XASS…";
         try
         {
             availableNativeUpdate = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);

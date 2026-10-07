@@ -172,7 +172,7 @@ class NativeUiContracts(unittest.TestCase):
         self.assertIn("fileGeneration", window); self.assertIn("generation != fileGeneration", window)
     def test_native_update_boundaries(self):
         code = (WINDOWS / "Xass.Native/Services/NativeUpdateClient.cs").read_text()
-        for check in ["lucifervalter-a11y/XASS", 'StartsWith("native-test-"', "GetProperty(\"prerelease\")", "SHA256", "AllowAutoRedirect = false", "native-test-update.json"]:
+        for check in ["lucifervalter-a11y/XASS", 'StartsWith(channel.TagPrefix', "GetProperty(\"prerelease\")", "SHA256", "AllowAutoRedirect = false", "native-test-update.json", "native-update.json"]:
             self.assertIn(check, code)
         self.assertNotIn("X-Api-Key", code)
 

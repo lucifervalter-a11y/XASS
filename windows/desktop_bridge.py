@@ -398,12 +398,18 @@ class DesktopService:
         result["compatibility_notice"] = identity["reason"]
         return result
 
+    def native_distribution(self) -> str:
+        value = read_json(self.source / "build-info.json").get("distribution", "native-test")
+        if value not in {"native-test", "native"}:
+            raise ValueError("Unknown native distribution")
+        return value
+
     def updates(self) -> dict:
         from client_update import current_version, current_revision
         state = read_json(self.data / ".updates" / ".in-progress")
         result = read_json(self.data / ".updates" / ".last-result.json")
         allowed = {"phase", "version", "revision", "message", "progress", "downloaded", "total", "updated_at", "ok", "finished_at"}
-        return {"version": current_version(), "revision": current_revision(), "distribution": "native-test",
+        return {"version": current_version(), "revision": current_revision(), "distribution": self.native_distribution(),
                 "state": {k: redact(v) if isinstance(v, str) else v for k, v in state.items() if k in allowed},
                 "result": {k: redact(v) if isinstance(v, str) else v for k, v in result.items() if k in allowed},
                 "auto_update": self.settings()["auto_update"]}
@@ -414,7 +420,7 @@ class DesktopService:
         key = str(config.get("api_key") or "")
         with factory(base, timeout=10, trust_env=config.get("trust_env_proxy") is True, follow_redirects=False) as c:
             response = c.get(base + "/agent/update-manifest", headers={"X-Api-Key": key},
-                params={"agent_version": current_version(), "agent_revision": current_revision(), "agent_distribution": "native-test"})
+                params={"agent_version": current_version(), "agent_revision": current_revision(), "agent_distribution": self.native_distribution()})
             if response.status_code == 204:
                 return {"available": False}
             response.raise_for_status()
@@ -426,7 +432,7 @@ class DesktopService:
                 return {"available": False}
         if not isinstance(manifest, dict) or not verify_manifest(manifest, key):
             raise ValueError("Unverified update manifest")
-        compatible = manifest.get("distribution") == "native-test" and manifest.get("native_ui") is True
+        compatible = manifest.get("distribution") == self.native_distribution() and manifest.get("native_ui") is True
         # No legacy installer/source update may replace this native installation.
         return {"available": True, "compatible": compatible, "version": str(manifest.get("version") or "")[:64],
                 "revision": str(manifest.get("revision") or "")[:128],

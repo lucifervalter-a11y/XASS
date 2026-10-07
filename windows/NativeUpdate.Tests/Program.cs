@@ -52,6 +52,41 @@ static void TotalTimeout(TimeoutException error) => Assert(error.Message.Contain
 
 try
 {
+    await Run("stable and test clients select only their own release channel", async () =>
+    {
+        foreach (var channel in new[] { NativeReleaseChannel.Stable, NativeReleaseChannel.Test })
+        {
+            using var fixture = new Fixture(Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N")), generous, fastIdle, channel);
+            var other = channel == NativeReleaseChannel.Stable ? NativeReleaseChannel.Test : NativeReleaseChannel.Stable;
+            object Release(NativeReleaseChannel c) => new
+            {
+                draft = false, prerelease = c.Prerelease, tag_name = c.TagPrefix + "fixture", assets = new[]
+                {
+                    new { name = c.ManifestName, browser_download_url = $"https://github.com/lucifervalter-a11y/XASS/releases/download/{c.TagPrefix}fixture/{c.ManifestName}", size = 1024 },
+                    new { name = c.InstallerName, browser_download_url = $"https://github.com/lucifervalter-a11y/XASS/releases/download/{c.TagPrefix}fixture/{c.InstallerName}", size = installer.Length }
+                }
+            };
+            var channelManifest = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                distribution = channel.Distribution, filename = channel.InstallerName, version = "1.2.3", revision, sha256 = hash, size = installer.Length
+            });
+            fixture.Handler.Enqueue(JsonSerializer.SerializeToUtf8Bytes(new[] { Release(other), Release(channel) }));
+            fixture.Handler.Enqueue(channelManifest);
+            var found = await fixture.Client.CheckAsync("", default);
+            Assert(found is not null && found.Tag == channel.TagPrefix + "fixture", "Cross-channel release was selected");
+            Assert(fixture.Handler.Requests.Last().AbsolutePath.EndsWith(channel.ManifestName), "Wrong manifest was requested");
+            fixture.Handler.Enqueue(installer);
+            string path = await fixture.Client.DownloadAsync(found!, new ProgressRecorder(), default);
+            Assert(Path.GetFileName(path) == channel.DownloadPrefix + revision + ".exe", "Wrong installer staging identity");
+            fixture.Handler.Enqueue(JsonSerializer.SerializeToUtf8Bytes(new[] { Release(channel) }));
+            fixture.Handler.Enqueue(JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                distribution = other.Distribution, filename = channel.InstallerName, version = "1.2.3", revision, sha256 = hash, size = installer.Length
+            }));
+            await Fails<InvalidOperationException>(() => fixture.Client.CheckAsync("", default));
+        }
+        await Fails<InvalidOperationException>(() => Task.FromResult(NativeReleaseChannel.FromDistribution("installer")));
+    });
     foreach (bool stallManifest in new[] { false, true })
     {
         await Run($"{(stallManifest ? "manifest" : "release list")} headers then stalled body times out and retries", async () =>
@@ -247,11 +282,11 @@ sealed class Fixture : IDisposable
     public FakeHttpHandler Handler { get; } = new();
     public NativeUpdateClient Client { get; }
     private readonly HttpClient http;
-    public Fixture(string folder, TimeSpan total, TimeSpan idle)
+    public Fixture(string folder, TimeSpan total, TimeSpan idle, NativeReleaseChannel? channel = null)
     {
         Folder = folder; Directory.CreateDirectory(folder);
         http = new HttpClient(Handler) { Timeout = Timeout.InfiniteTimeSpan };
-        Client = new NativeUpdateClient(http, total, total, idle, folder);
+        Client = new NativeUpdateClient(http, total, total, idle, folder, channel);
     }
     public void Dispose() => http.Dispose();
 }

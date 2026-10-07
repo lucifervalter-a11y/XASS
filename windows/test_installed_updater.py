@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--installed', type=Path, required=True)
     parser.add_argument('--installer', type=Path, required=True)
     parser.add_argument('--report', type=Path, required=True)
+    parser.add_argument('--target-metadata', type=Path)
     args = parser.parse_args()
     if os.name != 'nt' or os.environ.get('GITHUB_ACTIONS') != 'true' or not os.environ.get('RUNNER_TEMP'):
         raise SystemExit('Requires an ephemeral GitHub Actions Windows runner')
@@ -39,25 +40,32 @@ def main():
     if not installed.is_relative_to(Path(os.environ['RUNNER_TEMP']).resolve(strict=True)):
         raise SystemExit('Smoke installation must be within this ephemeral runner temp folder')
     identity = json.loads((installed / 'native-install.json').read_text())
-    revision = identity['revision']
+    target = json.loads(args.target_metadata.read_text()) if args.target_metadata else identity
+    revision = target['revision']
     updates = Path(os.environ['LOCALAPPDATA']) / 'XASS.Native' / 'updates'
     updates.mkdir(parents=True, exist_ok=True)
-    installer = updates / ('XASS-Native-Test-' + revision + '.exe')
+    prefixes = {'native': 'XASS-Native-', 'native-test': 'XASS-Native-Test-'}
+    installer = updates / (prefixes[target['distribution']] + revision + '.exe')
     if installer.exists():
-        raise SystemExit('Do not overwrite an existing updater download')
-    shutil.copyfile(args.installer.resolve(strict=True), installer)
+        if digest(installer) != digest(args.installer.resolve(strict=True)):
+            raise SystemExit('Do not overwrite a different updater download')
+    else:
+        shutil.copyfile(args.installer.resolve(strict=True), installer)
+    if args.target_metadata and (digest(installer) != target['sha256'] or installer.stat().st_size != target['size']):
+        raise SystemExit('Target installer does not match its metadata')
     marker = updates.parent / ('ci-preserve-' + uuid.uuid4().hex + '.txt')
     marker.write_text('ephemeral-ci-marker')
-    report = {'schema': 1, 'revision': revision, 'same_version': True}
+    report = {'schema': 1, 'revision': revision, 'same_version': identity['revision'] == revision,
+              'from_distribution': identity['distribution'], 'to_distribution': target['distribution']}
     try:
         for label, kind, expected in (
-            ('verified_install_and_native_readiness', NativeUpdater, 0),
             ('injected_failure_and_actual_rollback', ForcedPostInstallHealthFailure, 3),
+            ('verified_install_and_native_readiness', NativeUpdater, 0),
         ):
             job = updates / ('job-' + uuid.uuid4().hex)
             job.mkdir()
             request = {'schema': 1, 'job_id': job.name, 'install_root': str(installed), 'installer': str(installer),
-                       'sha256': digest(installer), 'size': installer.stat().st_size, 'version': identity['version'],
+                       'sha256': digest(installer), 'size': installer.stat().st_size, 'version': target['version'],
                        'revision': revision, 'parent_pid': os.getpid(), 'parent_created': 1.0, 'automatic': False}
             write_json(job / 'request.json', request)
             updater = kind(job / 'request.json')
@@ -72,17 +80,23 @@ def main():
                 if marker.read_text() != 'ephemeral-ci-marker':
                     raise RuntimeError('Updater changed an out-of-install user-data marker')
                 registration = updater.read_uninstall_registration()
-                if not registration or any(registration.get(key) != value for key, value in updater.registry.items()):
-                    raise RuntimeError('Per-user uninstall registration was not preserved/restored')
+                if not registration:
+                    raise RuntimeError('Per-user uninstall registration was lost')
+                if expected == 3 and any(registration.get(key) != value for key, value in updater.registry.items()):
+                    raise RuntimeError('Per-user uninstall registration was not restored')
+                if registration.get('InstallLocation') != updater.registry.get('InstallLocation'):
+                    raise RuntimeError('Update changed the registered installation directory')
                 report[label] = 'passed'
             finally:
                 # Stop only executables under this exact ephemeral install root.
                 updater.stop_install_processes()
-            if json.loads((installed / 'native-install.json').read_text())['revision'] != revision:
-                raise RuntimeError('Installed revision changed unexpectedly')
+            actual = json.loads((installed / 'native-install.json').read_text())
+            wanted = identity if expected == 3 else target
+            if any(actual[key] != wanted[key] for key in ('revision', 'distribution', 'version')):
+                raise RuntimeError('Installed identity does not match the expected update/rollback result')
         args.report.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.report, report)
-        print('Real same-version update, native readiness and injected-failure rollback passed. Cross-version acceptance remains separate.')
+        print('Real installed update, native readiness, channel identity and injected-failure rollback passed.')
     finally:
         marker.unlink(missing_ok=True)
 

@@ -110,14 +110,19 @@ class NativeUpdater:
             raise ValueError("Unsafe installation root")
         if self.install in {self.job, self.job.parent} or self.install.is_relative_to(self.job) or self.job.is_relative_to(self.install):
             raise ValueError("Update workspace overlaps installation")
-        if self.installer.parent != root.resolve() or self.installer.name != "XASS-Native-Test-" + r["revision"] + ".exe":
+        expected_names = {"XASS-Native-Test-" + r["revision"] + ".exe": "native-test",
+                          "XASS-Native-" + r["revision"] + ".exe": "native"}
+        if self.installer.parent != root.resolve() or self.installer.name not in expected_names:
             raise ValueError("Installer outside verified update folder")
         data = root.parent.parent / "XASS"
         if self.install == data or self.install.is_relative_to(data) or data.is_relative_to(self.install):
             raise ValueError("Installation overlaps agent data")
         self.previous = object_file(self.install / "native-install.json", 16384)
-        if self.previous.get("app_id") != APP_ID or self.previous.get("distribution") != "native-test":
-            raise ValueError("Not a native-test installation")
+        self.release_distribution = expected_names[self.installer.name]
+        if self.previous.get("app_id") != APP_ID or self.previous.get("distribution") not in {"native-test", "native"}:
+            raise ValueError("Not a native installation")
+        if self.previous.get("distribution") == "native" and self.release_distribution != "native":
+            raise ValueError("A stable installation cannot move to the test channel")
         if not re.fullmatch(r"[a-fA-F0-9]{40}", str(self.previous.get("revision") or "")):
             raise ValueError("Installed revision is unknown")
         if self.installer.stat().st_size != r["size"] or digest(self.installer) != r["sha256"].lower():
@@ -232,7 +237,8 @@ class NativeUpdater:
 
     def verify_installed(self, revision: str):
         marker = object_file(self.install / "native-install.json", 16384)
-        if marker.get("app_id") != APP_ID or marker.get("distribution") != "native-test" or marker.get("revision") != revision:
+        expected_distribution = self.previous["distribution"] if revision == self.previous["revision"] else self.release_distribution
+        if marker.get("app_id") != APP_ID or marker.get("distribution") != expected_distribution or marker.get("revision") != revision:
             raise ValueError("Installed identity/revision mismatch")
         payload = object_file(self.install / "payload-manifest.json", 16 * 1024 * 1024)
         if payload.get("revision") != revision or not isinstance(payload.get("files"), list):

@@ -15,7 +15,7 @@ public sealed class NativeUpdateCoordinator
         if (!File.Exists(marker) || !File.Exists(Path.Combine(runtime, "XASS.NativeHelper.exe")))
             throw new InvalidOperationException("Автоматическое обновление поддерживается после установки полного нативного пакета.");
         using (var document = JsonDocument.Parse(await File.ReadAllTextAsync(marker, token)))
-            if (document.RootElement.GetProperty("distribution").GetString() != "native-test"
+            if (document.RootElement.GetProperty("distribution").GetString() is not ("native-test" or "native")
                 || document.RootElement.GetProperty("app_id").GetString() != "B4D7E8B9-9C58-4C36-A432-D114393006D8")
                 throw new InvalidOperationException("Неизвестная установка XASS. Обновление остановлено.");
         string job = Path.Combine(UpdatesRoot, "job-" + Guid.NewGuid().ToString("N"));

@@ -2,7 +2,8 @@ param(
     [string]$PythonPath = "python.exe",
     [string]$IsccPath,
     [string]$Revision = "local-build",
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [ValidateSet('native-test', 'native')][string]$Distribution = 'native-test'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +54,7 @@ $Native = Join-Path $BuildRoot 'native'
 & dotnet publish (Join-Path $PSScriptRoot 'Xass.Native\Xass.Native.csproj') -c Release -r win-x64 -p:RuntimeIdentifiers=win-x64 -p:Platform=x64 -o $Native
 if ($LASTEXITCODE -ne 0) { throw 'WinUI publish failed.' }
 $Metadata = Join-Path $BuildRoot 'build-info.json'
-$BuildInfo = @{ version = $Version; revision = $Revision; distribution = 'native-test'; local_build = ($Revision -eq 'local-build') } | ConvertTo-Json
+$BuildInfo = @{ version = $Version; revision = $Revision; distribution = $Distribution; local_build = ($Revision -eq 'local-build') } | ConvertTo-Json
 [IO.File]::WriteAllText($Metadata, $BuildInfo, (New-Object Text.UTF8Encoding($false)))
 $Dist = Join-Path $BuildRoot 'frozen'
 $FreezeArguments = @(
@@ -110,19 +111,21 @@ $Payload = Join-Path $BuildRoot 'payload'
 & $Python -I -B (Join-Path $PSScriptRoot 'stage_native_package.py') --native $Native --companion $Companion --destination $Payload --licenses $Licenses --revision $Revision
 if ($LASTEXITCODE -ne 0) { throw 'Native payload verification failed.' }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-& $IsccPath "/DXassVersion=$Version" "/DSourceDir=$Payload" "/DOutputDir=$OutputDirectory" (Join-Path $PSScriptRoot 'packaging\XASS-Native.iss')
+& $IsccPath "/DXassVersion=$Version" "/DXassDistribution=$Distribution" "/DSourceDir=$Payload" "/DOutputDir=$OutputDirectory" (Join-Path $PSScriptRoot 'packaging\XASS-Native.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
-$Installer = Join-Path $OutputDirectory 'XASS-Native-Test-Setup.exe'
+$InstallerName = if ($Distribution -eq 'native') { 'XASS-Native-Setup.exe' } else { 'XASS-Native-Test-Setup.exe' }
+$ManifestName = if ($Distribution -eq 'native') { 'native-update.json' } else { 'native-test-update.json' }
+$Installer = Join-Path $OutputDirectory $InstallerName
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) { throw 'Installer executable not produced.' }
 $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLowerInvariant()
-"$Hash  XASS-Native-Test-Setup.exe" | Set-Content -LiteralPath "$Installer.sha256" -Encoding ascii
+"$Hash  $InstallerName" | Set-Content -LiteralPath "$Installer.sha256" -Encoding ascii
 $InstallerMetadata = @{ version = $Version; revision = $Revision; sha256 = $Hash; bytes = (Get-Item -LiteralPath $Installer).Length;
-   distribution = 'native-test'; python_bundled = $true; whisper_runtime_bundled = $true; whisper_model_bundled = $false } |
+   distribution = $Distribution; python_bundled = $true; whisper_runtime_bundled = $true; whisper_model_bundled = $false } |
     ConvertTo-Json
-[IO.File]::WriteAllText((Join-Path $OutputDirectory 'XASS-Native-Test-Setup.json'), $InstallerMetadata, (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText((Join-Path $OutputDirectory ([IO.Path]::ChangeExtension($InstallerName, '.json'))), $InstallerMetadata, (New-Object Text.UTF8Encoding($false)))
 $UpdateMetadata = @{ version = $Version; revision = $Revision; sha256 = $Hash; size = (Get-Item -LiteralPath $Installer).Length;
-   filename = 'XASS-Native-Test-Setup.exe'; distribution = 'native-test' } |
+   filename = $InstallerName; distribution = $Distribution } |
     ConvertTo-Json
-[IO.File]::WriteAllText((Join-Path $OutputDirectory 'native-test-update.json'), $UpdateMetadata, (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText((Join-Path $OutputDirectory $ManifestName), $UpdateMetadata, (New-Object Text.UTF8Encoding($false)))
 Copy-Item -LiteralPath (Join-Path $Payload 'payload-manifest.json') -Destination $OutputDirectory -Force
 Write-Output "Built complete single-download installer: $Installer (SHA256 $Hash)"

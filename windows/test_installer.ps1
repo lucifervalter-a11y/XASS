@@ -1,4 +1,5 @@
-param([Parameter(Mandatory=$true)][string]$Installer, [Parameter(Mandatory=$true)][string]$PayloadManifest)
+param([Parameter(Mandatory=$true)][string]$Installer, [Parameter(Mandatory=$true)][string]$PayloadManifest,
+      [string]$PreviousInstaller, [string]$TargetMetadata)
 $ErrorActionPreference = 'Stop'
 # This exercises real per-user installer registration and uninstall. Restrict it
 # to an ephemeral GitHub runner, never silently run it on someone's workstation.
@@ -45,6 +46,15 @@ try {
     }
     & python -I -X utf8 -B (Join-Path $PSScriptRoot 'test_installed_updater.py') --installed $InstallDir --installer $Installer --report (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\windows-native-smoke.json')
     if ($LASTEXITCODE -ne 0) { throw 'Real installed updater/rollback smoke failed.' }
+    if ($PreviousInstaller) {
+        if (-not $TargetMetadata) { throw 'Migration smoke requires verified target metadata.' }
+        $Process = Start-Process -FilePath (Join-Path $InstallDir 'unins000.exe') -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
+        if ($Process.ExitCode -ne 0) { throw 'Pre-migration uninstall failed.' }
+        $Process = Start-Process -FilePath ([IO.Path]::GetFullPath($PreviousInstaller)) -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOICONS', "/DIR=`"$InstallDir`"") -WindowStyle Hidden -Wait -PassThru
+        if ($Process.ExitCode -ne 0) { throw 'Previous native channel install failed.' }
+        & python -I -X utf8 -B (Join-Path $PSScriptRoot 'test_installed_updater.py') --installed $InstallDir --installer $Installer --target-metadata $TargetMetadata --report (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\windows-native-migration-smoke.json')
+        if ($LASTEXITCODE -ne 0) { throw 'Native test-to-stable migration/rollback smoke failed.' }
+    }
     $Uninstaller = Join-Path $InstallDir 'unins000.exe'
     $Process = Start-Process -FilePath $Uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
     if ($Process.ExitCode -ne 0) { throw 'Native test uninstall failed.' }

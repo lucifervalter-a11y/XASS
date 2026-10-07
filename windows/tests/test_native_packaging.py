@@ -92,6 +92,12 @@ class PackagingTests(unittest.TestCase):
                 package.require_x64_pe(path)
 
     def test_stage_copies_all_runtime_files_and_records_hashes(self):
+        self.assert_staging_channel("native-test")
+
+    def test_stable_stage_preserves_channel_in_all_identity_files(self):
+        self.assert_staging_channel("native")
+
+    def assert_staging_channel(self, distribution):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             native, companion, source, licenses = (root / name for name in ('native', 'companion', 'source', 'licenses'))
@@ -108,7 +114,7 @@ class PackagingTests(unittest.TestCase):
             (native / 'extra-required.dll').write_bytes(b'keep complete native folder')
             (companion / 'XASS.NativeHelper.exe').write_bytes(image)
             (companion / '_internal/python312.dll').write_bytes(b'python fixture')
-            (companion / '_internal/build-info.json').write_text(json.dumps({'revision': 'a' * 40, 'distribution': 'native-test', 'version': '1.0.0'}))
+            (companion / '_internal/build-info.json').write_text(json.dumps({'revision': 'a' * 40, 'distribution': distribution, 'version': '1.0.0'}))
             for name in ('module.py', 'requirements.txt', 'voice-requirements.txt', 'version.json'):
                 (source / 'pc_client' / name).write_text('fixture')
             (licenses / 'python-LICENSE.txt').write_text('license fixture')
@@ -132,7 +138,9 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(json.loads((destination / 'build-info.json').read_text())['revision'], 'a' * 40)
             marker = json.loads((destination / 'native-install.json').read_text())
             self.assertEqual(marker['revision'], 'a' * 40)
-            self.assertEqual(marker['distribution'], 'native-test')
+            self.assertEqual(marker['distribution'], distribution)
+            for identity in ('build-info.json', 'pc_client/build-info.json', 'runtime/_internal/build-info.json'):
+                self.assertEqual(json.loads((destination / identity).read_text())['distribution'], distribution)
             self.assertIn('native-install.json', indexed)
             self.assertEqual((destination / 'build-info.json').read_bytes(), (destination / 'pc_client/build-info.json').read_bytes())
 
@@ -156,7 +164,9 @@ class PackagingTests(unittest.TestCase):
     def test_installer_is_separate_per_user_and_preserves_data(self):
         installer = (ROOT / 'windows/packaging/XASS-Native.iss').read_text()
         for contract in ('PrivilegesRequired=lowest', 'UsePreviousAppDir=yes', 'CloseApplications=yes',
-                         'DefaultDirName={localappdata}\\Programs\\XASS-Native-Test', 'recursesubdirs', 'skipifsilent'):
+                         'DefaultDirName={localappdata}\\Programs\\{#NativeDirectory}', 'recursesubdirs', 'skipifsilent',
+                         '#define NativeDirectory "XASS-Native"', '#define NativeDirectory "XASS-Native-Test"',
+                         'B4D7E8B9-9C58-4C36-A432-D114393006D8'):
             self.assertIn(contract, installer)
         deletes = installer.split('[InstallDelete]', 1)[1].split('[Icons]', 1)[0]
         self.assertNotIn('Name: "{localappdata}', deletes)
