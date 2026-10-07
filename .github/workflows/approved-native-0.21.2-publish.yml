@@ -1,0 +1,96 @@
+name: Publish approved Windows Native 0.21.2
+
+on:
+  push:
+    branches: [ops/publish-native-0.21.2-20261007]
+    paths: [.github/workflows/approved-native-0.21.2-publish.yml]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: xass-approved-native-0.21.2-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_SHA: ac39edb0da2d7e56b49428e1fd893f7b75f9d7a7
+      CI_SHA: 9fc38807f6398698e162e48145ec173f8553daae
+      GH_REPO: lucifervalter-a11y/XASS
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: native-stable-0.21.2-ac39edb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          persist-credentials: false
+      - name: Require successful exact-revision build and all installer checks
+        shell: python
+        run: |
+          import json, os, subprocess
+          from pathlib import Path
+          run_id = 37700524422
+          run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/actions/runs/{run_id}']))
+          assert run['head_sha'] == os.environ['CI_SHA'] and run['name'] == 'Build approved Windows 0.21.2 installer'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          jobs = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/actions/runs/{run_id}/jobs']))['jobs']
+          assert {j['name'] for j in jobs} == {'regressions', 'build'}
+          assert all(j['conclusion'] == 'success' for j in jobs)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['RELEASE_SHA']
+          evidence = {'application_revision': os.environ['RELEASE_SHA'], 'run_id': run_id, 'ci_revision': run['head_sha'], 'conclusion': run['conclusion'], 'url': run['html_url'], 'jobs': [{'name': j['name'], 'conclusion': j['conclusion']} for j in jobs]}
+          Path('verified-checks.json').write_text(json.dumps(evidence, indent=2))
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-native-installer
+          run-id: 37700524422
+          github-token: ${{ github.token }}
+          path: release/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-native-installer-smoke
+          run-id: 37700524422
+          github-token: ${{ github.token }}
+          path: release/checks
+      - name: Verify complete installer and real upgrade and rollback evidence
+        shell: python
+        run: |
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('release/windows')
+          metadata = json.loads((root / 'native-update.json').read_text())
+          assert metadata['revision'] == os.environ['RELEASE_SHA'] and metadata['distribution'] == 'native'
+          assert metadata['filename'] == 'XASS-Native-Setup.exe' and metadata['version'] == '0.21.2'
+          installer = root / metadata['filename']
+          assert installer.stat().st_size == metadata['size']
+          with installer.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == metadata['sha256']
+          for name in ('XASS-Native-Setup.json', 'payload-manifest.json'):
+              assert json.loads((root / name).read_text())['revision'] == os.environ['RELEASE_SHA']
+          for name in ('windows-native-smoke.json', 'windows-native-migration-smoke.json'):
+              result = json.loads((Path('release/checks') / name).read_text())
+              assert result['revision'] == os.environ['RELEASE_SHA']
+              assert result['injected_failure_and_actual_rollback'] == 'passed'
+              assert result['verified_install_and_native_readiness'] == 'passed'
+              assert result['from_distribution'] == 'native' and result['to_distribution'] == 'native'
+              assert result['same_version'] is ('migration' not in name)
+      - name: Publish Windows-only immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp verified-checks.json release/checks/
+          cat > release-notes.md <<'NOTES'
+          XASS Native 0.21.2 for Windows: a responsive music workspace with embedded cover art, timed lyrics, queue and session history; a compact assistant with visible command plans and execution states; persistent light/dark themes and custom accent colors.
+
+          The assistant uses an explicit action allowlist and validated parameters. Microphone capture starts only through the user's controls. No speech model or paid AI account is bundled. Optional background voice mode remains opt-in. Discord voice joining requires a separately configured authorized OAuth/RPC integration; it is blocked when unavailable. Music Rich Presence is optional and requires a public Discord Application ID.
+
+          The exact source revision and successful CI are recorded in verified-checks.json. CI covers Python/browser contracts, native build and bundled runtime, fresh installation, same-version update, upgrade from stable 0.21.1, an injected failure with actual rollback, and uninstall with preserved user-data markers. Payload hashes and actual installer reports are included.
+
+          This release contains Windows artifacts only. No personal configuration, credentials, recordings, speech model, Minecraft data, or account tokens are included.
+          NOTES
+          gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title 'XASS Native 0.21.2 � Player and compact assistant' --notes-file release-notes.md --latest=false release/windows/XASS-Native-Setup.exe release/windows/XASS-Native-Setup.exe.sha256 release/windows/XASS-Native-Setup.json release/windows/native-update.json release/windows/payload-manifest.json release/checks/*.json
+          test "$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha)" = "$RELEASE_SHA"
+
