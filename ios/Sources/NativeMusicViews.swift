@@ -328,9 +328,6 @@ private struct NativeLibraryBrowser: View, Equatable {
                     NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
                         Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
                     }.accessibilityIdentifier("nativeTrackInformation")
-                    NavigationLink { NativePCTranscriptionView(store: store, trackID: track.id) } label: {
-                        Label("Текст и таймкоды на ПК", systemImage: "desktopcomputer.and.arrow.down")
-                    }.accessibilityIdentifier("nativeTrackPCTranscription")
                     Section("Обложка") {
                         NativeArtworkPicker(store: store, trackID: track.id)
                     }

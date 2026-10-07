@@ -24,6 +24,10 @@ enum PlayerMotion {
     static let trackChange = Animation.spring(response: 0.42, dampingFraction: 0.9)
     static let background = Animation.easeInOut(duration: 0.7)
     static func expand(_ reduceMotion: Bool) -> Animation { reduceMotion ? fade : hero }
+    /// A bounded landing without the invisible settling tail of the opening spring.
+    static func collapse(_ reduceMotion: Bool) -> Animation {
+        .easeOut(duration: reduceMotion ? 0.16 : 0.24)
+    }
 }
 
 /// Everything store-specific that Now Playing can host without knowing NativeStore.

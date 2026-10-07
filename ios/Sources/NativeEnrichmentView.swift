@@ -59,10 +59,11 @@ enum NativeEnrichmentPresentation {
     @State private var transcript = ""
     /// The recognizer's LRC; its timestamps are put back on save.
     @State private var transcriptLRC = ""
+    @State private var transcriptResult: NativeTranscriptResult?
     @AppStorage("xass.transcription.allowNetwork") private var allowNetworkRecognition = false
     @State private var language = "ru-RU"
     @State private var job: Task<Void, Never>?
-    /// The on-device recognizer is a hidden fallback; the PC transcription is primary.
+    /// iPhone recognition is a hidden fallback; the PC transcription is primary.
     @State private var showPhoneTranscription = false
     private var candidates: [[String: Any]] { info["candidates"] as? [[String: Any]] ?? [] }
     private var title: String { store.tracks.first { $0.id == trackID }?.title ?? (store.currentTrack?.id == trackID ? store.currentTrack?.title : nil) ?? "Песня" }
@@ -171,7 +172,10 @@ enum NativeEnrichmentPresentation {
                 }
             }
             if !transcript.isEmpty {
-                Text("Автоматическая расшифровка · проверьте слова").font(.caption).foregroundStyle(.orange)
+                if let result = transcriptResult {
+                    Text(result.reviewNotice).font(.caption).foregroundStyle(.orange)
+                        .accessibilityIdentifier("transcriptReviewNotice")
+                }
                 TextEditor(text: $transcript).frame(minHeight: 200).font(.body).accessibilityIdentifier("transcriptPreview")
                 Text("Таймкоды не показываются, но сохраняются. Если изменить число строк, время распределится по песне приблизительно.")
                     .font(.caption2).foregroundStyle(.secondary)
@@ -217,7 +221,8 @@ enum NativeEnrichmentPresentation {
         job = Task {
             do {
                 let result = try await transcriber.transcribe(file: file, language: language, allowNetwork: allowNetworkRecognition)
-                try Task.checkCancellation(); transcriptLRC = result; transcript = NativeLRCText.plainText(result)
+                try Task.checkCancellation()
+                transcriptResult = result; transcriptLRC = result.lrc; transcript = NativeLRCText.plainText(result.lrc)
             }
             catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
@@ -233,7 +238,8 @@ enum NativeEnrichmentPresentation {
                 let response = try await store.api.request("/api/mini/music/tracks/\(trackID)/lyrics", method: "PUT", body: ["text": text, "source": "on_device_transcription"])
                 try store.applyEnrichmentMutationReceipt(response)
                 info["owner_lyrics_available"] = true; info["owner_lyrics_enabled"] = true
-                transcript = ""; transcriptLRC = ""; message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
+                transcript = ""; transcriptLRC = ""; transcriptResult = nil
+                message = "Текст сохранён. Откройте его в плеере — строки будут следовать реальным таймкодам распознавания."
             } catch { if !Task.isCancelled { message = error.localizedDescription } }
         }
     }

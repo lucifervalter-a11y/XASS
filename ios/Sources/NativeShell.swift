@@ -6,12 +6,13 @@ import AVKit
 /// (e.g. a 401 while the queue was open never showed enrollment). `resolve`
 /// picks exactly one by priority: account/enrollment beats everything.
 enum NativeShellSheet: Hashable, Identifiable {
-    case enrollment, route, actions(Int), queue, fixtureDevice, fixtureStorage, fixtureAlbums, fixtureMusicImport
+    case enrollment, route, actions(Int), lyricsTools(Int), queue, fixtureDevice, fixtureStorage, fixtureAlbums, fixtureMusicImport
     var id: String {
         switch self {
         case .enrollment: return "enrollment"
         case .route: return "route"
         case .actions(let id): return "actions-\(id)"
+        case .lyricsTools(let id): return "lyrics-tools-\(id)"
         case .queue: return "queue"
         case .fixtureDevice: return "fixtureDevice"
         case .fixtureStorage: return "fixtureStorage"
@@ -21,10 +22,11 @@ enum NativeShellSheet: Hashable, Identifiable {
     }
     static func resolve(enrollment: Bool, route: Bool, actionsTrackID: Int?, queue: Bool,
                         fixtureDevice: Bool = false, fixtureStorage: Bool = false,
-                        fixtureAlbums: Bool = false, fixtureMusicImport: Bool = false) -> NativeShellSheet? {
+                        fixtureAlbums: Bool = false, fixtureMusicImport: Bool = false, lyricsToolsTrackID: Int? = nil) -> NativeShellSheet? {
         if enrollment { return .enrollment }
         if route { return .route }
         if let id = actionsTrackID { return .actions(id) }
+        if let id = lyricsToolsTrackID { return .lyricsTools(id) }
         if queue { return .queue }
         if fixtureDevice { return .fixtureDevice }
         if fixtureStorage { return .fixtureStorage }
@@ -47,6 +49,7 @@ enum NativeShellSheet: Hashable, Identifiable {
     @State private var nowPlayingLyrics = false
     @State private var showQueue = false
     @State private var playerActions: LibraryTrack?
+    @State private var lyricsToolsTrackID: Int?
     /// Set when the device picker was opened from Now Playing: closing the picker
     /// returns to Now Playing instead of dropping to the mini player.
     @State private var returnToNowPlaying = false
@@ -69,6 +72,11 @@ enum NativeShellSheet: Hashable, Identifiable {
             tabs.accessibilityHidden(rootOverlay == .nowPlaying)
             playerLayer
         }
+            .transformEnvironment(\.accessibilityReduceMotion) { value in
+                #if DEBUG && targetEnvironment(simulator)
+                if NativeFixture.enabled && ProcessInfo.processInfo.arguments.contains("--native-ui-reduce-motion") { value = true }
+                #endif
+            }
             .task(id: store.currentID) {
                 // Enrichment never delays Play or takes over the current route.
                 if let id = store.currentID, store.authorized { _ = try? await store.enrichTrack(id) }
@@ -77,7 +85,7 @@ enum NativeShellSheet: Hashable, Identifiable {
             .onChange(of: store.showRoutePicker) { _, open in
                 if open {
                     store.showPlayer = false; store.showLogin = false; store.showEnrollment = false
-                    showQueue = false; playerActions = nil
+                    showQueue = false; playerActions = nil; lyricsToolsTrackID = nil
                 } else if returnToNowPlaying {
                     returnToNowPlaying = false
                     if store.currentTrack != nil && !store.showEnrollment && !store.showLogin {
@@ -95,12 +103,12 @@ enum NativeShellSheet: Hashable, Identifiable {
             .onChange(of: store.showLogin) { _, open in
                 // 401: enrollment must win over whatever sheet is up (queue, actions, route).
                 if open {
-                    returnToNowPlaying = false; showQueue = false; playerActions = nil
+                    returnToNowPlaying = false; showQueue = false; playerActions = nil; lyricsToolsTrackID = nil
                     store.showRoutePicker = false; store.showPlayer = false; store.showLogin = false; store.showEnrollment = true
                 }
             }
             .onChange(of: store.showEnrollment) { _, open in
-                if open { returnToNowPlaying = false; showQueue = false; playerActions = nil; store.showRoutePicker = false; store.showPlayer = false }
+                if open { returnToNowPlaying = false; showQueue = false; playerActions = nil; lyricsToolsTrackID = nil; store.showRoutePicker = false; store.showPlayer = false }
             }
             .onAppear {
                 #if DEBUG && targetEnvironment(simulator)
@@ -148,7 +156,7 @@ enum NativeShellSheet: Hashable, Identifiable {
             NativeShellSheet.resolve(enrollment: store.showEnrollment, route: store.showRoutePicker,
                                      actionsTrackID: playerActions?.id, queue: showQueue,
                                      fixtureDevice: fixtureDevice, fixtureStorage: fixtureStorage,
-                                     fixtureAlbums: fixtureAlbums, fixtureMusicImport: fixtureMusicImport)
+                                     fixtureAlbums: fixtureAlbums, fixtureMusicImport: fixtureMusicImport, lyricsToolsTrackID: lyricsToolsTrackID)
         }, set: { value in
             guard value == nil else { return }
             // Clear only what was actually on screen; lower-priority flags stay.
@@ -156,6 +164,7 @@ enum NativeShellSheet: Hashable, Identifiable {
             case .enrollment: store.showEnrollment = false
             case .route: store.showRoutePicker = false
             case .actions: playerActions = nil
+            case .lyricsTools: lyricsToolsTrackID = nil
             case .queue: showQueue = false
             case .fixtureDevice: fixtureDevice = false
             case .fixtureStorage: fixtureStorage = false
@@ -172,6 +181,14 @@ enum NativeShellSheet: Hashable, Identifiable {
         case .route: NativeRoutePicker(store: store)
         case .actions:
             if let track = playerActions { NativeTrackActions(store: store, track: track) }
+        case .lyricsTools(let id):
+            NavigationStack {
+                NativeEnrichmentView(store: store, trackID: id).toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Готово") { lyricsToolsTrackID = nil }.accessibilityIdentifier("lyricsToolsDone")
+                    }
+                }
+            }
         case .queue: NativeQueueView(store: store)
         case .fixtureDevice: NavigationStack { if let device = store.devices.first { NativeDeviceDetail(store: store, deviceID: device.id) } }
         case .fixtureStorage: NavigationStack { NativeStorageView(store: store) }
@@ -237,7 +254,7 @@ enum NativeShellSheet: Hashable, Identifiable {
         slots.onDevices = { [store] in returnToNowPlaying = true; store.openRoutePicker() }
         slots.onQueue = { showQueue = true }
         slots.onMore = { [store] in playerActions = store.currentTrack }
-        slots.onLyricsTools = { [store] in playerActions = store.currentTrack }
+        slots.onLyricsTools = { [store] in lyricsToolsTrackID = store.currentID }
         return slots
     }
 
@@ -245,6 +262,8 @@ enum NativeShellSheet: Hashable, Identifiable {
     private var fixtureSlots: NowPlayingSlots {
         var slots = NowPlayingSlots()
         slots.sourceLabel = "Тестовый плеер"
+        slots.onMore = { [store] in playerActions = store.currentTrack }
+        slots.onLyricsTools = { [store] in lyricsToolsTrackID = store.currentID }
         slots.deviceLabel = store.deviceLabel
         // Opens the existing route sheet: proves Now Playing yields to `.devicePicker`.
         slots.onDevices = { [store] in returnToNowPlaying = true; store.openRoutePicker() }

@@ -125,5 +125,8 @@ final class NativePlayerOverlayTests: XCTestCase {
         XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: 7, queue: true), .actions(7))
         XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: nil, queue: true), .queue)
         XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: nil, queue: false, fixtureAlbums: true), .fixtureAlbums)
+        XCTAssertEqual(S.resolve(enrollment: false, route: false, actionsTrackID: nil, queue: false, lyricsToolsTrackID: 7), .lyricsTools(7))
+        XCTAssertEqual(S.resolve(enrollment: true, route: false, actionsTrackID: nil, queue: false, lyricsToolsTrackID: 7), .enrollment)
+        XCTAssertEqual(S.resolve(enrollment: false, route: true, actionsTrackID: nil, queue: false, lyricsToolsTrackID: 7), .route)
     }
 }

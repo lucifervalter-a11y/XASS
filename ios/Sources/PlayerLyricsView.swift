@@ -126,12 +126,6 @@ import UIKit
                 if !lyrics.hasTranslation {
                     Text("Перевод появится, когда его вернёт ваш XASS")
                 }
-                if let onTextTools {
-                    Divider()
-                    Button(action: onTextTools) {
-                        Label("Найти текст или расшифровать", systemImage: "wand.and.stars")
-                    }
-                }
             } label: {
                 Image(systemName: showPronunciation ? "character.bubble.fill" : "character.bubble")
                     .font(.title3.weight(.semibold)).frame(width: 46, height: 46)
