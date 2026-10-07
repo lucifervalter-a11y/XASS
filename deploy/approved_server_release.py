@@ -2,7 +2,7 @@
 """One approved code-only deployment; never changes dependencies, config or DB.
 
 Stream this helper over the existing pinned SSH transport. The server receives
-only the release commit (parent of the workflow commit), not this ops tooling.
+only the approved release commit, not this ops tooling.
 All subprocess stderr and response bodies stay private; receipts contain checks.
 """
 from __future__ import annotations
@@ -135,14 +135,22 @@ def api_checks(port, *, public=True):
                     require(response.url == origin + path, "API request unexpectedly redirected.")
             except urllib.error.HTTPError as exc:
                 status, body = exc.code, b""
+            except urllib.error.URLError as exc:
+                reason = type(exc.reason).__name__
+                verification = getattr(exc.reason, "verify_code", None)
+                raise Stop(f"{label}_{key}: transport failed ({reason}, TLS verify code {verification}).") from None
             if key.endswith("_auth"):
                 require(status in {401, 403}, "Protected API is not rejecting unauthenticated requests.")
             else:
                 require(status == 200 and len(body) <= 65536, "Public health API failed.")
-                data = json.loads(body)
+                try:
+                    data = json.loads(body)
+                except (ValueError, UnicodeError):
+                    raise Stop(f"{label}_{key}: response is not valid JSON.") from None
                 require(data.get("status") == "ok" if key == "health" else data.get("ok") is True,
                         "Health API returned an unexpected contract.")
             checks[f"{label}_{key}"] = status
+            progress(f"api_{label}_{key}_status_{status}")
     return checks
 
 
@@ -272,7 +280,11 @@ def deploy(support, run_id):
         progress("baseline_matches_fetching_approved_branch")
         git(ROOT, "fetch", "--no-tags", "origin", f"refs/heads/{BRANCH}")
         require(git(ROOT, "rev-parse", "FETCH_HEAD") == support, "Remote workflow branch moved.")
-        require(git(ROOT, "rev-list", "--parents", "-n", "1", support).split() == [support, RELEASE], "Workflow parent differs from release.")
+        git(ROOT, "merge-base", "--is-ancestor", RELEASE, support)
+        support_paths = set(git(ROOT, "diff", "--name-only", RELEASE, support).splitlines())
+        require(support_paths == {".github/workflows/approved-server-runtime.yml",
+                "deploy/approved_server_release.py", "deploy/check_approved_server_release.py",
+                "tests/test_approved_server_release.py"}, "Workflow changes extend beyond approved deployment tooling.")
         validate_release(ROOT, BASE, RELEASE, FILES)
         progress("release_verified_checking_dependencies")
         run([sys.executable, "-m", "pip", "check"])
@@ -280,10 +292,15 @@ def deploy(support, run_id):
         run(["sudo", "-n", "-l", systemctl, "restart", SERVICE])
         progress("restart_permission_verified_checking_service")
         before = service_state(systemctl)
-        progress("service_verified_checking_api_telegram_and_journal")
+        progress("service_verified_checking_api")
+        baseline_api = api_checks(port)
+        progress("api_verified_checking_telegram_get_me")
+        baseline_telegram = telegram_check()
+        progress("telegram_verified_checking_journal")
+        baseline_journal = journal_check(before["InvocationID"], reject_errors=False)
         receipt = {"baseline_matches": True, "release": RELEASE, "workflow": support,
-                   "baseline_api": api_checks(port), "baseline_telegram": telegram_check(),
-                   "baseline_journal": journal_check(before["InvocationID"], reject_errors=False)}
+                   "baseline_api": baseline_api, "baseline_telegram": baseline_telegram,
+                   "baseline_journal": baseline_journal}
         print(json.dumps({"stage": "preflight_passed", **receipt}), flush=True)
         destination = create_backup(ROOT, f"server-{run_id}")
         receipt["backup"] = str(destination)
@@ -342,7 +359,7 @@ def main():
         deploy(sys.argv[1], sys.argv[2])
     except BaseException as exc:
         message = str(exc) if isinstance(exc, Stop) else "Deployment failed; sensitive exception details withheld."
-        print(json.dumps({"status": "failed", "reason": message}), flush=True)
+        print(json.dumps({"status": "failed", "reason": message, "error_type": type(exc).__name__}), flush=True)
         return 1
     return 0
 
