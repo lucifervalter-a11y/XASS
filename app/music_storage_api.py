@@ -133,9 +133,13 @@ def build_router(settings, require_owner, require_action_proof):
         if not value or value.credential_id != auth.credential_id:
             raise HTTPException(404, "Передача не найдена")
         item = await track(session, value.track_id)
+        await lock_track(session, item.id)
+        # A concurrent finish may have completed or reset this job while we
+        # waited for the track lock. Never act on the pre-lock ORM snapshot.
+        await session.refresh(value)
+        await session.refresh(item)
         if item.sha256 != value.sha256 or item.size != value.size:
             raise HTTPException(409, "Версия трека изменилась")
-        await lock_track(session, item.id)
         return value, item
 
     @router.get("/api/mini/music/storage")
@@ -275,8 +279,24 @@ def build_router(settings, require_owner, require_action_proof):
             # A crash after atomic rename but before SQL commit is safely recoverable.
             if destination.is_file() and await asyncio.to_thread(checksum, destination) == (value.sha256, value.size):
                 pass
-            elif not part.is_file() or await asyncio.to_thread(checksum, part) != (value.sha256, value.size):
+            elif not part.is_file() or part.stat().st_size != value.size:
+                # Incomplete uploads keep their durable offset for ordinary resume.
                 raise HTTPException(409, "Восстановленная копия не прошла проверку SHA256/размера")
+            elif await asyncio.to_thread(checksum, part) != (value.sha256, value.size):
+                rejected = part.with_suffix(".rejected")
+                # Keep the bad temporary bytes as a durable retry marker. A
+                # crash between rename and SQL commit cannot grant extra retries.
+                # Never overwrite an existing marker or delete an original/replica.
+                if value.error_code == "restore_checksum_retry" or rejected.exists() or rejected.is_symlink():
+                    value.status, value.error_code, value.updated_at = "failed", "restore_checksum_failed", utcnow()
+                    await session.commit()
+                    raise HTTPException(409, {"code": "restore_checksum_failed", "retryable": False})
+                part.rename(rejected)
+                value.offset, value.error_code, value.updated_at = 0, "restore_checksum_retry", utcnow()
+                await session.commit()
+                # Existing clients retry through the next jobs poll, which now
+                # advertises offset zero. No client release is needed to recover.
+                raise HTTPException(409, {"code": "restore_restart_required", "offset": 0, "retryable": True})
             else:
                 part.replace(destination)
         else:
@@ -287,6 +307,7 @@ def build_router(settings, require_owner, require_action_proof):
                 session.add(copy)
             copy.sha256, copy.size, copy.verified_at = value.sha256, value.size, utcnow()
         value.offset, value.status, value.updated_at = value.size, "complete", utcnow()
+        value.error_code = ""
         await session.commit()
         return {"ok": True, "job": job_json(value)}
 
