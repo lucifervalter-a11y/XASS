@@ -47,8 +47,8 @@ public sealed partial class MainWindow : Window
             RootGrid.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
         }
         // The root retains its opaque themed background without Mica support.
-        RootGrid.SizeChanged += (_, args) => PageLayout.Padding =
-            args.NewSize.Width < 760 ? new Thickness(16) : new Thickness(28);
+        RootGrid.SizeChanged += (_, _) => UpdatePagePadding();
+        Navigation.DisplayModeChanged += (_, _) => UpdatePagePadding();
         TrackList.ItemsSource = Array.Empty<Track>();
         MusicPage.SizeChanged += (_, args) => PlayerScroller.MaxHeight = Math.Clamp(args.NewSize.Height * 0.45, 100, 260);
         DataPath.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS");
@@ -79,6 +79,7 @@ public sealed partial class MainWindow : Window
         };
         UpdateControls();
         InitializeAssistant();
+        InitializeAssistantPresentation();
         InitializeVoice();
         InitializeDesktop();
         _ = DiscoverAssistantModelAsync();
@@ -86,10 +87,14 @@ public sealed partial class MainWindow : Window
         InitializeAppearance();
     }
 
+    private void UpdatePagePadding() => PageLayout.Padding = assistantCompact ? new Thickness(16) : Navigation.DisplayMode == NavigationViewDisplayMode.Minimal
+        ? new Thickness(16, 52, 16, 16) : RootGrid.ActualWidth < 760 ? new Thickness(16) : new Thickness(28);
+
     private void Navigate(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
         if (args.SelectedItem is not NavigationViewItem item || OverviewPage is null) return;
         string page = item.Tag?.ToString() ?? "overview";
+        if (assistantCompact && page != "assistant") AssistantCompactClick(this, new RoutedEventArgs());
         OverviewPage.Visibility = page == "overview" ? Visibility.Visible : Visibility.Collapsed;
         DevicePage.Visibility = page == "device" ? Visibility.Visible : Visibility.Collapsed;
         MusicPage.Visibility = page == "music" ? Visibility.Visible : Visibility.Collapsed;
@@ -97,6 +102,7 @@ public sealed partial class MainWindow : Window
         AssistantPage.Visibility = page == "assistant" ? Visibility.Visible : Visibility.Collapsed;
         AppearancePage.Visibility = page == "appearance" ? Visibility.Visible : Visibility.Collapsed;
         PageTitle.Text = item.Content?.ToString() ?? "XASS";
+        PageTitle.Visibility = page is "music" or "assistant" ? Visibility.Collapsed : Visibility.Visible;
         OnDesktopNavigated(page);
         OnDesktopMusicNavigated(page);
     }
@@ -121,6 +127,8 @@ public sealed partial class MainWindow : Window
     private void InvalidateAssistantPlan()
     {
         assistantPlan = null;
+        AssistantPlanCard.Visibility = Visibility.Collapsed;
+        if (assistantRequest is null) SetAssistantStage("idle");
         AssistantExecute.IsEnabled = false;
         AssistantPreview.Text = "Разберите команду, чтобы проверить действие.";
     }
@@ -158,11 +166,14 @@ public sealed partial class MainWindow : Window
         if (operation == "execute" && plan is null) return;
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         assistantRequest = cancel;
+        assistantRecording = operation == "record";
         AssistantRecord.IsEnabled = AssistantPlanButton.IsEnabled = AssistantExecute.IsEnabled = false;
         AssistantSettingsPanel.IsEnabled = AssistantText.IsEnabled = false;
         AssistantCancel.IsEnabled = true;
         AssistantProgress.Visibility = Visibility.Visible;
         AssistantState.Text = "Подготовка…";
+        SetAssistantStage(operation == "execute" ? "executing" : operation == "record" ? "loading_model" : "planning");
+        if (assistantRecording) SetMicrophoneStatus("Подготовка записи. Микрофон выключен", MicrophonePhase.Preparing);
         try
         {
             await PrepareAssistantAudioAsync();
@@ -185,8 +196,10 @@ public sealed partial class MainWindow : Window
                 if (!closed && ReferenceEquals(assistantRequest, cancel) && !cancel.IsCancellationRequested)
                 {
                     AssistantState.Text = AssistantPhase(phase);
-                    if (phase == "recording") SetMicrophoneStatus("● Микрофон включён: запись 6 секунд");
-                    else if (operation == "record") SetMicrophoneStatus("Микрофон выключен. " + AssistantPhase(phase));
+                    SetAssistantStage(phase);
+                    if (phase == "recording") SetMicrophoneStatus("● Микрофон включён: запись 6 секунд", MicrophonePhase.Listening);
+                    else if (operation == "record") SetMicrophoneStatus("Микрофон выключен. " + AssistantPhase(phase),
+                        phase == "loading_model" ? MicrophonePhase.Preparing : MicrophonePhase.Processing);
                 }
             });
             var result = await assistantClient.RequestAsync(AssistantPython.Text.Trim(),
@@ -200,12 +213,14 @@ public sealed partial class MainWindow : Window
                 assistantDraftPending = !string.IsNullOrWhiteSpace(AssistantText.Text);
             }
             string state = result.GetProperty("state").GetString() ?? "failed";
+            SetAssistantStage(state);
             AssistantState.Text = AssistantPhase(state) + " " + result.GetProperty("message").GetString();
             if (state == "ready")
             {
                 assistantPlan = result.GetProperty("plan").Clone();
                 assistantPlannedText = AssistantText.Text;
                 AssistantPreview.Text = result.GetProperty("label").GetString();
+                AssistantPlanCard.Visibility = Visibility.Visible;
             }
             if (operation == "execute") assistantDraftPending = false;
             await SpeakAssistantAsync(state == "ready"
@@ -214,12 +229,14 @@ public sealed partial class MainWindow : Window
         }
         catch (OperationCanceledException)
         {
+            if (!closed) SetAssistantStage("cancelled");
             if (!closed) AssistantState.Text = operation == "execute"
                 ? "Ожидание отменено. Уже переданное Windows действие могло выполниться; проверьте приложение."
                 : "Отменено. Микрофон выключен.";
         }
         catch (Exception error)
         {
+            if (!closed) SetAssistantStage("failed");
             if (error is VoiceShutdownException)
             {
                 microphoneShutdownFailed = true;
@@ -232,6 +249,7 @@ public sealed partial class MainWindow : Window
         finally
         {
             assistantRequest = null;
+            assistantRecording = false;
             if (!closed)
             {
                 AssistantRecord.IsEnabled = AssistantPlanButton.IsEnabled = true;
@@ -258,6 +276,7 @@ public sealed partial class MainWindow : Window
         {
             AssistantCancel.IsEnabled = false;
             AssistantState.Text = "Команда отменена.";
+            SetAssistantStage("cancelled");
             _ = RefreshBackgroundSafelyAsync();
         }
     }

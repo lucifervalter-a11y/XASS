@@ -8,6 +8,9 @@
        Windows contrast colors are applied by MainWindow.Appearance.cs. -->
   <SolidColorBrush x:Key="XassAccentFillBrush" Color="#005FB8"/>
   <SolidColorBrush x:Key="XassAccentForegroundBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="XassAccentHoverBrush" Color="#0056A6"/>
+  <SolidColorBrush x:Key="XassAccentPressedBrush" Color="#00509B"/>
+  <SolidColorBrush x:Key="XassAccentTextBrush" Color="#005FB8"/>
   <SolidColorBrush x:Key="AccentButtonBackground" Color="#005FB8"/>
   <SolidColorBrush x:Key="AccentButtonBackgroundPointerOver" Color="#005FB8"/>
   <SolidColorBrush x:Key="AccentButtonBackgroundPressed" Color="#005FB8"/>

@@ -42,6 +42,15 @@ jobs:
         run: python -m pip install -r pc_client/requirements.txt
       - name: Test native bridge and source contracts
         run: python -m unittest discover -s windows/tests -v
+      - name: Test appearance and Discord presence boundaries
+        shell: pwsh
+        run: |
+          dotnet run --project windows/Appearance.Tests/Appearance.Tests.csproj -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet run --project windows/MusicPresentation.Tests/MusicPresentation.Tests.csproj -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet run --project windows/DiscordPresence.Tests/DiscordPresence.Tests.csproj -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Publish unpackaged native shell to artifact folder
         run: dotnet publish windows/Xass.Native/Xass.Native.csproj -c Release -r win-x64 -p:Platform=x64 -o artifacts/windows-native
       - name: Verify complete native artifact

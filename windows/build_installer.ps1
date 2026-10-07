@@ -43,6 +43,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime/build dependencies could not be
 if ($LASTEXITCODE -ne 0) { throw 'Native bridge source tests failed.' }
 & dotnet run --project (Join-Path $PSScriptRoot 'Appearance.Tests\Appearance.Tests.csproj') -c Release
 if ($LASTEXITCODE -ne 0) { throw 'Appearance persistence/contrast tests failed.' }
+& dotnet run --project (Join-Path $PSScriptRoot 'MusicPresentation.Tests\MusicPresentation.Tests.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Music palette/session-history tests failed.' }
+& dotnet run --project (Join-Path $PSScriptRoot 'DiscordPresence.Tests\DiscordPresence.Tests.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Discord presence boundary/lifecycle tests failed.' }
 & dotnet run --project (Join-Path $PSScriptRoot 'ModelDiscovery.Tests\ModelDiscovery.Tests.csproj') -c Release
 if ($LASTEXITCODE -ne 0) { throw 'Local model discovery tests failed.' }
 & dotnet run --project (Join-Path $PSScriptRoot 'NativeUpdate.Tests\NativeUpdate.Tests.csproj') -c Release

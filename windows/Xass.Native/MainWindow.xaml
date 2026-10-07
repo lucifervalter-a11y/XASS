@@ -1,6 +1,7 @@
 <Window x:Class="Xass.Native.MainWindow"
  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ xmlns:controls="using:Xass.Native.Controls"
  Title="XASS">
  <Grid x:Name="RootGrid" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
   <NavigationView x:Name="Navigation" PaneTitle="XASS" IsBackButtonVisible="Collapsed"
@@ -17,7 +18,7 @@
     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
     <TextBlock x:Name="PageTitle" Text="Обзор" Style="{ThemeResource TitleTextBlockStyle}" />
     <StackPanel Grid.Row="1" Spacing="8">
-     <Border Style="{StaticResource XassCard}" Padding="12">
+     <Border Padding="4,0">
       <Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
        <TextBlock x:Name="MicrophoneStatus" Text="Микрофон выключен" TextWrapping="Wrap" VerticalAlignment="Center" AutomationProperties.LiveSetting="Polite"/>
        <Button Grid.Column="1" x:Name="BackgroundStop" Content="Выключить микрофон" IsEnabled="False"/>
@@ -43,10 +44,10 @@
         <TextBlock Text="НА ЭТОМ КОМПЬЮТЕРЕ" Style="{StaticResource XassEyebrow}"/>
         <TextBlock x:Name="OverviewStatus" Text="Давайте подключимся" FontSize="22" FontWeight="SemiBold" TextWrapping="Wrap"/>
         <TextBlock x:Name="OverviewTrack" Text="Выберите существующий агент, и здесь появятся его состояние и музыка." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="2">
+        <controls:FlowPanel>
          <Button Content="Подключить агент" Click="OpenConnectionClick" Margin="0,0,12,8"/>
          <Button Content="Обновить состояние" Click="RefreshClick" Margin="0,0,0,8"/>
-        </VariableSizedWrapGrid>
+        </controls:FlowPanel>
        </StackPanel>
       </Border>
       <TextBlock Text="Привязка ПК, обновления, архив и системные команды доступны в меню XASS." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" Margin="4,0,4,12"/>
@@ -94,12 +95,12 @@
         <TextBlock Text="ПЛЕЕР · ЭТОТ ПК" Style="{StaticResource XassEyebrow}"/>
         <TextBlock x:Name="NowPlaying" Text="Ничего не играет" TextWrapping="Wrap" FontSize="18"/>
         <TextBlock x:Name="PlaybackState" Text="" Opacity="0.65"/>
-        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="4">
+        <controls:FlowPanel>
          <Button x:Name="PlayButton" Content="Включить выбранный" Style="{StaticResource AccentButtonStyle}" IsEnabled="False" Click="PlayClick" Margin="0,0,8,8"/>
          <Button x:Name="PauseButton" Content="Пауза" IsEnabled="False" Click="PauseClick" Margin="0,0,8,8"/>
          <Button x:Name="ResumeButton" Content="Продолжить" IsEnabled="False" Click="ResumeClick" Margin="0,0,8,8"/>
          <Button x:Name="StopButton" Content="Стоп" IsEnabled="False" Click="StopClick" Margin="0,0,8,8"/>
-        </VariableSizedWrapGrid>
+        </controls:FlowPanel>
         <Expander Header="Громкость и перемотка" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
          <StackPanel Spacing="12">
         <Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -117,28 +118,54 @@
       </Border>
      </Grid>
      <ScrollViewer x:Name="AssistantPage" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled">
-      <StackPanel Spacing="16" MaxWidth="840" Padding="0,0,0,20">
-       <Border Style="{StaticResource XassCard}"><StackPanel Spacing="12">
-        <TextBlock Text="Голосовой помощник" Style="{ThemeResource SubtitleTextBlockStyle}"/>
-        <TextBlock Text="Нажмите кнопку, дождитесь «Говорите» и произнесите одну команду. Запись длится 6 секунд. Проверьте распознанный текст перед выполнением." TextWrapping="Wrap"/>
-        <TextBlock Text="Примеры: «запусти майнкрафт», «открой ютуб», «открой дискорд», «перейди к каналу Шаурма классическая»." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-        <TextBox x:Name="AssistantText" Header="Команда" PlaceholderText="Джарвис, открой ютуб" MaxLength="512" AcceptsReturn="False"/>
-        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="3">
-         <Button x:Name="AssistantRecord" Content="Записать 6 секунд" Click="AssistantRecordClick" Style="{StaticResource AccentButtonStyle}" Margin="0,0,8,8"/>
-         <Button x:Name="AssistantPlanButton" Content="Разобрать текст" Click="AssistantPlanClick" Margin="0,0,8,8"/>
-         <Button x:Name="AssistantCancel" Content="Отменить" Click="AssistantCancelClick" IsEnabled="False" Margin="0,0,8,8"/>
-        </VariableSizedWrapGrid>
+      <StackPanel Spacing="12" MaxWidth="820" Padding="0,0,0,20">
+       <Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <TextBlock Text="XASS / ПОМОЩНИК" Style="{StaticResource XassEyebrow}" VerticalAlignment="Center"/>
+        <Button Grid.Column="1" x:Name="AssistantCompact" Content="Компактный вид" Click="AssistantCompactClick"/>
+       </Grid>
+       <Border Style="{StaticResource XassCard}" Padding="20"><StackPanel Spacing="14">
+        <Grid ColumnSpacing="18"><Grid.ColumnDefinitions><ColumnDefinition Width="80"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+         <Grid Width="80" Height="80" AutomationProperties.Name="Аватар помощника XASS">
+          <Ellipse x:Name="AssistantAvatarGlow" Fill="{StaticResource XassAccentFillBrush}" Opacity="0.18" Margin="2"/>
+          <Ellipse Stroke="{StaticResource XassAccentTextBrush}" StrokeThickness="1.5" Width="70" Height="42" RenderTransformOrigin="0.5,0.5"><Ellipse.RenderTransform><RotateTransform Angle="-35"/></Ellipse.RenderTransform></Ellipse>
+          <Ellipse Stroke="{StaticResource XassAccentTextBrush}" StrokeThickness="1.5" Width="70" Height="42" RenderTransformOrigin="0.5,0.5"><Ellipse.RenderTransform><RotateTransform Angle="35"/></Ellipse.RenderTransform></Ellipse>
+          <Ellipse Fill="{StaticResource XassAccentFillBrush}" Width="30" Height="30"/>
+          <StackPanel Orientation="Horizontal" Spacing="5" HorizontalAlignment="Center" VerticalAlignment="Center"><Ellipse Fill="{StaticResource XassAccentForegroundBrush}" Width="4" Height="6"/><Ellipse Fill="{StaticResource XassAccentForegroundBrush}" Width="4" Height="6"/></StackPanel>
+         </Grid>
+         <StackPanel Grid.Column="1" Spacing="6" VerticalAlignment="Center">
+          <TextBlock x:Name="AssistantStageTitle" Text="Готов к команде" FontSize="24" FontWeight="SemiBold" TextWrapping="Wrap"/>
+          <TextBlock Text="Скажите, что открыть, или напишите ниже." Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap"/>
+         </StackPanel>
+        </Grid>
+        <controls:FlowPanel HorizontalSpacing="16">
+         <TextBlock x:Name="AssistantInputStep" Text="01  Команда" FontSize="12"/>
+         <TextBlock x:Name="AssistantReviewStep" Text="02  Проверка" FontSize="12" Opacity="0.45"/>
+         <TextBlock x:Name="AssistantActionStep" Text="03  Действие" FontSize="12" Opacity="0.45"/>
+        </controls:FlowPanel>
         <ProgressBar x:Name="AssistantProgress" IsIndeterminate="True" Visibility="Collapsed"/>
-        <TextBlock x:Name="AssistantState" Text="Готов. Микрофон выключен." TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
-        <TextBlock x:Name="AssistantPreview" Text="Здесь появится действие для проверки." FontWeight="SemiBold" TextWrapping="Wrap"/>
-        <Button x:Name="AssistantExecute" Content="Выполнить" Click="AssistantExecuteClick" IsEnabled="False"/>
+        <TextBlock x:Name="AssistantState" Text="Микрофон включается по нажатию. Запись длится 6 секунд." TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+        <Border x:Name="AssistantPlanCard" Visibility="Collapsed" Padding="14" CornerRadius="12" BorderBrush="{StaticResource XassAccentTextBrush}" BorderThickness="1">
+         <StackPanel Spacing="5"><TextBlock Text="ПРОВЕРЬТЕ ДЕЙСТВИЕ" Style="{StaticResource XassEyebrow}"/><TextBlock x:Name="AssistantPreview" Text="Здесь появится действие для проверки." FontWeight="SemiBold" TextWrapping="Wrap"/></StackPanel>
+        </Border>
+        <TextBox x:Name="AssistantText" PlaceholderText="Джарвис, открой ютуб" AutomationProperties.Name="Команда помощнику" MaxLength="512" AcceptsReturn="False"/>
+        <controls:FlowPanel>
+         <Button x:Name="AssistantRecord" Click="AssistantRecordClick" Style="{StaticResource AccentButtonStyle}" AutomationProperties.Name="Записать команду, 6 секунд"><StackPanel Orientation="Horizontal" Spacing="8"><FontIcon Glyph="&#xE720;" FontSize="15"/><TextBlock Text="Сказать"/></StackPanel></Button>
+         <Button x:Name="AssistantPlanButton" Content="Проверить текст" Click="AssistantPlanClick"/>
+         <Button x:Name="AssistantCancel" Content="Отменить" Click="AssistantCancelClick" IsEnabled="False"/>
+         <Button x:Name="AssistantExecute" Content="Выполнить" Click="AssistantExecuteClick" IsEnabled="False"/>
+        </controls:FlowPanel>
+        <controls:FlowPanel><TextBlock Text="Попробуйте:" Opacity="0.6" VerticalAlignment="Center"/>
+         <Button Content="Minecraft" Tag="запусти майнкрафт" Click="AssistantExampleClick" Style="{StaticResource SubtleButtonStyle}"/>
+         <Button Content="YouTube" Tag="открой ютуб" Click="AssistantExampleClick" Style="{StaticResource SubtleButtonStyle}"/>
+         <Button Content="Discord" Tag="открой дискорд" Click="AssistantExampleClick" Style="{StaticResource SubtleButtonStyle}"/>
+        </controls:FlowPanel>
        </StackPanel></Border>
-       <Border Style="{StaticResource XassCard}"><StackPanel Spacing="12">
-        <ToggleSwitch x:Name="BackgroundListening" Header="Фоновый микрофон · только пока открыт XASS" IsOn="False" OffContent="Выключен" OnContent="Включён"/>
+       <Expander Header="Обращение «Джарвис» и фоновый режим" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch"><StackPanel Spacing="12">
+        <ToggleSwitch x:Name="BackgroundListening" Header="Фоновый режим · только пока открыт XASS" IsOn="False" OffContent="Не разрешён" OnContent="Разрешён"/>
         <TextBlock x:Name="BackgroundStatus" Text="Микрофон выключен" TextWrapping="Wrap"/>
         <TextBlock Text="Включите явно и скажите «Джарвис, открой ютуб» одной фразой. Работает и в свёрнутом окне. После команды запись приостанавливается до выполнения или отмены. Закрытие XASS выключает микрофон." TextWrapping="Wrap"/>
         <TextBlock Text="Это локальное распознавание коротких фраз, а не проверка личности. Телевизор или другой человек тоже могут произнести обращение. Действия выполняются только кнопкой «Выполнить». Модель остаётся в памяти; энергопотребление зависит от компьютера." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-       </StackPanel></Border>
+       </StackPanel></Expander>
        <Expander Header="Голосовые ответы Windows" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
         <StackPanel Spacing="12">
          <ToggleSwitch x:Name="AssistantSpeech" Header="Озвучивать результаты и подтверждения" IsOn="False"/>
@@ -153,7 +180,7 @@
          <TextBlock Text="Во время ответа фоновый микрофон закрыт, накопленное аудио удаляется. Аудио и посторонние разговоры не сохраняются. Голос не скачивается и не отправляется в облако." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
         </StackPanel>
        </Expander>
-       <Expander x:Name="AssistantSettingsPanel" Header="Настройки помощника" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+       <Expander x:Name="AssistantSettingsPanel" Header="Настройки помощника" IsExpanded="False" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
         <StackPanel Spacing="12">
          <TextBox x:Name="AssistantPython" Header="Резервный Python, если встроенный помощник отсутствует"/>
          <TextBox x:Name="AssistantModelPath" Header="Локальная папка модели faster-whisper"/>
@@ -173,32 +200,38 @@
         Message="Переход открывает страницу настроенного канала. Автоматический вход доступен только с разрешённым OAuth/RPC-коннектором; в этой сборке он не настроен. Ссылки не считаются подтверждением подключения."/>
       </StackPanel>
      </ScrollViewer>
-     <ScrollViewer x:Name="AppearancePage" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled">
-      <StackPanel Spacing="16" MaxWidth="840" Padding="0,0,0,20">
-       <Border Style="{StaticResource XassCard}"><StackPanel Spacing="16">
-        <TextBlock Text="Ваш XASS" Style="{ThemeResource SubtitleTextBlockStyle}"/>
-        <TextBlock Text="Выберите тему и цвет обложки и основных кнопок. Остальные элементы сохраняют системные цвета и привычные состояния Windows." TextWrapping="Wrap"/>
-        <ComboBox x:Name="AppearanceTheme" Header="Тема интерфейса" SelectedIndex="0" HorizontalAlignment="Stretch">
-         <ComboBoxItem Content="Как в Windows"/><ComboBoxItem Content="Светлая"/><ComboBoxItem Content="Тёмная"/>
-        </ComboBox>
-        <ComboBox x:Name="AppearanceAccentMode" Header="Акцент XASS" SelectedIndex="0" HorizontalAlignment="Stretch">
-         <ComboBoxItem Content="Цвет Windows"/><ComboBoxItem Content="Свой цвет"/>
-        </ComboBox>
-        <ColorPicker x:Name="AppearanceColor" Color="#005FB8" IsAlphaEnabled="False" IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False" IsColorChannelTextInputVisible="True" IsHexInputVisible="True" HorizontalAlignment="Left" AutomationProperties.Name="Свой цвет акцента"/>
-        <TextBlock Text="Текст на акценте автоматически становится чёрным или белым для контраста не ниже 4,5:1. В контрастных темах Windows используются системные цвета; ваш выбор сохраняется." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-        <VariableSizedWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="2">
-         <Button x:Name="AppearanceApply" Content="Применить и сохранить" Click="AppearanceApplyClick" Style="{StaticResource AccentButtonStyle}" Margin="0,0,8,8"/>
-         <Button x:Name="AppearanceReset" Content="Восстановить оформление Windows" Click="AppearanceResetClick" Margin="0,0,8,8"/>
-        </VariableSizedWrapGrid>
-        <TextBlock x:Name="AppearanceStatus" Text="Оформление сохраняется только на этом компьютере." TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
-       </StackPanel></Border>
-       <Border Padding="24" CornerRadius="16" Background="{StaticResource XassAccentFillBrush}">
-        <StackPanel Spacing="8"><TextBlock Text="Так выглядит ваш акцент" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource XassAccentForegroundBrush}" TextWrapping="Wrap"/>
-         <TextBlock Text="Изменения применяются кнопкой выше и сохраняются после перезапуска и обновления приложения." Foreground="{StaticResource XassAccentForegroundBrush}" TextWrapping="Wrap"/>
-        </StackPanel>
-       </Border>
-      </StackPanel>
-     </ScrollViewer>
+     <Grid x:Name="AppearancePage" Visibility="Collapsed" RowSpacing="12">
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+      <Border Style="{StaticResource XassCard}" Padding="16">
+       <StackPanel Spacing="10">
+        <controls:FlowPanel>
+         <Button x:Name="AppearanceApply" Click="AppearanceApplyClick" Style="{StaticResource AccentButtonStyle}" AutomationProperties.Name="Применить и сохранить"><TextBlock Text="Применить и сохранить" TextWrapping="Wrap"/></Button>
+         <Button x:Name="AppearanceReset" Click="AppearanceResetClick" AutomationProperties.Name="Восстановить оформление Windows"><TextBlock Text="Восстановить оформление Windows" TextWrapping="Wrap"/></Button>
+        </controls:FlowPanel>
+        <TextBlock x:Name="AppearanceStatus" Text="Выбранный цвет сразу виден во всём XASS. Сохраните его для следующего запуска." TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+       </StackPanel>
+      </Border>
+      <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+       <StackPanel Spacing="16" MaxWidth="840" Padding="0,0,0,20">
+        <Border Padding="20" CornerRadius="16" Background="{StaticResource XassAccentFillBrush}">
+         <StackPanel Spacing="6">
+          <TextBlock Text="Ваш цвет XASS" FontSize="22" FontWeight="SemiBold" Foreground="{StaticResource XassAccentForegroundBrush}" TextWrapping="Wrap"/>
+          <TextBlock Text="Кнопки, навигация, переключатели и управление музыкой используют общий акцент." Foreground="{StaticResource XassAccentForegroundBrush}" TextWrapping="Wrap"/>
+         </StackPanel>
+        </Border>
+        <Border Style="{StaticResource XassCard}"><StackPanel Spacing="16">
+         <ComboBox x:Name="AppearanceTheme" Header="Тема интерфейса" SelectedIndex="0" HorizontalAlignment="Stretch">
+          <ComboBoxItem Content="Как в Windows"/><ComboBoxItem Content="Светлая"/><ComboBoxItem Content="Тёмная"/>
+         </ComboBox>
+         <ComboBox x:Name="AppearanceAccentMode" Header="Акцент XASS" SelectedIndex="0" HorizontalAlignment="Stretch">
+          <ComboBoxItem Content="Цвет Windows"/><ComboBoxItem Content="Свой цвет"/>
+         </ComboBox>
+         <ColorPicker x:Name="AppearanceColor" Color="#005FB8" IsAlphaEnabled="False" IsAlphaSliderVisible="False" IsAlphaTextInputVisible="False" IsColorChannelTextInputVisible="True" IsHexInputVisible="True" HorizontalAlignment="Left" AutomationProperties.Name="Свой цвет акцента"/>
+         <TextBlock Text="XASS подбирает читаемый текст и оттенки акцента. В контрастных темах Windows действуют системные цвета; ваш выбор сохраняется." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+        </StackPanel></Border>
+       </StackPanel>
+      </ScrollViewer>
+     </Grid>
      <ScrollViewer x:Name="ConnectionPage" Visibility="Collapsed"><StackPanel Spacing="16" MaxWidth="840" HorizontalAlignment="Stretch">
       <TextBlock Text="Использовать существующий агент" Style="{ThemeResource SubtitleTextBlockStyle}"/>
       <TextBlock Text="Для этой предварительной сборки нужен Python с зависимостями pc_client и исходники XASS. Агент должен быть уже привязан и запущен. Укажите абсолютные локальные пути; они хранятся только до закрытия этого окна." TextWrapping="Wrap"/>

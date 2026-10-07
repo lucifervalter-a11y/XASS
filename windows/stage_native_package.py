@@ -11,7 +11,7 @@ import struct
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = Path(__file__).with_name("packaging") / "native-payload.json"
-FORBIDDEN_NAMES = {"config.json", "appearance.json", ".xass-master.key", ".agent-status.json",
+FORBIDDEN_NAMES = {"config.json", "appearance.json", "discord-presence.json", ".xass-master.key", ".agent-status.json",
                    "music-playback.json", "migration-manifest.json", ".command-results.json",
                    "runtime.json", "local-music.json", ".agent.log", "agent.log"}
 FORBIDDEN_SUFFIXES = {".key", ".pem", ".pfx", ".sqlite3", ".db", ".xass"}

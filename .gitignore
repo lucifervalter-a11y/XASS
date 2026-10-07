@@ -23,3 +23,4 @@ pc_client/.build-venv/
 pc_client/build/
 pc_client/dist/
 pc_client/packaging/*.generated.*
+/artifacts/

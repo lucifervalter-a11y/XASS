@@ -48,7 +48,8 @@ public sealed partial class MainWindow
     { var panel = new StackPanel { Spacing = 12 }; foreach (var child in children) panel.Children.Add(child); return panel; }
     private Button DButton(string title, Func<Task> action)
     {
-        var button = new Button { Content = title, Margin = new Thickness(0, 0, 8, 8) };
+        var button = new Button { Content = new TextBlock { Text = title, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center } };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, title);
         button.Click += async (_, _) =>
         {
             if (!button.IsEnabled) return;
@@ -60,8 +61,8 @@ public sealed partial class MainWindow
         };
         return button;
     }
-    private static VariableSizedWrapGrid DActions(params UIElement[] controls)
-    { var row = new VariableSizedWrapGrid { Orientation = Orientation.Horizontal, MaximumRowsOrColumns = 4 }; foreach (var control in controls) row.Children.Add(control); return row; }
+    private static Controls.FlowPanel DActions(params UIElement[] controls)
+    { var row = new Controls.FlowPanel(); foreach (var control in controls) row.Children.Add(control); return row; }
     private StackPanel AddDesktopPage(string tag, string title, Symbol icon)
     {
         var content = new StackPanel { Spacing = 16, MaxWidth = 1000, Padding = new Thickness(0, 0, 0, 28) };
@@ -304,6 +305,8 @@ public sealed partial class MainWindow
         var result = await DesktopRequestAsync("desktop_status"); if (closed) return;
         DeviceName.Text = DValue(result, "name", Environment.MachineName); DeviceState.Text = StateLabel(DValue(result, "state"));
         OverviewStatus.Text = DeviceName.Text + " · " + DeviceState.Text;
+        if (result.TryGetProperty("paired", out var paired) && paired.ValueKind == JsonValueKind.True &&
+            Notice.Title == "XASS · нативный Windows-клиент") Notice.IsOpen = false;
         if (result.TryGetProperty("legacy_agent", out var legacy) && legacy.GetBoolean())
         { Notice.IsOpen = true; Notice.Severity = InfoBarSeverity.Warning; Notice.Title = "Прежний агент XASS"; Notice.Message = DValue(result, "compatibility_notice"); }
         string greeting = DateTime.Now.Hour < 6 ? "Доброй ночи" : DateTime.Now.Hour < 12 ? "Доброе утро" : DateTime.Now.Hour < 18 ? "Добрый день" : "Добрый вечер";
@@ -691,7 +694,7 @@ public sealed partial class MainWindow
             catch (Exception error) { desktopQuitting = false; DesktopError(error); return; }
         }
         desktopTimer.Stop(); automaticUpdateTimer.Stop(); StopAllMicrophones(); DisposeVoice(); DisposeDesktopMusic();
-        await nativeMusic.DisposeAsync();
+        await discordMusic.DisposeAsync(); await nativeMusic.DisposeAsync();
         await desktopHost.CloseAsync(); desktopTray?.Dispose(); desktopTray = null;
         lifetime.Cancel(); Close();
     }

@@ -16,6 +16,7 @@ public sealed partial class MainWindow
     private bool assistantDraftPending;
     private bool applyingRecognizedText;
     private bool voiceSpeaking;
+    private bool assistantRecording;
     private bool backgroundPaused = true;
     private bool microphoneShutdownFailed;
     private bool acceptBackgroundCommands;
@@ -59,17 +60,22 @@ public sealed partial class MainWindow
     private bool CanListen => !microphoneShutdownFailed && !closed && BackgroundListening.IsOn && !assistantDraftPending
         && assistantPlan is null && assistantRequest is null && !voiceSpeaking;
 
-    private void SetMicrophoneStatus(string text)
+    private void SetMicrophoneStatus(string text, MicrophonePhase phase = MicrophonePhase.Off)
     {
         if (closed) return;
         if (microphoneShutdownFailed)
-            text = "Остановка микрофона не подтверждена. Закройте XASS; не считайте микрофон выключенным.";
-        else if (backgroundVoice is { IsStopped: true } || assistantRequest?.IsCancellationRequested == true)
-            text = "Останавливаю микрофон…";
+        { text = "Остановка микрофона не подтверждена. Закройте XASS; не считайте микрофон выключенным."; phase = MicrophonePhase.Failed; }
+        else if (backgroundVoice is { IsStopped: true } || (assistantRecording && assistantRequest?.IsCancellationRequested == true))
+        { text = "Останавливаю микрофон…"; phase = MicrophonePhase.Stopping; }
         MicrophoneStatus.Text = text;
         BackgroundStatus.Text = text;
-        BackgroundStop.IsEnabled = microphoneShutdownFailed || backgroundVoice is not null
-            || BackgroundListening.IsOn || assistantRequest is not null;
+        if (assistantRequest is null && assistantPlan is null && phase is not MicrophonePhase.Off)
+            SetAssistantStage(phase switch { MicrophonePhase.Preparing => "loading_model", MicrophonePhase.Listening => "listening",
+                MicrophonePhase.Processing => "transcribing", MicrophonePhase.Failed => "failed", _ => "paused" });
+        var presentation = MicrophonePresentation.For(phase, BackgroundListening.IsOn || assistantRecording);
+        BackgroundStop.Content = presentation.Action;
+        BackgroundStop.IsEnabled = presentation.CanStop;
+        BackgroundStop.Visibility = phase == MicrophonePhase.Off && !presentation.CanStop ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void AssistantDraftChanged()
@@ -114,7 +120,7 @@ public sealed partial class MainWindow
                 backgroundVoice = null;
             }
             if (closed || session != backgroundSession || !BackgroundListening.IsOn) return;
-            SetMicrophoneStatus("Подготовка модели. Микрофон выключен");
+            SetMicrophoneStatus("Подготовка модели. Микрофон выключен", MicrophonePhase.Preparing);
             var progress = new Progress<BackgroundVoiceEvent>(update =>
             {
                 if (!closed && session == backgroundSession && BackgroundListening.IsOn)
@@ -166,7 +172,7 @@ public sealed partial class MainWindow
             applyingRecognizedText = true;
             try { AssistantText.Text = update.Value; }
             finally { applyingRecognizedText = false; }
-            SetMicrophoneStatus("Микрофон на паузе: проверьте команду");
+            SetMicrophoneStatus("Микрофон на паузе: проверьте команду", MicrophonePhase.Paused);
             _ = RunAssistantAsync("plan"); // A preview only. Execute always remains an explicit click.
             return;
         }
@@ -180,7 +186,10 @@ public sealed partial class MainWindow
             "paused" => "Микрофон на паузе: ответ или проверка команды",
             _ => "Микрофон выключен"
         };
-        SetMicrophoneStatus(status);
+        SetMicrophoneStatus(status, update.Value switch {
+            "loading_model" => MicrophonePhase.Preparing, "listening" => MicrophonePhase.Listening,
+            "transcribing" => MicrophonePhase.Processing, "ready" or "paused" => MicrophonePhase.Paused,
+            _ => MicrophonePhase.Off });
     }
 
     private async Task ObserveBackgroundAsync(BackgroundVoiceClient worker, int session, CancellationTokenSource cancel)

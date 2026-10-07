@@ -41,6 +41,18 @@ public static class AccentPalette
         return (Math.Max(a, b) + 0.05) / (Math.Min(a, b) + 0.05);
     }
 
+    public static uint ReadableAccent(uint accent, uint surface)
+    {
+        if (Contrast(accent, surface) >= 4.5) return accent;
+        bool lighten = Luminance(surface) < 0.5;
+        for (int step = 1; step <= 20; step++)
+        {
+            uint candidate = Shift(accent, (lighten ? 1 : -1) * step / 20.0);
+            if (Contrast(candidate, surface) >= 4.5) return candidate;
+        }
+        return TextOn(surface);
+    }
+
     // One of opaque black and white always exceeds WCAG 4.5:1 for an opaque sRGB fill.
     public static uint TextOn(uint background) => Contrast(background, 0) >= Contrast(background, 0xFFFFFF)
         ? 0u : 0xFFFFFFu;

@@ -14,36 +14,76 @@ public sealed partial class MainWindow
     private AppearancePreferences appearance = AppearancePreferences.Defaults;
     private bool appearanceReady;
 
-    private async void InitializeAppearance()
+    private bool populatingAppearance;
+    private bool appearanceSaving;
+    private bool systemColorsSubscribed, contrastSubscribed;
+    private AppearancePreferences savedAppearance = AppearancePreferences.Defaults;
+
+    private void InitializeAppearance()
     {
-        AppearanceApply.IsEnabled = AppearanceReset.IsEnabled = false;
-        AppearanceAccentMode.SelectionChanged += (_, _) =>
-            AppearanceColor.IsEnabled = AppearanceAccentMode.SelectedIndex == 1;
-        var loaded = await Task.Run(() =>
+        // A bounded, local 4 KiB preference file is loaded on the UI thread.
+        // Initialization must always leave editing and saving available.
+        bool recovered = false;
+        try
         {
-            var preferences = appearanceStore.Load(out bool recovered);
-            return (preferences, recovered);
-        });
-        if (closed) return;
-        appearance = loaded.preferences;
-        PopulateAppearanceControls();
-        ApplyAppearance();
-        appearanceUi.ColorValuesChanged += AppearanceSystemColorsChanged;
-        appearanceAccessibility.HighContrastChanged += AppearanceContrastChanged;
+            appearance = savedAppearance = appearanceStore.Load(out recovered);
+            PopulateAppearanceControls();
+            ApplyAppearance();
+        }
+        catch (Exception error)
+        {
+            AppearanceStatus.Text = $"Не удалось полностью применить оформление ({error.GetType().Name}). Выберите цвет и повторите сохранение.";
+        }
+        finally
+        {
+            appearanceReady = true;
+            AppearanceApply.IsEnabled = AppearanceReset.IsEnabled = true;
+        }
+        AppearanceTheme.SelectionChanged += (_, _) => PreviewAppearance();
+        AppearanceAccentMode.SelectionChanged += (_, _) => PreviewAppearance();
+        AppearanceColor.ColorChanged += (_, _) => PreviewAppearance();
+        // Some desktop Windows sessions don't expose these WinRT events.
+        // Their absence must not disable the user's preview/save controls.
+        try { appearanceUi.ColorValuesChanged += AppearanceSystemColorsChanged; systemColorsSubscribed = true; }
+        catch (System.Runtime.InteropServices.COMException) { }
+        try { appearanceAccessibility.HighContrastChanged += AppearanceContrastChanged; contrastSubscribed = true; }
+        catch (System.Runtime.InteropServices.COMException) { }
         RootGrid.ActualThemeChanged += AppearanceActualThemeChanged;
-        appearanceReady = true;
-        AppearanceApply.IsEnabled = AppearanceReset.IsEnabled = true;
-        if (loaded.recovered)
-            AppearanceStatus.Text = "Не удалось прочитать часть настроек. Применено стандартное оформление; файл изменится только после сохранения.";
+        Activated += (_, _) => QueueAppearanceColors();
+        if (recovered)
+            AppearanceStatus.Text = "Настройки оформления не удалось прочитать. Используются значения Windows; исходный файл будет заменён только после сохранения.";
+    }
+
+    private AppearancePreferences SelectedAppearance() => new(
+        AppearanceTheme.SelectedIndex switch { 1 => "light", 2 => "dark", _ => "system" },
+        AppearanceAccentMode.SelectedIndex == 0 ? "system" : $"#{ToRgb(AppearanceColor.Color):X6}");
+
+    private void PreviewAppearance()
+    {
+        if (!appearanceReady || populatingAppearance || appearanceSaving || closed) return;
+        AppearanceColor.IsEnabled = AppearanceAccentMode.SelectedIndex == 1;
+        appearance = SelectedAppearance().Normalize();
+        try
+        {
+            ApplyAppearance();
+            AppearanceStatus.Text = appearance == savedAppearance ? "Оформление сохранено." : "Предпросмотр применяется ко всем экранам. Сохраните изменения, чтобы оставить их после перезапуска.";
+        }
+        catch (Exception error)
+        {
+            AppearanceStatus.Text = $"Предпросмотр не завершён ({error.GetType().Name}). Повторите сохранение.";
+        }
+        AppearanceApply.IsEnabled = true;
     }
 
     private void PopulateAppearanceControls()
     {
+        populatingAppearance = true;
         AppearanceTheme.SelectedIndex = appearance.Theme switch { "light" => 1, "dark" => 2, _ => 0 };
         AppearanceAccentMode.SelectedIndex = appearance.Accent == "system" ? 0 : 1;
         AppearanceColor.IsEnabled = AppearanceAccentMode.SelectedIndex == 1;
         AppearanceColor.Color = AccentPalette.TryParse(appearance.Accent, out uint custom)
             ? ToColor(custom) : appearanceUi.GetColorValue(UIColorType.Accent);
+        populatingAppearance = false;
     }
 
     private static Color ToColor(uint rgb) => Color.FromArgb(255,
@@ -82,8 +122,20 @@ public sealed partial class MainWindow
             SetAppearanceBrush("AccentButtonForeground" + state.suffix, stateText);
             SetAppearanceBrush("AccentButtonBorderBrush" + state.suffix, stateText);
         }
-        // Disabled controls, ordinary text, focus rings and native selection colors keep
-        // their WinUI resources. Do not overwrite system error/success/contrast semantics.
+        SetAppearanceBrush("XassAccentHoverBrush", highContrast ? fill : ToColor(AccentPalette.Shift(accent, -0.08)));
+        SetAppearanceBrush("XassAccentPressedBrush", highContrast ? fill : ToColor(AccentPalette.Shift(accent, -0.16)));
+        uint surface = RootGrid.ActualTheme == ElementTheme.Dark ? 0x202020u : 0xFFFFFFu;
+        SetAppearanceBrush("XassAccentTextBrush", highContrast ? fill : ToColor(AccentPalette.ReadableAccent(accent, surface)));
+        UpdateMusicBackdrop();
+        if (Microsoft.UI.Windowing.AppWindowTitleBar.IsCustomizationSupported())
+        {
+            var bar = AppWindow.TitleBar;
+            Color background = ToColor(surface), text = ToColor(AccentPalette.TextOn(surface));
+            bar.BackgroundColor = bar.InactiveBackgroundColor = background;
+            bar.ForegroundColor = bar.InactiveForegroundColor = text;
+            bar.ButtonBackgroundColor = bar.ButtonInactiveBackgroundColor = background;
+            bar.ButtonForegroundColor = bar.ButtonInactiveForegroundColor = text;
+        }
     }
 
     private void QueueAppearanceColors() => DispatcherQueue.TryEnqueue(() =>
@@ -97,9 +149,7 @@ public sealed partial class MainWindow
     private async void AppearanceApplyClick(object sender, RoutedEventArgs args)
     {
         if (!appearanceReady || !AppearanceApply.IsEnabled) return;
-        string theme = AppearanceTheme.SelectedIndex switch { 1 => "light", 2 => "dark", _ => "system" };
-        string accent = AppearanceAccentMode.SelectedIndex == 0 ? "system" : $"#{ToRgb(AppearanceColor.Color):X6}";
-        await SaveAppearanceAsync(new AppearancePreferences(theme, accent));
+        await SaveAppearanceAsync(SelectedAppearance());
     }
 
     private async void AppearanceResetClick(object sender, RoutedEventArgs args)
@@ -111,20 +161,27 @@ public sealed partial class MainWindow
 
     private async Task SaveAppearanceAsync(AppearancePreferences selected)
     {
+        appearanceSaving = true;
         AppearanceApply.IsEnabled = AppearanceReset.IsEnabled = false;
         appearance = selected.Normalize();
-        ApplyAppearance();
+        bool applied = false;
         try
         {
-            await Task.Run(() => appearanceStore.Save(selected));
+            ApplyAppearance();
+            applied = true;
+            await Task.Run(() => appearanceStore.Save(appearance));
+            savedAppearance = appearance;
             if (!closed) AppearanceStatus.Text = "Оформление сохранено. Оно останется после перезапуска и обновления.";
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        catch (Exception error)
         {
-            if (!closed) AppearanceStatus.Text = "Оформление применено к этому окну, но сохранить файл не удалось. Проверьте доступ к папке данных и попробуйте снова.";
+            if (!closed) AppearanceStatus.Text = applied
+                ? "Предпросмотр работает, но сохранить настройки не удалось. Повторите сохранение."
+                : $"Цвет не удалось применить ({error.GetType().Name}). Изменения не сохранены.";
         }
         finally
         {
+            appearanceSaving = false;
             if (!closed) AppearanceApply.IsEnabled = AppearanceReset.IsEnabled = true;
         }
     }
@@ -132,8 +189,8 @@ public sealed partial class MainWindow
     private void DisposeAppearance()
     {
         if (!appearanceReady) return;
-        appearanceUi.ColorValuesChanged -= AppearanceSystemColorsChanged;
-        appearanceAccessibility.HighContrastChanged -= AppearanceContrastChanged;
+        if (systemColorsSubscribed) appearanceUi.ColorValuesChanged -= AppearanceSystemColorsChanged;
+        if (contrastSubscribed) appearanceAccessibility.HighContrastChanged -= AppearanceContrastChanged;
         RootGrid.ActualThemeChanged -= AppearanceActualThemeChanged;
     }
 }

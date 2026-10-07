@@ -235,7 +235,8 @@ class ProtocolAndOwnershipTests(unittest.TestCase):
                 process.stdin.close(); process.stdout.close()
 
     def test_native_ui_and_process_lifecycle_contracts(self):
-        ui = (ROOT / "windows/Xass.Native/MainWindow.DesktopMusic.cs").read_text()
+        ui = "\n".join((ROOT / "windows/Xass.Native" / name).read_text(encoding="utf-8")
+                       for name in ("MainWindow.DesktopMusic.cs", "MainWindow.MusicLayout.cs"))
         client = (ROOT / "windows/Xass.Native/Services/MusicClient.cs").read_text()
         self.assertIn("PickMultipleFilesAsync", ui)
         self.assertIn("AddSeconds(30)", ui); self.assertIn("AddSeconds(120)", ui)

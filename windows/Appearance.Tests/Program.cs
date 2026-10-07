@@ -16,6 +16,13 @@ foreach (double shift in new[] { 0.0, -0.08, -0.16 })
 {
     uint background = AccentPalette.Shift((r << 16) | (g << 8) | b, shift);
     Require(AccentPalette.Contrast(background, AccentPalette.TextOn(background)) >= 4.5, "text contrast");
+    foreach (uint surface in new[] { 0x202020u, 0xFFFFFFu, 0x000000u })
+    {
+        uint readable = AccentPalette.ReadableAccent(background, surface);
+        Require(AccentPalette.Contrast(readable, surface) >= 4.5, "accent text contrast");
+        if (AccentPalette.Contrast(background, surface) >= 4.5)
+            Require(readable == background, "keep a readable user color");
+    }
 }
 string directory = Path.Combine(Path.GetTempPath(), "xass-appearance-tests-" + Guid.NewGuid().ToString("N"));
 try
@@ -41,4 +48,4 @@ try
     Require(Directory.GetFiles(directory).Length == 1, "temporary file cleanup");
 }
 finally { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
-Console.WriteLine("Appearance tests passed: parsing, 12,288 contrast cases, persistence, corruption, restore.");
+Console.WriteLine("Appearance tests passed: parsing, 12,288 fill + 36,864 accent text contrast cases, persistence, corruption, restore.");

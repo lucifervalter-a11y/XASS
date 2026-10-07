@@ -31,7 +31,7 @@ public sealed class MusicCatalogRow : INotifyPropertyChanged
 }
 public sealed record MusicQueueRow(int Index, string Path, string Title, bool Exists)
 {
-    public string Display => $"{Title}{(Exists ? "" : " · файл не найден")}\n{Path}";
+    public string Display => $"{Title}{(Exists ? "" : " · файл не найден")}";
 }
 public sealed record MusicLyricRow(double? Time, string Text)
 {
@@ -69,11 +69,10 @@ public sealed partial class MainWindow
     private List<MusicCatalogRow> musicRows = new();
     private List<MusicLyricRow> musicLyricRows = new();
     private string musicLyricsText = "", musicQueueSignature = "";
-    private ScrollViewer? musicPlayerScroll;
 
     private static Button MusicButton(string label, RoutedEventHandler click)
     {
-        var button = new Button { Content = label, Margin = new Thickness(0, 0, 8, 6) };
+        var button = new Button { Content = new TextBlock { Text = label, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center } };
         AutomationProperties.SetName(button, label);
         button.Click += click;
         return button;
@@ -81,84 +80,7 @@ public sealed partial class MainWindow
     private void InitializeDesktopMusic()
     {
         desktopMusicActive = true;
-        MusicPage.Children.Clear(); MusicPage.RowDefinitions.Clear();
-        MusicPage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        MusicPage.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        MusicPage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var search = new Grid { ColumnSpacing = 8 };
-        search.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        search.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        search.Children.Add(musicSearch);
-        var find = MusicButton("Найти / обновить", async (_, _) => await SearchDesktopMusicAsync());
-        Grid.SetColumn(find, 1); search.Children.Add(find); MusicPage.Children.Add(search);
-        AutomationProperties.SetName(musicSearch, "Поиск музыки сервера");
-        musicSearch.KeyDown += async (_, e) => { if (e.Key == VirtualKey.Enter) { e.Handled = true; await SearchDesktopMusicAsync(); } };
-        var tabs = new Pivot(); Grid.SetRow(tabs, 1); MusicPage.Children.Add(tabs);
-        var library = new Grid { RowSpacing = 8 };
-        library.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        library.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        var paging = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
-        musicBackPage = MusicButton("Предыдущая страница", async (_, _) => { if (musicPreviousOffsets.Count > 0) await LoadDesktopCatalogAsync(musicPreviousOffsets.Peek(), musicQuery, "previous"); });
-        musicNextPage = MusicButton("Следующая страница", async (_, _) => { if (musicNextOffset is int next) await LoadDesktopCatalogAsync(next, musicQuery, "next"); });
-        paging.Children.Add(musicBackPage); paging.Children.Add(musicNextPage); paging.Children.Add(musicCatalogCount);
-        library.Children.Add(paging); Grid.SetRow(musicTracks, 1); library.Children.Add(musicTracks);
-        tabs.Items.Add(new PivotItem { Header = "Сервер", Content = library });
-        var local = new Grid { RowSpacing = 8 };
-        local.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        local.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        var localActions = new VariableSizedWrapGrid { Orientation = Orientation.Horizontal, MaximumRowsOrColumns = 2 };
-        musicOpen = MusicButton("Выбрать MP3 / WAV / FLAC / OGG", PickDesktopMusic);
-        musicLocalPlay = MusicButton("Включить сохранённый", async (_, _) => await PlayLocalSelectionAsync());
-        localActions.Children.Add(musicOpen); localActions.Children.Add(musicLocalPlay); local.Children.Add(localActions);
-        Grid.SetRow(musicQueue, 1); local.Children.Add(musicQueue); tabs.Items.Add(new PivotItem { Header = "На компьютере", Content = local });
-        AutomationProperties.SetName(musicQueue, "Сохранённые локальные файлы, до 40 треков");
-        AutomationProperties.SetName(musicTracks, "Библиотека сервера: название, исполнитель, альбом, длительность и избранное");
-        musicTracks.SelectionChanged += (_, _) => UpdateDesktopMusicControls(); musicQueue.SelectionChanged += (_, _) => UpdateDesktopMusicControls();
-        musicTracks.KeyDown += async (_, e) => { if (e.Key is VirtualKey.Enter or VirtualKey.Space) { e.Handled = true; await PlayCatalogSelectionAsync(); } };
-        musicQueue.KeyDown += async (_, e) => { if (e.Key is VirtualKey.Enter or VirtualKey.Space) { e.Handled = true; await PlayLocalSelectionAsync(); } };
-        musicTracks.DoubleTapped += async (_, _) => await PlayCatalogSelectionAsync();
-        musicQueue.DoubleTapped += async (_, _) => await PlayLocalSelectionAsync();
-        var player = new StackPanel { Spacing = 8, Padding = new Thickness(12) };
-        var heading = new Grid { ColumnSpacing = 12 };
-        heading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        heading.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var coverFallback = new Grid { Width = 72, Height = 72 };
-        coverFallback.Children.Add(new FontIcon { Glyph = "\uE8D6", FontSize = 32 });
-        coverFallback.Children.Add(musicCover); heading.Children.Add(coverFallback);
-        var labels = new StackPanel { Spacing = 4 }; labels.Children.Add(musicTitle); labels.Children.Add(musicStatus); labels.Children.Add(musicError);
-        Grid.SetColumn(labels, 1); heading.Children.Add(labels); player.Children.Add(heading);
-        AutomationProperties.SetLiveSetting(musicError, Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite);
-        var transport = new VariableSizedWrapGrid { Orientation = Orientation.Horizontal, MaximumRowsOrColumns = 7 };
-        musicPrevious = MusicButton("Предыдущий трек", async (_, _) => await MusicActionAsync(new { action = "previous" }));
-        musicNext = MusicButton("Следующий трек", async (_, _) => await MusicActionAsync(new { action = "next" }));
-        musicPlay = MusicButton("Включить с сервера", async (_, _) => await PlayCatalogSelectionAsync());
-        musicPause = MusicButton("Пауза", async (_, _) => await MusicActionAsync(new { action = "pause" }));
-        musicResume = MusicButton("Продолжить / повторить", async (_, _) => await MusicActionAsync(new { action = "resume" }));
-        musicStop = MusicButton("Стоп / сброс", async (_, _) => await MusicActionAsync(new { action = "reset" }));
-        foreach (Button b in new[] { musicPrevious, musicPause, musicResume, musicStop, musicNext, musicPlay }) transport.Children.Add(b);
-        player.Children.Add(transport);
-        AutomationProperties.SetName(musicSeek, "Позиция трека в секундах; стрелки и Home / End перематывают");
-        AutomationProperties.SetName(musicVolume, "Громкость, от 0 до 100; стрелки применяют сразу");
-        musicSeek.ValueChanged += (_, _) => { if (!musicUpdating) musicSeekDirty = true; };
-        musicVolume.ValueChanged += (_, _) => { if (!musicUpdating) musicVolumeDirty = true; };
-        musicSeek.KeyUp += async (_, e) => { if (IsMusicSliderKey(e.Key)) await CommitMusicSeekAsync(); };
-        musicVolume.KeyUp += async (_, e) => { if (IsMusicSliderKey(e.Key)) await CommitMusicVolumeAsync(); };
-        musicSeek.PointerCaptureLost += async (_, _) => { if (musicSeekDirty) await CommitMusicSeekAsync(); };
-        musicVolume.PointerCaptureLost += async (_, _) => { if (musicVolumeDirty) await CommitMusicVolumeAsync(); };
-        var sliders = new StackPanel { Spacing = 6 }; sliders.Children.Add(musicSeek);
-        sliders.Children.Add(MusicButton("Перемотать", async (_, _) => await CommitMusicSeekAsync())); sliders.Children.Add(musicVolume);
-        sliders.Children.Add(MusicButton("Применить громкость", async (_, _) => await CommitMusicVolumeAsync()));
-        player.Children.Add(new Expander { Header = "Позиция и громкость", Content = sliders, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch });
-        var lyricPanel = new Expander { Header = "Текст песни", Content = musicLyrics, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
-        AutomationProperties.SetName(musicLyrics, "Текст песни; текущая строка выделена"); player.Children.Add(lyricPanel);
-        player.KeyDown += async (_, e) =>
-        {
-            if (e.Key != VirtualKey.Space || e.OriginalSource is Button or Slider or TextBox) return;
-            e.Handled = true; await MusicActionAsync(new { action = musicState == "playing" ? "pause" : "resume" });
-        };
-        musicPlayerScroll = new ScrollViewer { Content = player, MaxHeight = 310, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-        Grid.SetRow(musicPlayerScroll, 2); MusicPage.Children.Add(musicPlayerScroll);
-        MusicPage.SizeChanged += (_, e) => { if (musicPlayerScroll is not null) musicPlayerScroll.MaxHeight = Math.Clamp(e.NewSize.Height * 0.53, 130, 420); };
+        BuildMusicWorkspace();
         musicTimer.Tick += async (_, _) =>
         {
             if (closed) return;
@@ -198,7 +120,7 @@ public sealed partial class MainWindow
     }
     private async void DisposeDesktopMusic()
     {
-        musicTimer.Stop(); await nativeMusic.DisposeAsync();
+        musicTimer.Stop(); await discordMusic.DisposeAsync(); await nativeMusic.DisposeAsync();
     }
     private async Task PollDesktopMusicAsync()
     {
@@ -208,7 +130,16 @@ public sealed partial class MainWindow
         musicPolling = true;
         try { await ApplyDesktopMusicAsync(await MusicRequestAsync(new { action = "snapshot" })); }
         catch (OperationCanceledException) { }
-        catch (Exception) { if (musicPageVisible && !closed) musicStatus.Text = "Музыкальный модуль недоступен. Проверьте установку или пути подключения."; }
+        catch (Exception)
+        {
+            _ = PublishDiscordMusicAsync(null);
+            if (!closed)
+            {
+                musicState = "unavailable";
+                musicStatus.Text = "Музыкальный модуль недоступен. Проверьте установку или пути подключения.";
+                UpdateDesktopMusicControls();
+            }
+        }
         finally { musicPolling = false; }
     }
     private async Task MusicActionAsync(object request)
@@ -272,7 +203,7 @@ public sealed partial class MainWindow
         musicOpen.IsEnabled = !musicBusy && localAvailable;
         musicLocalPlay.IsEnabled = !musicBusy && localAvailable && musicQueue.SelectedItem is MusicQueueRow;
         musicPrevious.IsEnabled = musicNext.IsEnabled = !musicBusy && localAvailable && musicQueue.Items.Count > 0;
-        musicPlay.IsEnabled = !musicBusy && musicTracks.SelectedItem is MusicCatalogRow;
+        musicPlay.IsEnabled = !musicBusy && (musicSource.SelectedIndex == 0 ? localAvailable && musicQueue.SelectedItem is MusicQueueRow : musicTracks.SelectedItem is MusicCatalogRow);
         musicPause.IsEnabled = !musicBusy && musicState == "playing";
         musicResume.IsEnabled = !musicBusy && musicState is "paused" or "ended";
         musicStop.IsEnabled = !musicBusy && musicState is "playing" or "paused" or "loading" or "error" or "stopping" or "ended";
@@ -280,11 +211,21 @@ public sealed partial class MainWindow
         musicVolume.IsEnabled = !musicBusy;
         musicBackPage.IsEnabled = !musicCatalogBusy && musicPreviousOffsets.Count > 0;
         musicNextPage.IsEnabled = !musicCatalogBusy && musicNextOffset.HasValue;
+        musicPause.Visibility = musicState == "playing" ? Visibility.Visible : Visibility.Collapsed;
+        musicResume.Visibility = musicState is "paused" or "ended" ? Visibility.Visible : Visibility.Collapsed;
+        musicPlay.Visibility = musicState is "playing" or "paused" or "ended" ? Visibility.Collapsed : Visibility.Visible;
+        musicLoading.IsActive = musicBusy || musicState == "loading";
+        musicLoading.Visibility = musicLoading.IsActive ? Visibility.Visible : Visibility.Collapsed;
+        musicQueueEmpty.Visibility = musicQueue.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        musicCatalogEmpty.Visibility = musicTracks.Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        musicCatalogEmpty.Text = musicCatalogBusy ? "Загружаем библиотеку…" : musicCatalogLoaded ? "Треки не найдены. Измените запрос." : "Библиотека пока недоступна. Нажмите «Найти» для повторной попытки.";
+        musicFollow.IsEnabled = musicLyricRows.Any(row => row.Time is not null);
     }
 
     private async Task ApplyDesktopMusicAsync(JsonElement snap)
     {
         if (closed) return;
+        _ = PublishDiscordMusicAsync(DiscordMusicTrack.FromSnapshot(snap));
         musicSnapshot = snap;
         musicOwner = snap.GetProperty("owner").GetString() ?? "local";
         musicState = snap.GetProperty("state").GetString() ?? "idle";
@@ -292,10 +233,17 @@ public sealed partial class MainWindow
         string key = musicOwner + snap.GetProperty("track_id") + title + artist + snap.GetProperty("current_index");
         if (key != musicTrackKey) musicSeekDirty = false;
         musicTrackKey = key;
-        musicTitle.Text = string.IsNullOrWhiteSpace(artist) ? title : $"{title} · {artist}";
-        OverviewTrack.Text = musicTitle.Text;
+        musicTitle.Text = title; musicArtist.Text = artist;
+        musicArtist.Visibility = string.IsNullOrWhiteSpace(artist) ? Visibility.Collapsed : Visibility.Visible;
+        OverviewTrack.Text = string.IsNullOrWhiteSpace(artist) ? title : $"{title} · {artist}";
+        if (musicHistory.Observe(musicState,key,title,artist,DateTimeOffset.Now))
+        {
+            musicHistoryList.ItemsSource = musicHistory.Entries.ToList();
+            musicHistoryEmpty.Visibility = Visibility.Collapsed;
+        }
         double position = snap.GetProperty("position").GetDouble(), duration = snap.GetProperty("duration").GetDouble();
-        musicStatus.Text = $"{(musicOwner == "agent" ? "Трансляция" : "На компьютере")} · {StateLabel(musicState)} · {Clock(position)} / {Clock(duration)}";
+        musicStatus.Text = $"{(musicOwner == "agent" ? "Трансляция" : "На компьютере")} · {StateLabel(musicState)}";
+        musicElapsed.Text = Clock(position); musicDuration.Text = Clock(duration);
         musicError.Text = snap.TryGetProperty("compatibility_notice", out var compatibility) && !string.IsNullOrWhiteSpace(compatibility.GetString())
             ? compatibility.GetString() : snap.GetProperty("error").GetString(); musicError.Visibility = string.IsNullOrWhiteSpace(musicError.Text) ? Visibility.Collapsed : Visibility.Visible;
         musicUpdating = true;
@@ -318,12 +266,13 @@ public sealed partial class MainWindow
             musicLyricRows = snap.GetProperty("lyric_rows").EnumerateArray().Select(r => new MusicLyricRow(r.GetProperty("time").ValueKind == JsonValueKind.Number ? r.GetProperty("time").GetDouble() : null, r.GetProperty("text").GetString() ?? "")).ToList();
             if (musicLyricRows.Count == 0) musicLyricRows.Add(new(null, "Текст песни отсутствует"));
             musicLyrics.ItemsSource = musicLyricRows;
+            musicLyricStatus.Text = musicLyricRows.Any(row => row.Time is not null) ? "По времени трека" : string.IsNullOrWhiteSpace(lyrics) ? "В треке нет текста песни" : "Текст без временных меток";
         }
         int lyricIndex = musicLyricRows.FindLastIndex(r => r.Time is double at && at <= position);
         if (musicLyrics.SelectedIndex != lyricIndex)
         {
             musicLyrics.SelectedIndex = lyricIndex;
-            if (lyricIndex >= 0) musicLyrics.ScrollIntoView(musicLyricRows[lyricIndex], ScrollIntoViewAlignment.Leading);
+            if (lyricIndex >= 0 && musicFollow.IsChecked == true) musicLyrics.ScrollIntoView(musicLyricRows[lyricIndex], ScrollIntoViewAlignment.Leading);
         }
         int reveal = snap.GetProperty("reveal").GetInt32();
         if (musicRevealInitialized && reveal > 0 && reveal != musicReveal)
@@ -335,7 +284,7 @@ public sealed partial class MainWindow
         UpdateDesktopMusicControls();
         string digest = snap.GetProperty("cover_sha256").GetString() ?? "";
         if (digest == musicCoverDigest) return;
-        musicCoverDigest = digest; int coverGeneration = ++musicCoverGeneration; musicCover.Source = null;
+        musicCoverDigest = digest; int coverGeneration = ++musicCoverGeneration; musicCover.Source = null; coverPalette = null; UpdateMusicBackdrop();
         if (digest.Length != 64) return;
         try
         {
@@ -344,7 +293,13 @@ public sealed partial class MainWindow
             using var stream = new InMemoryRandomAccessStream();
             using (var writer = new DataWriter(stream.GetOutputStreamAt(0))) { writer.WriteBytes(bytes); await writer.StoreAsync(); await writer.FlushAsync(); }
             stream.Seek(0); var bitmap = new BitmapImage(); await bitmap.SetSourceAsync(stream);
-            if (!closed && coverGeneration == musicCoverGeneration) musicCover.Source = bitmap;
+            stream.Seek(0);
+            var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(stream);
+            var pixels = await decoder.GetPixelDataAsync(Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8,
+                Windows.Graphics.Imaging.BitmapAlphaMode.Straight, new Windows.Graphics.Imaging.BitmapTransform { ScaledWidth = 32, ScaledHeight = 32 },
+                Windows.Graphics.Imaging.ExifOrientationMode.IgnoreExifOrientation, Windows.Graphics.Imaging.ColorManagementMode.ColorManageToSRgb);
+            var palette = CoverPalette.FromBgra(pixels.DetachPixelData());
+            if (!closed && coverGeneration == musicCoverGeneration) { musicCover.Source = bitmap; coverPalette = palette; UpdateMusicBackdrop(); }
         }
         catch (Exception) { if (coverGeneration == musicCoverGeneration) musicCover.Source = null; }
     }

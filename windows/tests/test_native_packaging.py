@@ -50,7 +50,7 @@ class PackagingTests(unittest.TestCase):
     def test_payload_rejects_personal_configs_keys_and_symlinks(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            for name in ('config.json', '.env', '.env.local', 'secret.key', 'backup.db', 'appearance.json', 'config.json.bak', 'runtime.json', 'local-music.json'):
+            for name in ('config.json', '.env', '.env.local', 'secret.key', 'backup.db', 'appearance.json', 'discord-presence.json', 'discord-presence.json.bak', 'config.json.bak', 'runtime.json', 'local-music.json'):
                 path = root / name
                 path.write_text('private')
                 with self.subTest(name=name), self.assertRaises(ValueError):
