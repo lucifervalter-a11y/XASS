@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import socket
 import ssl
 import subprocess
@@ -234,13 +237,195 @@ def check_health():
             emit("backend_health", location=label, ok=False, **error_fields(exc))
 
 
+def policy_read(arguments, *, privileged=False):
+    """Run fixed read commands, using sudo only if already permitted for that exact read."""
+    executable = shutil.which(arguments[0])
+    if not executable:
+        return None, "not_installed"
+    command = [executable, *arguments[1:]]
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=12)
+        permission_hint = any(hint in result.stderr.lower() for hint in (b"permission denied", b"not seeing messages", b"no journal files"))
+        if (result.returncode or permission_hint) and privileged and os.geteuid() != 0:
+            sudo = shutil.which("sudo")
+            if not sudo:
+                return None, "read_access_unavailable"
+            permission = subprocess.run([sudo, "-n", "-l", *command], stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            if permission.returncode:
+                return None, "existing_sudo_permission_unavailable"
+            result = subprocess.run([sudo, "-n", *command], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
+        if result.returncode:
+            return None, "read_failed"
+        if len(result.stdout) > 4 * 1024 * 1024:
+            return None, "output_exceeds_private_parse_limit"
+        return result.stdout, "ok"
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+def summarize_iptables(raw):
+    """Keep rule mechanics/counters, excluding comments, log prefixes and payload strings."""
+    tables = []
+    current = None
+    arity = {k: 1 for k in ["-A", "-p", "-s", "-d", "-j", "-g", "-i", "-o", "-m",
+        "--dport", "--sport", "--dports", "--sports", "--ctstate", "--state", "--uid-owner",
+        "--gid-owner", "--mark", "--set-mark", "--set-xmark", "--reject-with", "--to-destination",
+        "--to-source", "--match-set", "--set", "--tcp-option", "--ctdir", "--ctstatus"]}
+    arity["--tcp-flags"] = 2
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("*"):
+            current = {"table": line[1:], "chains": [], "rules": []}
+            tables.append(current)
+        elif current is not None and line.startswith(":"):
+            parts = line[1:].split()
+            current["chains"].append({"chain": parts[0], "policy": parts[1], "counters": parts[2] if len(parts)>2 else None})
+        elif current is not None and (line.startswith("-A ") or re.match(r"\[\d+:\d+\] -A ", line)):
+            tokens = shlex.split(line)
+            clean, omitted = [], []
+            index = 0
+            if tokens and re.fullmatch(r"\[\d+:\d+\]", tokens[0]):
+                clean.append(tokens[0]); index = 1
+            while index < len(tokens):
+                token = tokens[index]
+                if token == "!":
+                    clean.append(token); index += 1
+                elif token in arity:
+                    count = arity[token]
+                    clean.extend(tokens[index:index+count+1]); index += count+1
+                elif token in {"--syn", "--random", "--random-fully", "--notrack"}:
+                    clean.append(token); index += 1
+                else:
+                    if token.startswith("-"):
+                        omitted.append(token)
+                    index += 1
+            current["rules"].append({"mechanics": clean, "omitted_options": omitted})
+    return tables
+
+
+def nft_summary(value):
+    """Summarize hooks/verdicts/sets without emitting arbitrary rule payloads."""
+    result = {"tables": [], "chains": [], "rules": [], "sets": []}
+    for item in value.get("nftables", []):
+        if "table" in item:
+            result["tables"].append({key: item["table"].get(key) for key in ("family", "name")})
+        if "chain" in item:
+            result["chains"].append({key: item["chain"].get(key) for key in ("family", "table", "name", "type", "hook", "prio", "policy")})
+        if "rule" in item:
+            rule = item["rule"]
+            verdicts, counters, expression_types = [], [], []
+            for expression in rule.get("expr", []):
+                expression_types.extend(expression.keys())
+                for key in ("accept", "drop", "reject", "return", "jump", "goto", "dnat", "snat", "redirect"):
+                    if key in expression:
+                        detail = expression[key]
+                        verdicts.append({"kind": key, "target": detail.get("target") if isinstance(detail, dict) else None})
+                if "counter" in expression:
+                    counters.append(expression["counter"])
+            result["rules"].append({"family": rule.get("family"), "table": rule.get("table"), "chain": rule.get("chain"),
+                "handle": rule.get("handle"), "expression_types": expression_types, "verdicts": verdicts, "counters": counters,
+                "matches_withheld": any("match" in expression for expression in rule.get("expr", []))})
+        if "set" in item:
+            definition = item["set"]
+            result["sets"].append({key: definition.get(key) for key in ("family", "table", "name", "type")})
+    return result
+
+
+def kernel_filter_summary(entries, destination):
+    target, drops, route_faults = 0, 0, 0
+    for entry in entries:
+        message = str(entry.get("MESSAGE", ""))
+        matching = f"DST={destination}" in message and "DPT=443" in message
+        target += int(matching)
+        drops += int(matching and bool(re.search(r"BLOCK|DROP|REJECT|DENY", message, re.I)))
+        route_faults += int(bool(re.search(r"martian source|NETDEV WATCHDOG|link is down|unreachable", message, re.I)))
+    return {"entries_checked": len(entries), "target_tcp443_entries": target,
+            "target_block_entries": drops, "network_fault_entries": route_faults}
+
+
+def egress_policy_checks(pid):
+    target = "149.154.166.110"
+    uid = os.stat(f"/proc/{pid}").st_uid
+    route_device = None
+    for label, address in [("telegram", target), ("github_control", "140.82.121.3")]:
+        raw, access = policy_read(["ip", "-j", "-4", "route", "get", address, "uid", str(uid), "ipproto", "tcp", "dport", "443"])
+        routes = json.loads(raw) if raw is not None else []
+        if label == "telegram" and routes:
+            route_device = routes[0].get("dev")
+        emit("route_lookup", target=label, access=access, routes=routes)
+    raw, access = policy_read(["ip", "-j", "-4", "rule", "show"])
+    emit("policy_routing_rules", access=access, rules=json.loads(raw) if raw is not None else [])
+    raw, access = policy_read(["ip", "-j", "-4", "route", "show", "table", "all"])
+    routes = json.loads(raw) if raw is not None else []
+    relevant = []
+    for route in routes:
+        destination = route.get("dst", "default")
+        try:
+            match = destination == "default" or ipaddress.ip_address(target) in ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            match = False
+        if match:
+            relevant.append(route)
+    emit("routes_covering_telegram", access=access, routes=relevant)
+    for tool in ("iptables-save", "ip6tables-save"):
+        raw, access = policy_read([tool, "-c"], privileged=True)
+        emit("packet_filter", backend=tool, access=access, tables=summarize_iptables(raw) if raw is not None else [])
+    raw, access = policy_read(["nft", "-j", "list", "ruleset"], privileged=True)
+    emit("nftables", access=access, summary=nft_summary(json.loads(raw)) if raw is not None else None)
+    # Legacy and nft backends may coexist. Read both explicitly if installed.
+    for tool in ("iptables-legacy-save", "iptables-nft-save"):
+        raw, access = policy_read([tool, "-c"], privileged=True)
+        emit("packet_filter", backend=tool, access=access, tables=summarize_iptables(raw) if raw is not None else [])
+    if route_device and re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", route_device):
+        for direction in ("ingress", "egress"):
+            raw, access = policy_read(["tc", "-j", "filter", "show", "dev", route_device, direction], privileged=True)
+            filters = json.loads(raw) if raw is not None else []
+            emit("traffic_control_filters", direction=direction, access=access, count=len(filters), kinds=[item.get("kind") for item in filters])
+    raw, access = policy_read(["systemctl", "show", SERVICE, "--property=IPAddressDeny", "--property=IPAddressAllow", "--property=RestrictAddressFamilies", "--property=PrivateNetwork"])
+    restrictions = dict(line.split("=", 1) for line in raw.decode().splitlines() if "=" in line) if raw is not None else {}
+    emit("service_network_restrictions", access=access, properties=restrictions)
+    raw, access = policy_read(["journalctl", "-k", "--since=-30min", "--no-pager", "-o", "json", "-n", "2000"], privileged=True)
+    entries = [json.loads(line) for line in raw.splitlines() if line.strip()] if raw is not None else []
+    emit("kernel_filter_log", access=access, **kernel_filter_summary(entries, target))
+    yc = shutil.which("yc")
+    if not yc:
+        candidate = Path.home() / "yandex-cloud/bin/yc"
+        yc = str(candidate) if candidate.is_file() else None
+    if yc:
+        raw, access = policy_read([yc, "config", "profile", "list"])
+        profiles = raw.decode().splitlines() if raw is not None else []
+        emit("yandex_cli_existing_profiles", installed=True, access=access, nonempty_lines=len([line for line in profiles if line.strip()]), metadata_accessed=False)
+    else:
+        emit("yandex_cli_existing_profiles", installed=False, metadata_accessed=False)
+    check_health()
+
+
 def main():
     public_only = sys.argv[1:] == ["--public-only"]
     logs_and_control = sys.argv[1:] == ["--logs-and-control-only"]
-    if not public_only and not logs_and_control and sys.argv[1:]:
+    policy_only = sys.argv[1:] == ["--egress-policy-only"]
+    if not public_only and not logs_and_control and not policy_only and sys.argv[1:]:
         return 2
     try:
         emit("start", location="github_runner" if public_only else "server", deployment_attempted=False)
+        if policy_only:
+            if Path.cwd() != ROOT or ROOT.resolve() != ROOT:
+                raise RuntimeError("Unexpected checkout")
+            show = capture(["systemctl", "show", SERVICE, "--property=MainPID", "--property=ActiveState", "--property=WorkingDirectory"])
+            service = dict(line.split("=", 1) for line in show.decode().splitlines() if "=" in line)
+            pid = service["MainPID"]
+            if not pid.isdigit() or int(pid) <= 0 or service["WorkingDirectory"] != str(ROOT):
+                raise RuntimeError("Invalid backend process")
+            emit("egress_backend_context", backend_active=service["ActiveState"] == "active",
+                 baseline_matches=capture(["git", "rev-parse", "HEAD"]).decode().strip() == BASE,
+                 tracked_clean=not capture(["git", "status", "--porcelain", "--untracked-files=no"]).strip(),
+                 process_checkout_matches=Path(f"/proc/{pid}/cwd").resolve() == ROOT,
+                 credential_environment_read=False, metadata_accessed=False)
+            egress_policy_checks(int(pid))
+            emit("complete", deployment_attempted=False, telegram_connections_attempted=0, metadata_accessed=False)
+            return 0
         environment, pid, same_namespace = (dict(os.environ), None, True) if public_only else backend_context()
         # Network values stay inside the child/server process; never display them.
         for name in NETWORK_KEYS:

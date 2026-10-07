@@ -44,7 +44,7 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip check
           python -B deploy/check_approved_server_release.py
-      - name: Read-only Telegram DNS, TCP, TLS, HTTP and backend diagnostics
+      - name: Read-only VPS egress rules, routes and filter logs
         if: env.XASS_OPERATION == 'diagnose-telegram'
         shell: bash
         env:
@@ -55,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            printf "cd /home/red/serverredus\n.venv/bin/python -B - --logs-and-control-only <<'XASS_TELEGRAM_DIAGNOSTIC_PY'\n"
+            printf "cd /home/red/serverredus\n.venv/bin/python -B - --egress-policy-only <<'XASS_TELEGRAM_DIAGNOSTIC_PY'\n"
             cat deploy/telegram_network_diagnostics.py
             printf '\nXASS_TELEGRAM_DIAGNOSTIC_PY\n'
           } | bash deploy/github_ssh.sh exec
