@@ -1,0 +1,116 @@
+name: Publish approved stable desktop and iOS artifacts
+
+on:
+  push:
+    branches: [ops/publish-stable-20261007]
+    paths: [.github/workflows/approved-stable-publish.yml]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: xass-approved-stable-publication-20261007
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_SHA: 9b26976d2eccb7bfe707ad37348aa12e1096ab55
+      IOS_SOURCE_SHA: eb850ab0ca57bfd01792b232cf14ee197bb85af4
+      GH_REPO: lucifervalter-a11y/XASS
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: native-stable-0.21.1-9b26976
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require successful exact-revision application and installer checks
+        shell: python
+        run: |
+          import json, os, subprocess
+          expected = {
+              37677557930: (os.environ['RELEASE_SHA'], 'Tests and interface contracts'),
+              37677558184: (os.environ['RELEASE_SHA'], 'Validate native Windows shell'),
+              37676254130: (os.environ['IOS_SOURCE_SHA'], 'Build XASS iOS (unsigned)'),
+              37677982722: ('f6c979930dc9e856c719651e5e373b68a477d4b7', 'Build approved Windows release candidate'),
+          }
+          subprocess.check_call(['git', 'diff', '--exit-code', os.environ['IOS_SOURCE_SHA'], os.environ['RELEASE_SHA'], '--', 'ios', 'assets/xass-app-icon-source.png'])
+          evidence = []
+          for run_id, (revision, name) in expected.items():
+              run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GH_REPO"]}/actions/runs/{run_id}']))
+              assert run['head_sha'] == revision and run['name'] == name
+              assert run['status'] == 'completed' and run['conclusion'] == 'success', f'Unsuccessful required run {run_id}'
+              evidence.append({'run_id': run_id, 'revision': revision, 'name': name, 'url': run['html_url'], 'conclusion': run['conclusion']})
+          from pathlib import Path
+          Path('verified-checks.json').write_text(json.dumps(evidence, indent=2))
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-native-installer
+          run-id: 37677982722
+          github-token: ${{ github.token }}
+          path: release/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-native-installer-smoke
+          run-id: 37677982722
+          github-token: ${{ github.token }}
+          path: release/checks
+      - uses: actions/download-artifact@v4
+        with:
+          name: XASS-iOS-UNSIGNED-requires-signing
+          run-id: 37676254130
+          github-token: ${{ github.token }}
+          path: release/ios
+      - name: Verify release payload identities and migration results
+        shell: python
+        run: |
+          import hashlib, json, os, plistlib, zipfile
+          from pathlib import Path
+          root = Path('release/windows')
+          metadata = json.loads((root / 'native-update.json').read_text())
+          assert metadata['revision'] == os.environ['RELEASE_SHA'] and metadata['distribution'] == 'native'
+          assert metadata['filename'] == 'XASS-Native-Setup.exe' and metadata['version'] == '0.21.1'
+          installer = root / metadata['filename']
+          assert installer.stat().st_size == metadata['size']
+          with installer.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == metadata['sha256']
+          for name in ('windows-native-smoke.json', 'windows-native-migration-smoke.json'):
+              result = json.loads((Path('release/checks') / name).read_text())
+              assert result['revision'] == os.environ['RELEASE_SHA']
+              assert result['injected_failure_and_actual_rollback'] == 'passed'
+              assert result['verified_install_and_native_readiness'] == 'passed'
+              if 'migration' in name:
+                  assert result['from_distribution'] == 'native-test' and result['to_distribution'] == 'native'
+                  assert result['same_version'] is False
+          ipa = Path('release/ios/XASS-unsigned.ipa')
+          with zipfile.ZipFile(ipa) as archive:
+              info = plistlib.loads(archive.read('Payload/XASS.app/Info.plist'))
+              assert info['CFBundleShortVersionString'] == '0.21.1'
+              assert str(info['CFBundleVersion']) == '4'
+              assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
+          with ipa.open('rb') as stream:
+              actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+          assert actual == Path(str(ipa) + '.sha256').read_text().split()[0]
+      - name: Publish an immutable stable native release and explicitly unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          cp verified-checks.json release/checks/
+          cat > release-notes.md <<'NOTES'
+          XASS Native 0.21.1 for Windows, with a stable update channel and a verified migration from the native test installation. The installer preserves native application and agent data. Automatic updates and continuous microphone access are not enabled by this release.
+
+          The iOS 0.21.1 (4) IPA includes the music-card dismissal and lyrics-tools fixes. **XASS-unsigned.ipa is unsigned and requires your own signing before installation on an iPhone.** It is not an App Store or TestFlight package.
+
+          This release publishes desktop/mobile artifacts only. The production backend remains at its previous revision while its Telegram readiness check is failing.
+
+          Exact source revision and successful CI runs are recorded in verified-checks.json. Windows payload hashes and real installer/migration/rollback reports are included. No accounts, personal configuration or speech model are bundled.
+          NOTES
+          gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title 'XASS Native 0.21.1 · iOS 0.21.1 (4), unsigned' --notes-file release-notes.md --latest=false release/windows/XASS-Native-Setup.exe release/windows/XASS-Native-Setup.exe.sha256 release/windows/XASS-Native-Setup.json release/windows/native-update.json release/windows/payload-manifest.json release/checks/*.json release/ios/XASS-unsigned.ipa release/ios/XASS-unsigned.ipa.sha256 release/ios/UNSIGNED.md
+          gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha > released-revision.txt
+          test "$(cat released-revision.txt)" = "$RELEASE_SHA"
