@@ -41,6 +41,18 @@ class TelegramDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("secret text", output.getvalue())
         connection.close.assert_called_once()
 
+    def test_recent_transport_failures_are_distinct_from_polling_conflicts(self):
+        entries = [
+            {"MESSAGE": "telegram_polling_loop Telegram API error: Telegram API request failed | method=getUpdates", "__REALTIME_TIMESTAMP": "9900000000"},
+            {"MESSAGE": "Polling conflict (409): private-sentinel", "__REALTIME_TIMESTAMP": "9950000000"},
+            {"MESSAGE": "telegram_polling_loop Telegram API error: Telegram API request failed", "__REALTIME_TIMESTAMP": "1000000000"},
+        ]
+        result = diagnostics.journal_summary(entries, now=10000)
+        self.assertEqual(result["telegram_transport_errors"], 2)
+        self.assertEqual(result["telegram_transport_errors_last_30_minutes"], 1)
+        self.assertEqual(result["telegram_conflicts_last_30_minutes"], 1)
+        self.assertNotIn("private-sentinel", json.dumps(result))
+
     def test_tls_verification_failure_is_never_bypassed(self):
         connection = MagicMock()
         context = MagicMock(verify_mode=ssl.CERT_REQUIRED, check_hostname=True)

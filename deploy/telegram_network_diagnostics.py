@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 
 ROOT = Path("/home/red/serverredus")
 BASE = "822ac05d4a53dd5475312834065501b9af063b1a"
@@ -108,20 +109,34 @@ def probe(host, family, address, *, timeout=4):
     return result
 
 
-def journal_summary(entries):
+def journal_summary(entries, now=None):
+    cutoff = int(((time.time() if now is None else now) - 1800) * 1000000)
     summary = {"entries_checked": len(entries), "error_entries": 0, "telegram_related_entries": 0,
                "polling_error_entries": 0, "polling_start_entries": 0, "webhook_start_entries": 0,
                "identity_discovery_failures": 0, "identity_discovery_successes": 0,
-               "telegram_http_success_entries": 0, "last_telegram_event_utc_microseconds": None}
+               "telegram_http_success_entries": 0, "last_telegram_event_utc_microseconds": None,
+               "telegram_transport_errors": 0, "telegram_conflicts_409": 0,
+               "telegram_transport_errors_last_30_minutes": 0, "telegram_conflicts_last_30_minutes": 0,
+               "observed_journal_first_utc_microseconds": None, "observed_journal_last_utc_microseconds": None}
     for entry in entries:
         message = str(entry.get("MESSAGE", ""))
+        timestamp = str(entry.get("__REALTIME_TIMESTAMP", ""))
+        timestamp = int(timestamp) if timestamp.isdigit() else 0
+        if timestamp:
+            summary["observed_journal_first_utc_microseconds"] = min(timestamp, summary["observed_journal_first_utc_microseconds"] or timestamp)
+            summary["observed_journal_last_utc_microseconds"] = max(timestamp, summary["observed_journal_last_utc_microseconds"] or 0)
         summary["error_entries"] += int(int(entry.get("PRIORITY", 6)) <= 3 or bool(re.search(r"\bERROR\b|Traceback \(most recent call last\)", message)))
         related = bool(re.search(r"telegram|api\.telegram\.org|polling|getMe", message, re.I))
         if related:
             summary["telegram_related_entries"] += 1
-            timestamp = str(entry.get("__REALTIME_TIMESTAMP", ""))
-            if timestamp.isdigit():
-                summary["last_telegram_event_utc_microseconds"] = max(int(timestamp), summary["last_telegram_event_utc_microseconds"] or 0)
+            if timestamp:
+                summary["last_telegram_event_utc_microseconds"] = max(timestamp, summary["last_telegram_event_utc_microseconds"] or 0)
+        transport = related and bool(re.search(r"Telegram API request failed|ConnectTimeout|ConnectError|ReadTimeout|ReadError|NetworkError", message))
+        conflict = related and ("Polling conflict (409)" in message or "http=409" in message)
+        summary["telegram_transport_errors"] += int(transport)
+        summary["telegram_conflicts_409"] += int(conflict)
+        summary["telegram_transport_errors_last_30_minutes"] += int(transport and timestamp >= cutoff)
+        summary["telegram_conflicts_last_30_minutes"] += int(conflict and timestamp >= cutoff)
         summary["polling_error_entries"] += int("telegram_polling_loop" in message or "Polling conflict" in message)
         summary["polling_start_entries"] += int("Startup mode: polling" in message or "Polling mode enabled" in message)
         summary["webhook_start_entries"] += int("Startup mode: webhook" in message)
@@ -204,9 +219,25 @@ def backend_context():
     return effective, int(pid), same_namespace
 
 
+def check_health():
+    from dotenv import dotenv_values
+    port = str(dotenv_values(ROOT / ".env").get("PORT") or "8000")
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise RuntimeError("Invalid port")
+    for label, url in [("local", f"http://127.0.0.1:{port}/health"), ("public", "https://redvps.site/health")]:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                data = json.loads(response.read(65536))
+                emit("backend_health", location=label, http_status=response.status,
+                     ok=response.status == 200 and data.get("status") == "ok")
+        except Exception as exc:
+            emit("backend_health", location=label, ok=False, **error_fields(exc))
+
+
 def main():
     public_only = sys.argv[1:] == ["--public-only"]
-    if not public_only and sys.argv[1:]:
+    logs_and_control = sys.argv[1:] == ["--logs-and-control-only"]
+    if not public_only and not logs_and_control and sys.argv[1:]:
         return 2
     try:
         emit("start", location="github_runner" if public_only else "server", deployment_attempted=False)
@@ -215,23 +246,28 @@ def main():
         for name in NETWORK_KEYS:
             os.environ.pop(name, None)
         os.environ.update({name: value for name, value in environment.items() if name in NETWORK_KEYS})
-        results = [probe(HOST, family, address) for family, address in dns(HOST)]
+        records = dns(HOST)
+        results = [] if logs_and_control else [probe(HOST, family, address) for family, address in records]
         if not public_only:
             import psutil
-            addresses = {item["address"] for item in results}
+            addresses = {item[1] for item in records}
             counts = {}
             for connection in psutil.Process(pid).net_connections(kind="inet"):
                 if connection.raddr and connection.raddr.ip in addresses and connection.raddr.port == 443:
                     counts[connection.status] = counts.get(connection.status, 0) + 1
             emit("backend_telegram_sockets", states=counts, note="Connections only; not proof of successful Bot API calls")
-            if same_namespace and any(item.get("ok") for item in results):
+            if logs_and_control:
+                emit("get_me_trace", attempted=False, reason="Follow-up reads logs and socket state only; no repeated Telegram connection attempt")
+            elif same_namespace and any(item.get("ok") for item in results):
                 emit("get_me_trace", **json.loads(capture([sys.executable, "-B", "-c", GET_ME_WORKER], timeout=18, env=environment)))
             else:
                 emit("get_me_trace", attempted=False, reason="No verified Telegram TLS/HTTP path or network namespace differs")
             # Independent HTTPS control: distinguish a general outbound failure.
-            control = dns("redvps.site")
+            control_host = "github.com" if logs_and_control else "redvps.site"
+            control = dns(control_host)
             if control:
-                probe("redvps.site", *control[0])
+                probe(control_host, *control[0])
+            check_health()
         emit("complete", deployment_attempted=False)
         return 0
     except Exception as exc:

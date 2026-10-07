@@ -54,9 +54,8 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
         run: |
           set -euo pipefail
-          python -B deploy/telegram_network_diagnostics.py --public-only
           {
-            printf "cd /home/red/serverredus\n.venv/bin/python -B - <<'XASS_TELEGRAM_DIAGNOSTIC_PY'\n"
+            printf "cd /home/red/serverredus\n.venv/bin/python -B - --logs-and-control-only <<'XASS_TELEGRAM_DIAGNOSTIC_PY'\n"
             cat deploy/telegram_network_diagnostics.py
             printf '\nXASS_TELEGRAM_DIAGNOSTIC_PY\n'
           } | bash deploy/github_ssh.sh exec
