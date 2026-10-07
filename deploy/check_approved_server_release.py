@@ -14,6 +14,7 @@ PATTERNS = [
     "test_music_play_without_pc.py", "test_music_transfers.py", "test_music_transfer_diagnostics.py",
     "test_music_archive_uploads.py", "test_music_api.py", "test_predeploy_backup.py",
     "test_approved_server_release.py",
+    "test_telegram_network_diagnostics.py",
 ]
 
 if __name__ == "__main__":

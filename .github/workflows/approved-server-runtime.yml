@@ -8,9 +8,14 @@ on:
       - deploy/approved_server_release.py
       - deploy/check_approved_server_release.py
       - tests/test_approved_server_release.py
+      - deploy/telegram_network_diagnostics.py
+      - tests/test_telegram_network_diagnostics.py
 
 permissions:
   contents: read
+
+env:
+  XASS_OPERATION: diagnose-telegram
 
 concurrency:
   group: xass-production
@@ -39,7 +44,24 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip check
           python -B deploy/check_approved_server_release.py
+      - name: Read-only Telegram DNS, TCP, TLS, HTTP and backend diagnostics
+        if: env.XASS_OPERATION == 'diagnose-telegram'
+        shell: bash
+        env:
+          SSH_HOST: 51.250.80.137
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          python -B deploy/telegram_network_diagnostics.py --public-only
+          {
+            printf "cd /home/red/serverredus\n.venv/bin/python -B - <<'XASS_TELEGRAM_DIAGNOSTIC_PY'\n"
+            cat deploy/telegram_network_diagnostics.py
+            printf '\nXASS_TELEGRAM_DIAGNOSTIC_PY\n'
+          } | bash deploy/github_ssh.sh exec
       - name: Preflight, verified backup, deploy and live checks with rollback
+        if: env.XASS_OPERATION == 'deploy'
         shell: bash
         env:
           SSH_HOST: 51.250.80.137

@@ -337,7 +337,8 @@ def deploy(support, run_id):
         support_paths = set(git(ROOT, "diff", "--name-only", RELEASE, support).splitlines())
         require(support_paths == {".github/workflows/approved-server-runtime.yml",
                 "deploy/approved_server_release.py", "deploy/check_approved_server_release.py",
-                "tests/test_approved_server_release.py"}, "Workflow changes extend beyond approved deployment tooling.")
+                "tests/test_approved_server_release.py", "deploy/telegram_network_diagnostics.py",
+                "tests/test_telegram_network_diagnostics.py"}, "Workflow changes extend beyond approved deployment tooling.")
         validate_release(ROOT, BASE, RELEASE, FILES)
         progress("release_verified_checking_dependencies")
         run([sys.executable, "-m", "pip", "check"])
