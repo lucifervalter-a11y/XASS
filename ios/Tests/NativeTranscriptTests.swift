@@ -32,6 +32,91 @@ final class NativeTranscriptTests: XCTestCase {
         XCTAssertEqual(result, "[00:00.00] First Same\n[00:00.20]\n[00:45.13] Later\n[00:45.33]\n[01:01.24] After minute\n[01:01.44]")
     }
 
+    func testExplicitAppleNetworkRequestKeepsFinalOnlyRecognition() {
+        let request = NativeTranscriptPolicy.recognitionRequest(file: URL(fileURLWithPath: "/fixture/segment.m4a"), onDevice: false)
+        XCTAssertFalse(request.requiresOnDeviceRecognition)
+        XCTAssertFalse(request.shouldReportPartialResults)
+    }
+
+    func testFailedMiddleClipProducesPartialResultWithExactGapAndOriginalTimings() throws {
+        var transcript = NativeTranscriptAccumulator(totalClips: 3, mode: .onDevice)
+        try transcript.append(.success([word("First", 1)]), for: .init(start: 0, duration: 45))
+        try transcript.append(.failure(OwnerAPIError(status: 408, message: "timeout")), for: .init(start: 45, duration: 45))
+        try transcript.append(.success([word("Last", 2)]), for: .init(start: 90, duration: 10))
+        let result = try transcript.result()
+        XCTAssertTrue(result.isPartial)
+        XCTAssertEqual(result.totalClips, 3)
+        XCTAssertEqual(result.failedClips, [.init(start: 45, duration: 45)])
+        XCTAssertTrue(result.lrc.contains("[00:01.00] First"))
+        XCTAssertTrue(result.lrc.contains("[01:32.00] Last"))
+        XCTAssertTrue(result.reviewNotice.contains("Частичная расшифровка"))
+        XCTAssertTrue(result.reviewNotice.contains("1 из 3"))
+        XCTAssertTrue(result.reviewNotice.contains("00:45–01:30"))
+    }
+
+    func testSuccessfulSilentClipIsNotReportedAsFailure() throws {
+        var transcript = NativeTranscriptAccumulator(totalClips: 2, mode: .onDevice)
+        try transcript.append(.success([]), for: .init(start: 0, duration: 45))
+        try transcript.append(.success([word("Voice", 0)]), for: .init(start: 45, duration: 2))
+        let result = try transcript.result()
+        XCTAssertFalse(result.isPartial)
+        XCTAssertEqual(result.failedClips, [])
+        XCTAssertFalse(result.reviewNotice.contains("Пропуски"))
+        XCTAssertTrue(result.reviewNotice.contains("на iPhone"))
+    }
+
+    func testAppleNetworkPartialResultDoesNotClaimAudioStayedOnDevice() throws {
+        var transcript = NativeTranscriptAccumulator(totalClips: 2, mode: .appleNetwork)
+        try transcript.append(.failure(OwnerAPIError(status: 422, message: "no speech")), for: .init(start: 0, duration: 45))
+        try transcript.append(.success([word("Voice", 0)]), for: .init(start: 45, duration: 2))
+        let result = try transcript.result()
+        XCTAssertEqual(result.mode, .appleNetwork)
+        XCTAssertTrue(result.isPartial)
+        XCTAssertTrue(result.reviewNotice.contains("Аудио могло отправляться в Apple"))
+        XCTAssertFalse(result.reviewNotice.contains("Аудио не отправлялось"))
+    }
+
+    func testAllFailedClipsThrowModeSpecificErrorInsteadOfPublishingEmptyResult() throws {
+        for mode in [NativeTranscriptMode.onDevice, .appleNetwork] {
+            var transcript = NativeTranscriptAccumulator(totalClips: 1, mode: mode)
+            try transcript.append(.failure(OwnerAPIError(status: 422, message: "recognition failed")), for: .init(start: 0, duration: 45))
+            XCTAssertThrowsError(try transcript.result()) { error in
+                XCTAssertEqual(error.localizedDescription, mode.failureMessage)
+                if mode == .appleNetwork {
+                    XCTAssertTrue(error.localizedDescription.contains("через интернет"))
+                    XCTAssertFalse(error.localizedDescription.contains("Аудио не отправлялось"))
+                } else {
+                    XCTAssertTrue(error.localizedDescription.contains("локальной модели"))
+                }
+            }
+        }
+    }
+
+    func testCancellationCannotBecomeAPartialResult() throws {
+        var transcript = NativeTranscriptAccumulator(totalClips: 2, mode: .onDevice)
+        try transcript.append(.success([word("First", 0)]), for: .init(start: 0, duration: 45))
+        XCTAssertThrowsError(try transcript.append(.failure(CancellationError()), for: .init(start: 45, duration: 1))) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertThrowsError(try transcript.result()) { XCTAssertTrue($0 is CancellationError) }
+    }
+
+    func testNoWordsCannotBePublishedAsCompletedTranscript() throws {
+        var transcript = NativeTranscriptAccumulator(totalClips: 1, mode: .appleNetwork)
+        try transcript.append(.success([]), for: .init(start: 0, duration: 45))
+        XCTAssertThrowsError(try transcript.result()) {
+            XCTAssertTrue($0.localizedDescription.contains("Аудио могло отправляться в Apple"))
+            XCTAssertFalse($0.localizedDescription.contains("Аудио не отправлялось"))
+        }
+    }
+
+    func testAccumulatedWordLimitAndClipBoundsAreStillEnforced() throws {
+        var transcript = NativeTranscriptAccumulator(totalClips: 2, mode: .onDevice)
+        try transcript.append(.success([word("negative", -1), word("outside", 45), word("invalid", .nan)] + Array(repeating: word("valid", 0), count: 8000)), for: .init(start: 0, duration: 45))
+        XCTAssertThrowsError(try transcript.append(.success([word("overflow", 0)]), for: .init(start: 45, duration: 1)))
+        XCTAssertThrowsError(try transcript.result())
+    }
+
     func testLRCGroupingBreaksOnLongPauseSevenWordsAndLongPhrase() {
         let phrase = (0..<8).map { word("w\($0)", Double($0) * 0.1) }
         XCTAssertEqual(NativeTranscriptFormat.lrc(phrase), "[00:00.00] w0 w1 w2 w3 w4 w5 w6\n[00:00.70] w7\n[00:00.90]")

@@ -72,9 +72,79 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         capture(app, "NowPlaying-Lyrics-Seek")
     }
 
-    @MainActor private func launch(screen: String) -> XCUIApplication {
+    @MainActor func testCloseImmediatelyReleasesTabsAndRepeatedOpenDoesNotChangePlayback() throws {
+        let app = launch(screen: "nowplaying")
+        let toggle = app.buttons["nativePlayerToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        toggle.tap()
+        for _ in 0..<3 {
+            XCTAssertEqual(toggle.label, "Слушать")
+            app.buttons["nowPlayingCollapse"].tap()
+            // No sleep or wait for the closing card before navigating the underlying screen.
+            app.tabBars.buttons["Главная"].tap()
+            XCTAssertTrue(app.staticTexts["Тестовый XASS"].waitForExistence(timeout: 3))
+            let mini = app.buttons["nativeMiniPlayer"]
+            XCTAssertTrue(mini.waitForExistence(timeout: 3))
+            XCTAssertTrue(app.buttons["miniPlayerPlayPause"].isHittable)
+            XCTAssertFalse(toggle.exists)
+            mini.doubleTap()
+            XCTAssertTrue(toggle.waitForExistence(timeout: 3))
+            XCTAssertEqual(toggle.label, "Слушать", "A repeated expand tap must not activate the incoming transport")
+            XCTAssertEqual(app.buttons.matching(identifier: "nativePlayerToggle").count, 1)
+        }
+        capture(app, "NowPlaying-Repeated-Reopen")
+    }
+
+    @MainActor func testReducedMotionCloseAndReopenKeepsSinglePlayer() throws {
+        let app = launch(screen: "nowplaying", reducedMotion: true)
+        XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 10))
+        app.buttons["nowPlayingCollapse"].tap()
+        app.tabBars.buttons["Музыка"].tap()
+        XCTAssertTrue(app.buttons["nativeMiniPlayer"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["nativePlayerToggle"].exists)
+        app.buttons["nativeMiniPlayer"].tap()
+        XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.buttons["nativePlayerToggle"].label, "Пауза")
+        XCTAssertFalse(app.buttons["miniPlayerPlayPause"].exists)
+        capture(app, "NowPlaying-ReducedMotion-Reopen")
+    }
+
+    @MainActor func testLyricsToolsHaveOneEntryAndCloseBackAndReopenKeepPlayer() throws {
+        let app = launch(screen: "lyrics")
+        let tools = app.buttons["nowPlayingLyricsTools"]
+        XCTAssertTrue(tools.waitForExistence(timeout: 10))
+        app.buttons["nowPlayingLyricsLanguage"].tap()
+        XCTAssertTrue(app.buttons["lyricsTranslationToggle"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["lyricsPronunciationToggle"].exists)
+        let duplicateTextAction = NSPredicate(format: "label == %@ AND identifier != %@",
+                                             "Найти текст или расшифровать", "nowPlayingLyricsTools")
+        XCTAssertEqual(app.buttons.matching(duplicateTextAction).count, 0, "Language menu contains only distinct language actions")
+        app.tap() // Cancel the language menu without changing playback.
+        tools.tap()
+        XCTAssertTrue(app.buttons["phoneTranscriptionDisclosure"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["lyricsToolsDone"].exists)
+        XCTAssertFalse(app.buttons["nativeTrackInformation"].exists, "Lyrics opens the text tools directly, not another actions menu")
+        app.buttons["lyricsToolsDone"].tap()
+        XCTAssertTrue(tools.waitForExistence(timeout: 3))
+        tools.tap()
+        XCTAssertTrue(app.buttons["lyricsToolsDone"].waitForExistence(timeout: 3))
+        app.buttons["lyricsToolsDone"].tap()
+        app.buttons["nativePlayerMore"].tap()
+        XCTAssertTrue(app.buttons["nativeTrackInformation"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["nativeTrackPCTranscription"].exists)
+        app.buttons["nativeTrackInformation"].tap()
+        XCTAssertTrue(app.buttons["phoneTranscriptionDisclosure"].waitForExistence(timeout: 3))
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.buttons["nativeTrackInformation"].waitForExistence(timeout: 3))
+        app.buttons["Готово"].tap()
+        XCTAssertTrue(app.buttons["nativePlayerToggle"].waitForExistence(timeout: 3))
+        capture(app, "NowPlaying-TextTools-Returned")
+    }
+
+    @MainActor private func launch(screen: String, reducedMotion: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--native-ui-fixture", "--native-ui-screen", screen]
+        if reducedMotion { app.launchArguments.append("--native-ui-reduce-motion") }
         app.launch()
         return app
     }

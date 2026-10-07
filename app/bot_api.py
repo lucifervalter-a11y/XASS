@@ -89,7 +89,10 @@ class TelegramBotClient:
 
         url = f"{self.base_url}/{method}"
         try:
-            response = await self.client.post(url, json=payload, data=data, files=files, timeout=timeout)
+            # Passing None explicitly disables all httpx timeouts. Omitted
+            # overrides must inherit the client's configured transport limits.
+            options = {"timeout": timeout} if timeout is not None else {}
+            response = await self.client.post(url, json=payload, data=data, files=files, **options)
         except httpx.HTTPError as exc:
             raise _safe_http_error("Telegram API request failed", method, exc) from None
         body: dict[str, Any]
@@ -276,7 +279,8 @@ class TelegramBotClient:
         url = f"{self.file_url}/{quote(cleaned, safe='/')}"
         response: httpx.Response | None = None
         try:
-            request = self.client.build_request("GET", url, headers=headers, timeout=timeout)
+            options = {"timeout": timeout} if timeout is not None else {}
+            request = self.client.build_request("GET", url, headers=headers, **options)
             response = await self.client.send(request, stream=True)
             response.raise_for_status()
             return TelegramFileResponse(response)
