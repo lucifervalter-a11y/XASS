@@ -152,6 +152,12 @@ class ApprovedReleaseTests(unittest.TestCase):
 
 
 class PublicApiChecksTests(unittest.TestCase):
+    def test_network_environment_excludes_credentials_and_other_process_settings(self):
+        raw = b"BOT_TOKEN=private-sentinel\0HTTPS_PROXY=http://127.0.0.1:8080\0PATH=/changed\0NO_PROXY=localhost\0OWNER_TOKEN=secret\0SSL_CERT_FILE=/etc/cert.pem\0"
+        selected = release.network_environment(raw)
+        self.assertEqual(selected, {"HTTPS_PROXY": "http://127.0.0.1:8080", "NO_PROXY": "localhost", "SSL_CERT_FILE": "/etc/cert.pem"})
+        self.assertNotIn("private-sentinel", repr(selected))
+
     def response(self, request, *, broken_auth=False, invalid_json=False, **_kwargs):
         url = urlparse(request.full_url)
         public = url.hostname == "redvps.site"

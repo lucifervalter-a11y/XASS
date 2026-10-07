@@ -54,10 +54,10 @@ def progress(stage):
     print(json.dumps({"stage": stage}), flush=True)
 
 
-def run(args, root=ROOT, timeout=60):
+def run(args, root=ROOT, timeout=60, env=None):
     result = subprocess.run(args, cwd=root, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=timeout)
+                            timeout=timeout, env=env)
     require(result.returncode == 0, "Subprocess failed; output withheld to protect configuration.")
     return result.stdout
 
@@ -178,10 +178,35 @@ def wait_healthy(port):
     raise Stop("Backend health checks did not pass after restart.")
 
 
-def telegram_check():
+NETWORK_ENVIRONMENT = frozenset({
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+})
+
+
+def network_environment(raw):
+    """Select only the running service's network settings; never export tokens."""
+    selected = {}
+    for entry in raw.split(b"\0"):
+        name, separator, value = entry.partition(b"=")
+        if separator and name.decode("ascii", errors="ignore") in NETWORK_ENVIRONMENT:
+            selected[name.decode("ascii")] = os.fsdecode(value)
+    return selected
+
+
+def telegram_check(pid):
     # Separate process avoids importing pre-deploy modules again after checkout changes.
+    # HTTPX reads proxies/CA paths from the process environment, not Settings' .env.
+    # Use exactly the already-running service's values, without printing them or
+    # changing systemd, proxy services, VPNs, trust stores or configuration files.
+    selected = network_environment(Path(f"/proc/{pid}/environ").read_bytes())
+    environment = {key: value for key, value in os.environ.items() if key not in NETWORK_ENVIRONMENT}
+    environment.update(selected)
+    print(json.dumps({"stage": "telegram_using_existing_service_network_environment",
+                      "setting_names": sorted(selected)}), flush=True)
     worker = '''
-import asyncio
+import asyncio, json
 from app.config import Settings
 from app.bot_api import TelegramBotClient
 async def check():
@@ -189,13 +214,27 @@ async def check():
     assert token
     client = TelegramBotClient(token)
     try:
-        identity = await client.get_me()
+        identity = await asyncio.wait_for(client.get_me(), timeout=25)
         assert identity.get("is_bot") is True and isinstance(identity.get("id"), int)
+        print(json.dumps({"ok": True}))
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        print(json.dumps({"ok": False, "failure_type": type(exc).__name__,
+                          "http_status": status if type(status) is int else None}))
     finally:
         await client.close()
 asyncio.run(check())
 '''
-    run([sys.executable, "-B", "-c", worker], timeout=35)
+    try:
+        result = json.loads(run([sys.executable, "-B", "-c", worker], timeout=35, env=environment))
+    except (Stop, subprocess.TimeoutExpired):
+        raise Stop("Telegram getMe failed or exceeded its deadline with the existing backend network settings.") from None
+    if result.get("ok") is not True:
+        kind = result.get("failure_type", "UnknownError")
+        require(isinstance(kind, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", kind), "Invalid Telegram diagnostic result.")
+        status = result.get("http_status")
+        require(status is None or type(status) is int, "Invalid Telegram diagnostic status.")
+        raise Stop(f"Telegram getMe failed using existing backend network settings: {kind}, HTTP status {status}.")
     return {"get_me": True, "messages_sent": 0, "updates_consumed": 0}
 
 
@@ -308,10 +347,11 @@ def deploy(support, run_id):
         before = service_state(systemctl)
         progress("service_verified_checking_api")
         baseline_api = api_checks(port)
-        progress("api_verified_checking_telegram_get_me")
-        baseline_telegram = telegram_check()
-        progress("telegram_verified_checking_journal")
+        progress("api_verified_checking_journal")
         baseline_journal = journal_check(before["InvocationID"], reject_errors=False)
+        print(json.dumps({"stage": "baseline_journal_checked", **baseline_journal}), flush=True)
+        progress("journal_verified_checking_telegram_get_me")
+        baseline_telegram = telegram_check(before["MainPID"])
         receipt = {"baseline_matches": True, "release": RELEASE, "workflow": support,
                    "baseline_api": baseline_api, "baseline_telegram": baseline_telegram,
                    "baseline_journal": baseline_journal}
@@ -340,7 +380,7 @@ def deploy(support, run_id):
             after = service_state(systemctl)
             require(after["InvocationID"] != before["InvocationID"], "Backend did not start a new invocation.")
             receipt["api"] = api_checks(port)
-            receipt["telegram"] = telegram_check()
+            receipt["telegram"] = telegram_check(after["MainPID"])
             time.sleep(10)
             receipt["journal"] = journal_check(after["InvocationID"], reject_errors=True)
             require(service_state(systemctl)["InvocationID"] == after["InvocationID"], "Backend restarted during verification.")
