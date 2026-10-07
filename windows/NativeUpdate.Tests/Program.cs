@@ -71,12 +71,14 @@ try
     }
     await Run("manifest trickle progress cannot extend the total deadline", async () =>
     {
-        using var fixture = Create(TimeSpan.FromMilliseconds(450), TimeSpan.FromMilliseconds(250));
+        using var fixture = Create(TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(500));
         fixture.Handler.Enqueue(releases);
         var body = new SyntheticBody(manifest, chunkSize: 1, delay: TimeSpan.FromMilliseconds(25));
         fixture.Handler.Enqueue(body);
         TotalTimeout(await Fails<TimeoutException>(() => fixture.Client.CheckAsync("", default)));
-        Assert(body.BytesRead > 1 && body.CancellationObserved && body.Disposed, "Trickling JSON did not make bounded progress");
+        // The deadline can be observed between reads or inside a pending read.
+        // Both must stop before the complete body, dispose it and permit retry.
+        Assert(body.BytesRead > 1 && body.BytesRead < manifest.Length && body.Disposed, "Trickling JSON did not make bounded progress");
         fixture.Handler.Enqueue(releases); fixture.Handler.Enqueue(manifest);
         Assert(await fixture.Client.CheckAsync("", default) == update, "Total timeout poisoned retry");
     });

@@ -119,7 +119,11 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         let duplicateTextAction = NSPredicate(format: "label == %@ AND identifier != %@",
                                              "Найти текст или расшифровать", "nowPlayingLyricsTools")
         XCTAssertEqual(app.buttons.matching(duplicateTextAction).count, 0, "Language menu contains only distinct language actions")
-        app.tap() // Cancel the language menu without changing playback.
+        // The screen centre lies inside the language menu's disabled hint row.
+        // Tap outside the popup and verify dismissal before using the player.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.2)).tap()
+        waitForDisappearance(app.buttons["lyricsTranslationToggle"])
+        XCTAssertTrue(tools.isHittable)
         tools.tap()
         XCTAssertTrue(app.buttons["phoneTranscriptionDisclosure"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["lyricsToolsDone"].exists)

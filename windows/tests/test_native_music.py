@@ -219,7 +219,10 @@ class ProtocolAndOwnershipTests(unittest.TestCase):
     def test_crashed_process_releases_audio_and_priority_locks(self):
         with tempfile.TemporaryDirectory() as temp:
             source = "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from native_music_ownership import AudioOwnership; a=AudioOwnership(Path(sys.argv[2]),local=False); a.acquire(); print('locked',flush=True); sys.stdin.read()"
-            process = subprocess.Popen([sys.executable, "-I", "-c", source, str(ROOT / "pc_client"), temp], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            # The Windows venv executable can be a launcher with a child Python.
+            # Crash the actual stdlib-only lock owner, not just that launcher.
+            interpreter = getattr(sys, "_base_executable", sys.executable)
+            process = subprocess.Popen([interpreter, "-I", "-c", source, str(ROOT / "pc_client"), temp], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
                 self.assertEqual(process.stdout.readline().strip(), "locked")
                 local = AudioOwnership(Path(temp), local=True)

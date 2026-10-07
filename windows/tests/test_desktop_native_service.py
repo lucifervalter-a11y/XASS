@@ -181,11 +181,16 @@ if __name__ == "__main__": unittest.main()
 class NativeArchiveHostTests(unittest.TestCase):
     def setUp(self):
         import threading
-        from background_agent import DesktopHost
+        from background_agent import DesktopHost, paused_agent_lease
+        self.real_lease = paused_agent_lease
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve(); self.source = self.root / "old"; self.source.mkdir(); self.target = self.root / "new"; self.target.mkdir()
         self.env = patch.dict(os.environ, {"XASS_DATA_ROOT": str(self.root), "LOCALAPPDATA": str(self.root)})
         self.env.start(); self.addCleanup(self.env.stop)
+        # Archive-copy fixtures must not contend with the user's real running
+        # Windows agent mutex. Lease rejection is covered separately below.
+        lease = patch("background_agent.paused_agent_lease", side_effect=contextlib.nullcontext)
+        self.lease = lease.start(); self.addCleanup(lease.stop)
         self.host = DesktopHost.__new__(DesktopHost)
         self.host.data = self.root; self.host.source = SOURCE; self.host.lock = threading.RLock(); self.host.stop_event = threading.Event()
         self.host.job_cancel = threading.Event(); self.host.job_thread = None; self.host.music = None
@@ -193,6 +198,15 @@ class NativeArchiveHostTests(unittest.TestCase):
         self.host.service = Mock(); self.config = {"archive_folder":str(self.source), "api_key":"ag_fixture"}
         self.host.service.config.return_value = self.config
         self.host.stop = Mock(); self.host.start = Mock()
+    def test_archive_copy_refuses_a_live_writer_before_modifying_data(self):
+        self.lease.side_effect = self.real_lease
+        with patch("runtime_state.acquire_single_instance", return_value=None):
+            self.host._move_archive(self.target, True)
+        self.assertEqual(self.host.job["state"], "error")
+        self.host.service.save.assert_not_called()
+        self.assertEqual(list(self.target.iterdir()), [])
+        self.assertTrue(self.source.is_dir())
+
     def test_consistent_archive_copy_rewrites_paths_preserves_source_and_commits_last(self):
         from archive_store import DB_FILE, _connect
         media = self.source / "media"; media.mkdir(); (media / "file.jpg").write_bytes(b"fixture-media")
