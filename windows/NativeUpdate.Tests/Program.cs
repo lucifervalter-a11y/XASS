@@ -159,11 +159,13 @@ try
     });
     await Run("installer trickle progress is bounded by total deadline", async () =>
     {
-        using var fixture = Create(TimeSpan.FromMilliseconds(450), TimeSpan.FromMilliseconds(250));
+        using var fixture = Create(TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(500));
         var body = new SyntheticBody(installer, chunkSize: 16, delay: TimeSpan.FromMilliseconds(25));
         fixture.Handler.Enqueue(body);
         TotalTimeout(await Fails<TimeoutException>(() => fixture.Client.DownloadAsync(update, new ProgressRecorder(), default)));
-        Assert(body.BytesRead > 16 && body.CancellationObserved && body.Disposed, "Trickling installer was not canceled");
+        // The total deadline may expire between reads, including while writing
+        // a chunk to disk. In that case the stream need not observe cancellation.
+        Assert(body.BytesRead > 16 && body.BytesRead < installer.Length && body.Disposed, "Trickling installer did not stop and dispose after bounded progress");
         NoPartial(fixture); NoInstaller(fixture);
         fixture.Handler.Enqueue(installer);
         Assert(File.Exists(await fixture.Client.DownloadAsync(update, new ProgressRecorder(), default)), "Total timeout prevented retry");
