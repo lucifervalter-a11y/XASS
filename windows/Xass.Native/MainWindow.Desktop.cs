@@ -33,7 +33,7 @@ public sealed partial class MainWindow
     private readonly NativeUpdateClient nativeUpdates = new();
     private NativeUpdate? availableNativeUpdate;
     private readonly NativeUpdateCoordinator updateCoordinator = new();
-    private readonly CheckBox nativeAutomatic = new() { Content = "Автоматически обновлять нативную тестовую версию после закрытия окна в трей" };
+    private readonly CheckBox nativeAutomatic = new() { Content = "Автоматически обновлять XASS после закрытия окна в трей" };
     private readonly DispatcherTimer automaticUpdateTimer = new() { Interval = TimeSpan.FromMinutes(30) };
     private bool nativeUpdateRunning;
     private bool nativeUpdateCommitAuthorized;
@@ -76,7 +76,7 @@ public sealed partial class MainWindow
     {
         InitializeDesktopPaths();
         BuildConnectionPanel(); BuildComputerPanels(); BuildFilesPanel(); BuildArchivePanel(); BuildJournalPanel(); BuildUpdatesPanel(); BuildSettingsPanel();
-        Notice.Title = "XASS · нативный тестовый клиент";
+        Notice.Title = "XASS · нативный Windows-клиент";
         Notice.Message = "Привяжите компьютер или импортируйте файл подключения. Приложение управляет агентом, музыкой и локальными данными.";
         var commands = AddDesktopPage("commands", "Команды", Symbol.More);
         commands.Children.Add(DLabel("Локальные действия", 24));
@@ -493,7 +493,7 @@ public sealed partial class MainWindow
             && !await DesktopConfirmAsync("Включить расшифровку песен?", "Агент сможет скачать среду Demucs + Whisper и модели с официальных источников. Это использует интернет, диск и ресурсы ПК.", "Включить")) return;
         bool automatic = nativeAutomatic.IsChecked == true;
         if (automatic && !NativeUpdatePreferences.Load() && !await DesktopConfirmAsync("Включить нативное автообновление?",
-            "После закрытия окна в трей XASS сможет проверять официальный тестовый канал раз в 30 минут. Если музыка не играет и архив не переносится, приложение и агент будут перезапущены для установки. Перед установкой создаётся проверенная резервная копия; при неудачном запуске будет выполнен откат. Микрофоны не включатся автоматически.", "Включить")) return;
+            "После закрытия окна в трей XASS сможет проверять обновления своего канала раз в 30 минут. Если музыка не играет и архив не переносится, приложение и агент будут перезапущены для установки. Перед установкой создаётся проверенная резервная копия; при неудачном запуске будет выполнен откат. Микрофоны не включатся автоматически.", "Включить")) return;
         await client.RequestAsync(new { action = "desktop_save_settings", settings = new { owner_name = ownerName.Text.Trim(), interval_sec = seconds,
             auto_update = autoUpdates.IsChecked == true, transcription_enabled = transcription.IsChecked == true, archive_folder = archiveFolder.Text.Trim(), archive_max_gb = gb, archive_retention_days = days } }, lifetime.Token);
         NativeUpdatePreferences.Save(automatic);
@@ -504,10 +504,10 @@ public sealed partial class MainWindow
     {
         var page = AddDesktopPage("updates", "Обновления", Symbol.Download);
         installUpdate = DButton("Скачать и установить", InstallNativeUpdateAsync); installUpdate.IsEnabled = false;
-        page.Children.Add(updateStatus); page.Children.Add(DActions(DButton("Проверить тестовое обновление", CheckNativeUpdateAsync), installUpdate,
+        page.Children.Add(updateStatus); page.Children.Add(DActions(DButton("Проверить обновления", CheckNativeUpdateAsync), installUpdate,
             DButton("Перезапустить агент", RestartDesktopAgentAsync), DButton("Отменить подготовку", () => { nativeUpdateCancellation?.Cancel(); return Task.CompletedTask; })));
         page.Children.Add(updateProgress);
-        page.Children.Add(DLabel("Принимаются только нативные тестовые выпуски официального репозитория XASS. Старый установщик с Tk не заменит этот интерфейс. Перед установкой создаётся проверенная копия программы. Ошибка проверки запуска вызывает восстановление предыдущей версии. Проверка на реальной Windows остаётся обязательной для тестового выпуска."));
+        page.Children.Add(DLabel("Принимаются только нативные выпуски официального репозитория XASS для установленного канала. Перед установкой создаётся проверенная копия программы. Если новая версия не пройдёт проверку запуска, XASS восстановит предыдущую. Данные и настройки сохраняются."));
     }
     private async Task LoadDesktopUpdatesAsync()
     {
@@ -530,7 +530,7 @@ public sealed partial class MainWindow
         {
             availableNativeUpdate = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);
             installUpdate.IsEnabled = availableNativeUpdate is not null;
-            updateStatus.Text = availableNativeUpdate is null ? "Новых совместимых нативных тестовых выпусков не найдено." : $"Доступна {availableNativeUpdate.Version}\n{availableNativeUpdate.Revision}\n{availableNativeUpdate.Size / 1048576.0:F1} МБ";
+            updateStatus.Text = availableNativeUpdate is null ? "Новых совместимых обновлений не найдено." : $"Доступна {availableNativeUpdate.Version}\n{availableNativeUpdate.Revision}\n{availableNativeUpdate.Size / 1048576.0:F1} МБ";
             SelectDesktopPage("updates");
         }
         catch (OperationCanceledException) { updateStatus.Text = "Проверка обновления отменена. Можно повторить."; throw; }
@@ -540,7 +540,7 @@ public sealed partial class MainWindow
     private async Task InstallNativeUpdateAsync()
     {
         var update = availableNativeUpdate; if (update is null || nativeUpdateRunning) return;
-        if (!await DesktopConfirmAsync("Установить тестовое обновление?", $"XASS {update.Version}, ревизия {update.Revision}\nЗагрузка: {update.Size / 1048576.0:F1} МБ. После проверки SHA-256 и резервного копирования XASS, агент и микрофоны завершатся. Если проверка новой версии не пройдёт, предыдущая версия будет восстановлена. Данные сохраняются.", "Скачать и установить")) return;
+        if (!await DesktopConfirmAsync("Установить обновление?", $"XASS {update.Version}, ревизия {update.Revision}\nЗагрузка: {update.Size / 1048576.0:F1} МБ. После проверки SHA-256 и резервного копирования XASS, агент и микрофоны завершатся. Если проверка новой версии не пройдёт, предыдущая версия будет восстановлена. Данные сохраняются.", "Скачать и установить")) return;
         await ApplyNativeUpdateAsync(update, automatic: false);
     }
     private bool AutomaticNativeGuardsAllow(CancellationToken token) => NativeAutomaticUpdatePolicy.AllowsShutdown(new(

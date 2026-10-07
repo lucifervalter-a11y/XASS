@@ -24,7 +24,7 @@
       </Grid>
      </Border>
      <InfoBar x:Name="Notice" IsOpen="True" IsClosable="True" Severity="Informational"
-      Title="Нативный Windows-клиент · предварительная версия"
+       Title="Нативный Windows-клиент"
       Message="Подключите существующий агент в разделе «Подключение». Привязка и фоновая работа остаются в установленном XASS." />
      <ProgressBar x:Name="Progress" IsIndeterminate="True" Visibility="Collapsed" />
     </StackPanel>
@@ -49,7 +49,7 @@
         </VariableSizedWrapGrid>
        </StackPanel>
       </Border>
-      <TextBlock Text="Предварительная нативная версия. Привязка ПК, обновления, архив и системные команды пока остаются в существующем XASS." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" Margin="4,0,4,12"/>
+      <TextBlock Text="Привязка ПК, обновления, архив и системные команды доступны в меню XASS." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" Margin="4,0,4,12"/>
      </StackPanel></ScrollViewer>
      <ScrollViewer x:Name="DevicePage" Visibility="Collapsed"><Border Style="{StaticResource XassCard}" MaxWidth="900" VerticalAlignment="Top"><StackPanel Spacing="18">
       <FontIcon Glyph="&#xE7F4;" FontSize="36" HorizontalAlignment="Left" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"/>
