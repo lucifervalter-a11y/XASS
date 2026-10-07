@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 50
     env:
-      RELEASE_SHA: ba7ad9326fbd452032640d4a77985846e805ccd5
+      RELEASE_SHA: a376ed5829f85caa49613c64eadce25a1e9a5996
     steps:
       - uses: actions/checkout@v4
         with:
