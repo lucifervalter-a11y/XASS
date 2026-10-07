@@ -15,7 +15,7 @@ import UIKit
     let setExpanded: (Bool) -> Void
     var onMiniHeightChange: (CGFloat) -> Void = { _ in }
     @Namespace private var namespace
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @PlayerReduceMotion private var reduceMotion
     @State private var look = PlayerArtworkLook.neutral
     @State private var fileArtwork: FileArtwork?
     @State private var hostBottom: CGFloat?
@@ -233,7 +233,7 @@ import UIKit
     let onExpand: () -> Void
     /// Pill frame in `PlayerHostSpace`: the collapse target of the Now Playing card.
     var onFrameChange: (CGRect) -> Void = { _ in }
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @PlayerReduceMotion private var reduceMotion
     @State private var dragX: CGFloat = 0
     @State private var horizontal: Bool?
     @State private var slideDirection: CGFloat = 1
@@ -408,7 +408,7 @@ private enum PlayerDragMode { case undecided, active, ignored }
     let slots: NowPlayingSlots
     let onCollapse: () -> Void
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @PlayerReduceMotion private var reduceMotion
     @State private var dragMode = PlayerDragMode.undecided
     @GestureState private var dragging = false
     @State private var dismissing = false

@@ -16,6 +16,19 @@ enum PlayerLayout {
     static let miniReservedHeight: CGFloat = 76
 }
 
+/// SwiftUI's system Reduce Motion value is read-only. Fixture tests can force
+/// reduced animation inside the player without changing system preferences.
+@propertyWrapper struct PlayerReduceMotion: DynamicProperty {
+    @Environment(\.accessibilityReduceMotion) private var systemValue
+    var wrappedValue: Bool {
+        #if DEBUG && targetEnvironment(simulator)
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--native-ui-fixture") && arguments.contains("--native-ui-reduce-motion") { return true }
+        #endif
+        return systemValue
+    }
+}
+
 enum PlayerMotion {
     /// Expand/collapse and hero moves.
     static let hero = Animation.spring(response: 0.45, dampingFraction: 0.85)

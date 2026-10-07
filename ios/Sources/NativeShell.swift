@@ -72,11 +72,6 @@ enum NativeShellSheet: Hashable, Identifiable {
             tabs.accessibilityHidden(rootOverlay == .nowPlaying)
             playerLayer
         }
-            .transformEnvironment(\.accessibilityReduceMotion) { value in
-                #if DEBUG && targetEnvironment(simulator)
-                if NativeFixture.enabled && ProcessInfo.processInfo.arguments.contains("--native-ui-reduce-motion") { value = true }
-                #endif
-            }
             .task(id: store.currentID) {
                 // Enrichment never delays Play or takes over the current route.
                 if let id = store.currentID, store.authorized { _ = try? await store.enrichTrack(id) }
