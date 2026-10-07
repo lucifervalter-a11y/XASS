@@ -1,0 +1,58 @@
+name: Build approved Windows release candidate
+
+on:
+  push:
+    branches: [ops/windows-release-build-20261007]
+    paths: [.github/workflows/approved-windows-build.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-approved-windows-release-candidate
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_SHA: 42f7b4740cac46f6f9720bf2b13f03d336958e99
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            pc_client/requirements.txt
+            pc_client/build-requirements.txt
+      - name: Verify the exact application revision
+        shell: powershell
+        run: |
+          if ((git rev-parse HEAD) -ne $env:RELEASE_SHA) { throw 'Release revision mismatch' }
+          if (git status --porcelain) { throw 'Release checkout is not clean' }
+      - name: Install Inno Setup on the build runner
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+      - name: Build installer and check the frozen runtime
+        shell: powershell
+        run: .\pc_client\build_installer.ps1 -SkipToolInstall
+      - name: Verify installer metadata and checksum
+        shell: powershell
+        run: |
+          $metadata = Get-Content pc_client/dist/installer/XASS-Setup.json -Raw | ConvertFrom-Json
+          if ($metadata.revision -ne $env:RELEASE_SHA -or $metadata.local_build) { throw 'Installer revision mismatch' }
+          $hash = (Get-FileHash pc_client/dist/installer/XASS-Setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($metadata.sha256 -ne $hash) { throw 'Installer checksum mismatch' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-windows-installer
+          path: |
+            pc_client/dist/installer/XASS-Setup.exe
+            pc_client/dist/installer/XASS-Setup.json
+          if-no-files-found: error
+          retention-days: 30
