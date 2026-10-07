@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: xass-approved-windows-release-candidate
@@ -17,7 +18,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 50
     env:
-      RELEASE_SHA: a376ed5829f85caa49613c64eadce25a1e9a5996
+      RELEASE_SHA: 6a23b8a73eac2431628f09f475d9d4c80bd8bf40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,25 +51,46 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Voice lifecycle tests failed.' }
       - name: Build complete native installer and validate bundled runtime
         shell: pwsh
-        run: ./windows/build_installer.ps1 -Revision $env:RELEASE_SHA -OutputDirectory artifacts/windows-installer
+        run: ./windows/build_installer.ps1 -Revision $env:RELEASE_SHA -Distribution native -OutputDirectory artifacts/windows-installer
       - name: Install process inspection for the updater smoke
         run: python -m pip install psutil==7.0.0
+      - name: Download previous verified native test installer for migration coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: xass-native-installer
+          run-id: 37671177714
+          github-token: ${{ github.token }}
+          path: artifacts/previous-native-installer
+      - name: Verify previous installer identity and bytes
+        shell: python
+        run: |
+          import hashlib, json
+          from pathlib import Path
+          root = Path('artifacts/previous-native-installer')
+          data = json.loads((root / 'native-test-update.json').read_text())
+          assert data['revision'] == 'a376ed5829f85caa49613c64eadce25a1e9a5996'
+          assert data['distribution'] == 'native-test'
+          installer = root / 'XASS-Native-Test-Setup.exe'
+          assert installer.stat().st_size == data['size']
+          with installer.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == data['sha256']
       - name: Verify fresh install, upgrade and uninstall on the runner
         shell: pwsh
-        run: ./windows/test_installer.ps1 -Installer artifacts/windows-installer/XASS-Native-Test-Setup.exe -PayloadManifest artifacts/windows-installer/payload-manifest.json
+        run: ./windows/test_installer.ps1 -Installer artifacts/windows-installer/XASS-Native-Setup.exe -PayloadManifest artifacts/windows-installer/payload-manifest.json -PreviousInstaller artifacts/previous-native-installer/XASS-Native-Test-Setup.exe -TargetMetadata artifacts/windows-installer/native-update.json
       - name: Verify immutable native revision and checksum
         shell: python
         run: |
           import hashlib, json, os
           from pathlib import Path
           root = Path('artifacts/windows-installer')
-          installer = root / 'XASS-Native-Test-Setup.exe'
+          installer = root / 'XASS-Native-Setup.exe'
           with installer.open('rb') as stream:
               digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-          for name in ('XASS-Native-Test-Setup.json', 'native-test-update.json', 'payload-manifest.json'):
+          for name in ('XASS-Native-Setup.json', 'native-update.json', 'payload-manifest.json'):
               data = json.loads((root / name).read_text())
               assert data['revision'] == os.environ['RELEASE_SHA'], 'Native revision mismatch'
               if name != 'payload-manifest.json':
+                  assert data['distribution'] == 'native', 'Not a stable native installer'
                   assert data['sha256'] == digest, 'Native checksum mismatch'
           assert (root / (installer.name + '.sha256')).read_text().strip() == f'{digest}  {installer.name}'
       - uses: actions/upload-artifact@v4
@@ -81,6 +103,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: xass-native-installer-smoke
-          path: artifacts/windows-native-smoke.json
+          path: artifacts/windows-native*-smoke.json
           if-no-files-found: error
           retention-days: 30
