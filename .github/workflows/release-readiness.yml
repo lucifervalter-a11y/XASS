@@ -1,0 +1,35 @@
+name: Read-only release readiness (2026-10-07)
+on:
+  push:
+    branches: [ops/release-readiness-20261007]
+    paths: [.github/workflows/release-readiness.yml]
+permissions:
+  contents: read
+concurrency:
+  group: xass-production
+  cancel-in-progress: false
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify diagnostic syntax
+        run: python3 -m py_compile deploy/telegram_network_diagnostics.py
+      - name: Check current Telegram transport and server health without deployment
+        env:
+          SSH_HOST: 51.250.80.137
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf "cd /home/red/serverredus\n.venv/bin/python -B - <<'XASS_READINESS_PY'\n"
+            cat deploy/telegram_network_diagnostics.py
+            printf '\nXASS_READINESS_PY\n'
+          } | bash deploy/github_ssh.sh exec
