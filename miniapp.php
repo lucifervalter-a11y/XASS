@@ -25,6 +25,12 @@
 
  <section class="view on" id="view-home">
   <div class="intro"><div class="eyebrow">Личный центр управления</div><h1 id="helloTitle">Система в сети.</h1><p>Сервер, устройства, музыка и сайт — в одном спокойном интерфейсе.</p></div>
+  <div class="quick-actions" role="toolbar" aria-label="Быстрые действия">
+   <button class="quick-chip" id="quickLockAll" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Лок всех ПК</button>
+   <button class="quick-chip" id="quickAway" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg><span id="quickAwayLabel">Не в сети</span></button>
+   <button class="quick-chip" id="quickCheckPC" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Проверить ПК</button>
+   <button class="quick-chip" id="quickOpenMusic" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>Плеер</button>
+  </div>
   <div class="section"><div class="section-head"><h2 class="section-title">Состояние</h2><span class="section-note" id="appVersion">—</span></div><div class="metrics" id="homeMetrics"></div></div>
   <div class="section"><div class="section-head"><h2 class="section-title">Устройства</h2><button class="btn" data-view="tools">Управление</button></div><div class="line-list" id="homeDevices"></div></div>
   <div class="section"><a class="home-site" id="homeOpenSite" href="/profile.php" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg><div><div class="row-title">Открыть публичный сайт</div><div class="row-sub">Проверить, как профиль выглядит для посетителей.</div></div><svg class="home-site-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9"/></svg></a></div>
@@ -195,7 +201,43 @@ $('homeOpenSite').onclick=event=>{if(!tg?.openLink)return;event.preventDefault()
 $('copyDomainBtn').onclick=()=>copyText(location.hostname).then(()=>toast('Домен скопирован'));
 $('openBotFatherBtn').onclick=()=>{const url='https://t.me/BotFather';if(tg?.openTelegramLink)tg.openTelegramLink(url);else window.open(url,'_blank')};
 function pushSetting(key,value,done){api('setting',{method:'POST',body:{key,value}}).then(r=>{if(!r.data?.ok)return toast(r.data?.detail||'Ошибка');if(r.data.settings){state.boot.settings=r.data.settings;renderSettings(r.data.settings)}if(r.data.status){state.boot.status=r.data.status;renderMusic(r.data.status)}done?.()})}
-$('saveModeBtn').onclick=()=>pushSetting('save_mode_cycle',null);$('quietToggle').onclick=()=>pushSetting('quiet_toggle',null);$('awayToggle').onclick=()=>pushSetting('away_toggle',null);$('awaySaveBtn').onclick=()=>pushSetting('away_message',$('awayMessage').value,()=>toast('Автоответ сохранён'));function updateAwayCount(){$('awayCount').textContent=$('awayMessage').value.length+' / 4000'}$('awayMessage').addEventListener('input',updateAwayCount);
+$('saveModeBtn').onclick=()=>pushSetting('save_mode_cycle',null);$('quietToggle').onclick=()=>pushSetting('quiet_toggle',null);$('awayToggle').onclick=()=>pushSetting('away_toggle',null);
+$('quickLockAll')?.addEventListener('click', ()=>{
+  const pcs = (state.boot?.sources || []).filter(isPc).filter(x => x.is_online);
+  if(!pcs.length) return toast('Нет активных ПК онлайн для блокировки');
+  ask('Заблокировать экран на всех активных ПК (' + pcs.length + ' шт.)?', async ok => {
+    if(!ok) return;
+    haptic('heavy');
+    for(const agent of pcs){
+      try{
+        const proof = await passkeyAction('agent:lock:' + agent.source_name);
+        await api('agents/' + encodeURIComponent(agent.source_name) + '/commands', {
+          method: 'POST', body: { command: 'lock', payload: {}, action_proof: proof }
+        });
+      }catch(e){if(e?.name !== 'NotAllowedError') toast(e.message || 'Ошибка блокировки');}
+    }
+    toast('Команда блокировки отправлена на ПК');
+    await loadBoot();
+  });
+});
+$('quickAway')?.addEventListener('click', ()=>{
+  haptic('medium');
+  pushSetting('away_toggle', null, ()=>{
+    const isAway = state.boot?.settings?.away_enabled;
+    toast(isAway ? 'Режим «Не в сети» включён' : 'Режим «Не в сети» выключен');
+    if($('quickAwayLabel')) $('quickAwayLabel').textContent = isAway ? 'В сети' : 'Не в сети';
+  });
+});
+$('quickCheckPC')?.addEventListener('click', async ()=>{
+  haptic('light');
+  toast('Проверяю состояние ПК…');
+  await loadBoot();
+  toast('Состояние обновлено');
+});
+$('quickOpenMusic')?.addEventListener('click', ()=>{
+  haptic('light');
+  showView('music');
+});$('awaySaveBtn').onclick=()=>pushSetting('away_message',$('awayMessage').value,()=>toast('Автоответ сохранён'));function updateAwayCount(){$('awayCount').textContent=$('awayMessage').value.length+' / 4000'}$('awayMessage').addEventListener('input',updateAwayCount);
 document.querySelectorAll('#sourceSeg button').forEach(button=>button.onclick=()=>pushSetting('now_source',button.dataset.source,()=>{renderMusic({...state.boot.status,now_source:button.dataset.source,now_source_label:button.textContent});toast('Источник изменён')}));
 async function findMusic(){const q=$('musicInput').value.trim();if(!q)return toast('Введите исполнителя и трек');$('musicBtn').disabled=true;$('musicBtn').textContent='Ищу…';try{const r=await api('music?q='+encodeURIComponent(q));if(!r.data?.ok)throw new Error(r.data?.detail||'Не найдено');const d=r.data;$('musicResult').style.display='block';$('musicTitle').textContent=[d.artist,d.title].filter(Boolean).join(' — ')||d.query;$('musicMeta').textContent=d.album||'Альбом не указан';$('musicArt').src=d.artwork_url||'/assets/xass-app-icon-192.png';$('musicLinks').innerHTML=Object.entries(d.links||{}).map(([label,url])=>'<a href="'+esc(url)+'" target="_blank" rel="noopener">'+esc(label)+' ↗</a>').join('');haptic('medium')}catch(e){toast(e.message)}finally{$('musicBtn').disabled=false;$('musicBtn').textContent='Найти'}}$('musicBtn').onclick=findMusic;$('musicInput').addEventListener('keydown',e=>{if(e.key==='Enter')findMusic()});
 $('discordSave').onclick=()=>pushSetting('discord_tag',$('discordTag').value,()=>toast('Discord сохранён'));$('vkSave').onclick=()=>pushSetting('vk_app_id',$('vkAppId').value,()=>toast('VK App ID сохранён'));$('vkConnect').onclick=()=>api('vk-url?chat_id='+(state.boot?.user?.id||'')).then(r=>{if(!r.data?.ok)return toast(r.data?.detail||'Сначала сохраните VK App ID');const url=r.data.url;if(tg?.openLink)tg.openLink(url);else window.open(url,'_blank')});

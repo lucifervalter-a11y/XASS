@@ -36,3 +36,24 @@ body{font-size:15px;background:radial-gradient(70% 30% at 50% -8%,rgba(48,88,214
 .chat-avatar img{width:100%;height:100%;border-radius:inherit;object-fit:cover}
 @media(max-width:520px){.wrap{padding-left:18px;padding-right:18px}.head{height:72px}.brand{font-size:22px}.intro{padding-top:30px}.metrics{grid-template-columns:repeat(3,1fr)}.metric{display:block;padding:14px 10px;border-right:1px solid var(--line);border-bottom:0}.metric-name{font-size:8px}.metric-value{font-size:21px;text-align:left;margin-top:5px}.profile-preview{grid-template-columns:62px minmax(0,1fr)}.profile-preview img{width:62px;height:62px}.save-state{grid-column:2}.avatar-editor{grid-template-columns:72px minmax(0,1fr)}.avatar-preview{width:72px;height:72px}.save-dock{grid-template-columns:1fr;margin-inline:-4px}.save-dock .btn{width:100%}.home-site{grid-template-columns:40px minmax(0,1fr) auto}.archive-summary{grid-template-columns:repeat(2,1fr)}.archive-number:nth-child(2){border-right:0}.archive-number:nth-child(-n+2){border-bottom:1px solid var(--line)}.agent-grid{grid-template-columns:1fr}.bubble{max-width:94%}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+/* Modern UI/UX Polish: Glassmorphism, Floating Island Dock & Glowing Micro-interactions */
+body{background:radial-gradient(ellipse 90% 45% at 50% -12%,rgba(55,109,255,.14),transparent 65%),radial-gradient(ellipse 60% 30% at 80% 90%,rgba(127,101,255,.07),transparent 60%),#000}
+.feature,.pwa-card,.setup-card,.home-site{transition:transform .24s var(--ease),border-color .24s,box-shadow .24s;border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+.feature:hover,.pwa-card:hover,.setup-card:hover{transform:translateY(-2px);box-shadow:0 20px 60px rgba(0,0,0,.45);border-color:rgba(75,124,255,.4)}
+.dot.ok{background:var(--green);box-shadow:0 0 8px rgba(82,220,144,.6);position:relative}
+.dot.ok::after{content:'';position:absolute;inset:-2px;border-radius:50%;border:1px solid var(--green);animation:radarPing 2.2s cubic-bezier(0,0,.2,1) infinite}
+@keyframes radarPing{0%{transform:scale(1);opacity:.8}100%{transform:scale(2.8);opacity:0}}
+.metric-bar{height:4px;border-radius:4px;background:#151922;overflow:hidden}
+.metric-bar i{background:linear-gradient(90deg,#376dff,#68a5ff);box-shadow:0 0 10px rgba(75,124,255,.5);border-radius:4px}
+.quick-actions{display:flex;gap:8px;overflow-x:auto;padding:16px 0 4px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.quick-actions::-webkit-scrollbar{display:none}
+.quick-chip{display:inline-flex;align-items:center;gap:7px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:20px;padding:9px 15px;font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;transition:all .2s var(--ease);flex-shrink:0}
+.quick-chip:hover{background:rgba(75,124,255,.16);border-color:rgba(75,124,255,.45);color:#9ebdff;transform:translateY(-1px)}
+.quick-chip:active{transform:scale(.96)}
+.quick-chip svg{width:16px;height:16px;color:var(--blue-soft)}
+.tabs{position:fixed;z-index:100;left:50%;transform:translateX(-50%);bottom:calc(10px + env(safe-area-inset-bottom));width:min(calc(100% - 20px),620px);background:rgba(12,16,23,.88);border:1px solid rgba(255,255,255,.11);border-radius:24px;box-shadow:0 12px 45px rgba(0,0,0,.65),inset 0 1px 0 rgba(255,255,255,.08);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);padding:6px 8px}
+.tab{border-radius:16px;transition:all .22s var(--ease)}
+.tab.on{background:rgba(75,124,255,.14);color:#8bb0ff}
+.btn{box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.btn:hover{box-shadow:0 4px 16px rgba(0,0,0,.35)}
+.btn.primary{box-shadow:0 6px 20px rgba(55,105,236,.35)}

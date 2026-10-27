@@ -38,6 +38,7 @@ if (-not $BuildPythonReady) {
         (Join-Path $RepoRoot ".venv312\Scripts\python.exe"),
         (Join-Path $RepoRoot ".venv\Scripts\python.exe"),
         (Join-Path $ClientRoot ".venv\Scripts\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.12-64\python.exe"),
         (Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
         (Get-Command py.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
     ) | Where-Object { $_ -and (Test-Path $_) }
