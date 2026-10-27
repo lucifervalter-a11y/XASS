@@ -124,6 +124,9 @@ struct NativePlaybackQueue {
     @Published private(set) var cacheBytes: Int64 = 0
     @Published private(set) var cacheLimitMB = 256
     @Published private(set) var cacheWorking = false
+    @Published private(set) var sleepTimerEndDate: Date?
+    @Published private(set) var sleepTimerAtTrackEnd = false
+    private var sleepTimerTask: Task<Void, Never>?
     var emit: (([String: Any]) -> Void)?
     var reportSession: (([String: Any]) -> Void)?
     var requestTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
@@ -173,6 +176,13 @@ struct NativePlaybackQueue {
         observers.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             Task { @MainActor in
                 guard let self = self, !self.awaitingTrack, let item = note.object as? AVPlayerItem, item === self.player.currentItem else { return }
+                if self.sleepTimerAtTrackEnd {
+                    self.cancelSleepTimer()
+                    self.pause()
+                    self.state = "ended"
+                    self.publish(forceReport: true)
+                    return
+                }
                 self.state = "ended"; self.publish(forceReport: true); self.advance(direction: 1, automatic: true)
             }
         })
@@ -201,6 +211,38 @@ struct NativePlaybackQueue {
             Task { @MainActor in self?.seek(event.positionTime) }; return .success
         }
     }
+    func setSleepTimer(minutes: Int) {
+        cancelSleepTimer()
+        guard minutes > 0 else { return }
+        let target = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        sleepTimerEndDate = target
+        sleepTimerTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(minutes * 60) * 1_000_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            self.pause()
+            self.cancelSleepTimer()
+        }
+    }
+
+    func setSleepTimerAtTrackEnd() {
+        cancelSleepTimer()
+        sleepTimerAtTrackEnd = true
+    }
+
+    func cancelSleepTimer() {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerEndDate = nil
+        sleepTimerAtTrackEnd = false
+    }
+
+    var sleepTimerRemainingText: String? {
+        if sleepTimerAtTrackEnd { return "В конце этого трека" }
+        guard let end = sleepTimerEndDate else { return nil }
+        let remaining = max(0, Int(end.timeIntervalSinceNow))
+        return String(format: "%d:%02d", remaining / 60, remaining % 60)
+    }
+
     func configure(_ origin: ServerOrigin) {
         if self.origin == origin { return }
         stop(); jobs.values.forEach { $0.cancel() }; jobs.removeAll(); downloadIDs.removeAll()

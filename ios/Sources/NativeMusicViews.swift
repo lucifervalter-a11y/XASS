@@ -330,6 +330,27 @@ private struct NativeLibraryBrowser: View, Equatable {
                 .padding(.vertical, 8)
 
                 List {
+                    Section("Таймер сна") {
+                        if let remaining = store.audio.sleepTimerRemainingText {
+                            HStack {
+                                Label("Активен: \(remaining)", systemImage: "moon.fill").foregroundStyle(XASSStyle.accent)
+                                Spacer()
+                                Button("Отключить", role: .destructive) { store.audio.cancelSleepTimer() }
+                            }
+                        }
+                        Menu {
+                            Button("15 минут") { store.audio.setSleepTimer(minutes: 15) }
+                            Button("30 минут") { store.audio.setSleepTimer(minutes: 30) }
+                            Button("45 минут") { store.audio.setSleepTimer(minutes: 45) }
+                            Button("1 час") { store.audio.setSleepTimer(minutes: 60) }
+                            Button("В конце этого трека") { store.audio.setSleepTimerAtTrackEnd() }
+                            if store.audio.sleepTimerEndDate != nil || store.audio.sleepTimerAtTrackEnd {
+                                Button("Отключить таймер", role: .destructive) { store.audio.cancelSleepTimer() }
+                            }
+                        } label: {
+                            Label(store.audio.sleepTimerEndDate != nil || store.audio.sleepTimerAtTrackEnd ? "Изменить таймер сна" : "Таймер сна", systemImage: "moon.stars")
+                        }
+                    }
                     Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
                     NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
                         Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")
