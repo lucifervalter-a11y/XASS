@@ -73,7 +73,7 @@
     const q=s.query.trim().toLocaleLowerCase();
     return q?rows.filter(t=>[t.title,t.artist,t.album].join(' ').toLocaleLowerCase().includes(q)):rows;
   }
-  function row(t){return `<div class="xm-track ${s.current?.id===t.id?'xm-selected':''}" data-track="${t.id}"><button class="xm-track-play" data-xm="play" data-id="${t.id}"><img src="${ART}" alt="" loading="lazy"><span><strong>${esc(t.title)}</strong><small>${esc(t.artist||'Неизвестный исполнитель')}</small></span></button><button class="xm-icon ${t.favorite?'xm-active':''}" data-xm="favorite" data-id="${t.id}" aria-label="${t.favorite?'Убрать из избранного':'В избранное'}" aria-pressed="${!!t.favorite}">${icon('heart',!!t.favorite)}</button>${button('track-menu','Действия с треком','more',`data-id="${t.id}"`)}<time>${seconds(t.duration)}</time></div>`;}
+  function row(t){return `<div class="xm-track ${s.current?.id===t.id?'xm-selected':''}" data-track="${t.id}"><button class="xm-track-play" data-xm="play" data-id="${t.id}" aria-label="${esc(t.title)}, ${esc(t.artist||'Неизвестный исполнитель')}, ${seconds(t.duration)}"><img src="${ART}" alt="" loading="lazy"><span><strong>${esc(t.title)}</strong><small>${esc(t.artist||'Неизвестный исполнитель')}</small></span></button><button class="xm-icon ${t.favorite?'xm-active':''}" data-xm="favorite" data-id="${t.id}" aria-label="${t.favorite?'Убрать из избранного':'В избранное'}" aria-pressed="${!!t.favorite}">${icon('heart',!!t.favorite)}</button>${button('track-menu','Действия с треком: ' + esc(t.title),'more',`data-id="${t.id}"`)}<time aria-hidden="true">${seconds(t.duration)}</time></div>`;}
   function renderLibrary(){
     root.querySelectorAll('.xm-tabs button').forEach(el=>el.setAttribute('aria-selected',String(el.dataset.xm==='filter-'+s.filter)));
     const list=tracks(), playlist=s.playlists.find(p=>p.id===s.playlist);
@@ -118,9 +118,12 @@
   }
   function renderProgress(){
     const duration=Math.max(0,finite(s.duration||s.current?.duration));
-    $('xmPosition').textContent=seconds(s.position);$('xmDuration').textContent=seconds(duration);
+    const posSec=seconds(s.position), durSec=seconds(duration);
+    $('xmPosition').textContent=posSec;$('xmDuration').textContent=durSec;
     if(document.activeElement!==$('xmSeek')){$('xmSeek').max=Math.max(duration,1);$('xmSeek').value=Math.min(s.position,duration);}
+    $('xmSeek').setAttribute('aria-valuetext',`${posSec} из ${durSec}`);
     $('xmSeek').style.setProperty('--xm-range',`${duration?Math.min(100,s.position/duration*100):0}%`);
+    $('xmVolume').setAttribute('aria-valuetext',`${Math.round(s.volume)}%`);
     $('xmVolume').style.setProperty('--xm-range',s.volume+'%');
   }
   function playerOpen(open){
