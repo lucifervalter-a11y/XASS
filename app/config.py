@@ -229,6 +229,17 @@ class Settings(BaseSettings):
         parsed = int(value)
         return max(6, min(parsed, 24))
 
+    def validate_security(self) -> list[str]:
+        """Returns list of security warnings for dangerous default values."""
+        warnings: list[str] = []
+        if self.setup_api_key.startswith("change-me"):
+            warnings.append("SETUP_API_KEY uses the insecure default value — change it before exposing to the internet")
+        if self.agent_api_key.startswith("change-me") and self.agent_api_key_enabled:
+            warnings.append("AGENT_API_KEY uses the insecure default value while AGENT_API_KEY_ENABLED=true")
+        if self.telegram_webhook_path.startswith("change-me"):
+            warnings.append("TELEGRAM_WEBHOOK_PATH uses the insecure default value")
+        return warnings
+
     @property
     def all_authorized_user_ids(self) -> set[int]:
         user_ids = {user_id for user_id in self.authorized_user_ids}

@@ -1,5 +1,6 @@
 import ctypes
 import json
+import logging
 import platform
 import re
 import shutil
@@ -7,6 +8,8 @@ import subprocess
 from typing import Any
 
 import psutil
+
+logger = logging.getLogger(__name__)
 
 MUSIC_WINDOW_MARKERS = (
     "youtube music",
@@ -68,7 +71,7 @@ def _is_probable_non_music_session(row: dict[str, Any]) -> bool:
     return browser_session and not artist and not known_music
 
 
-def _run_powershell(command: str, timeout_sec: int = 8) -> tuple[str, str]:
+def _run_powershell(command: str, timeout_sec: int = 6) -> tuple[str, str]:
     wrapped = (
         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
         "$OutputEncoding=[System.Text.Encoding]::UTF8; "
@@ -127,8 +130,12 @@ def _collect_windows_media_sessions() -> list[dict[str, Any]]:
     )
 
     try:
-        raw, stderr = _run_powershell(command)
-    except Exception:
+        raw, stderr = _run_powershell(command, timeout_sec=6)
+    except subprocess.TimeoutExpired:
+        logger.warning("PowerShell SMTC query timed out after 6s")
+        return []
+    except Exception as exc:
+        logger.warning("PowerShell SMTC query failed: %s", exc)
         return []
     if not raw:
         return []
@@ -267,8 +274,12 @@ def _vk_window_now_playing() -> str | None:
         "Select-Object Name, MainWindowTitle | ConvertTo-Json -Compress"
     )
     try:
-        raw, _ = _run_powershell(command, timeout_sec=6)
-    except Exception:
+        raw, _ = _run_powershell(command, timeout_sec=4)
+    except subprocess.TimeoutExpired:
+        logger.warning("PowerShell VK window query timed out after 4s")
+        return None
+    except Exception as exc:
+        logger.warning("PowerShell VK window query failed: %s", exc)
         return None
     if not raw:
         return None
@@ -299,7 +310,7 @@ def _vk_window_now_playing() -> str | None:
                     if cleaned:
                         return " - ".join(cleaned[:2]) if len(cleaned) >= 2 else cleaned[0]
             return win_title
-    return None
+        return None
 
 
 def get_now_playing() -> str | None:
@@ -319,28 +330,34 @@ def get_now_playing() -> str | None:
 
 
 def _windows_active_window() -> tuple[str | None, str | None]:
-    user32 = ctypes.windll.user32
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
+    if platform.system().lower() != "windows" or not hasattr(ctypes, "windll"):
         return None, None
-
-    length = user32.GetWindowTextLengthW(hwnd)
-    if length <= 0:
-        return None, None
-
-    buffer = ctypes.create_unicode_buffer(length + 1)
-    user32.GetWindowTextW(hwnd, buffer, length + 1)
-    title = buffer.value.strip() or None
-
-    pid = ctypes.c_ulong()
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    process_name = None
     try:
-        if pid.value:
-            process_name = psutil.Process(pid.value).name()
-    except Exception:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None, None
+
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return None, None
+
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        title = buffer.value.strip() or None
+
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         process_name = None
-    return title, process_name
+        try:
+            if pid.value:
+                process_name = psutil.Process(pid.value).name()
+        except Exception:
+            process_name = None
+        return title, process_name
+    except Exception as exc:
+        logger.debug("Failed getting active window on Windows: %s", exc)
+        return None, None
 
 
 def get_active_activity() -> dict[str, Any]:

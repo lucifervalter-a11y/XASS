@@ -389,7 +389,16 @@ private struct NativeLibraryBrowser: View, Equatable {
                 NativeMessage(store: store)
                 Text("Треков в плейлисте: \(playlist.trackIDs.count)").font(.caption).foregroundStyle(.secondary)
             }
-        }.navigationTitle(playlist?.name ?? "Плейлист").toolbar { Menu { Button("Изменить") { editing = true }; Button("Удалить плейлист", role: .destructive) { confirmDelete = true } } label: { Image(systemName: "ellipsis") } }
+        }
+        .navigationTitle(playlist?.name ?? "Плейлист")
+        .toolbar {
+            Menu {
+                Button("Изменить") { editing = true }
+                Button("Удалить плейлист", role: .destructive) { confirmDelete = true }
+            } label: {
+                Image(systemName: "ellipsis")
+            }
+        }
             .task(id: playlist?.trackIDs) { await loadTracks() }
             .refreshable { await loadTracks() }
             .overlay { if loading && tracks.isEmpty { ProgressView() } }
@@ -427,7 +436,25 @@ private struct NativeLibraryBrowser: View, Equatable {
                 }
                 NativeMessage(store: store)
             }.navigationTitle(playlist == nil ? "Новый плейлист" : "Изменить плейлист")
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() }.disabled(saving) }; ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { saving = true; store.run { defer { saving = false }; let preserved = (playlist?.trackIDs ?? []).filter { selected.contains($0) }; let ids = preserved + tracks.filter { selected.contains($0.id) && !preserved.contains($0.id) }.map(\.id); try await store.savePlaylist(id: playlist?.id, name: String(name.prefix(160)), trackIDs: ids); dismiss() } }.disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Отмена") { dismiss() }
+                            .disabled(saving)
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Сохранить") {
+                            saving = true
+                            store.run {
+                                defer { saving = false }
+                                let preserved = (playlist?.trackIDs ?? []).filter { selected.contains($0) }
+                                let ids = preserved + tracks.filter { selected.contains($0.id) && !preserved.contains($0.id) }.map(\.id)
+                                try await store.savePlaylist(id: playlist?.id, name: String(name.prefix(160)), trackIDs: ids)
+                                dismiss()
+                            }
+                        }
+                        .disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
                 .onAppear { name = playlist?.name ?? ""; selected = Set(playlist?.trackIDs ?? []) }
                 .task { await loadMore() }
         }.interactiveDismissDisabled(saving)
@@ -436,10 +463,10 @@ private struct NativeLibraryBrowser: View, Equatable {
         guard !loading, let offset = nextOffset else { return }
         loading = true; defer { loading = false }
         do {
-            let response = try await store.api.request("/api/mini/music/library?offset=\(offset)&limit=200", method: "GET", body: nil)
-            let page = (response["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
-            let seen = Set(tracks.map(\.id)); tracks += page.filter { !seen.contains($0.id) }
-            nextOffset = response["has_more"] as? Bool == true ? response["next_offset"] as? Int : nil
+            let result = try await store.fetchLibraryPage(offset: offset, limit: 200)
+            let seen = Set(tracks.map(\.id))
+            tracks += result.tracks.filter { !seen.contains($0.id) }
+            nextOffset = result.hasMore ? result.nextOffset : nil
             if let next = nextOffset, next <= offset { nextOffset = nil }
         } catch is CancellationError { }
         catch { store.handle(error) }

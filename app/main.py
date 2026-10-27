@@ -6,6 +6,8 @@ import ipaddress
 import logging
 import os
 import re
+import signal
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -652,7 +654,11 @@ async def _restart_after_mini_request(chat_id: int, reason: str) -> None:
         logger.exception("Mini App update applied, but service restart command failed")
         mode = (settings.service_restart_mode or "systemd").strip().lower()
         if mode == "systemd" and (os.environ.get("INVOCATION_ID") or os.getppid() == 1):
-            os._exit(0)
+            logger.warning("Sending SIGTERM for graceful shutdown")
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            except Exception:
+                os._exit(0)
         clear_restart_notice(settings)
 
 
@@ -684,6 +690,8 @@ async def lifespan(_: FastAPI):
         raise RuntimeError("Migration is staged. Stop the source server, then run deploy/migrate.py activate")
     require_explicit_global_agent_key(settings.agent_api_key, enabled=bool(getattr(settings, "agent_api_key_enabled", False)))
     ensure_data_dirs()
+    for warning in settings.validate_security():
+        logger.warning("SECURITY: %s", warning)
     ensure_profile_exists(Path(settings.profile_json_path))
     ensure_projects_exists(Path(settings.projects_json_path))
     ensure_site_config_exists(Path(settings.site_config_json_path))
@@ -752,7 +760,6 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/mini/ping")
 async def mini_ping() -> dict[str, Any]:
-    import sys
     return {"ok": True, "python": sys.version, "status": "backend running", "app_version": APP_VERSION}
 
 

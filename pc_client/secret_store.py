@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+logger = logging.getLogger(__name__)
 
 AAD = b"xass-config-sealed-v2"
 SECRET_KEYS = ("api_key", "e2e_private_jwk")
@@ -87,15 +90,17 @@ def _master_key(data_dir: Path) -> bytes:
             return raw
     data_dir.mkdir(parents=True, exist_ok=True)
     key = os.urandom(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp_path = path.with_suffix(".tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, key)
     finally:
         os.close(fd)
     try:
-        os.chmod(path, 0o600)
+        os.chmod(tmp_path, 0o600)
     except OSError:
         pass
+    os.replace(tmp_path, path)
     return key
 
 
@@ -115,15 +120,19 @@ def protect_bytes(data: bytes, *, data_dir: Path) -> dict[str, str]:
     if os.name == "nt":
         try:
             return {"cipher": "dpapi", "data": _encode(_dpapi_protect(data))}
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("DPAPI protection unavailable (%s), falling back to AES-256-GCM", exc)
     return _aes_protect(data, data_dir)
 
 
 def unprotect_bytes(envelope: dict[str, Any], *, data_dir: Path) -> bytes:
     cipher = str(envelope.get("cipher") or "")
     if cipher == "dpapi":
-        return _dpapi_unprotect(_decode(str(envelope["data"])))
+        try:
+            return _dpapi_unprotect(_decode(str(envelope["data"])))
+        except OSError as exc:
+            logger.warning("DPAPI unprotect failed (%s)", exc)
+            raise
     if cipher == "aes-256-gcm":
         return _aes_unprotect(envelope, data_dir)
     raise ValueError("Unsupported secret cipher")

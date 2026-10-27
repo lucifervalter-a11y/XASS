@@ -330,6 +330,14 @@ import UIKit
             offset = next
         } while true
     }
+    func fetchLibraryPage(offset: Int, limit: Int = 200) async throws -> (tracks: [LibraryTrack], hasMore: Bool, nextOffset: Int?) {
+        let page = try await api.request(libraryPath(offset: offset, limit: limit), method: "GET", body: nil)
+        let values = (page["tracks"] as? [[String: Any]] ?? []).compactMap(LibraryTrack.init)
+        remember(values)
+        let hasMore = page["has_more"] as? Bool == true
+        let next = page["next_offset"] as? Int
+        return (tracks: values, hasMore: hasMore, nextOffset: next)
+    }
 
     func openRoutePicker() {
         // Mutually exclusive: close player sheet while choosing route.

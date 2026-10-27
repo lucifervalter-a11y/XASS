@@ -5,7 +5,7 @@ import UIKit
     private static let light = UIImpactFeedbackGenerator(style: .light)
     private static let soft = UIImpactFeedbackGenerator(style: .soft)
     private static let selection = UISelectionFeedbackGenerator()
-    static func tap() { light.impactOccurred() }
+    static func tap() { light.prepare(); light.impactOccurred(intensity: 0.55) }
     static func dismiss() { soft.impactOccurred() }
     static func prepareScrub() { selection.prepare() }
     static func scrub() { selection.selectionChanged() }
@@ -182,6 +182,7 @@ struct PlayerScrubber: View {
     @State private var pendingSeek: TimeInterval?
     @State private var hapticStep = -1
     @GestureState private var touching = false
+    private let seekTolerance: TimeInterval = 1.5
 
     private var shown: TimeInterval { min(max(0, dragValue ?? pendingSeek ?? position), max(0, duration)) }
 
@@ -220,7 +221,7 @@ struct PlayerScrubber: View {
             .font(.caption.weight(.medium)).monospacedDigit().foregroundStyle(.white.opacity(active ? 0.9 : 0.6))
         }
         .onChange(of: position) { _, value in
-            if let pending = pendingSeek, abs(value - pending) < 1.5 { pendingSeek = nil }
+            if let pending = pendingSeek, abs(value - pending) < seekTolerance { pendingSeek = nil }
         }
         .onChange(of: trackID) { _, _ in
             // A new song never inherits the previous song's pending seek or drag.
@@ -339,11 +340,15 @@ struct PlayerScrollViewTuner: UIViewRepresentable {
             found.bounces = false
             found.alwaysBounceVertical = false
             observation = found.observe(\.contentOffset, options: [.initial, .new]) { [weak self] scroll, _ in
-                // SwiftUI may re-apply its own bounce settings on update: keep them off.
-                if scroll.bounces { scroll.bounces = false }
-                if scroll.alwaysBounceVertical { scroll.alwaysBounceVertical = false }
                 let top = scroll.contentOffset.y <= -scroll.adjustedContentInset.top + 0.5
-                DispatchQueue.main.async { self?.report(top) }
+                DispatchQueue.main.async { [weak scroll] in
+                    // SwiftUI may re-apply its own bounce settings on update: keep them off safely on the main thread.
+                    if let scroll = scroll {
+                        if scroll.bounces { scroll.bounces = false }
+                        if scroll.alwaysBounceVertical { scroll.alwaysBounceVertical = false }
+                    }
+                    self?.report(top)
+                }
             }
         }
         private func report(_ top: Bool) {
