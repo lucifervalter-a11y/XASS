@@ -85,8 +85,14 @@ enum XASSStyle {
                         Text(track.artist.isEmpty ? "Моя коллекция" : track.artist).font(.subheadline).foregroundStyle(XASSStyle.secondary).lineLimit(1)
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.contentShape(Rectangle())
-            }.buttonStyle(.plain).disabled(store.busy).accessibilityIdentifier("track-\(track.id)")
-            Text(NativeValue.time(track.duration)).font(.caption).monospacedDigit().foregroundStyle(XASSStyle.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(store.busy)
+            .accessibilityIdentifier("track-\(track.id)")
+            .accessibilityLabel("\(track.title), \(track.artist.isEmpty ? "Моя коллекция" : track.artist)")
+            .accessibilityValue(NativeValue.time(track.duration))
+            .accessibilityHint("Воспроизвести трек")
+            Text(NativeValue.time(track.duration)).font(.caption).monospacedDigit().foregroundStyle(XASSStyle.secondary).accessibilityHidden(true)
             Button(action: menu) { Image(systemName: "ellipsis").font(.title3).frame(width: 36, height: 44).contentShape(Rectangle()) }
                 .buttonStyle(.plain).foregroundStyle(.white).accessibilityLabel("Действия: \(track.title)")
         }.padding(.leading, 4).padding(.trailing, 4).padding(.vertical, 9)

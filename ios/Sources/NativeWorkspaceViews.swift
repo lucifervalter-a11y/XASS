@@ -85,18 +85,24 @@ import SwiftUI
     private func health(_ name: String, key: String, icon: String) -> some View {
         let data = systems[key] as? [String: Any] ?? [:]
         let available = data["available"] as? Bool
+        let statusText = available == true ? "Работает" : available == false ? "Требует внимания" : "Проверяем…"
         return HStack {
             Label(name, systemImage: icon); Spacer()
-            Text(available == true ? "Работает" : available == false ? "Требует внимания" : "Проверяем…")
+            Text(statusText)
                 .font(.caption).foregroundStyle(available == true ? Color.green : available == false ? Color.orange : Color.secondary)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(name): \(statusText)")
     }
     private func metric(_ title: String, key: String) -> some View {
         let value = min(100, NativeValue.number(metrics[key]))
         return VStack(spacing: 8) {
             HStack { Text(title); Spacer(); Text("\(Int(value))%").monospacedDigit().foregroundStyle(.secondary) }
             ProgressView(value: value, total: 100).tint(value >= 90 ? Color.orange : XASSStyle.accent)
-        }.padding(.vertical, 4)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title): \(Int(value))%")
     }
 }
 
@@ -143,8 +149,12 @@ import SwiftUI
                     HStack { if item.unread { Circle().fill(XASSStyle.accent).frame(width: 7, height: 7) }; Text(item.title).font(.headline) }
                     Text(item.message).font(.subheadline).foregroundStyle(.secondary)
                     if let date = ISO8601DateFormatter().date(from: item.createdAt) { Text(date.formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundStyle(.secondary) }
-                }.padding(.vertical, 4)
-                    .swipeActions { if item.unread { Button("Прочитано") { Task { await workspace.read(item) } }.tint(XASSStyle.accent) } }
+                }
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(item.unread ? "Новое: " : "")\(item.title)")
+                .accessibilityValue(item.message)
+                .swipeActions { if item.unread { Button("Прочитано") { Task { await workspace.read(item) } }.tint(XASSStyle.accent) } }
             }
         }.navigationTitle("Уведомления")
             .toolbar { Button("Прочитать всё") { Task { await workspace.readAll() } }.disabled(workspace.saving || workspace.unreadCount == 0) }

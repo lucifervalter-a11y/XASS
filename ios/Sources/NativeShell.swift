@@ -333,7 +333,7 @@ enum NativeShellSheet: Hashable, Identifiable {
                         }.padding(.vertical, 6)
                     }.accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isButton)
-                    .accessibilityLabel(device.name)
+                    .accessibilityLabel("\(device.name), \(device.online ? "В сети" : "Не в сети")")
                     .accessibilityIdentifier("native-device-\(device.id)")
                 }
                 if store.authorized && store.devices.isEmpty { ContentUnavailableView("Нет подключённых ПК", systemImage: "desktopcomputer", description: Text("Добавьте Windows-агент в Telegram Mini App и импортируйте его конфигурацию на ПК.")) }
@@ -549,7 +549,8 @@ struct NativeTransferWait: View {
                             }
                             .disabled(!device.online || store.busy)
                             .accessibilityIdentifier("route-device-\(device.id)")
-                            .accessibilityLabel(Text(device.name))
+                            .accessibilityLabel("\(device.name), \(device.online ? (store.pcTransportLabel(device.name) ?? "В сети") : "Не в сети")")
+                            .accessibilityValue(store.selectedDevice == "agent:" + device.name ? "Выбрано" : "")
                         }
                     }
 
