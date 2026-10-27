@@ -15,7 +15,7 @@
     volume:'m11 5-6 4H2v6h3l6 4ZM15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14',
     speaker:'M5 3h14v18H5ZM12 6h.01M16 14a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
     download:'M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5', queue:'M3 5h14M3 10h14M3 15h8m7-3v8m0-8 4-1m-4 9a2 2 0 1 1-4 0 2 2 0 0 1 4 0',
-    device:'M8 2h8v20H8ZM11 18h2', check:'m5 12 4 4L19 6', chevron:'m9 5 7 7-7 7', trash:'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7',
+    device:'M8 2h8v20H8ZM11 18h2', check:'m5 12 4 4L19 6', chevron:'m9 5 7 7-7 7', trash:'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7', moon:'M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z',
   };
   const icon = (name, filled=false) => `<svg viewBox="0 0 24 24" aria-hidden="true" fill="${filled?'currentColor':'none'}" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="${PATHS[name]||PATHS.play}"/></svg>`;
   const button = (action, label, glyph, extra='') => `<button type="button" class="xm-icon" data-xm="${action}" aria-label="${esc(label)}" title="${esc(label)}" ${extra}>${icon(glyph)}</button>`;
@@ -29,7 +29,7 @@
     current:null,queue:[],shuffle:false,repeat:'off',state:'stopped',position:0,duration:0,volume:70,
     device:'local',output:'default',outputs:[],shareSite:false,shareSaving:false,shareDiscord:false,playerOpen:false,playGeneration:0,
     pcPolling:false,sessionOwned:false,publishing:false,lastPublish:0,upload:null,downloads:new Set(),busy:false,
-    transitioning:false,requestedDevice:null,needsStart:false,enabled:true};
+    transitioning:false,requestedDevice:null,needsStart:false,enabled:true,sleepTimerId:null,sleepTimerTarget:null,sleepTimerAtEnd:false,prevVolume:null};
   const audio = document.createElement('audio');
   audio.preload='metadata'; audio.setAttribute('playsinline',''); audio.id='xmAudio';
   root.innerHTML = `<div class="xm-library">
@@ -43,7 +43,7 @@
   <input id="xmFile" type="file" accept=".mp3,.wav,.flac,.ogg,.m4a,.zip,audio/*,application/zip" multiple hidden>
   <div id="xmMini" class="xm-mini" hidden><button data-xm="expand" class="xm-mini-track"><img src="${ART}" alt=""><span><strong id="xmMiniTitle"></strong><small id="xmMiniDevice"></small></span></button>${button('toggle','Воспроизвести','play','id="xmMiniPlay"')}</div>
   <div id="xmPlayer" class="xm-player-backdrop" hidden><section class="xm-player" role="dialog" aria-modal="true" aria-labelledby="xmPlayerCaption" tabindex="-1">
-    <header class="xm-player-head">${button('collapse','Свернуть плеер','down')}<span id="xmPlayerCaption">Сейчас играет</span>${button('queue','Очередь воспроизведения','queue')}</header>
+    <header class="xm-player-head">${button('collapse','Свернуть плеер','down')}<span id="xmPlayerCaption">Сейчас играет</span><div class="xm-player-head-actions">${button('sleep-timer','Таймер сна','moon','id="xmSleepTimerBtn"')}${button('queue','Очередь воспроизведения','queue')}</div></header>
     <img class="xm-art" src="${ART}" alt="Обложка трека">
     <div class="xm-track-heading"><div><h2 id="xmPlayerTitle"></h2><p id="xmPlayerArtist"></p></div>${button('favorite-current','Добавить в избранное','heart','id="xmPlayerFavorite"')}</div>
     <div class="xm-progress"><input id="xmSeek" type="range" min="0" max="1" step="0.1" value="0" aria-label="Позиция трека"><div><span id="xmPosition">0:00</span><span id="xmDuration">0:00</span></div></div>
@@ -78,7 +78,8 @@
     root.querySelectorAll('.xm-tabs button').forEach(el=>el.setAttribute('aria-selected',String(el.dataset.xm==='filter-'+s.filter)));
     const list=tracks(), playlist=s.playlists.find(p=>p.id===s.playlist);
     $('xmPlaylistHeading').innerHTML=playlist?`<div class="xm-playlist-heading"><button class="xm-text" data-xm="back-playlists">Все плейлисты</button><h2>${esc(playlist.name)}</h2>${button('edit-playlist','Изменить плейлист','more',`data-id="${playlist.id}"`)}</div>`:'';
-    $('xmLibraryMessage').innerHTML=s.loading?'<p class="xm-empty">Загружаю библиотеку…</p>':s.error?`<div class="xm-empty"><p>${esc(s.error)}</p><button class="xm-secondary" data-xm="retry">Повторить</button></div>`:'';
+    $('xmLibraryMessage').innerHTML=s.loading?'':s.error?`<div class="xm-empty"><p>${esc(s.error)}</p><button class="xm-secondary" data-xm="retry">Повторить</button></div>`:'';
+    if(s.loading&&!s.tracks.length){$('xmTracks').innerHTML=skeletonHtml();$('xmMore').hidden=true;return;}
     if(s.filter==='playlists'&&!playlist){
       $('xmTracks').innerHTML=`<button class="xm-new-playlist" data-xm="new-playlist">${icon('plus')}Создать плейлист</button>`+s.playlists.map(p=>`<div class="xm-playlist-row"><button data-xm="open-playlist" data-id="${p.id}">${icon('queue')}<span><strong>${esc(p.name)}</strong><small>${p.track_ids.length} треков</small></span>${icon('chevron')}</button></div>`).join('');
       $('xmMore').hidden=true;
@@ -130,6 +131,63 @@
     s.playerOpen=open;$('xmPlayer').hidden=!open;document.body.classList.toggle('xm-player-open',open);
     if(open){renderPlayer();root.querySelector('.xm-player').focus();}else root.querySelector('[data-xm="expand"]')?.focus();
   }
+  
+  function cancelSleepTimer(silent=false){
+    if(s.sleepTimerId){clearTimeout(s.sleepTimerId);s.sleepTimerId=null;}
+    s.sleepTimerTarget=null;s.sleepTimerAtEnd=false;
+    $('xmSleepTimerBtn')?.classList.remove('xm-active');
+    if(!silent)X.toast('Таймер сна отключён');
+  }
+  function setSleepTimer(minutes,atEnd=false){
+    cancelSleepTimer(true);
+    if(atEnd){
+      s.sleepTimerAtEnd=true;
+      $('xmSleepTimerBtn')?.classList.add('xm-active');
+      X.toast('Таймер: остановка в конце этого трека');
+      return;
+    }
+    const ms=minutes*60*1000;
+    s.sleepTimerTarget=Date.now()+ms;
+    $('xmSleepTimerBtn')?.classList.add('xm-active');
+    X.toast(`Таймер сна: ${minutes} мин`);
+    s.sleepTimerId=setTimeout(async()=>{
+      cancelSleepTimer(true);
+      if(s.state==='playing')await toggle();
+      X.toast('Таймер сна: воспроизведение остановлено');
+    },ms);
+  }
+  function addSleepTimerMinutes(minutes=5){
+    if(s.sleepTimerTarget){
+      const remaining=Math.max(0,s.sleepTimerTarget-Date.now());
+      const newMinutes=Math.round((remaining+minutes*60*1000)/60000);
+      setSleepTimer(newMinutes);
+    }else{
+      setSleepTimer(minutes);
+    }
+  }
+  function openSleepTimerDialog(){
+    let content='<div class="xm-menu">';
+    if(s.sleepTimerTarget||s.sleepTimerAtEnd){
+      let remainingText='';
+      if(s.sleepTimerAtEnd){
+        remainingText='В конце текущего трека';
+      }else{
+        const remSec=Math.max(0,Math.round((s.sleepTimerTarget-Date.now())/1000));
+        remainingText=`Осталось ${Math.floor(remSec/60)} мин ${remSec%60} сек`;
+      }
+      content+=`<div class="xm-field" style="margin-bottom:12px;padding:8px 0;border-bottom:1px solid var(--xm-line);font-size:14px"><span>Таймер активен: </span><b style="color:var(--xm-blue)">${remainingText}</b></div>`;
+      content+='<button class="xm-danger" data-xm="cancel-sleep-timer"><span>Отключить таймер</span></button>';
+      if(!s.sleepTimerAtEnd&&s.sleepTimerTarget){
+        content+='<button data-xm="add-sleep-timer" data-minutes="5"><span>+5 минут к таймеру</span></button>';
+      }
+    }
+    content+=`<button data-xm="set-sleep-timer" data-minutes="15"><span>Через 15 минут</span></button><button data-xm="set-sleep-timer" data-minutes="30"><span>Через 30 минут</span></button><button data-xm="set-sleep-timer" data-minutes="45"><span>Через 45 минут</span></button><button data-xm="set-sleep-timer" data-minutes="60"><span>Через 1 час</span></button><button data-xm="set-sleep-timer-end"><span>В конце этого трека</span></button></div>`;
+    dialog('Таймер сна',content);
+  }
+  function skeletonHtml(){
+    return [1,2,3,4].map(()=>`<div class="xm-skeleton" aria-hidden="true"><div class="xm-skeleton-art"></div><div class="xm-skeleton-lines"><div class="xm-skeleton-title"></div><div class="xm-skeleton-sub"></div></div><div class="xm-skeleton-time"></div></div>`).join('');
+  }
+
   function dialog(title,content){$('xmDialogTitle').textContent=title;$('xmDialogBody').innerHTML=content;$('xmDialog').showModal();}
   function closeDialog(){$('xmDialog').close();}
   function notice(error){const text=error?.message||String(error);X.toast(text);return text;}
@@ -298,6 +356,11 @@
     if(native()&&s.device==='local'){if(!automatic)nativeSend(direction>0?'next':'previous');return;}
     const ids=s.queue.filter(id=>s.tracks.some(t=>t.id===id));if(!ids.length)return;
     if(automatic&&!s.sessionOwned)return;
+    if(automatic&&s.sleepTimerAtEnd){
+      cancelSleepTimer(true);s.state='paused';
+      if(s.device!=='local')await control('pause');else if(native())nativeSend('pause');else audio.pause();
+      renderPlayer();await publish();X.toast('Таймер сна: трек завершён, воспроизведение остановлено');return;
+    }
     if(automatic&&s.repeat==='one')return play(s.current,{keepQueue:true,takeover:false});
     let index=ids.indexOf(s.current?.id);
     if(direction<0&&s.position>3)return seek(0);
@@ -408,6 +471,11 @@
       case 'download':await download(id);break;
       case 'download-current':await download(s.current?.id);break;
       case 'resume-upload':await upload(null,true);break;
+      case 'sleep-timer':openSleepTimerDialog();break;
+      case 'cancel-sleep-timer':cancelSleepTimer();closeDialog();break;
+      case 'add-sleep-timer':addSleepTimerMinutes(Number(el.dataset.minutes||5));closeDialog();break;
+      case 'set-sleep-timer':setSleepTimer(Number(el.dataset.minutes));closeDialog();break;
+      case 'set-sleep-timer-end':setSleepTimer(0,true);closeDialog();break;
       case 'cancel-upload':{const u=s.upload;if(u){u.cancelled=true;s.upload=null;uploadStatus();if(u.id)await request('uploads/'+u.id,'DELETE');}break;}
     }
   }
@@ -439,9 +507,29 @@
     s.position=finite(d.position);s.duration=finite(d.duration)||s.duration;s.error=d.error||'';renderPlayer();if(ended)step(1,true).catch(notice);
   });
   document.addEventListener('keydown',e=>{
-    if(!s.playerOpen||$('xmDialog').open)return;
-    if(e.key==='Escape')playerOpen(false);
-    if(e.key==='Tab'){const items=[...root.querySelectorAll('.xm-player button:not(:disabled),.xm-player input:not(:disabled)')],first=items[0],last=items[items.length-1];if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}}
+    const isEditing=['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)||document.activeElement?.isContentEditable;
+    if($('xmDialog').open){if(e.key==='Escape')closeDialog();return;}
+    if(s.playerOpen&&e.key==='Escape'){playerOpen(false);return;}
+    if(s.playerOpen&&e.key==='Tab'){
+      const items=[...root.querySelectorAll('.xm-player button:not(:disabled),.xm-player input:not(:disabled)')],first=items[0],last=items[items.length-1];
+      if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+      else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+      return;
+    }
+    if(isEditing)return;
+    if(e.code==='Space'){e.preventDefault();toggle().catch(notice);return;}
+    if(e.key==='ArrowRight'){e.preventDefault();if(e.shiftKey)step(1).catch(notice);else seek(Math.min(s.duration||0,s.position+5)).catch(notice);return;}
+    if(e.key==='ArrowLeft'){e.preventDefault();if(e.shiftKey)step(-1).catch(notice);else seek(Math.max(0,s.position-5)).catch(notice);return;}
+    if(e.key==='ArrowUp'){e.preventDefault();s.volume=Math.min(100,Math.round(s.volume+5));$('xmVolume').value=s.volume;renderProgress();if(s.device==='local'){if(native())nativeSend('volume',{volume:s.volume});else audio.volume=s.volume/100;}else control('volume',{volume:s.volume}).catch(notice);return;}
+    if(e.key==='ArrowDown'){e.preventDefault();s.volume=Math.max(0,Math.round(s.volume-5));$('xmVolume').value=s.volume;renderProgress();if(s.device==='local'){if(native())nativeSend('volume',{volume:s.volume});else audio.volume=s.volume/100;}else control('volume',{volume:s.volume}).catch(notice);return;}
+    if(e.key==='m'||e.key==='M'||e.key==='ь'||e.key==='Ь'){
+      e.preventDefault();
+      if(s.volume>0){s.prevVolume=s.volume;s.volume=0;}else{s.volume=s.prevVolume||70;}
+      $('xmVolume').value=s.volume;renderProgress();
+      if(s.device==='local'){if(native())nativeSend('volume',{volume:s.volume});else audio.volume=s.volume/100;}
+      else control('volume',{volume:s.volume}).catch(notice);
+      return;
+    }
   });
   document.addEventListener('xass:view',event=>{const visible=event.detail?.name==='music';$('xmMini').classList.toggle('xm-outside',!visible);if(visible&&!s.loaded)load();});
   document.addEventListener('xass:boot',()=>{if(document.getElementById('view-music').classList.contains('on')&&!s.loaded)load();});

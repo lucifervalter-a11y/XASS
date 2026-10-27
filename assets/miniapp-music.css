@@ -19,3 +19,13 @@
 @media(min-width:760px){#xassMusic{padding-top:34px}.xm-heading h1{font-size:43px}.xm-track{min-height:85px}.xm-track-play img{width:57px;height:57px}.xm-track strong{font-size:17px}.xm-track small{font-size:13px}.xm-track time{min-width:55px}.xm-track>.xm-icon{width:44px}.xm-search{max-width:640px}.xm-tabs{max-width:500px}.xm-list-actions{max-width:500px}.xm-player{margin-block:24px;min-height:0;height:max-content;border:1px solid #253145;border-radius:24px}.xm-player-backdrop{align-items:flex-start}}
 @media(max-width:350px){.xm-heading h1{font-size:32px}.xm-track-play{gap:9px}.xm-track-play img{width:43px;height:43px}.xm-track strong{font-size:14px}.xm-track small{font-size:11px}.xm-track>.xm-icon{width:29px;padding:5px}.xm-track time{min-width:29px;font-size:11px;margin-left:0}.xm-track .xm-icon svg{width:19px}.xm-player{padding-inline:19px}.xm-track-heading h2{font-size:23px}.xm-sharing{gap:10px}.xm-sharing label{gap:7px;font-size:12px}.xm-transport .xm-icon{width:40px}#xmMainPlay{width:62px;height:62px}}
 @media(prefers-reduced-motion:reduce){#xassMusic *,#xassMusic *::after{transition:none!important}}
+.xm-player-head-actions{display:flex;align-items:center;gap:4px}
+#xmSleepTimerBtn.xm-active{color:var(--xm-blue);position:relative}
+#xmSleepTimerBtn.xm-active::after{content:'';position:absolute;top:9px;right:9px;width:6px;height:6px;border-radius:50%;background:var(--xm-blue)}
+.xm-skeleton{display:flex;align-items:center;gap:13px;border-bottom:1px solid var(--xm-line);min-height:76px;padding:10px 0;animation:xmPulse 1.5s ease-in-out infinite}
+.xm-skeleton-art{width:51px;height:51px;border-radius:7px;background:var(--xm-surface);flex-shrink:0}
+.xm-skeleton-lines{flex:1;display:flex;flex-direction:column;gap:8px}
+.xm-skeleton-title{width:60%;height:14px;border-radius:4px;background:var(--xm-surface)}
+.xm-skeleton-sub{width:38%;height:11px;border-radius:4px;background:var(--xm-surface);opacity:.7}
+.xm-skeleton-time{width:28px;height:12px;border-radius:4px;background:var(--xm-surface);opacity:.5}
+@keyframes xmPulse{0%,100%{opacity:.4}50%{opacity:.9}}
