@@ -126,6 +126,7 @@ struct NativePlaybackQueue {
     @Published private(set) var cacheWorking = false
     @Published private(set) var sleepTimerEndDate: Date?
     @Published private(set) var sleepTimerAtTrackEnd = false
+    @Published private(set) var playbackRate: Float = 1.0
     private var sleepTimerTask: Task<Void, Never>?
     var emit: (([String: Any]) -> Void)?
     var reportSession: (([String: Any]) -> Void)?
@@ -219,7 +220,7 @@ struct NativePlaybackQueue {
         sleepTimerTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(minutes * 60) * 1_000_000_000)
             guard !Task.isCancelled, let self = self else { return }
-            self.pause()
+            self.fadeOutAndPause()
             self.cancelSleepTimer()
         }
     }
@@ -241,6 +242,28 @@ struct NativePlaybackQueue {
         guard let end = sleepTimerEndDate else { return nil }
         let remaining = max(0, Int(end.timeIntervalSinceNow))
         return String(format: "%d:%02d", remaining / 60, remaining % 60)
+    }
+
+    func setPlaybackRate(_ rate: Float) {
+        let safe = min(2.0, max(0.5, rate))
+        playbackRate = safe
+        if state == "playing" { player.rate = safe }
+    }
+
+    func fadeOutAndPause(duration: TimeInterval = 1.5) {
+        guard state == "playing" else { return }
+        let steps = 15
+        let stepDuration = duration / Double(steps)
+        Task { @MainActor in
+            for i in 1...steps {
+                try? await Task.sleep(nanoseconds: UInt64(stepDuration * 1_000_000_000))
+                guard self.state == "playing" else { break }
+                let fraction = 1.0 - (Float(i) / Float(steps))
+                self.player.volume = fraction
+            }
+            self.pause()
+            self.player.volume = 1.0
+        }
     }
 
     func configure(_ origin: ServerOrigin) {

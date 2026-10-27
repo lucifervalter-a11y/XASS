@@ -351,6 +351,23 @@ private struct NativeLibraryBrowser: View, Equatable {
                             Label(store.audio.sleepTimerEndDate != nil || store.audio.sleepTimerAtTrackEnd ? "Изменить таймер сна" : "Таймер сна", systemImage: "moon.stars")
                         }
                     }
+                    Section("Скорость воспроизведения") {
+                        HStack(spacing: 8) {
+                            ForEach([Float(0.75), 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
+                                Button {
+                                    store.audio.setPlaybackRate(rate)
+                                } label: {
+                                    Text(rate == 1.0 ? "1x" : String(format: "%.2gx", rate))
+                                        .font(.caption.weight(store.audio.playbackRate == rate ? .bold : .regular))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 7)
+                                        .background(store.audio.playbackRate == rate ? XASSStyle.accent : XASSStyle.surface, in: RoundedRectangle(cornerRadius: 8))
+                                        .foregroundStyle(.white)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
                     Button { perform { try await store.favorite(current) } } label: { Label(current.favorite ? "Убрать из избранного" : "В избранное", systemImage: "heart") }
                     NavigationLink { NativeEnrichmentView(store: store, trackID: track.id) } label: {
                         Label("Текст и информация о песне", systemImage: "sparkle.magnifyingglass")

@@ -29,7 +29,7 @@
     current:null,queue:[],shuffle:false,repeat:'off',state:'stopped',position:0,duration:0,volume:70,
     device:'local',output:'default',outputs:[],shareSite:false,shareSaving:false,shareDiscord:false,playerOpen:false,playGeneration:0,
     pcPolling:false,sessionOwned:false,publishing:false,lastPublish:0,upload:null,downloads:new Set(),busy:false,
-    transitioning:false,requestedDevice:null,needsStart:false,enabled:true,sleepTimerId:null,sleepTimerTarget:null,sleepTimerAtEnd:false,prevVolume:null};
+    transitioning:false,requestedDevice:null,needsStart:false,enabled:true,sleepTimerId:null,sleepTimerTarget:null,sleepTimerAtEnd:false,prevVolume:null,playbackRate:1.0};
   const audio = document.createElement('audio');
   audio.preload='metadata'; audio.setAttribute('playsinline',''); audio.id='xmAudio';
   root.innerHTML = `<div class="xm-library">
@@ -44,14 +44,14 @@
   <div id="xmMini" class="xm-mini" hidden><button data-xm="expand" class="xm-mini-track"><img src="${ART}" alt=""><span><strong id="xmMiniTitle"></strong><small id="xmMiniDevice"></small></span></button>${button('toggle','Воспроизвести','play','id="xmMiniPlay"')}</div>
   <div id="xmPlayer" class="xm-player-backdrop" hidden><section class="xm-player" role="dialog" aria-modal="true" aria-labelledby="xmPlayerCaption" tabindex="-1">
     <header class="xm-player-head">${button('collapse','Свернуть плеер','down')}<span id="xmPlayerCaption">Сейчас играет</span><div class="xm-player-head-actions">${button('sleep-timer','Таймер сна','moon','id="xmSleepTimerBtn"')}${button('queue','Очередь воспроизведения','queue')}</div></header>
-    <img class="xm-art" src="${ART}" alt="Обложка трека">
+    <div class="xm-art-wrap"><img class="xm-art" src="${ART}" alt="Обложка трека"><canvas id="xmVisualizer" class="xm-visualizer" width="350" height="48" aria-hidden="true"></canvas></div>
     <div class="xm-track-heading"><div><h2 id="xmPlayerTitle"></h2><p id="xmPlayerArtist"></p></div>${button('favorite-current','Добавить в избранное','heart','id="xmPlayerFavorite"')}</div>
     <div class="xm-progress"><input id="xmSeek" type="range" min="0" max="1" step="0.1" value="0" aria-label="Позиция трека"><div><span id="xmPosition">0:00</span><span id="xmDuration">0:00</span></div></div>
     <div id="xmPlayerStatus" class="xm-player-status" role="status"></div>
     <div class="xm-transport">${button('shuffle','Перемешивание','shuffle','id="xmShuffle"')}${button('prev','Предыдущий трек','prev')}${button('toggle','Воспроизвести','play','id="xmMainPlay"')}${button('next','Следующий трек','next')}${button('repeat','Повтор выключен','repeat','id="xmRepeat"')}</div>
     <button class="xm-device" data-xm="devices">${icon('volume')}<span id="xmDeviceName"></span>${icon('chevron')}</button>
     <label class="xm-volume">${icon('volume')}<input id="xmVolume" type="range" min="0" max="100" step="1" value="70" aria-label="Громкость">${icon('speaker')}</label>
-    <div class="xm-sharing"><label><input id="xmShareSite" type="checkbox" role="switch" aria-label="Публиковать музыку на сайте"><span class="xm-switch"></span><span id="xmShareSiteText" aria-live="polite">На сайте</span></label><button class="xm-text" data-xm="discord-help">Звук в Discord</button></div>
+    <div class="xm-sharing"><label><input id="xmShareSite" type="checkbox" role="switch" aria-label="Публиковать музыку на сайте"><span class="xm-switch"></span><span id="xmShareSiteText" aria-live="polite">На сайте</span></label><button type="button" class="xm-text" data-xm="rate" id="xmRateBtn" aria-label="Скорость воспроизведения" title="Скорость воспроизведения">1x</button><button class="xm-text" data-xm="discord-help">Звук в Discord</button></div>
     <button class="xm-download" data-xm="download-current">${icon('download')}<span id="xmDownloadLabel">Скачать трек</span></button>
   </section></div>
   <dialog id="xmDialog" class="xm-dialog"><div class="xm-dialog-head"><h2 id="xmDialogTitle"></h2>${button('close-dialog','Закрыть','close')}</div><div id="xmDialogBody"></div></dialog>`;
@@ -129,9 +129,59 @@
   }
   function playerOpen(open){
     s.playerOpen=open;$('xmPlayer').hidden=!open;document.body.classList.toggle('xm-player-open',open);
-    if(open){renderPlayer();root.querySelector('.xm-player').focus();}else root.querySelector('[data-xm="expand"]')?.focus();
+    if(open){renderPlayer();initVisualizer();if(audioCtx?.state==='suspended')audioCtx.resume();renderVisualizer();root.querySelector('.xm-player').focus();}else root.querySelector('[data-xm="expand"]')?.focus();
   }
   
+  let audioCtx=null,analyser=null,audioSrcNode=null,animFrameId=null;
+  function initVisualizer(){
+    if(audioCtx||native()||s.device!=='local')return;
+    try{
+      const AC=window.AudioContext||window.webkitAudioContext;
+      if(!AC)return;
+      audioCtx=new AC();
+      analyser=audioCtx.createAnalyser();analyser.fftSize=64;
+      audioSrcNode=audioCtx.createMediaElementSource(audio);
+      audioSrcNode.connect(analyser);analyser.connect(audioCtx.destination);
+    }catch(_){}
+  }
+  function renderVisualizer(){
+    const canvas=$('xmVisualizer');if(!canvas)return;
+    const ctx=canvas.getContext('2d');if(!ctx)return;
+    const width=canvas.width,height=canvas.height;
+    function draw(){
+      if(!s.playerOpen){if(animFrameId){cancelAnimationFrame(animFrameId);animFrameId=null;}return;}
+      animFrameId=requestAnimationFrame(draw);
+      ctx.clearRect(0,0,width,height);
+      const count=analyser?analyser.frequencyBinCount:16;
+      const data=new Uint8Array(count);
+      if(analyser&&s.state==='playing')analyser.getByteFrequencyData(data);
+      const barW=(width/count)*1.4;let x=0;
+      for(let i=0;i<count;i++){
+        let barH=s.state==='playing'?(data[i]/255)*height*0.88:2;
+        barH=Math.max(2,barH);
+        const grad=ctx.createLinearGradient(0,height,0,0);
+        grad.addColorStop(0,'rgba(40,117,255,0.2)');
+        grad.addColorStop(1,'rgba(100,170,255,0.85)');
+        ctx.fillStyle=grad;
+        ctx.beginPath();
+        if(ctx.roundRect)ctx.roundRect(x,height-barH,Math.max(1,barW-2),barH,[3,3,0,0]);
+        else ctx.rect(x,height-barH,Math.max(1,barW-2),barH);
+        ctx.fill();x+=barW+1;
+      }
+    }
+    if(!animFrameId)draw();
+  }
+  function fadeOutAndPause(durationMs=1200){
+    if(audio.paused)return Promise.resolve();
+    const startVol=audio.volume,steps=12,interval=durationMs/steps;
+    return new Promise(resolve=>{
+      let step=0;
+      const timer=setInterval(()=>{
+        step++;audio.volume=Math.max(0,startVol*(1-step/steps));
+        if(step>=steps){clearInterval(timer);audio.pause();audio.volume=startVol;resolve();}
+      },interval);
+    });
+  }
   function cancelSleepTimer(silent=false){
     if(s.sleepTimerId){clearTimeout(s.sleepTimerId);s.sleepTimerId=null;}
     s.sleepTimerTarget=null;s.sleepTimerAtEnd=false;
@@ -152,8 +202,12 @@
     X.toast(`Таймер сна: ${minutes} мин`);
     s.sleepTimerId=setTimeout(async()=>{
       cancelSleepTimer(true);
-      if(s.state==='playing')await toggle();
-      X.toast('Таймер сна: воспроизведение остановлено');
+      if(s.state==='playing'){
+        if(s.device==='local'&&!native()){
+          await fadeOutAndPause();s.state='paused';renderPlayer();publish();
+        }else await toggle();
+      }
+      X.toast('Таймер сна: воспроизведение плавно остановлено');
     },ms);
   }
   function addSleepTimerMinutes(minutes=5){
@@ -328,7 +382,7 @@
         if(generation!==s.playGeneration)return;
         const url=cached?'':mediaUrl(ticket.path);
         if(native())nativeSend('play',{url,title:t.title,artist:t.artist||'',trackId:t.id,position:s.position,volume:s.volume,artwork:new URL(ART,location.origin).href,session:nativeSession(),queue:nativeQueue(),repeat:s.repeat});
-        else {audio.src=url;audio.volume=s.volume/100;audio.currentTime=s.position;await startBrowserAudio();}
+        else {audio.src=url;audio.volume=s.volume/100;audio.playbackRate=s.playbackRate||1.0;audio.currentTime=s.position;if(audioCtx?.state==='suspended')audioCtx.resume();await startBrowserAudio();}
       }
       if(generation===s.playGeneration)setMediaSession();
     }catch(error){if(generation!==s.playGeneration)return;s.state='error';s.error=error.name==='NotAllowedError'?'Браузер ждёт нажатия. Нажмите «Воспроизвести» ещё раз.':error.name==='NotSupportedError'?'Этот браузер не поддерживает аудиоформат. Попробуйте MP3 или WAV':error.message;renderPlayer();await publish(false,{allowTransition:true});throw new Error(s.error);}
@@ -471,6 +525,14 @@
       case 'download':await download(id);break;
       case 'download-current':await download(s.current?.id);break;
       case 'resume-upload':await upload(null,true);break;
+      case 'rate':{
+        const rates=[1.0,1.25,1.5,2.0,0.75];
+        const nextRate=rates[(rates.indexOf(s.playbackRate||1.0)+1)%rates.length];
+        s.playbackRate=nextRate;audio.playbackRate=nextRate;
+        const btn=$('xmRateBtn');if(btn)btn.textContent=`${nextRate}x`;
+        X.toast(`Скорость: ${nextRate}x`);
+        break;
+      }
       case 'sleep-timer':openSleepTimerDialog();break;
       case 'cancel-sleep-timer':cancelSleepTimer();closeDialog();break;
       case 'add-sleep-timer':addSleepTimerMinutes(Number(el.dataset.minutes||5));closeDialog();break;
