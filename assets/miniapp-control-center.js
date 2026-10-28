@@ -672,7 +672,7 @@
     if (source !== ui.activeAgent || !$('ccClipboardValue')) return;
     $('ccClipboardValue').textContent = text || 'Буфер ПК пуст.';
     $('ccClipboardCopy').disabled = !text;
-    $('ccClipboardCopy').onclick = () => X.copyText(text).then(() => X.toast('Скопировано'));
+    $('ccClipboardCopy').onclick = () => X.copyText(text).then(() => X.toast('Скопировано')).catch(() => X.toast('Не удалось скопировать'));
     storeClipboard(text, 'ПК → XASS');
     } catch (error) { X.toast(error.message || 'Не удалось получить буфер ПК'); }
   }
@@ -692,7 +692,7 @@
   function renderClipboardHistory() {
     const host = $('ccClipboardHistory'); if (!host) return;
     host.innerHTML = ui.clipboardHistory.map((item, index) => '<button class="cc-history-item" data-history="' + index + '" style="color:inherit;text-align:left;background:#0a0f16"><p>' + esc(item.text.replace(/\s+/g, ' ')) + '</p><span>' + esc(item.direction) + '<br>' + dateText(item.at) + '</span></button>').join('') || '<div class="cc-empty">История хранится только в этом браузере.</div>';
-    host.querySelectorAll('[data-history]').forEach(button => button.onclick = () => { const item = ui.clipboardHistory[Number(button.dataset.history)]; if (item) X.copyText(item.text).then(() => X.toast('Скопировано')); });
+    host.querySelectorAll('[data-history]').forEach(button => button.onclick = () => { const item = ui.clipboardHistory[Number(button.dataset.history)]; if (item) X.copyText(item.text).then(() => X.toast('Скопировано')).catch(() => X.toast('Не удалось скопировать')); });
   }
 
   function timelinePanelHtml() {

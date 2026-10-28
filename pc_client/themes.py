@@ -11,6 +11,8 @@ THEME_NORDIC = "Nordic"
 THEME_MATRIX = "Matrix"
 THEME_CLASSIC = "Classic"
 
+DEFAULT_THEME = THEME_CLASSIC
+
 ALL_THEMES: list[str] = [
     THEME_CYBER,
     THEME_TOKYO,
@@ -20,6 +22,30 @@ ALL_THEMES: list[str] = [
 ]
 
 THEMES: dict[str, dict[str, str]] = {
+    THEME_CLASSIC: {
+        "BG": "#202022",
+        "CARD": "#2b2b2f",
+        "HOVER": "#34343a",
+        "LINE": "#43434f",
+        "SIDEBAR": "#141418",
+        "FIELD": "#1a1a1e",
+        "WELL": "#35353f",
+        "NOTE": "#1a1a1e",
+        "TEXT": "#f5f5f7",
+        "MUTED": "#b1b1bb",
+        "ACCENT": "#829cff",
+        "ACCENT_SOFT": "#9aafff",
+        "LILAC": "#c495f4",
+        "GREEN": "#61c554",
+        "AMBER": "#efb65c",
+        "RED": "#f36b76",
+        "SIDEBAR_CARD": "#1c1c24",
+        "SIDEBAR_BORDER": "#2e2e3a",
+        "NAV_FG": "#a3a3b0",
+        "NAV_ACTIVE_BG": "#2a2a34",
+        "NAV_SELECTED_BG": "#24242e",
+        "DWM_CAPTION": "0x00181414",
+    },
     THEME_CYBER: {
         "BG": "#0d1017",
         "CARD": "#161b26",
@@ -116,30 +142,6 @@ THEMES: dict[str, dict[str, str]] = {
         "NAV_SELECTED_BG": "#121c16",
         "DWM_CAPTION": "0x00070906",
     },
-    THEME_CLASSIC: {
-        "BG": "#202022",
-        "CARD": "#2b2b2f",
-        "HOVER": "#34343a",
-        "LINE": "#434f4f",
-        "SIDEBAR": "#141418",
-        "FIELD": "#1a1a1e",
-        "WELL": "#35353f",
-        "NOTE": "#1a1a1e",
-        "TEXT": "#f5f5f7",
-        "MUTED": "#b1b1bb",
-        "ACCENT": "#829cff",
-        "ACCENT_SOFT": "#9aafff",
-        "LILAC": "#c495f4",
-        "GREEN": "#61c554",
-        "AMBER": "#efb65c",
-        "RED": "#f36b76",
-        "SIDEBAR_CARD": "#1c1c24",
-        "SIDEBAR_BORDER": "#2e2e3a",
-        "NAV_FG": "#a3a3b0",
-        "NAV_ACTIVE_BG": "#2a2a34",
-        "NAV_SELECTED_BG": "#24242e",
-        "DWM_CAPTION": "0x00181414",
-    },
 }
 
 THEME_ALIASES: dict[str, str] = {
@@ -160,7 +162,7 @@ THEME_ALIASES: dict[str, str] = {
     "terminal": THEME_MATRIX,
 }
 
-_CURRENT_THEME = THEME_CLASSIC
+_CURRENT_THEME = DEFAULT_THEME
 
 
 def resolve_theme_name(candidate: str | None) -> str:
@@ -171,13 +173,13 @@ def resolve_theme_name(candidate: str | None) -> str:
     for standard in ALL_THEMES:
         if standard.lower() == raw:
             return standard
-    return THEME_CLASSIC
+    return DEFAULT_THEME
 
 
 def get_theme(name: str | None = None) -> dict[str, str]:
     """Return dictionary of theme colors for given theme name."""
     canonical = resolve_theme_name(name)
-    return dict(THEES_MAP := THEMES.get(canonical, THEMES[THEME_CLASSIC]))
+    return dict(THEMES.get(canonical, THEMES[DEFAULT_THEME]))
 
 
 def current_theme_name() -> str:

@@ -24,7 +24,7 @@
 <div class="screen" id="gate"><div class="loader" id="loader"><div class="spin"></div><span>Подключение к XASS…</span></div><div class="login" id="login"><img src="/assets/xass-app-icon-512.png" alt="XASS"><h1>XASS</h1><p>Войдите Telegram-аккаунтом владельца, чтобы управлять системой с iPhone и рабочего стола.</p><div class="widget" id="telegramWidget"></div><button class="btn primary passkey-login" id="passkeyLoginBtn">Войти с Face ID / Passkey</button><div class="ios-help">На iPhone после входа: «Поделиться» → «На экран Домой». XASS откроется как отдельное приложение.</div></div><div class="deny" id="deny"><h2>Нет доступа</h2><p id="denyText">Не удалось подключиться.</p><button class="btn" id="retryBtn">Повторить</button></div></div>
 <div class="screen confirm-screen" id="confirmScreen" role="dialog" aria-modal="true" aria-labelledby="confirmTitle"><div class="confirm-card"><h2 id="confirmTitle">Подтвердите действие</h2><p id="confirmText"></p><div class="confirm-actions"><button class="btn" id="confirmCancel">Отмена</button><button class="btn danger" id="confirmYes">Продолжить</button></div></div></div>
 <div class="screen crop-screen" id="cropScreen" role="dialog" aria-modal="true" aria-labelledby="cropTitle"><div class="crop-card"><h2 id="cropTitle">Кадрирование аватара</h2><p class="row-sub">Настройте масштаб и положение. На сервер отправится только квадрат 512×512.</p><canvas id="avatarCropCanvas" width="512" height="512"></canvas><div class="crop-controls"><label class="crop-control"><span>Масштаб</span><input id="cropZoom" type="range" min="1" max="3" step="0.01" value="1"></label><label class="crop-control"><span>По горизонтали</span><input id="cropX" type="range" min="-100" max="100" step="1" value="0"></label><label class="crop-control"><span>По вертикали</span><input id="cropY" type="range" min="-100" max="100" step="1" value="0"></label></div><div class="confirm-actions" style="margin-top:18px"><button class="btn" id="cropCancel">Отмена</button><button class="btn primary" id="cropApply">Обрезать и загрузить</button></div></div></div>
-<div class="screen theme-modal-screen" id="themeModal" role="dialog" aria-modal="true" aria-labelledby="themeModalTitle"><div class="theme-modal-card"><div class="theme-modal-head"><div><h2 id="themeModalTitle">Оформление XASS</h2><p class="row-sub">Выберите стиль интерфейса и акцентный цвет</p></div><button class="btn theme-modal-close" id="themeModalClose" type="button" aria-label="Закрыть">×</button></div><div class="theme-grid" id="themeModalGrid"></div><div class="setup-divider" style="margin:16px 0"></div><div class="theme-accent-section"><div class="label" style="margin-bottom:8px"><span>Акцентный цвет (независимый)</span><button class="btn-link" id="modalResetAccentBtn" type="button">По умолчанию</button></div><div class="theme-accent-picker-row"><input class="color-input theme-color-input" id="modalThemeAccentPicker" type="color" value="#376dff" aria-label="Выбор акцентного цвета"><div class="theme-swatches" id="modalThemeSwatches"></div></div><div class="row-sub" style="margin-top:8px">Тонкая настройка акцента поверх выбранной темы.</div></div></div></div>
+<div class="screen theme-modal-screen" id="themeModal" role="dialog" aria-modal="true" aria-labelledby="themeModalTitle"><div class="theme-modal-card"><div class="theme-modal-head"><div><h2 id="themeModalTitle">Оформление XASS</h2><p class="row-sub">Выберите стиль интерфейса и акцентный цвет</p></div><button class="btn theme-modal-close" id="themeModalClose" type="button" aria-label="Закрыть">×</button></div><div class="theme-grid" id="themeModalGrid"></div><div class="setup-divider" style="margin:16px 0"></div><div class="theme-accent-section"><div class="label" style="margin-bottom:8px"><span>Акцентный цвет (независимый)</span><button class="btn-link" id="modalResetAccentBtn" type="button" aria-label="Сбросить акцентный цвет к значению темы по умолчанию">По умолчанию</button></div><div class="theme-accent-picker-row"><input class="color-input theme-color-input" id="modalThemeAccentPicker" type="color" value="#376dff" aria-label="Выбор акцентного цвета"><div class="theme-swatches" id="modalThemeSwatches"></div></div><div class="row-sub" style="margin-top:8px">Тонкая настройка акцента поверх выбранной темы.</div></div></div></div>
 <div class="toast" id="toast"></div>
 <main class="wrap" id="app" hidden>
  <header class="head"><div class="brand"><img src="/assets/xass-app-icon-192.png" alt=""><span>XASS</span></div><div class="head-actions"><button class="theme-quick-btn" id="themeQuickBtn" type="button" aria-label="Сменить тему" title="Оформление и темы"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="13.5" cy="6.5" r=".7" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".7" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".7" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".7" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg><span>Тема</span><span class="theme-btn-dot" id="headThemeDot"></span></button><div class="head-state"><span class="dot" id="headDot"></span><span id="headStatus">Подключение</span><span class="head-version" id="headVersion">—</span></div></div></header>
@@ -64,7 +64,7 @@
     <div class="hermes-control-group">
      <label class="label" for="hermesModelSelect">Модель</label>
      <div class="hermes-select-wrap">
-      <select class="input hermes-select" id="hermesModelSelect">
+      <select class="input hermes-select" id="hermesModelSelect" aria-label="Выбор языковой модели Hermes">
        <option value="nous-hermes-3">Nous Hermes 3 (Llama-3.1 70B)</option>
        <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
        <option value="gpt-4o">GPT-4o Omnichannel</option>
@@ -77,10 +77,10 @@
     <div class="hermes-control-group">
      <label class="label" for="hermesSessionSelect">Сессия</label>
      <div class="hermes-session-selector">
-      <select class="input hermes-select" id="hermesSessionSelect">
+      <select class="input hermes-select" id="hermesSessionSelect" aria-label="Выбор диалоговой сессии">
        <option value="default">Главный диалог</option>
       </select>
-      <button class="btn blue hermes-new-session-btn" id="hermesNewSessionBtn" type="button" title="Новая сессия">
+      <button class="btn blue hermes-new-session-btn" id="hermesNewSessionBtn" type="button" title="Новая сессия" aria-label="Создать новую сессию">
        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
        <span>Новая</span>
       </button>
@@ -138,9 +138,9 @@
      </div>
 
      <form class="hermes-input-box" id="hermesChatForm" onsubmit="return false;">
-      <textarea class="input hermes-textarea" id="hermesPromptInput" rows="1" maxlength="8000" placeholder="Спросите Гермеса или дайте команду серверу… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+      <textarea class="input hermes-textarea" id="hermesPromptInput" rows="1" maxlength="8000" placeholder="Спросите Гермеса или дайте команду серверу… (Enter — отправить, Shift+Enter — новая строка)" aria-label="Текст запроса для Hermes AI"></textarea>
       <div class="hermes-input-actions">
-       <button class="btn hermes-clear-chat-btn" id="hermesClearSessionBtn" type="button" title="Очистить сообщения текущей сессии">
+       <button class="btn hermes-clear-chat-btn" id="hermesClearSessionBtn" type="button" title="Очистить сообщения текущей сессии" aria-label="Очистить сообщения текущей сессии">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
        </button>
        <button class="btn primary hermes-send-btn" id="hermesSendBtn" type="submit" aria-label="Отправить запрос Гермесу">

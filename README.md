@@ -78,6 +78,8 @@ XASS объединяет персонального Telegram Business‑бот�
 | iPhone / native 0.21 | Пять SwiftUI-вкладок: Главная, Музыка, Сайт, Инструменты, Погода; AVPlayer, альбомы, исполнители, синхронные тексты, нативный вход и управление ПК без WebView |
 | Публичный сайт | Профиль, проекты, цитаты, аватары, контакты, погода и музыка с раздельными зонами интерфейса |
 | Backend | FastAPI, heartbeat, PostgreSQL/SQLite, очередь команд, экспорт, резервные копии и контроль состояния сервисов |
+| Hermes Agent AI | Автономный ассистент, сессии диалогов, вызовы инструментов, цепочка мыслей (thought drawer), управление через Telegram-бота, Mini App, iOS и ПК |
+| Мульти-темы | 6 тем оформления (Cyber OLED, Tokyo Night, Nordic Frost, Matrix, Sunset Amber, Liquid Glass) с независимым выбором акцентного цвета без FOUC |
 
 ### Управление компьютерами
 
@@ -134,6 +136,25 @@ XASS объединяет персонального Telegram Business‑бот�
 - Обложки проектов загружаются из галереи или задаются URL.
 - Автопогода через Open‑Meteo и отдельный блок контактов без смешивания данных.
 - Бэкап и аудит каждого изменения контента.
+
+### Hermes Agent AI
+
+- Интеграция с демоном Hermes Agent / WebUI (`HERMES_URL` / `HERMES_WEBUI_URL`, по умолчанию `http://127.0.0.1:8787`).
+- Автономное выполнение инструкций, запуск зарегистрированных инструментов и генерация сценариев.
+- Инспекция мыслей модели (`Thought Drawer`), трекинг токенов и времени генерации ответа.
+- Управление через Telegram: `/hermes <запрос>`, `/hermes_status`, `/hermes_sessions`, `/hermes_new` и интерактивные кнопки панели `/panel`.
+- Интерактивный чат в Telegram Mini App с быстрым чипом «Гермес AI» на главном экране и переключателем моделей (`nous-hermes-3`, `hermes-function-calling`).
+- Поддержка в iOS-приложении (`HermesView`, `HermesService`) и системном трее Windows (`pystray`, команды `hermes_prompt` и `hermes_status`).
+- Плавная деградация (graceful fallback) в локальный режим XASS Core при временном отключении демона Hermes.
+- Подробная документация: [Hermes Agent AI в XASS](./docs/HERMES_AGENT.md).
+
+### Мульти-темы оформления (Multi-Theme Engine)
+
+- 6 тем оформления: OLED Cyber Dark (`cyber`), Tokyo Night (`tokyo`), Nordic Frost (`nordic`), Matrix Terminal (`matrix`), Sunset Amber (`sunset`), Liquid Glass (`glass`).
+- Независимый выбор акцентного цвета через колор-пикер и палитру быстрых сватчей с мгновенной генерацией мягких оттенков и свечения.
+- Сохранение настроек в `localStorage` и мгновенное применение без мерцания (Zero-FOUC) через синхронный инлайн-скрипт в `<head>`.
+- Быстрое переключение темы из Telegram-бота: `/theme <название>` или интерактивная клавиатура выбора тем.
+- Подробная документация: [Система тем оформления XASS](./docs/THEME_SYSTEM.md).
 
 ## Как всё связано
 
@@ -294,6 +315,8 @@ GitHub Actions автоматически:
 - [Последняя стабильная версия Windows](https://github.com/lucifervalter-a11y/XASS/releases/tag/agent-latest)
 - [iPhone: IPA в Releases — требуется своя подпись](https://github.com/lucifervalter-a11y/XASS/releases/tag/ios-latest)
 - [Установка и настройка iOS-приложения](./ios/README.md)
+- [Hermes Agent AI](./docs/HERMES_AGENT.md)
+- [Multi-Theme System](./docs/THEME_SYSTEM.md)
 
 ---
 
