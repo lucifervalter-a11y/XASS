@@ -14,6 +14,88 @@ struct NativeTranscriptClip: Equatable {
     let duration: Double
 }
 
+enum NativeTranscriptMode: Equatable {
+    case onDevice, appleNetwork
+
+    var privacyNotice: String {
+        switch self {
+        case .onDevice: return "Распознавание выполнялось на iPhone. Аудио не отправлялось в облако."
+        case .appleNetwork: return "Вы разрешили распознавание Apple через интернет. Аудио могло отправляться в Apple."
+        }
+    }
+
+    var failureMessage: String {
+        switch self {
+        case .onDevice:
+            return "Распознавание на iPhone не завершилось. Проверьте доступность локальной модели языка и повторите. " + privacyNotice
+        case .appleNetwork:
+            return "Распознавание Apple через интернет не завершилось. Проверьте подключение и повторите позже. " + privacyNotice
+        }
+    }
+}
+
+struct NativeTranscriptResult: Equatable {
+    let lrc: String
+    let failedClips: [NativeTranscriptClip]
+    let totalClips: Int
+    let mode: NativeTranscriptMode
+    var isPartial: Bool { !failedClips.isEmpty }
+
+    var reviewNotice: String {
+        guard isPartial else { return "Автоматическая расшифровка · проверьте слова. " + mode.privacyNotice }
+        func stamp(_ seconds: Double) -> String {
+            let value = Int(seconds.rounded(.up))
+            return String(format: "%02d:%02d", value / 60, value % 60)
+        }
+        let gaps = failedClips.map { stamp($0.start) + "–" + stamp($0.start + $0.duration) }.joined(separator: ", ")
+        return "Частичная расшифровка: не распознано \(failedClips.count) из \(totalClips) фрагментов. Пропуски: \(gaps). Проверьте и дополните текст перед сохранением. " + mode.privacyNotice
+    }
+}
+
+/// Recognition failures may leave useful words, but must remain visible in the
+/// review result. Cancellation and size limits still abort the whole operation.
+struct NativeTranscriptAccumulator {
+    let totalClips: Int
+    let mode: NativeTranscriptMode
+    private var words: [NativeTranscriptWord] = []
+    private var failedClips: [NativeTranscriptClip] = []
+    private var processedClips = 0
+
+    init(totalClips: Int, mode: NativeTranscriptMode) {
+        self.totalClips = totalClips
+        self.mode = mode
+    }
+
+    mutating func append(_ result: Result<[NativeTranscriptWord], Error>, for clip: NativeTranscriptClip) throws {
+        switch result {
+        case .success(let chunk):
+            let bounded = chunk.filter { $0.time >= 0 && $0.time < clip.duration }
+            guard words.count + bounded.count <= 8000 else {
+                throw OwnerAPIError(status: 422, message: "Результат распознавания слишком большой. Текст не был сохранён.")
+            }
+            words.append(contentsOf: bounded.map {
+                NativeTranscriptWord(text: $0.text, time: clip.start + $0.time, duration: $0.duration)
+            })
+        case .failure(let error):
+            if error is CancellationError { throw error }
+            failedClips.append(clip)
+        }
+        processedClips += 1
+    }
+
+    func result() throws -> NativeTranscriptResult {
+        guard processedClips == totalClips, totalClips > 0 else { throw CancellationError() }
+        if failedClips.count == totalClips {
+            throw OwnerAPIError(status: 422, message: mode.failureMessage)
+        }
+        let value = NativeTranscriptFormat.lrc(words)
+        guard !value.isEmpty, value.utf8.count <= NativeTranscriptPolicy.maximumBytes else {
+            throw OwnerAPIError(status: 422, message: "Не удалось уверенно распознать слова. Инструментальная музыка и пение распознаются не всегда. " + mode.privacyNotice)
+        }
+        return NativeTranscriptResult(lrc: value, failedClips: failedClips, totalClips: totalClips, mode: mode)
+    }
+}
+
 enum NativeTranscriptPolicy {
     static let maximumDuration: Double = 900
     static let clipDuration: Double = 45
@@ -130,8 +212,8 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
     }
 }
 
-/// No microphone and no cloud fallback. A downloaded file is processed in short,
-/// private clips because the legacy Speech API is designed for short requests.
+/// No microphone or automatic cloud fallback. Apple network recognition requires
+/// explicit opt-in when no local model is available; downloaded audio uses short clips.
 @MainActor final class NativeTranscription: ObservableObject {
     @Published private(set) var progress: Double = 0
     @Published private(set) var running = false
@@ -141,7 +223,7 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
 
     /// `allowNetwork`: the owner explicitly allowed Apple's server recognition
     /// when this iPhone has no on-device model for the language.
-    func transcribe(file: URL, language: String, allowNetwork: Bool = false) async throws -> String {
+    func transcribe(file: URL, language: String, allowNetwork: Bool = false) async throws -> NativeTranscriptResult {
         guard !running, NativeTranscriptPolicy.localFile(file) else { throw XASSErr.invalidMedia }
         try Task.checkCancellation()
         running = true; progress = 0
@@ -153,8 +235,11 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
         guard onDevice || allowNetwork else {
             throw OwnerAPIError(status: 422, message: "На этом iPhone нет локальной модели распознавания выбранного языка. Включите «Разрешить распознавание Apple через интернет» или скачайте язык диктовки в настройках iOS. Аудио не отправлялось.")
         }
+        let mode: NativeTranscriptMode = onDevice ? .onDevice : .appleNetwork
         guard recognizer.isAvailable else {
-            throw OwnerAPIError(status: 503, message: "Распознавание речи сейчас недоступно. Проверьте сеть или повторите позже.")
+            throw OwnerAPIError(status: 503, message: onDevice
+                ? "Распознавание на iPhone сейчас недоступно. Проверьте локальную модель языка или повторите позже."
+                : "Распознавание Apple через интернет сейчас недоступно. Проверьте сеть или повторите позже.")
         }
         let permission = try await authorization()
         try Task.checkCancellation()
@@ -163,13 +248,12 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
         let length = try await asset.load(.duration).seconds
         try Task.checkCancellation()
         guard let clips = NativeTranscriptPolicy.clips(duration: length) else {
-            throw OwnerAPIError(status: 422, message: "Локальная расшифровка доступна для треков длительностью до 15 минут.")
+            throw OwnerAPIError(status: 422, message: "Расшифровка доступна для треков длительностью до 15 минут.")
         }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("xass-transcript-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.protectionKey: FileProtectionType.complete])
         defer { try? FileManager.default.removeItem(at: folder) } // Only this operation's UUID temporary directory.
-        var words: [NativeTranscriptWord] = []
-        var failedChunks = 0
+        var transcript = NativeTranscriptAccumulator(totalClips: clips.count, mode: mode)
         for segment in clips {
             try Task.checkCancellation()
             guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else { throw XASSErr.invalidMedia }
@@ -186,29 +270,17 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
             }, onCancel: { exportGate.cancel { exporter.cancelExport() } })
             try Task.checkCancellation()
             guard exporter.status == .completed else { throw OwnerAPIError(status: 422, message: "Не удалось прочитать аудиофайл для расшифровки.") }
-            // A 45 s intro/solo without vocals makes Speech report "no speech
-            // detected". That used to abort the whole song; skip that clip.
-            let chunk: [NativeTranscriptWord]
-            do { chunk = try await recognize(clip, recognizer: recognizer, onDevice: onDevice) }
-            catch is CancellationError { throw CancellationError() }
-            catch { failedChunks += 1; chunk = [] }
-            let boundedChunk = chunk.filter { $0.time >= 0 && $0.time < segment.duration }
-            guard words.count + boundedChunk.count <= 8000 else {
-                throw OwnerAPIError(status: 422, message: "Результат распознавания слишком большой. Текст не был сохранён.")
-            }
-            words.append(contentsOf: boundedChunk.map {
-                NativeTranscriptWord(text: $0.text, time: segment.start + $0.time, duration: $0.duration)
-            })
+            // Speech can fail on an instrumental clip or a service error. Keep
+            // useful text from other clips, with explicit gaps for review.
+            let chunk: Result<[NativeTranscriptWord], Error>
+            do { chunk = .success(try await recognize(clip, recognizer: recognizer, onDevice: onDevice)) }
+            catch { chunk = .failure(error) }
+            try transcript.append(chunk, for: segment)
             try? FileManager.default.removeItem(at: clip)
             progress = min(1, (segment.start + segment.duration) / length)
         }
         try Task.checkCancellation()
-        if words.isEmpty && failedChunks == clips.count {
-            throw OwnerAPIError(status: 422, message: "Распознавание не вернуло ни одного фрагмента. Проверьте, что язык диктовки установлен в iOS, и повторите.")
-        }
-        let value = NativeTranscriptFormat.lrc(words)
-        guard !value.isEmpty, value.utf8.count <= 64_000 else { throw OwnerAPIError(status: 422, message: "Не удалось уверенно распознать слова. Инструментальная музыка и пение распознаются не всегда.") }
-        return value
+        return try transcript.result()
     }
 
     private func authorization() async throws -> SFSpeechRecognizerAuthorizationStatus {
@@ -238,7 +310,8 @@ final class NativeTranscriptExportGate: @unchecked Sendable {
                             let words = result.bestTranscription.segments.map { NativeTranscriptWord(text: $0.substring, time: $0.timestamp, duration: $0.duration) }
                             self?.finish(.success(words), token: token)
                         } else if error != nil {
-                            self?.finish(.failure(OwnerAPIError(status: 422, message: "Локальное распознавание не завершилось. Проверьте доступность языка и повторите. Аудио не отправлялось в облако.")), token: token)
+                            let mode: NativeTranscriptMode = onDevice ? .onDevice : .appleNetwork
+                            self?.finish(.failure(OwnerAPIError(status: 422, message: mode.failureMessage)), token: token)
                         }
                     }
                 }

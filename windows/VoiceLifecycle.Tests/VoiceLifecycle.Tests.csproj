@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Xass.Native/Services/BackgroundVoiceClient.cs" Link="BackgroundVoiceClient.cs" />
+    <Compile Include="../Xass.Native/Services/AssistantProcessStart.cs" Link="AssistantProcessStart.cs" />
+    <Content Include="fake_listener.py" Link="background_voice_bridge.py" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

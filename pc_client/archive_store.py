@@ -274,7 +274,9 @@ def cleanup_archive(config: dict[str, Any], *, force: bool = False) -> dict[str,
                 size, parsed = 0, None
             existing.append((int(asset_id), file_path, size, parsed))
 
-        total = sum(item[2] for item in existing)
+        # Telegram deduplication lets multiple assets reference one local file.
+        # Count its bytes once; the last saved reference below frees them once.
+        total = sum({file_path: size for _, file_path, size, _ in existing}.values())
         for asset_id, file_path, size, saved_at in existing:
             expired = bool(retention_days and saved_at and (now - saved_at).days >= retention_days)
             over_limit = bool(max_bytes and total > max_bytes)

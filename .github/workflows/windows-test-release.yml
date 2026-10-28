@@ -1,0 +1,139 @@
+name: Validate native Windows test installer
+
+on:
+  push:
+    branches: [test]
+    paths:
+      - 'windows/**'
+      - 'pc_client/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - '.github/workflows/windows-test-release.yml'
+  workflow_dispatch:
+
+# Build artifacts only. The owner reviews this exact commit and its checks before
+# a separate, explicitly authorized test prerelease is created. No server deploy.
+# Ubuntu regressions and Windows build run in parallel; both must pass for release.
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-native-test-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regressions:
+    if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pc_client/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install headless desktop and PHP test support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk
+      - name: Install complete pinned test dependencies
+        run: python -m pip install -r requirements.txt -r pc_client/requirements.txt
+      - name: Existing Python regression suite
+        env:
+          PYTHONUTF8: '1'
+          XASS_TEST_PHP: /usr/bin/php
+        run: xvfb-run -a python -X utf8 -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Browser and PHP contracts
+        run: |
+          node --test tests/*.cjs tests/*.js
+          php -l proxy.php
+          php -l index.php
+          php -l miniapp.php
+          php -l profile.php
+
+  build:
+    if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            pc_client/requirements.txt
+            pc_client/voice-requirements.txt
+            pc_client/build-requirements.txt
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install Inno Setup from standard runner package source
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Verify voice child-process lifecycle without microphone
+        shell: pwsh
+        run: |
+          dotnet run --project windows/VoiceLifecycle.Tests/VoiceLifecycle.Tests.csproj -c Release -- (Get-Command python).Source
+          if ($LASTEXITCODE -ne 0) { throw 'Voice lifecycle tests failed.' }
+      - name: Build complete native installer and validate bundled runtime
+        shell: pwsh
+        run: ./windows/build_installer.ps1 -Revision '${{ github.sha }}' -OutputDirectory artifacts/windows-installer
+      - name: Install minimal process inspection for real updater smoke
+        run: python -m pip install psutil==7.0.0
+      - name: Verify fresh install, same-version upgrade and uninstall
+        shell: pwsh
+        run: ./windows/test_installer.ps1 -Installer artifacts/windows-installer/XASS-Native-Test-Setup.exe -PayloadManifest artifacts/windows-installer/payload-manifest.json
+      - name: Verify exact delivery set and immutable revision
+        shell: python
+        run: |
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('artifacts/windows-installer')
+          required = {'XASS-Native-Test-Setup.exe', 'XASS-Native-Test-Setup.exe.sha256',
+                      'XASS-Native-Test-Setup.json', 'native-test-update.json', 'payload-manifest.json'}
+          if {p.name for p in root.iterdir()} != required:
+              raise SystemExit('Installer delivery set differs from expected files')
+          installer = root / 'XASS-Native-Test-Setup.exe'
+          with installer.open('rb') as source:
+              digest = hashlib.file_digest(source, 'sha256').hexdigest()
+          if (root / (installer.name + '.sha256')).read_text().strip() != f'{digest}  {installer.name}':
+              raise SystemExit('Installer checksum mismatch')
+          for name in ('XASS-Native-Test-Setup.json', 'native-test-update.json', 'payload-manifest.json'):
+              data = json.loads((root / name).read_text())
+              if data['revision'] != os.environ['GITHUB_SHA']:
+                  raise SystemExit('Installer manifest revision mismatch')
+              if name != 'payload-manifest.json' and data['sha256'] != digest:
+                  raise SystemExit('Installer manifest digest mismatch')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('Validated test installer artifact only. No release or server deployment.\n\n'
+                            f'Commit: {os.environ["GITHUB_SHA"]}\n\nSHA256: {digest}\n\n'
+                            'Python 3.12, CPU speech dependencies, .NET and Windows App SDK are bundled. '
+                            'A local Whisper model is required separately. Real microphone, voices and '
+                            'interactive WinUI acceptance are not established by CI.\n')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-native-test-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/windows-installer/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-native-test-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/windows-native-smoke.json
+          if-no-files-found: error
+          retention-days: 14

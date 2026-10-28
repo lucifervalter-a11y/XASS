@@ -107,6 +107,9 @@ final class NativeMusicImportFile: @unchecked Sendable {
               extensionsAllowed(url) else { throw OwnerAPIError(status: 400, message: "Выберите MP3, M4A, WAV, FLAC, OGG или ZIP из приложения «Файлы».") }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        // A missing picker entry must fail before file coordination. Waiting for
+        // a nonexistent item can block the serial staging queue and later files.
+        guard try url.checkResourceIsReachable() else { throw CocoaError(.fileReadNoSuchFile) }
         let archive = url.pathExtension.lowercased() == "zip"
         let limit = archive ? archiveLimit : fileLimit
         guard limit > 0, limit <= NativeMusicImportPolicy.maximumArchiveBytes else { throw OwnerAPIError.invalidResponse }

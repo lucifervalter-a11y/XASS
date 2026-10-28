@@ -46,10 +46,12 @@ async def telegram_polling_loop(
             )
             for update in updates:
                 update_id = update.get("update_id")
-                if isinstance(update_id, int):
-                    offset = update_id + 1
                 async with SessionLocal() as session:
                     await update_handler.handle_update(session, update)
+                # The next getUpdates call acknowledges everything below this
+                # offset. Retain the failed update if handling or cleanup raises.
+                if isinstance(update_id, int):
+                    offset = update_id + 1
         except TelegramApiError as exc:
             if exc.status_code == 409:
                 logger.warning(

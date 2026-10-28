@@ -16,6 +16,19 @@ enum PlayerLayout {
     static let miniReservedHeight: CGFloat = 76
 }
 
+/// SwiftUI's system Reduce Motion value is read-only. Fixture tests can force
+/// reduced animation inside the player without changing system preferences.
+@propertyWrapper struct PlayerReduceMotion: DynamicProperty {
+    @Environment(\.accessibilityReduceMotion) private var systemValue
+    var wrappedValue: Bool {
+        #if DEBUG && targetEnvironment(simulator)
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--native-ui-fixture") && arguments.contains("--native-ui-reduce-motion") { return true }
+        #endif
+        return systemValue
+    }
+}
+
 enum PlayerMotion {
     /// Expand/collapse and hero moves.
     static let hero = Animation.spring(response: 0.45, dampingFraction: 0.85)
@@ -24,6 +37,10 @@ enum PlayerMotion {
     static let trackChange = Animation.spring(response: 0.42, dampingFraction: 0.9)
     static let background = Animation.easeInOut(duration: 0.7)
     static func expand(_ reduceMotion: Bool) -> Animation { reduceMotion ? fade : hero }
+    /// A bounded landing without the invisible settling tail of the opening spring.
+    static func collapse(_ reduceMotion: Bool) -> Animation {
+        .easeOut(duration: reduceMotion ? 0.16 : 0.24)
+    }
 }
 
 /// Everything store-specific that Now Playing can host without knowing NativeStore.

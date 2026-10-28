@@ -634,6 +634,23 @@ class MusicPlayer:
         self._media_transport = ""
         self._reveal = 0
         self._reveal_listener = None
+        self._ownership = None
+
+    def set_ownership(self, ownership) -> None:
+        """Optional native-local/cast lock gate; never required by legacy callers."""
+        with self._lock:
+            self._ownership = ownership
+
+    def _claim_ownership(self):
+        if self._ownership is not None:
+            try:
+                self._ownership.acquire()
+            except (OSError, ValueError):
+                raise MusicError("Другой плеер ещё использует звук. Остановите трансляцию и повторите") from None
+
+    def _release_ownership(self):
+        if self._ownership is not None:
+            self._ownership.release()
 
     def set_reveal_listener(self, listener) -> None:
         """GUI wake-up only. The listener must not do work while the player lock is held."""
@@ -669,6 +686,7 @@ class MusicPlayer:
                 elif self._progress["ended"]:
                     self._state = "ended"
                     self._release_device()
+                    self._release_ownership()
                 elif self._device is not None and not self._device.running:
                     self._state, self._error = "error", "Аудиовыход отключён. Выберите доступное устройство"
                     self._release_device()
@@ -729,6 +747,7 @@ class MusicPlayer:
             decoder.close()
 
     def _start_at(self, position: float):
+        self._claim_ownership()
         self._release_device()
         try:
             engine = self._engine()
@@ -738,6 +757,7 @@ class MusicPlayer:
             self._progress = {"position": position, "ended": False, "error": ""}
             if position >= self._duration:
                 self._state = "ended"
+                self._release_ownership()
                 return
             decoder = engine.stream(self._path, position)
             stream = self._callback(decoder, self._progress)
@@ -752,12 +772,14 @@ class MusicPlayer:
             raise MusicError(self._error) from None
         self._state, self._error = "playing", ""
 
-    def play_local(self, path: Path, *, title: str = "", artist: str = "") -> dict[str, Any]:
+    def play_local(self, path: Path, *, title: str = "", artist: str = "", cancelled=None) -> dict[str, Any]:
         """Play a file that already exists on this PC. No server and no copy."""
         resolved = _local_audio_file(path)
         with self._condition:
             if self._closed:
                 raise MusicError("Музыкальный плеер завершает работу")
+            if cancelled is not None and cancelled():
+                return self.snapshot()
             self._generation += 1
             generation = self._generation
             self._pending = None
@@ -771,7 +793,7 @@ class MusicPlayer:
         with self._condition:
             if self._closed:
                 raise MusicError("Музыкальный плеер завершает работу")
-            if generation != self._generation:
+            if generation != self._generation or (cancelled is not None and cancelled()):
                 return self.snapshot()
             self._discard_track()
             self._track_id = None
@@ -829,6 +851,7 @@ class MusicPlayer:
                     _, ids = self._engine().outputs()
                     if output_id not in ids:
                         raise MusicError("Аудиовыход не найден. Обновите список устройств")
+                    self._claim_ownership()
                     self._discard_track()
                     self._generation += 1
                     self._track_id, self._output_id, self._volume = track_id, output_id, volume
@@ -850,6 +873,7 @@ class MusicPlayer:
                     self._pending = None
                     self._discard_track()
                     self._state, self._error = "stopped", ""
+                    self._release_ownership()
                     self._progress = {"position": 0.0, "ended": False, "error": ""}
                 elif command == "music_volume":
                     self._volume = _number(payload.get("volume"), "Громкость", 0, 100)
@@ -864,6 +888,7 @@ class MusicPlayer:
                             self._pending = None
                             self._discard_track()
                         self._state, self._error = "stopped", ""
+                        self._release_ownership()
                         return self.snapshot()
                     if self._path is None or self._state in {"idle", "loading", "stopped", "error"}:
                         raise MusicError("Сначала запустите трек и дождитесь загрузки")
@@ -1074,6 +1099,7 @@ class MusicPlayer:
             self._pending = None
             self._generation += 1
             self._discard_track()
+            self._release_ownership()
             self._condition.notify_all()
         if self._worker is not None and self._worker is not threading.current_thread():
             self._worker.join(timeout=0.1)

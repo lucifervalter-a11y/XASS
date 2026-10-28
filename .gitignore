@@ -24,3 +24,4 @@ pc_client/build/
 pc_client/dist/
 pc_client/packaging/*.generated.*
 dist-release/
+/artifacts/
