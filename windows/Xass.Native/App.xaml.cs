@@ -19,7 +19,9 @@ public partial class App : Application
         // Exception messages can contain user data. Keep only code locations.
         try
         {
-            string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native");
+            string directory;
+            try { directory = NativeRuntimeMode.PreferencesRoot; }
+            catch { directory = Path.Combine(Path.GetTempPath(), "XASS.Native.Test-Failures"); }
             Directory.CreateDirectory(directory);
             File.WriteAllText(Path.Combine(directory, "native-failure.txt"),
                 $"{DateTimeOffset.UtcNow:o}\n{error.GetType().FullName}\nHRESULT {error.HResult:X8}\n{error.StackTrace}");
@@ -28,7 +30,7 @@ public partial class App : Application
     }
     protected override async void OnLaunched(LaunchActivatedEventArgs args)
     {
-        instance = new NativeInstance();
+        instance = new NativeInstance(NativeRuntimeMode.InstanceName);
         string[] arguments = Environment.GetCommandLineArgs().Skip(1).ToArray();
         if (!instance.Primary)
         {

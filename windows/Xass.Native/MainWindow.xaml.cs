@@ -51,7 +51,7 @@ public sealed partial class MainWindow : Window
         Navigation.DisplayModeChanged += (_, _) => UpdatePagePadding();
         TrackList.ItemsSource = Array.Empty<Track>();
         MusicPage.SizeChanged += (_, args) => PlayerScroller.MaxHeight = Math.Clamp(args.NewSize.Height * 0.45, 100, 260);
-        DataPath.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS");
+        DataPath.Text = NativeRuntimeMode.DataRoot;
         Navigation.SelectedItem = Navigation.MenuItems[0];
         SeekSlider.ValueChanged += (_, _) => { if (!updatingSeek) seekDirty = true; };
         VolumeSlider.ValueChanged += (_, _) => { if (!updatingVolume) volumeDirty = true; };

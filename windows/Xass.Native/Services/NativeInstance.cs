@@ -10,13 +10,16 @@ public sealed class NativeInstance : IDisposable
 {
     private readonly Mutex mutex;
     private readonly CancellationTokenSource stop = new();
-    private const string Name = "XASS.Native.Test.Activation";
+    private readonly string name;
     public bool Primary { get; }
-    public NativeInstance()
-    { mutex = new Mutex(true, "Local\\" + Name, out bool primary); Primary = primary; }
+    public NativeInstance(string? instanceName = null)
+    {
+        name = string.IsNullOrWhiteSpace(instanceName) ? "XASS.Native.Test.Activation" : instanceName;
+        mutex = new Mutex(true, "Local\\" + name, out bool primary); Primary = primary;
+    }
     public async Task ForwardAsync(string[] args)
     {
-        using var pipe = new NamedPipeClientStream(".", Name, PipeDirection.Out, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        using var pipe = new NamedPipeClientStream(".", name, PipeDirection.Out, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await pipe.ConnectAsync(timeout.Token);
         using var writer = new StreamWriter(pipe);
@@ -28,7 +31,7 @@ public sealed class NativeInstance : IDisposable
         {
             try
             {
-                using var pipe = new NamedPipeServerStream(Name, PipeDirection.In, 1, PipeTransmissionMode.Byte,
+                using var pipe = new NamedPipeServerStream(name, PipeDirection.In, 1, PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 await pipe.WaitForConnectionAsync(stop.Token);
                 using var reader = new StreamReader(pipe);

@@ -42,7 +42,7 @@ public sealed partial class MainWindow
     private int desktopArchiveMutationPending;
     private CancellationTokenSource? nativeUpdateCancellation;
     private ProgressBar updateProgress = new() { Minimum = 0, Maximum = 100, Visibility = Visibility.Collapsed };
-    private readonly string runtimePreferences = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "runtime.json");
+    private readonly string runtimePreferences = NativeRuntimeMode.RuntimePreferencesFile;
 
     private static TextBlock DLabel(string value, double size = 14) => new() { Text = value, FontSize = size, TextWrapping = TextWrapping.Wrap };
     private static string DValue(JsonElement row, string key, string fallback = "") => row.TryGetProperty(key, out var v) && v.ValueKind != JsonValueKind.Null ? v.ToString() : fallback;
@@ -92,13 +92,22 @@ public sealed partial class MainWindow
         desktopTimer.Tick += async (_, _) => await PollDesktopAsync();
         desktopTimer.Start();
         automaticUpdateTimer.Tick += async (_, _) => await CheckAutomaticNativeUpdateAsync();
-        automaticUpdateTimer.Start();
+        if (NativeRuntimeMode.AllowUpdates) automaticUpdateTimer.Start();
         RootGrid.Loaded += async (_, _) =>
         {
             try
             {
-                await EnsureDesktopHostAsync();
                 AcceptDesktopActivation(Environment.GetCommandLineArgs().Skip(1).ToArray());
+                if (!NativeRuntimeMode.AllowBackgroundServices)
+                {
+                    Notice.IsOpen = true;
+                    Notice.Severity = InfoBarSeverity.Warning;
+                    Notice.Title = "XASS Native Test";
+                    Notice.Message = "Isolated test mode: background agent and updater are disabled.";
+                    await RefreshDesktopAsync();
+                    return;
+                }
+                await EnsureDesktopHostAsync();
                 await RefreshDesktopAsync();
                 await LoadDesktopJournalAsync();
             }
@@ -169,6 +178,8 @@ public sealed partial class MainWindow
     }
     private async Task EnsureDesktopHostAsync()
     {
+        if (!NativeRuntimeMode.AllowBackgroundServices)
+            throw new InvalidOperationException("Background services are disabled in isolated test mode.");
         await desktopStartGate.WaitAsync(lifetime.Token);
         try { await desktopHost.StartAsync(client.PythonPath, client.SourcePath, client.DataPath, lifetime.Token); }
         finally { desktopStartGate.Release(); }
@@ -620,6 +631,8 @@ public sealed partial class MainWindow
     }
     private async Task ApplyNativeUpdateAsync(NativeUpdate update, bool automatic)
     {
+        if (!NativeRuntimeMode.AllowUpdates)
+            throw new InvalidOperationException("Updates are disabled in isolated test mode.");
         if (nativeUpdateRunning) return;
         if (!NativeAutomaticUpdatePolicy.MayAttemptRelease(update.Sha256, automatic, NativeUpdatePreferences.IsRejected))
         { updateStatus.Text = "Этот пакет ранее не прошёл проверку. Автоповтор отключён; доступен явный повтор установки или новый выпуск."; return; }

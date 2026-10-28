@@ -66,8 +66,7 @@ public sealed class NativeUpdatePreferencesStore
 
 public static class NativeUpdatePreferences
 {
-    private static readonly NativeUpdatePreferencesStore Store = new(Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "native-updater.json"));
+    private static readonly NativeUpdatePreferencesStore Store = new(NativeRuntimeMode.UpdatePreferencesFile);
     public static bool Load() => Store.Load();
     public static void Save(bool enabled) => Store.Save(enabled);
     public static void RememberRejected(string sha256) => Store.RememberRejected(sha256);

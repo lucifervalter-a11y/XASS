@@ -7,7 +7,7 @@ public sealed record PreparedNativeUpdate(string JobFolder);
 public sealed class NativeUpdateCoordinator
 {
     internal PreparedNativeUpdate? PendingJob { get; private set; }
-    public static string UpdatesRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "updates");
+    public static string UpdatesRoot => NativeRuntimeMode.UpdatesRoot;
     public async Task<PreparedNativeUpdate> PrepareAsync(NativeUpdate update, string installer, IProgress<string> progress, CancellationToken token, bool automatic = false)
     {
         string install = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);

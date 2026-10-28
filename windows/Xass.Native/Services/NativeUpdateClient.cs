@@ -35,7 +35,7 @@ public sealed class NativeUpdateClient
     public NativeUpdateClient() : this(
         new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan },
         TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(15), TimeSpan.FromSeconds(30),
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "updates"), NativeReleaseChannel.Installed()) { }
+        NativeRuntimeMode.UpdatesRoot, NativeReleaseChannel.Installed()) { }
 
     // The transport and deadlines can be replaced by deterministic, offline tests.
     // Production keeps the same strict HTTPS/repository/redirect checks below.
