@@ -2069,16 +2069,19 @@ class XassDesktop:
             self.latency_var.set("—")
             self._set_status("Остановлен" if self.config.get("api_key") else "Требуется подключение", AMBER)
         # Sync server theme if requested
-        if self.sync_server_theme_var.get() and isinstance(payload, dict):
-            srv_theme = payload.get("server_theme") or payload.get("theme")
-            if srv_theme and srv_theme != self.theme_var.get():
+        sync_var = getattr(self, "sync_server_theme_var", None)
+        theme_v = getattr(self, "theme_var", None)
+        payload_dict = payload if isinstance(locals().get("payload"), dict) else {}
+        if sync_var is not None and sync_var.get() and payload_dict:
+            srv_theme = payload_dict.get("server_theme") or payload_dict.get("theme")
+            if srv_theme and (theme_v is None or srv_theme != theme_v.get()):
                 self.set_theme(str(srv_theme), save=True)
 
         # Periodic Hermes status poll
         now = time.time()
-        if now - getattr(self, "_last_hermes_check", 0) >= 10:
+        if hasattr(self, "_last_hermes_check") and now - getattr(self, "_last_hermes_check", 0) >= 10:
             self._last_hermes_check = now
-            self._check_hermes_status_async(self._on_hermes_checked)
+            self._check_hermes_status_async(getattr(self, "_on_hermes_checked", None))
 
         try:
             self._surface_cast_playback()
@@ -2804,10 +2807,18 @@ class HermesPromptDialog(tk.Toplevel):
         self.output_text = DarkScrolledText(card, bg=FIELD, fg=TEXT, font=("Consolas", 10), padx=10, pady=8, relief="flat", wrap="word", height=9)
         self.output_text.pack(fill="both", expand=True)
 
+        self._closed = False
         self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Destroy>", self._on_dialog_destroy, add="+")
         self.refresh_status()
 
+    def _on_dialog_destroy(self, event: Any = None) -> None:
+        if event is None or event.widget is self:
+            self._closed = True
+
     def refresh_status(self) -> None:
+        if getattr(self, "_closed", False):
+            return
         url = self.app.hermes_url_var.get().strip() or DEFAULT_HERMES_URL
         self.status_var.set(f"Проверка {url}…")
         self.status_dot.configure(fg=AMBER)
@@ -2818,9 +2829,12 @@ class HermesPromptDialog(tk.Toplevel):
             except ModuleNotFoundError:
                 from pc_client.hermes_client import check_hermes_status
             res = check_hermes_status(url, timeout=2.0)
+            if getattr(self, "_closed", False):
+                return
             try:
-                self.after(0, lambda: self._apply_status(res))
-            except (tk.TclError, AttributeError):
+                if self.winfo_exists():
+                    self.after(0, lambda: self._apply_status(res))
+            except Exception:
                 pass
 
         threading.Thread(target=worker, daemon=True).start()

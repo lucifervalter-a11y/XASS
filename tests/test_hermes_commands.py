@@ -21,9 +21,12 @@ class HermesCommandsTests(unittest.TestCase):
             "api_key": "ag_test",
             "source_name": "PC-TEST",
             "hermes_url": "http://127.0.0.1:8787",
-            "theme": "Cyber",
+            "theme": "Classic",
         }
         self.client = MagicMock()
+
+    def tearDown(self) -> None:
+        themes.apply_theme_colors(themes.THEME_CLASSIC)
 
     @patch.object(client_agent, "store_command_result")
     @patch.object(client_agent, "_log_command")

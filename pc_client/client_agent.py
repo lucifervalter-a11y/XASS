@@ -1409,7 +1409,7 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
     if "hermes_url" not in config:
         config["hermes_url"] = "http://127.0.0.1:8787"
     if "theme" not in config:
-        config["theme"] = "Cyber"
+        config["theme"] = "Classic"
     if "sync_server_theme" not in config:
         config["sync_server_theme"] = True
     return config

@@ -13,6 +13,9 @@ import desktop_widgets
 
 
 class PcThemesTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        themes.apply_theme_colors(themes.THEME_CLASSIC)
+
     def test_standard_themes_defined(self) -> None:
         expected = ["Cyber", "Tokyo", "Nordic", "Matrix", "Classic"]
         self.assertEqual(themes.ALL_THEMES, expected)
