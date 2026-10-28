@@ -25,6 +25,11 @@ class NativeTestModeContracts(unittest.TestCase):
         self.assertIn("new NativeInstance(NativeRuntimeMode.InstanceName)", app)
         self.assertIn("NamedPipeServerStream(name", instance)
 
+        appearance = (ROOT / "Services" / "AppearancePreferences.cs").read_text(encoding="utf-8")
+        discord = (ROOT / "Services" / "DiscordMusicPresence.cs").read_text(encoding="utf-8")
+        self.assertIn('Path.Combine(\n        NativeRuntimeMode.PreferencesRoot, "appearance.json")', appearance)
+        self.assertIn('Path.Combine(\n        NativeRuntimeMode.PreferencesRoot, "discord-presence.json")', discord)
+
     def test_test_mode_cannot_autostart_or_update(self):
         desktop = (ROOT / "MainWindow.Desktop.cs").read_text(encoding="utf-8")
         self.assertIn("if (NativeRuntimeMode.AllowUpdates) automaticUpdateTimer.Start()", desktop)

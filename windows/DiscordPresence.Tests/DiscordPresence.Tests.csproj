@@ -3,5 +3,6 @@
  <ItemGroup>
   <Compile Include="../Xass.Native/Services/DiscordMusicPresence.cs" Link="DiscordMusicPresence.cs"/>
   <Compile Include="../Xass.Native/Services/MicrophonePresentation.cs" Link="MicrophonePresentation.cs"/>
+  <Compile Include="../Xass.Native/Services/NativeRuntimeMode.cs" Link="NativeRuntimeMode.cs"/>
  </ItemGroup>
 </Project>

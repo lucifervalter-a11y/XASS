@@ -3,5 +3,6 @@
  <ItemGroup>
   <Compile Include="../Xass.Native/Services/AppearancePreferences.cs" Link="AppearancePreferences.cs"/>
   <Compile Include="../Xass.Native/Services/AppearanceThemeCatalog.cs" Link="AppearanceThemeCatalog.cs"/>
+  <Compile Include="../Xass.Native/Services/NativeRuntimeMode.cs" Link="NativeRuntimeMode.cs"/>
  </ItemGroup>
 </Project>

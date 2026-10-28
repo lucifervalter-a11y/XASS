@@ -17,7 +17,7 @@ public sealed class DiscordPresenceStore
 {
     private readonly string path;
     public DiscordPresenceStore(string? file = null) => path = file ?? Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XASS.Native", "discord-presence.json");
+        NativeRuntimeMode.PreferencesRoot, "discord-presence.json");
     public DiscordPresencePreferences Load()
     {
         try

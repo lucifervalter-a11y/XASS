@@ -71,8 +71,7 @@ public sealed class AppearanceStore
     private const int MaxBytes = 4096;
     public string FilePath { get; }
     public AppearanceStore(string? path = null) => FilePath = path ?? Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "XASS.Native", "appearance.json");
+        NativeRuntimeMode.PreferencesRoot, "appearance.json");
 
     public AppearancePreferences Load(out bool recovered)
     {
