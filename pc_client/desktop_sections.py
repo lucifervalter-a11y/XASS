@@ -215,12 +215,11 @@ def build_commands(app: Any) -> None:
 
     hermes = app._card(app.content, padding=22)
     hermes.pack(fill="x", pady=(0, 14))
-    _card_heading(hermes, "Hermes Agent AI", "Локальный агент искусственного интеллекта", "terminal", color=ACCENT)
-    _label(hermes, "Интеграция с локальным демоном Hermes (http://127.0.0.1:8787). Запускайте быстрые задачи или открывайте веб-интерфейс.").pack(fill="x", pady=(0, 16))
+    _card_heading(hermes, "XASS AI", "Локальный помощник с проверяемым состоянием", "terminal", color=ACCENT)
+    _label(hermes, "Локальная служба XASS AI: http://127.0.0.1:9119. Запросы выполняются только через подтверждённый защищённый канал.").pack(fill="x", pady=(0, 16))
     hermes_actions = tk.Frame(hermes, bg=CARD)
     hermes_actions.pack(fill="x")
     app._button(hermes_actions, "Запустить задачу агента", app.open_hermes_prompt_dialog, kind="primary").pack(side="left")
-    app._button(hermes_actions, "Открыть Hermes WebUI", app.open_hermes_webui, kind="secondary").pack(side="left", padx=(8, 0))
     app._flow_actions(hermes_actions)
 
     security = app._card(app.content, padding=22, border_color="#6a3d49")

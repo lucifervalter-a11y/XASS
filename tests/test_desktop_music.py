@@ -59,8 +59,9 @@ class LibraryTests(unittest.TestCase):
     def test_open_job_does_no_audio_or_disk_work_on_caller_thread(self):
         started, release = threading.Event(), threading.Event()
         thread_ids = []
-        def play(path):
+        def play(path, *, cancelled=None):
             thread_ids.append(threading.get_ident())
+            self.assertIsNotNone(cancelled)
             started.set()
             release.wait(2)
             return {"state": "playing"}
@@ -94,7 +95,8 @@ class LibraryTests(unittest.TestCase):
         started, release = threading.Event(), threading.Event()
         player = Mock()
 
-        def play(_path):
+        def play(_path, *, cancelled=None):
+            self.assertIsNotNone(cancelled)
             started.set()
             release.wait(2)
             return {"state": "playing"}
@@ -167,6 +169,33 @@ class CastCommandPumpTests(unittest.TestCase):
         stopped = music._optimistic_cast({**status, "error": "failed"}, "music_stop")
         self.assertEqual((stopped["state"], stopped["error"]), ("stopping", ""))
         self.assertTrue(music._cast_live({**stopped, "track_id": 4}))
+
+    def test_local_seek_controls_run_off_caller_and_collapse_waiting_values(self):
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        worker_ids = []
+
+        def sender(command, payload):
+            calls.append((command, payload))
+            worker_ids.append(threading.get_ident())
+            if len(calls) == 1:
+                started.set()
+                release.wait(2)
+            return {"state": "playing", "position_sec": payload["position_sec"]}
+
+        pump = music.CastCommandPump(sender, collapse_commands={"music_seek"})
+        try:
+            pump.submit("music_seek", {"position_sec": 1})
+            self.assertTrue(started.wait(1))
+            for value in range(2, 101):
+                pump.submit("music_seek", {"position_sec": value})
+            release.set()
+            self.assertTrue(pump.wait_idle())
+            self.assertEqual([payload["position_sec"] for _command, payload in calls], [1, 100])
+            self.assertTrue(all(ident != threading.get_ident() for ident in worker_ids))
+        finally:
+            release.set()
+            pump.close(wait=True)
 
 
 class MusicRenderTests(unittest.TestCase):
@@ -310,6 +339,44 @@ class MusicRenderTests(unittest.TestCase):
                       and (button.cget("icon") in {"previous", "next"} or button.cget("text") == "Добавить музыку")]
         self.assertTrue(local_only)
         self.assertTrue(all(button.cget("state") == "disabled" for button in local_only))
+
+    def test_local_pause_from_music_page_never_blocks_tk(self):
+        content = tk.Frame(self.root)
+        content.place(x=0, y=0, width=900, height=1200)
+        started, release = threading.Event(), threading.Event()
+        worker_ids = []
+        player = Mock()
+        player._path = Path("local.wav")
+        player.snapshot.return_value = {
+            "state": "playing", "title": "Local", "artist": "PC", "volume": 70,
+            "duration_sec": 120, "position_sec": 10,
+        }
+        player.presentation.return_value = {}
+
+        def command(name, payload, config):
+            worker_ids.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+            return {**player.snapshot.return_value, "state": "paused"}
+
+        player.command.side_effect = command
+        app = SimpleNamespace(root=self.root, content=content, local_music=lambda: player,
+                              current_view="music", _header=Mock())
+        try:
+            with patch.object(music, "_cast_status", return_value={}), \
+                    patch.object(music, "load_playlist", return_value=[]):
+                music.build_music(app)
+                stage = next(child for child in content.winfo_children() if isinstance(child, music.MusicStage))
+                stage.actions["toggle"]()
+                self.assertTrue(started.wait(1))
+                self.assertTrue(app._music_local_pump.busy())
+                self.assertNotEqual(worker_ids, [threading.get_ident()])
+                self.root.update_idletasks()
+        finally:
+            release.set()
+            pump = getattr(app, "_music_local_pump", None)
+            if pump is not None:
+                pump.close(wait=True)
 
     def test_compact_title_and_transport_fit_then_return_to_wide(self):
         stage = self.stage(560)

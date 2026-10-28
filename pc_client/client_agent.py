@@ -1064,22 +1064,22 @@ def _dispatch_agent_command(
                 store_command_result(command_id, True, "Версия уже актуальна")
         elif command_name == "hermes_status":
             try:
-                from hermes_client import check_hermes_status
+                from hermes_client import DEFAULT_HERMES_URL, check_hermes_status
             except ModuleNotFoundError:
-                from pc_client.hermes_client import check_hermes_status
-            hermes_url = str(command_payload.get("url") or config.get("hermes_url") or "http://127.0.0.1:8787")
+                from pc_client.hermes_client import DEFAULT_HERMES_URL, check_hermes_status
+            hermes_url = str(command_payload.get("url") or config.get("hermes_url") or DEFAULT_HERMES_URL)
             status = check_hermes_status(hermes_url=hermes_url)
             store_command_result(
                 command_id,
-                status.get("online", False),
-                f"Hermes Agent AI: {status.get('status_label', 'Статус получен')}",
+                status.get("online") is True,
+                f"XASS AI: {status.get('status_label', 'Статус получен')}",
                 status,
             )
         elif command_name == "hermes_prompt":
             try:
-                from hermes_client import send_hermes_prompt
+                from hermes_client import DEFAULT_HERMES_URL, send_hermes_prompt
             except ModuleNotFoundError:
-                from pc_client.hermes_client import send_hermes_prompt
+                from pc_client.hermes_client import DEFAULT_HERMES_URL, send_hermes_prompt
             prompt = str(
                 command_payload.get("prompt")
                 or command_payload.get("task")
@@ -1087,23 +1087,23 @@ def _dispatch_agent_command(
                 or ""
             ).strip()
             if not prompt:
-                store_command_result(command_id, False, "Пустой запрос для Hermes", {"error": "empty_prompt"})
+                store_command_result(command_id, False, "Пустой запрос XASS AI", {"error": "empty_prompt"})
             else:
-                hermes_url = str(command_payload.get("url") or config.get("hermes_url") or "http://127.0.0.1:8787")
+                hermes_url = str(command_payload.get("url") or config.get("hermes_url") or DEFAULT_HERMES_URL)
                 result = send_hermes_prompt(prompt, hermes_url=hermes_url)
-                if result.get("ok"):
+                if result.get("ok") is True:
                     preview = str(result.get("response", ""))[:180]
                     store_command_result(
                         command_id,
                         True,
-                        f"Hermes: {preview}" if preview else "Hermes prompt выполнен",
+                        f"XASS AI: {preview}" if preview else "Запрос XASS AI выполнен",
                         result,
                     )
                 else:
                     store_command_result(
                         command_id,
                         False,
-                        f"Hermes ошибка: {result.get('error', 'Не удалось выполнить задачу')}",
+                        f"XASS AI: {result.get('error', 'Запрос недоступен')}",
                         result,
                     )
         elif command_name == "set_theme":
@@ -1407,7 +1407,7 @@ def ensure_minimal_defaults(config: dict[str, Any]) -> dict[str, Any]:
     if "transcription_enabled" not in config:
         config["transcription_enabled"] = False
     if "hermes_url" not in config:
-        config["hermes_url"] = "http://127.0.0.1:8787"
+        config["hermes_url"] = "http://127.0.0.1:9119"
     if "theme" not in config:
         config["theme"] = "Classic"
     if "sync_server_theme" not in config:

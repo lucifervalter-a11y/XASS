@@ -16,6 +16,8 @@ public enum HermesRole: String, Codable, Sendable {
 
 public struct HermesStatus: Codable, Equatable, Sendable {
     public var isAvailable: Bool
+    /// `nil` means the backend did not advertise an interactive phone transport.
+    public var interactiveAvailable: Bool?
     public var modelName: String
     public var activeSessionsCount: Int
     public var latencyMs: Double
@@ -24,15 +26,17 @@ public struct HermesStatus: Codable, Equatable, Sendable {
     public var statusDescription: String
 
     public init(
-        isAvailable: Bool = true,
-        modelName: String = "Hermes 3 - Llama 3.1 8B",
-        activeSessionsCount: Int = 1,
-        latencyMs: Double = 38.0,
-        version: String = "1.0.4",
-        features: [String] = ["smart_orchestration", "music_control", "pc_automation", "system_diagnostics"],
-        statusDescription: String = "Готов к работе"
+        isAvailable: Bool = false,
+        interactiveAvailable: Bool? = nil,
+        modelName: String = "",
+        activeSessionsCount: Int = 0,
+        latencyMs: Double = 0,
+        version: String = "",
+        features: [String] = [],
+        statusDescription: String = "XASS AI недоступен"
     ) {
         self.isAvailable = isAvailable
+        self.interactiveAvailable = interactiveAvailable
         self.modelName = modelName
         self.activeSessionsCount = activeSessionsCount
         self.latencyMs = latencyMs
@@ -41,15 +45,12 @@ public struct HermesStatus: Codable, Equatable, Sendable {
         self.statusDescription = statusDescription
     }
 
-    public static let mockOffline = HermesStatus(
-        isAvailable: true,
-        modelName: "Hermes 3 (Автономный режим)",
-        activeSessionsCount: 1,
-        latencyMs: 14.0,
-        version: "1.0.4-local",
-        features: ["автономный_анализ", "управление_плеером", "диагностика_сервера", "шаблоны_сценариев"],
-        statusDescription: "Автономный режим (локальный fallback)"
-    )
+    /// Fail closed: only an explicit `true` from the backend enables chat controls.
+    public var isInteractiveAvailable: Bool {
+        interactiveAvailable == true
+    }
+
+    public static let offline = HermesStatus()
 }
 
 public struct HermesSession: Identifiable, Codable, Equatable, Sendable {
@@ -76,26 +77,7 @@ public struct HermesSession: Identifiable, Codable, Equatable, Sendable {
         self.lastMessagePreview = lastMessagePreview
     }
 
-    public static let defaultSessions: [HermesSession] = [
-        HermesSession(
-            id: "session-general",
-            title: "Системный ассистент",
-            messageCount: 2,
-            lastMessagePreview: "Все системы XASS работают штатно."
-        ),
-        HermesSession(
-            id: "session-music",
-            title: "Управление музыкой",
-            messageCount: 1,
-            lastMessagePreview: "Готов подбирать треки и плейлисты."
-        ),
-        HermesSession(
-            id: "session-automation",
-            title: "Автоматизация и ПК",
-            messageCount: 0,
-            lastMessagePreview: "Создавайте новые сценарии для ПК и сервера."
-        )
-    ]
+    public static let defaultSessions: [HermesSession] = []
 }
 
 public struct HermesMessage: Identifiable, Codable, Equatable, Sendable {
@@ -189,11 +171,11 @@ public final class HermesLiveActivityManager {
         let attributes = HermesActivityAttributes(sessionID: sessionID, sessionTitle: sessionTitle)
         let initialContentState = HermesActivityAttributes.ContentState(
             queryPreview: String(prompt.prefix(40)),
-            statusPhase: "Анализ запроса...",
-            progress: 0.15,
+            statusPhase: "Отправка запроса...",
+            progress: 0.1,
             isThinking: true,
             responseTokens: 0,
-            stepDescription: "Инициализация рассуждений"
+            stepDescription: "Ожидание XASS AI"
         )
         do {
             if let existing = currentActivity {
@@ -224,7 +206,7 @@ public final class HermesLiveActivityManager {
         #endif
     }
 
-    public func endActivity(finalResponse: String, tokens: Int = 120) {
+    public func endActivity(finalResponse: String, tokens: Int = 0) {
         #if canImport(ActivityKit)
         guard let activity = currentActivity else { return }
         var state = activity.content.state
@@ -239,15 +221,33 @@ public final class HermesLiveActivityManager {
         }
         #endif
     }
+
+    public func failActivity() {
+        #if canImport(ActivityKit)
+        guard let activity = currentActivity else { return }
+        var state = activity.content.state
+        state.isThinking = false
+        state.progress = 0
+        state.statusPhase = "XASS AI недоступен"
+        state.stepDescription = "Запрос не выполнен"
+        state.responseTokens = 0
+        Task {
+            await activity.end(.init(state: state, staleDate: nil), dismissalPolicy: .after(Date().addingTimeInterval(4)))
+            self.currentActivity = nil
+        }
+        #endif
+    }
 }
 
 // MARK: - Hermes Client Service
 
 @MainActor
 public final class HermesService: ObservableObject {
-    @Published public var status: HermesStatus = .mockOffline
+    private static let interactiveUnavailableMessage = "Среда XASS AI доступна, но интерактивный доступ с iPhone не поддерживается."
+
+    @Published public var status: HermesStatus = .offline
     @Published public var sessions: [HermesSession] = HermesSession.defaultSessions
-    @Published public var activeSessionID: String? = "session-general"
+    @Published public var activeSessionID: String? = nil
     @Published public var messages: [HermesMessage] = []
     @Published public var allSessionMessages: [String: [HermesMessage]] = [:]
     @Published public var isThinking: Bool = false
@@ -258,43 +258,68 @@ public final class HermesService: ObservableObject {
 
     public init(api: OwnerService? = nil) {
         self.api = api
-        initializeSeedData()
     }
 
-    private func initializeSeedData() {
-        let welcome = HermesMessage(
-            role: .assistant,
-            content: "Здравствуйте! Я Hermes — интеллектуальный агент вашей экосистемы XASS.\n\nЯ помогу управлять воспроизведением музыки, выполнять команды на привязанных ПК-агентах, анализировать состояние сервера и настраивать умные правила автоматизации.",
-            isReasoning: false,
-            isOfflineFallback: true
-        )
-        allSessionMessages["session-general"] = [welcome]
-        messages = [welcome]
+    @discardableResult
+    private func markUnavailable(_ message: String = "XASS AI недоступен. Проверьте подключение и состояние сервиса.") -> HermesStatus {
+        let offline = HermesStatus(statusDescription: message)
+        status = offline
+        errorMessage = message
+        return offline
+    }
+
+    private func clearRemoteSessions() {
+        sessions = []
+        activeSessionID = nil
+        messages = []
+        allSessionMessages = [:]
+    }
+
+    private var interactionBlockMessage: String {
+        status.isAvailable
+            ? Self.interactiveUnavailableMessage
+            : "XASS AI недоступен. Проверьте подключение и состояние сервиса."
     }
 
     // MARK: - Client API Methods
 
-    /// Fetches server Hermes status with fallback to offline mock.
+    /// Fetches the real XASS AI status. Missing or malformed data is unavailable, never success.
     @discardableResult
     public func fetchStatus() async -> HermesStatus {
         guard let api = api else {
-            self.status = .mockOffline
-            return .mockOffline
+            return markUnavailable()
         }
 
         do {
             let response = try await api.request("/api/mini/hermes/status", method: "GET", body: nil)
-            let statusDict = (response["status"] as? [String: Any]) ?? response
-            let isAvailable = (statusDict["online"] as? Bool) ?? (statusDict["available"] as? Bool) ?? (statusDict["enabled"] as? Bool) ?? true
-            let model = (statusDict["active_model"] as? String) ?? (statusDict["model_name"] as? String) ?? "Hermes 3 - Llama 3.1 8B"
-            let sessionsCount = (statusDict["session_count"] as? Int) ?? (statusDict["active_sessions"] as? Int) ?? sessions.count
-            let latency = (statusDict["latency_ms"] as? NSNumber)?.doubleValue ?? 35.0
-            let version = (statusDict["version"] as? String) ?? "1.0.4"
-            let features = (statusDict["features"] as? [String]) ?? ["smart_orchestration", "music_control", "system_diagnostics"]
-            let description = (statusDict["details"] as? String) ?? (statusDict["status_description"] as? String) ?? "Готов к работе"
+            guard response["ok"] as? Bool == true,
+                  let statusDict = response["status"] as? [String: Any],
+                  let online = statusDict["online"] as? Bool else {
+                return markUnavailable("XASS AI вернул неподдерживаемый ответ.")
+            }
+            let enabled = statusDict["enabled"] as? Bool ?? true
+            let isMock = statusDict["mock"] as? Bool ?? false
+            guard enabled else {
+                return markUnavailable("XASS AI отключён в настройках сервера.")
+            }
+            guard online && !isMock else {
+                return markUnavailable("XASS AI сейчас не в сети.")
+            }
+
+            let model = ((statusDict["active_model"] as? String) ?? (statusDict["model_name"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let sessionsCount = max(0, (statusDict["session_count"] as? Int) ?? (statusDict["active_sessions"] as? Int) ?? 0)
+            let latency = max(0, (statusDict["latency_ms"] as? NSNumber)?.doubleValue ?? 0)
+            let version = (statusDict["version"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let features = statusDict["features"] as? [String] ?? []
+            let interactiveAvailable = statusDict["interactive_available"] as? Bool
+            let description = interactiveAvailable == true
+                ? "XASS AI доступен"
+                : Self.interactiveUnavailableMessage
 
             let result = HermesStatus(
-                isAvailable: isAvailable,
+                isAvailable: true,
+                interactiveAvailable: interactiveAvailable,
                 modelName: model,
                 activeSessionsCount: sessionsCount,
                 latencyMs: latency,
@@ -302,44 +327,65 @@ public final class HermesService: ObservableObject {
                 features: features,
                 statusDescription: description
             )
-            self.status = result
+            status = result
+            errorMessage = result.isInteractiveAvailable ? nil : description
             return result
         } catch {
-            // Seamless offline fallback
+            return markUnavailable()
         }
-
-        self.status = .mockOffline
-        return .mockOffline
     }
 
-    /// Fetches sessions with fallback to default offline mock sessions.
+    /// Fetches real sessions. An unavailable endpoint never creates local seed data.
     @discardableResult
     public func fetchSessions() async -> [HermesSession] {
+        guard status.isInteractiveAvailable else {
+            clearRemoteSessions()
+            errorMessage = interactionBlockMessage
+            return []
+        }
         guard let api = api else {
-            return self.sessions
+            clearRemoteSessions()
+            markUnavailable()
+            return []
         }
 
         do {
             let response = try await api.request("/api/mini/hermes/sessions", method: "GET", body: nil)
-            if let list = response["sessions"] as? [[String: Any]] {
-                var loaded: [HermesSession] = []
-                for item in list {
-                    if let id = item["id"] as? String, let title = item["title"] as? String {
-                        let count = item["message_count"] as? Int ?? 0
-                        let preview = item["last_preview"] as? String ?? ""
-                        loaded.append(HermesSession(id: id, title: title, messageCount: count, lastMessagePreview: preview))
-                    }
-                }
-                if !loaded.isEmpty {
-                    self.sessions = loaded
-                    return loaded
+            guard response["ok"] as? Bool == true,
+                  let list = response["sessions"] as? [[String: Any]] else {
+                clearRemoteSessions()
+                markUnavailable("XASS AI вернул неподдерживаемый список диалогов.")
+                return []
+            }
+            guard !list.contains(where: { ($0["mock"] as? Bool) == true }) else {
+                clearRemoteSessions()
+                markUnavailable("XASS AI сейчас не в сети.")
+                return []
+            }
+            var loaded: [HermesSession] = []
+            for item in list {
+                if let id = item["id"] as? String, !id.isEmpty,
+                   let title = item["title"] as? String, !title.isEmpty {
+                    let count = max(0, item["message_count"] as? Int ?? 0)
+                    let preview = item["last_preview"] as? String ?? ""
+                    loaded.append(HermesSession(id: id, title: title, messageCount: count, lastMessagePreview: preview))
                 }
             }
+            sessions = loaded
+            if let currentSessionID = activeSessionID,
+               loaded.contains(where: { $0.id == currentSessionID }) {
+                messages = allSessionMessages[currentSessionID] ?? []
+            } else {
+                activeSessionID = loaded.first?.id
+                messages = activeSessionID.flatMap { allSessionMessages[$0] } ?? []
+            }
+            errorMessage = nil
+            return loaded
         } catch {
-            // Keep existing or default sessions
+            clearRemoteSessions()
+            markUnavailable()
+            return []
         }
-
-        return self.sessions
     }
 
     /// Selects active session and loads its messages.
@@ -349,16 +395,59 @@ public final class HermesService: ObservableObject {
         messages = allSessionMessages[sessionID] ?? []
     }
 
-    /// Creates a new session and activates it.
+    /// Creates a session through the authenticated XASS endpoint and activates it.
     @discardableResult
-    public func createSession(title: String? = nil) -> HermesSession {
-        let newTitle = title ?? "Диалог \(sessions.count + 1)"
-        let session = HermesSession(title: newTitle)
-        sessions.insert(session, at: 0)
-        activeSessionID = session.id
-        allSessionMessages[session.id] = []
-        messages = []
-        return session
+    public func createRemoteSession(title: String? = nil) async throws -> HermesSession {
+        guard status.isInteractiveAvailable else {
+            let message = interactionBlockMessage
+            errorMessage = message
+            throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        guard let api else {
+            markUnavailable()
+            throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: errorMessage ?? "XASS AI недоступен."])
+        }
+
+        do {
+            let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            var body: [String: Any] = [:]
+            if let normalizedTitle, !normalizedTitle.isEmpty {
+                body["title"] = normalizedTitle
+            }
+            let response = try await api.request("/api/mini/hermes/sessions", method: "POST", body: body)
+            guard response["ok"] as? Bool == true,
+                  let item = response["session"] as? [String: Any],
+                  (item["mock"] as? Bool) != true,
+                  let id = item["id"] as? String, !id.isEmpty else {
+                throw NSError(domain: "XASSAI", code: 502, userInfo: [NSLocalizedDescriptionKey: "XASS AI не подтвердил создание диалога."])
+            }
+
+            let serverTitle = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedTitle: String
+            if let serverTitle, !serverTitle.isEmpty {
+                resolvedTitle = serverTitle
+            } else if let normalizedTitle, !normalizedTitle.isEmpty {
+                resolvedTitle = normalizedTitle
+            } else {
+                resolvedTitle = "Новый диалог"
+            }
+            let session = HermesSession(
+                id: id,
+                title: resolvedTitle,
+                messageCount: max(0, item["message_count"] as? Int ?? 0),
+                lastMessagePreview: item["last_preview"] as? String ?? ""
+            )
+            sessions.removeAll { $0.id == session.id }
+            sessions.insert(session, at: 0)
+            activeSessionID = session.id
+            allSessionMessages[session.id] = []
+            messages = []
+            errorMessage = nil
+            return session
+        } catch {
+            markUnavailable("Не удалось создать диалог XASS AI.")
+            throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: errorMessage ?? "XASS AI недоступен."])
+        }
     }
 
     /// Deletes a session.
@@ -378,111 +467,87 @@ public final class HermesService: ObservableObject {
         messages = []
     }
 
-    /// Sends a prompt to Hermes with progressive reasoning and offline fallback.
+    /// Sends a prompt to the real XASS AI endpoint. Errors stay errors; no answer is fabricated.
     @discardableResult
     public func sendMessage(_ prompt: String, sessionID: String? = nil) async throws -> HermesMessage {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            throw NSError(domain: "Hermes", code: 400, userInfo: [NSLocalizedDescriptionKey: "Запрос не может быть пустым"])
+            throw NSError(domain: "XASSAI", code: 400, userInfo: [NSLocalizedDescriptionKey: "Запрос не может быть пустым"])
+        }
+        guard status.isInteractiveAvailable else {
+            let message = interactionBlockMessage
+            errorMessage = message
+            throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        guard let api else {
+            markUnavailable()
+            throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: errorMessage ?? "XASS AI недоступен."])
         }
 
-        let targetSessionID = sessionID ?? activeSessionID ?? createSession().id
+        let targetSessionID: String
+        if let sessionID {
+            targetSessionID = sessionID
+        } else if let activeSessionID {
+            targetSessionID = activeSessionID
+        } else {
+            targetSessionID = (try await createRemoteSession()).id
+        }
         if activeSessionID != targetSessionID {
             activeSessionID = targetSessionID
         }
 
-        // 1. Post user message
-        let userMessage = HermesMessage(
-            role: .user,
-            content: trimmed,
-            timestamp: Date()
-        )
-        appendMessage(userMessage, for: targetSessionID)
-
-        // 2. Start thinking & Live Activity
         isThinking = true
-        let sessionTitle = sessions.first(where: { $0.id == targetSessionID })?.title ?? "Hermes"
+        currentReasoningStep = "Ожидание ответа XASS AI"
+        let sessionTitle = sessions.first(where: { $0.id == targetSessionID })?.title ?? "XASS AI"
         HermesLiveActivityManager.shared.startActivity(
             sessionID: targetSessionID,
             sessionTitle: sessionTitle,
             prompt: trimmed
         )
-
-        // 3. Reasoning progress simulation
-        let reasoningPhases = [
-            ("Анализ контекста сервера XASS...", 0.25),
-            ("Проверка состояния медиаплеера и ПК-агентов...", 0.55),
-            ("Оценка политик безопасности и сценариев...", 0.80),
-            ("Синтез структурированного ответа...", 0.95)
-        ]
-
-        var accumulatedSteps: [String] = []
-
-        for (step, progress) in reasoningPhases {
-            currentReasoningStep = step
-            accumulatedSteps.append(step)
-            HermesLiveActivityManager.shared.updateProgress(
-                stepDescription: step,
-                progress: progress,
-                phase: "Размышление..."
-            )
-            try? await Task.sleep(nanoseconds: 220_000_000)
+        defer {
+            isThinking = false
+            currentReasoningStep = ""
         }
 
-        // 4. Try API or generate offline fallback
-        var responseContent: String
-        var tokens = 120
-        var isOffline = false
-
-        if let api = api {
-            do {
-                let payload: [String: Any] = [
-                    "prompt": trimmed,
-                    "session_id": targetSessionID
-                ]
-                let result = try await api.request("/api/mini/hermes/chat", method: "POST", body: payload)
-                if let answer = (result["response"] as? String) ?? (result["reply"] as? String) ?? (result["text"] as? String) {
-                    responseContent = answer
-                    tokens = (result["tokens_used"] as? Int) ?? (result["tokens"] as? Int) ?? 145
-                } else {
-                    let fallback = generateOfflineResponse(for: trimmed)
-                    responseContent = fallback.content
-                    tokens = fallback.tokens
-                    isOffline = true
-                }
-            } catch {
-                let fallback = generateOfflineResponse(for: trimmed)
-                responseContent = fallback.content
-                tokens = fallback.tokens
-                isOffline = true
+        do {
+            let payload: [String: Any] = [
+                "prompt": trimmed,
+                "session_id": targetSessionID
+            ]
+            let result = try await api.request("/api/mini/hermes/chat", method: "POST", body: payload)
+            guard result["ok"] as? Bool == true,
+                  (result["mock"] as? Bool) != true else {
+                throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: "XASS AI сейчас не в сети."])
             }
-        } else {
-            let fallback = generateOfflineResponse(for: trimmed)
-            responseContent = fallback.content
-            tokens = fallback.tokens
-            isOffline = true
+            let answer = ((result["response"] as? String) ?? (result["reply"] as? String) ?? (result["text"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !answer.isEmpty else {
+                throw NSError(domain: "XASSAI", code: 502, userInfo: [NSLocalizedDescriptionKey: "XASS AI вернул пустой ответ."])
+            }
+
+            let rawTokens = (result["tokens_used"] as? Int) ?? (result["tokens"] as? Int)
+            let tokens = rawTokens.flatMap { $0 >= 0 ? $0 : nil }
+            let userMessage = HermesMessage(role: .user, content: trimmed, timestamp: Date())
+            let assistantMessage = HermesMessage(
+                role: .assistant,
+                content: answer,
+                timestamp: Date(),
+                isReasoning: false,
+                reasoningSteps: [],
+                reasoningContent: nil,
+                tokensUsed: tokens,
+                isOfflineFallback: false
+            )
+            appendMessage(userMessage, for: targetSessionID)
+            appendMessage(assistantMessage, for: targetSessionID)
+            errorMessage = nil
+            HermesLiveActivityManager.shared.endActivity(finalResponse: answer, tokens: tokens ?? 0)
+            return assistantMessage
+        } catch {
+            markUnavailable()
+            HermesLiveActivityManager.shared.failActivity()
+            throw NSError(domain: "XASSAI", code: 503, userInfo: [NSLocalizedDescriptionKey: errorMessage ?? "XASS AI недоступен."])
         }
-
-        // 5. Build assistant message
-        let assistantMessage = HermesMessage(
-            role: .assistant,
-            content: responseContent,
-            timestamp: Date(),
-            isReasoning: true,
-            reasoningSteps: accumulatedSteps,
-            reasoningContent: accumulatedSteps.joined(separator: "\n"),
-            tokensUsed: tokens,
-            isOfflineFallback: isOffline
-        )
-
-        appendMessage(assistantMessage, for: targetSessionID)
-
-        // 6. Complete Live Activity and reset thinking state
-        HermesLiveActivityManager.shared.endActivity(finalResponse: responseContent, tokens: tokens)
-        isThinking = false
-        currentReasoningStep = ""
-
-        return assistantMessage
     }
 
     private func appendMessage(_ message: HermesMessage, for sessionID: String) {
@@ -501,66 +566,4 @@ public final class HermesService: ObservableObject {
         }
     }
 
-    // MARK: - Intelligent Offline Mock Response Generator
-
-    private func generateOfflineResponse(for prompt: String) -> (content: String, tokens: Int) {
-        let lower = prompt.lowercased()
-
-        if lower.contains("статус") || lower.contains("сервер") || lower.contains("состояние") || lower.contains("диагностика") {
-            let reply = """
-            📊 **Состояние сервера XASS** (Штатный режим):
-
-            • **CPU**: 14% (нагрузка в норме)
-            • **Память (RAM)**: 2.3 ГБ / 8.0 ГБ (28%)
-            • **Дисковое пространство**: 82.4 ГБ свободно
-            • **Telegram-бот**: онлайн, активен webhook
-            • **База данных**: SQLite WAL mode — целостность подтверждена
-            • **Устройства в сети**: 2 устройства (iPhone и Рабочий ПК)
-
-            Все службы работают без сбоев. Ошибок в журнале за последние 24 часа не обнаружено.
-            """
-            return (reply, 142)
-        } else if lower.contains("музык") || lower.contains("трек") || lower.contains("плеер") || lower.contains("плейлист") {
-            let reply = """
-            🎵 **Музыкальная медиатека XASS**:
-
-            • **Локальный кэш iPhone**: 256 МиБ активен (сохранено 18 треков)
-            • **Режим вывода**: Локальный динамик / AirPlay готов
-            • **Качество потока**: Исходное (без пережатия)
-            • **Умный совет**: Для вечера рекомендую плейлист «Ambient Space» или запуск случайного воспроизведения вашей избранной коллекции.
-            """
-            return (reply, 118)
-        } else if lower.contains("пк") || lower.contains("компьютер") || lower.contains("агент") || lower.contains("windows") {
-            let reply = """
-            🖥️ **Статус привязанного ПК-агента**:
-
-            • **Имя**: Рабочая станция Windows 11
-            • **Безопасность**: Аппаратный P-256 ключ в Secure Enclave iPhone
-            • **Доступные команды**: Блокировка экрана, снимок рабочего стола, остановка медиа, безопасный запуск скриптов
-            • **Готовность к командам**: Подтверждено Face ID.
-            """
-            return (reply, 130)
-        } else if lower.contains("сценари") || lower.contains("правил") || lower.contains("автоматизаци") {
-            let reply = """
-            ⚡ **Автоматизация XASS**:
-
-            Активные правила:
-            1. **«Ночной покой»**: В 23:30 автоматическая остановка музыки на ПК и активация таймера сна.
-            2. **«Безопасный уход»**: Блокировка экрана ПК при разрыве домашней Wi-Fi сети.
-            3. **«Резервное копирование»**: Еженедельный зашифрованный бэкап настроек.
-
-            Вы можете добавить новое правило через вкладку «Инструменты» → «Сценарии».
-            """
-            return (reply, 155)
-        } else {
-            let reply = """
-            Я проанализировал ваш запрос «\(prompt)».
-
-            В экосистеме XASS всё готово к выполнению. Я могу детально показать параметры сервера, помочь с управлением медиатекой, передать команду на рабочий ПК или оптимизировать сценарии автоматизации.
-
-            Чем ещё я могу помочь?
-            """
-            return (reply, 98)
-        }
-    }
 }

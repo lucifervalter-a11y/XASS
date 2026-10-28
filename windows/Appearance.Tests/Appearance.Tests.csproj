@@ -1,4 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
- <ItemGroup><Compile Include="../Xass.Native/Services/AppearancePreferences.cs" Link="AppearancePreferences.cs"/></ItemGroup>
+ <ItemGroup>
+  <Compile Include="../Xass.Native/Services/AppearancePreferences.cs" Link="AppearancePreferences.cs"/>
+  <Compile Include="../Xass.Native/Services/AppearanceThemeCatalog.cs" Link="AppearanceThemeCatalog.cs"/>
+ </ItemGroup>
 </Project>

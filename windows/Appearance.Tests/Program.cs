@@ -7,6 +7,24 @@ static void Require(bool condition, string label)
 
 Require(new AppearancePreferences("invalid", "#xyzxyz").Normalize() == AppearancePreferences.Defaults, "invalid values");
 Require(new AppearancePreferences("dark", "#aBcDef").Normalize() == new AppearancePreferences("dark", "#ABCDEF"), "hex normalization");
+Require(AppearanceThemeCatalog.NormalizeThemeName(" dark ") == "dark", "WinUI dark remains reserved");
+foreach (var alias in new[]
+{
+    ("default", "classic"), ("xass", "classic"), ("cyberpunk", "cyber"), ("neon", "cyber"),
+    ("tokyo_night", "tokyo"), ("TOKYONIGHT", "tokyo"), ("nord", "nordic"),
+    ("hacker", "matrix"), ("terminal", "matrix")
+}) Require(AppearanceThemeCatalog.NormalizeThemeName(alias.Item1) == alias.Item2, "theme alias " + alias.Item1);
+foreach (string name in AppearanceThemeCatalog.PresetNames)
+{
+    Require(AppearanceThemeCatalog.TryGetPalette(name, out var palette), "preset lookup " + name);
+    Require(palette.Name.Equals(name, StringComparison.OrdinalIgnoreCase), "preset display name " + name);
+    foreach (string color in new[] { palette.Background, palette.Card, palette.Hover, palette.Line,
+        palette.Sidebar, palette.Field, palette.Well, palette.Note, palette.Text, palette.Muted,
+        palette.Accent, palette.AccentSoft, palette.Lilac, palette.Green, palette.Amber, palette.Red,
+        palette.SidebarCard, palette.SidebarBorder, palette.NavigationForeground,
+        palette.NavigationActiveBackground, palette.NavigationSelectedBackground })
+        Require(AccentPalette.TryParse(color, out _), "valid preset color " + name);
+}
 foreach (string? bad in new string?[] { null, "", "#123", "#80112233", "red", "#GG0000", "112233" })
     Require(!AccentPalette.TryParse(bad, out _), "reject non-opaque/non-hex color");
 for (uint r = 0; r <= 255; r += 17)
@@ -33,6 +51,16 @@ try
     var expected = new AppearancePreferences("light", "#123ABC");
     store.Save(expected);
     Require(store.Load(out recovered) == expected && !recovered, "saved round trip");
+    var preset = new AppearancePreferences("CYBERPUNK", "#abcdef");
+    store.Save(preset);
+    Require(store.Load(out recovered) == new AppearancePreferences("cyber", "#ABCDEF") && !recovered,
+        "canonical preset round trip");
+    File.WriteAllText(path, "{\"version\":1,\"theme\":\"tokyo_night\",\"accent\":\"system\"}");
+    Require(store.Load(out recovered) == new AppearancePreferences("tokyo", "system") && recovered,
+        "alias load is canonical and marked recovered");
+    store.Save(new AppearancePreferences("tokyo_night", "system"));
+    Require(File.ReadAllText(path).Contains("\"theme\":\"tokyo\""), "save writes canonical theme");
+    store.Save(expected);
     var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
     Require(json.RootElement.EnumerateObject().Select(p => p.Name).Order().SequenceEqual(new[] { "accent", "theme", "version" }), "allowlisted fields");
     File.WriteAllText(path, "broken json");

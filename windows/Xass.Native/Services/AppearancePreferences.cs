@@ -10,8 +10,8 @@ public sealed record AppearancePreferences(string Theme = "system", string Accen
     public static AppearancePreferences Defaults => new();
 
     public AppearancePreferences Normalize() => new(
-        Theme is "light" or "dark" ? Theme : "system",
-        Accent == "system" ? Accent : AccentPalette.TryParse(Accent, out var rgb)
+        AppearanceThemeCatalog.NormalizeThemeName(Theme),
+        string.Equals(Accent, "system", StringComparison.OrdinalIgnoreCase) ? "system" : AccentPalette.TryParse(Accent, out var rgb)
             ? $"#{rgb:X6}" : "system");
 }
 

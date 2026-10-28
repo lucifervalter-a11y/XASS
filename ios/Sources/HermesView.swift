@@ -18,6 +18,7 @@ public struct HermesView: View {
     @State private var showSessionSheet = false
     @State private var showClearConfirm = false
     @State private var copiedMessageID: String? = nil
+    @State private var isCreatingSession = false
     @FocusState private var isInputFocused: Bool
 
     public init(hermes: HermesService, store: NativeStore? = nil) {
@@ -46,8 +47,12 @@ public struct HermesView: View {
                 VStack(spacing: 0) {
                     sessionHeaderBar
 
+                    if let errorMessage = hermes.errorMessage {
+                        availabilityErrorBanner(errorMessage)
+                    }
+
                     if hermes.isThinking {
-                        reasoningBanner
+                        requestProgressBanner
                             .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
@@ -88,14 +93,16 @@ public struct HermesView: View {
 
                     // Quick Chips & Input Bar
                     VStack(spacing: 10) {
-                        quickChipsView
+                        if hermes.status.isInteractiveAvailable {
+                            quickChipsView
+                        }
                         inputBar
                     }
                     .padding(.bottom, 8)
                     .background(currentTheme.backgroundColor.opacity(0.95))
                 }
             }
-            .navigationTitle("Hermes Agent")
+            .navigationTitle("XASS AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -105,10 +112,11 @@ public struct HermesView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button {
-                            _ = hermes.createSession()
+                            createNewSession()
                         } label: {
                             Label("Новый диалог", systemImage: "plus.bubble")
                         }
+                        .disabled(!canCreateSession)
 
                         Button {
                             showSessionSheet = true
@@ -121,22 +129,22 @@ public struct HermesView: View {
                         Button(role: .destructive) {
                             showClearConfirm = true
                         } label: {
-                            Label("Очистить этот чат", systemImage: "trash")
+                            Label("Очистить экран чата", systemImage: "trash")
                         }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                             .font(.system(size: 17, weight: .medium))
                             .foregroundStyle(currentTheme.accentColor)
                     }
-                    .accessibilityLabel("Меню управления диалогами Hermes")
+                    .accessibilityLabel("Меню управления диалогами XASS AI")
                 }
             }
             .confirmationDialog(
-                "Очистить переписку в текущем диалоге?",
+                "Убрать сообщения текущего диалога с этого экрана? История на сервере не изменится.",
                 isPresented: $showClearConfirm,
                 titleVisibility: .visible
             ) {
-                Button("Очистить чат", role: .destructive) {
+                Button("Очистить на iPhone", role: .destructive) {
                     withAnimation {
                         hermes.clearActiveHistory()
                     }
@@ -147,35 +155,61 @@ public struct HermesView: View {
                 sessionSelectorSheet
             }
             .task {
-                await hermes.fetchStatus()
-                await hermes.fetchSessions()
+                let status = await hermes.fetchStatus()
+                if status.isInteractiveAvailable {
+                    await hermes.fetchSessions()
+                }
             }
         }
     }
 
     // MARK: - Header & Status
 
+    private var statusAccessibilityLabel: String {
+        var label: String
+        if hermes.status.isInteractiveAvailable {
+            label = "Статус XASS AI: интерактивный режим доступен"
+        } else if hermes.status.isAvailable {
+            label = "Статус XASS AI: среда онлайн, интерактивный режим недоступен"
+        } else {
+            label = "Статус XASS AI: офлайн"
+        }
+        if !hermes.status.version.isEmpty {
+            label += ", версия \(hermes.status.version)"
+        }
+        return label
+    }
+
+    private var statusColor: Color {
+        if hermes.status.isInteractiveAvailable {
+            return .green
+        }
+        return hermes.status.isAvailable ? .yellow : .orange
+    }
+
     private var statusPill: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(hermes.status.isAvailable ? Color.green : Color.orange)
+                .fill(statusColor)
                 .frame(width: 8, height: 8)
-                .shadow(color: hermes.status.isAvailable ? Color.green.opacity(0.6) : Color.clear, radius: 4)
+                .shadow(color: hermes.status.isInteractiveAvailable ? Color.green.opacity(0.6) : Color.clear, radius: 4)
 
-            Text("Hermes")
+            Text("XASS AI")
                 .font(.caption.weight(.bold))
                 .foregroundStyle(.white)
 
-            Text(hermes.status.version)
-                .font(.caption2)
-                .foregroundStyle(currentTheme.secondaryTextColor)
+            if !hermes.status.version.isEmpty {
+                Text(hermes.status.version)
+                    .font(.caption2)
+                    .foregroundStyle(currentTheme.secondaryTextColor)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(currentTheme.cardColor, in: Capsule())
         .overlay(Capsule().stroke(currentTheme.borderColor, lineWidth: 1))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Статус агента: \(hermes.status.isAvailable ? "Онлайн" : "Офлайн"), версия \(hermes.status.version)")
+        .accessibilityLabel(statusAccessibilityLabel)
     }
 
     private var sessionHeaderBar: some View {
@@ -209,9 +243,7 @@ public struct HermesView: View {
             Spacer()
 
             Button {
-                withAnimation {
-                    _ = hermes.createSession()
-                }
+                createNewSession()
             } label: {
                 Image(systemName: "plus")
                     .font(.caption.weight(.bold))
@@ -220,14 +252,15 @@ public struct HermesView: View {
                     .background(currentTheme.accentColor, in: Circle())
             }
             .accessibilityLabel("Создать новый диалог")
+            .disabled(!canCreateSession)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
     }
 
-    // MARK: - Reasoning Dynamic Island Banner
+    // MARK: - Request Progress
 
-    private var reasoningBanner: some View {
+    private var requestProgressBanner: some View {
         HStack(spacing: 12) {
             ZStack {
                 Circle()
@@ -240,7 +273,7 @@ public struct HermesView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text("Hermes размышляет...")
+                    Text("XASS AI обрабатывает запрос…")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(.white)
 
@@ -251,7 +284,7 @@ public struct HermesView: View {
                         .tint(currentTheme.accentColor)
                 }
 
-                Text(hermes.currentReasoningStep.isEmpty ? "Формирование ответа" : hermes.currentReasoningStep)
+                Text(hermes.currentReasoningStep.isEmpty ? "Ожидание ответа" : hermes.currentReasoningStep)
                     .font(.caption2)
                     .foregroundStyle(currentTheme.secondaryTextColor)
                     .lineLimit(1)
@@ -268,7 +301,41 @@ public struct HermesView: View {
         .padding(.horizontal, 16)
         .padding(.bottom, 6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Hermes размышляет: \(hermes.currentReasoningStep)")
+        .accessibilityLabel("XASS AI обрабатывает запрос: \(hermes.currentReasoningStep)")
+    }
+
+    private func availabilityErrorBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.orange)
+
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.white)
+                .textSelection(.enabled)
+
+            Spacer(minLength: 0)
+
+            Button("Повторить") {
+                Task {
+                    let status = await hermes.fetchStatus()
+                    if status.isInteractiveAvailable {
+                        await hermes.fetchSessions()
+                    }
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(currentTheme.accentColor)
+            .accessibilityHint("Повторно проверить доступность XASS AI")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.orange.opacity(0.45), lineWidth: 1))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 6)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("XASS AI: \(message)")
     }
 
     // MARK: - Welcome State
@@ -289,60 +356,66 @@ public struct HermesView: View {
             .padding(.top, 24)
 
             VStack(spacing: 6) {
-                Text("Hermes Agent")
+                Text("XASS AI")
                     .font(.title2.weight(.bold))
                     .foregroundStyle(.white)
 
-                Text("Персональный ИИ-ассистент экосистемы XASS.\nЗадавайте вопросы о сервере, управляйте музыкой и контролируйте ПК-агенты.")
+                Text(
+                    hermes.status.isInteractiveAvailable
+                        ? "Введите запрос. Ответ появится после подтверждённого ответа сервиса."
+                        : (hermes.errorMessage ?? hermes.status.statusDescription)
+                )
                     .font(.subheadline)
                     .foregroundStyle(currentTheme.secondaryTextColor)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Популярные запросы:")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(currentTheme.secondaryTextColor)
-                    .padding(.horizontal, 4)
+            if hermes.status.isInteractiveAvailable {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Популярные запросы:")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(currentTheme.secondaryTextColor)
+                        .padding(.horizontal, 4)
 
-                ForEach(quickPrompts.prefix(3)) { chip in
-                    Button {
-                        inputPrompt = chip.prompt
-                        sendMessage()
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: chip.icon)
-                                .font(.body)
-                                .foregroundStyle(currentTheme.accentColor)
-                                .frame(width: 24)
+                    ForEach(quickPrompts.prefix(3)) { chip in
+                        Button {
+                            inputPrompt = chip.prompt
+                            sendMessage()
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: chip.icon)
+                                    .font(.body)
+                                    .foregroundStyle(currentTheme.accentColor)
+                                    .frame(width: 24)
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(chip.title)
-                                    .font(.subheadline.weight(.medium))
-                                    .foregroundStyle(.white)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(chip.title)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.white)
 
-                                Text(chip.prompt)
-                                    .font(.caption)
+                                    Text(chip.prompt)
+                                        .font(.caption)
+                                        .foregroundStyle(currentTheme.secondaryTextColor)
+                                        .lineLimit(1)
+                                }
+
+                                Spacer()
+
+                                Image(systemName: "arrow.up.right")
+                                    .font(.caption2)
                                     .foregroundStyle(currentTheme.secondaryTextColor)
-                                    .lineLimit(1)
                             }
-
-                            Spacer()
-
-                            Image(systemName: "arrow.up.right")
-                                .font(.caption2)
-                                .foregroundStyle(currentTheme.secondaryTextColor)
+                            .padding(12)
+                            .background(currentTheme.cardColor, in: RoundedRectangle(cornerRadius: 12))
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(currentTheme.borderColor, lineWidth: 0.8))
                         }
-                        .padding(12)
-                        .background(currentTheme.cardColor, in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(currentTheme.borderColor, lineWidth: 0.8))
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Отправить запрос: \(chip.title)")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Отправить запрос: \(chip.title)")
                 }
+                .padding(.top, 10)
             }
-            .padding(.top, 10)
         }
         .padding(.vertical, 16)
     }
@@ -384,13 +457,14 @@ public struct HermesView: View {
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 10) {
             HStack(alignment: .center, spacing: 8) {
-                TextField("Спросите Hermes о сервере или музыке…", text: $inputPrompt, axis: .vertical)
+                TextField("Введите запрос для XASS AI…", text: $inputPrompt, axis: .vertical)
                     .font(.body)
                     .lineLimit(1...5)
                     .focused($isInputFocused)
                     .foregroundStyle(.white)
                     .tint(currentTheme.accentColor)
-                    .accessibilityLabel("Поле ввода запроса к Hermes")
+                    .accessibilityLabel("Поле ввода запроса к XASS AI")
+                    .disabled(!hermes.status.isInteractiveAvailable)
 
                 if !inputPrompt.isEmpty {
                     Button {
@@ -431,13 +505,19 @@ public struct HermesView: View {
             }
             .disabled(!canSend)
             .accessibilityLabel("Отправить запрос")
-            .accessibilityHint("Дважды коснитесь, чтобы отправить введенный запрос агенту Hermes")
+            .accessibilityHint("Дважды коснитесь, чтобы отправить введенный запрос в XASS AI")
         }
         .padding(.horizontal, 16)
     }
 
     private var canSend: Bool {
-        !inputPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hermes.isThinking
+        hermes.status.isInteractiveAvailable
+            && !inputPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !hermes.isThinking
+    }
+
+    private var canCreateSession: Bool {
+        hermes.status.isInteractiveAvailable && !isCreatingSession
     }
 
     private func sendMessage() {
@@ -449,6 +529,25 @@ public struct HermesView: View {
         Task {
             do {
                 try await hermes.sendMessage(promptToSend)
+            } catch {
+                hermes.errorMessage = error.localizedDescription
+                if inputPrompt.isEmpty {
+                    inputPrompt = promptToSend
+                }
+            }
+        }
+    }
+
+    private func createNewSession(closeSheetOnSuccess: Bool = false) {
+        guard canCreateSession else { return }
+        isCreatingSession = true
+        Task {
+            defer { isCreatingSession = false }
+            do {
+                _ = try await hermes.createRemoteSession()
+                if closeSheetOnSuccess {
+                    showSessionSheet = false
+                }
             } catch {
                 hermes.errorMessage = error.localizedDescription
             }
@@ -506,7 +605,7 @@ public struct HermesView: View {
                                 Button(role: .destructive) {
                                     hermes.deleteSession(session.id)
                                 } label: {
-                                    Label("Удалить", systemImage: "trash")
+                                    Label("Скрыть на iPhone", systemImage: "eye.slash")
                                 }
                             }
                         }
@@ -515,7 +614,7 @@ public struct HermesView: View {
             }
             .scrollContentBackground(.hidden)
             .background(currentTheme.backgroundColor.ignoresSafeArea())
-            .navigationTitle("Диалоги Hermes")
+            .navigationTitle("Диалоги XASS AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -527,12 +626,12 @@ public struct HermesView: View {
 
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        _ = hermes.createSession()
-                        showSessionSheet = false
+                        createNewSession(closeSheetOnSuccess: true)
                     } label: {
                         Image(systemName: "plus")
                             .foregroundStyle(currentTheme.accentColor)
                     }
+                    .disabled(!canCreateSession)
                 }
             }
         }
@@ -547,8 +646,6 @@ struct HermesMessageRow: View {
     @Binding var copiedID: String?
     let onRetry: (String) -> Void
 
-    @State private var isReasoningExpanded: Bool = false
-
     var isUser: Bool {
         message.role == .user
     }
@@ -556,7 +653,7 @@ struct HermesMessageRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             if !isUser {
-                // Hermes avatar
+                // XASS AI avatar
                 ZStack {
                     Circle()
                         .fill(theme.cardColor)
@@ -572,11 +669,6 @@ struct HermesMessageRow: View {
             }
 
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
-                // Reasoning accordion for Assistant
-                if !isUser, !message.reasoningSteps.isEmpty {
-                    reasoningDisclosure
-                }
-
                 // Bubble container
                 VStack(alignment: .leading, spacing: 8) {
                     Text(message.content)
@@ -585,16 +677,6 @@ struct HermesMessageRow: View {
                         .textSelection(.enabled)
                         .lineSpacing(3)
 
-                    if message.isOfflineFallback {
-                        HStack(spacing: 4) {
-                            Image(systemName: "bolt.slash.fill")
-                                .font(.caption2)
-                            Text("Автономный ответ")
-                                .font(.caption2.weight(.medium))
-                        }
-                        .foregroundStyle(theme.secondaryTextColor)
-                        .padding(.top, 2)
-                    }
                 }
                 .padding(.horizontal, 15)
                 .padding(.vertical, 12)
@@ -641,7 +723,7 @@ struct HermesMessageRow: View {
                             .foregroundStyle(copiedID == message.id ? Color.green : theme.secondaryTextColor)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("Скопировать ответ Hermes в буфер обмена")
+                        .accessibilityLabel("Скопировать ответ XASS AI в буфер обмена")
 
                         if let tokens = message.tokensUsed {
                             Text("\(tokens) токенов")
@@ -674,59 +756,7 @@ struct HermesMessageRow: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(isUser ? "Вы" : "Hermes"): \(message.content)")
-    }
-
-    private var reasoningDisclosure: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                    isReasoningExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "brain.head.profile")
-                        .font(.caption)
-                        .foregroundStyle(theme.accentColor)
-
-                    Text("Ход рассуждений (\(message.reasoningSteps.count) шага)")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(theme.secondaryTextColor)
-
-                    Spacer()
-
-                    Image(systemName: isReasoningExpanded ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                        .foregroundStyle(theme.secondaryTextColor)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(theme.cardColor.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Ход рассуждений Hermes. \(isReasoningExpanded ? "Свернуть" : "Развернуть").")
-
-            if isReasoningExpanded {
-                VStack(alignment: .leading, spacing: 5) {
-                    ForEach(Array(message.reasoningSteps.enumerated()), id: \.offset) { index, step in
-                        HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.caption2)
-                                .foregroundStyle(Color.green)
-                                .padding(.top, 2)
-
-                            Text(step)
-                                .font(.caption)
-                                .foregroundStyle(theme.secondaryTextColor)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-                .padding(10)
-                .background(theme.cardColor.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.borderColor.opacity(0.5), lineWidth: 0.8))
-            }
-        }
+        .accessibilityLabel("\(isUser ? "Вы" : "XASS AI"): \(message.content)")
     }
 
     private func copyMessage(_ text: String) {

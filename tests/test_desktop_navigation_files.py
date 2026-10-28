@@ -69,7 +69,21 @@ class NavigationAndFilesTests(unittest.TestCase):
 
     def assert_navigation_accessible(self, scaling):
         app = self.make_shell(scaling)
-        self.assertEqual(len(app.nav_buttons), 9)
+        self.assertEqual(
+            set(app.nav_buttons),
+            {
+                "overview",
+                "computer",
+                "connection",
+                "hermes",
+                "files",
+                "music",
+                "archive",
+                "journal",
+                "updates",
+                "settings",
+            },
+        )
         for key, button in app.nav_buttons.items():
             with self.subTest(key=key, scaling=scaling):
                 self.assertTrue(button.winfo_ismapped())

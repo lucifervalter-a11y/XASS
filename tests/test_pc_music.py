@@ -506,6 +506,78 @@ class MusicPlayerTests(unittest.TestCase):
         self.audio.devices[-1].running = False
         self.assertEqual(self.player.snapshot()["state"], "error")
 
+    def test_snapshot_never_waits_for_a_blocked_native_device_close(self):
+        self.play()
+        self.wait_state("playing")
+        device = self.audio.devices[-1]
+        original_close = device.close
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked_close():
+            entered.set()
+            release.wait(2)
+            original_close()
+
+        device.close = blocked_close
+        self.player._progress["ended"] = True
+        started = time.monotonic()
+        try:
+            self.assertEqual(self.player.snapshot()["state"], "ended")
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(device.closed)
+        finally:
+            release.set()
+        deadline = time.monotonic() + 1
+        while not device.closed and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(device.closed)
+
+    def test_reopen_waits_off_ui_until_prior_native_close_finishes(self):
+        self.play()
+        self.wait_state("playing")
+        device = self.audio.devices[-1]
+        original_close = device.close
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked_close():
+            entered.set()
+            release.wait(2)
+            original_close()
+
+        device.close = blocked_close
+        self.player._progress["ended"] = True
+        self.assertEqual(self.player.snapshot()["state"], "ended")
+        self.assertTrue(entered.wait(1))
+
+        # A legacy Tk/main-thread caller fails immediately and cannot open a
+        # second WASAPI device while the first one is still closing.
+        started = time.monotonic()
+        with self.assertRaises(mp.MusicError):
+            self.command("music_resume")
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual(len(self.audio.devices), 1)
+
+        result, errors = [], []
+
+        def resume_off_ui():
+            try:
+                result.append(self.command("music_resume"))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=resume_off_ui)
+        worker.start()
+        time.sleep(0.03)
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(len(self.audio.devices), 1)
+        release.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[-1]["state"], "playing")
+        self.assertEqual(len(self.audio.devices), 2)
+
     def test_no_device_or_network_for_status_before_first_play(self):
         with patch.object(self.player, "_audio_factory") as factory:
             self.assertEqual(self.command("music_status")["state"], "idle")

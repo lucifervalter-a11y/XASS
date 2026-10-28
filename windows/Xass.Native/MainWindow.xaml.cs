@@ -69,6 +69,7 @@ public sealed partial class MainWindow : Window
         {
             DisposeDesktop();
             DisposeDesktopMusic();
+            DisposeXassAi();
             closed = true;
             timer.Stop();
             DisposeVoice();
@@ -82,6 +83,7 @@ public sealed partial class MainWindow : Window
         InitializeAssistantPresentation();
         InitializeVoice();
         InitializeDesktop();
+        InitializeXassAi();
         _ = DiscoverAssistantModelAsync();
         InitializeDesktopMusic();
         InitializeAppearance();
@@ -105,6 +107,7 @@ public sealed partial class MainWindow : Window
         PageTitle.Visibility = page is "music" or "assistant" ? Visibility.Collapsed : Visibility.Visible;
         OnDesktopNavigated(page);
         OnDesktopMusicNavigated(page);
+        OnXassAiNavigated(page);
     }
 
     private void InitializeAssistant()

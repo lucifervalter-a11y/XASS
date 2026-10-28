@@ -71,6 +71,7 @@ class ServerStartupTests(unittest.IsolatedAsyncioTestCase):
             use_polling=False,
             agent_api_key="",
             agent_api_key_enabled=False,
+            validate_security=lambda: [],
             profile_public_url="https://xass.example",
             profile_json_path="profile.json",
             projects_json_path="projects.json",

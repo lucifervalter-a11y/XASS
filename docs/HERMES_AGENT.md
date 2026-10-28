@@ -1,111 +1,89 @@
-# Hermes Agent AI Integration in XASS
+# XASS AI: интеграция с Hermes 0.22.2
 
-## Обзор
+## Статус
 
-Интеграция **Hermes Agent** расширяет экосистему XASS возможностями автономного искусственного интеллекта на базе моделей семейства Hermes (включая Nous Hermes 3 / Hermes Function Calling). Агент доступен во всех клиентских интерфейсах системы: Telegram Mini App, iOS-приложении, Windows PC-клиенте и командах Telegram-бота.
+В пользовательском интерфейсе продукт называется **XASS AI**. Hermes Agent —
+внутренний внешний runtime, а не пользовательский бренд. Проверенная локальная
+установка сообщает версию `0.22.2` и commit
+`d923a5eb487a17c0a68801bba9ef0f56c81040a8`.
 
-### Ключевые возможности
+End-to-end интеграция пока **не завершена**. В baseline `81601bb` есть экраны и
+команды, но старые backend, Windows, iOS и Mini App пути использовали
+предполагаемые REST эндпоинты или демонстрационные ответы. Удаление этих ответов
+делает ошибку честной, но само по себе не добавляет рабочий транспорт.
 
-- **Автономный ассистент**: выполнение задач управления инфраструктурой, запуск инструментов, генерация скриптов и сценариев автоматизации.
-- **Инспекция цепочки рассуждений (Thought Drawer)**: отображение мыслей модели, используемых инструментов (tool calls) и метрик токенов.
-- **Управление сессиями**: многосессионный контекст, история диалогов, создание новых веток обсуждений.
-- **Вызов инструментов (Tool / Skill Calling)**: встроенный запуск зарегистрированных навыков XASS и Hermes.
-- **Отказоустойчивость (Graceful Degradation)**: при временной недоступности демона Hermes интерфейсы плавно переключаются в локальный режим (XASS Core demo mode) без сбоев или блокировки интерфейса.
+В текущем native working tree уже есть точный loopback WebSocket adapter и
+честное отключённое состояние. Его статус — **partial / source-tested**: десять
+source-contract checks прошли, но C# не собран и реальный runtime не запускался.
+До подключения реального транспорта UI обязан показывать недоступность, а не
+`online`, `ok: true`, фиктивные устройства, метрики, навыки или результаты команд.
 
----
+## Фактический runtime-контракт
 
-## Конфигурация
+- `GET /api/health` возвращает `ok`, `version`, `displayVersion`, `commit` и
+  `auth_required`.
+- Диалог работает через WebSocket JSON-RPC на `/api/ws`, а не через
+  `/v1/chat/completions`, `/api/chat`, `/chat` или другие угадываемые REST пути.
+- Loopback WebSocket требует `?token=...`, совпадающий с токеном процесса.
+- `session.create` создаёт сессию.
+- `prompt.submit` получает `{session_id, text}`.
+- `message.delta` передаёт поток результата; только `message.complete` завершает
+  запрос успешно.
+- Обычный standalone порт — 9119. Для desktop-owned процесса безопаснее порт
+  `0` с обнаружением фактического адреса через `HERMES_DESKTOP_READY_FILE`.
 
-Параметры интеграции настраиваются через переменные окружения в файле `.env` либо через API настроек.
+401, 404, отсутствие токена/ready-файла, несовместимая версия протокола, разрыв
+WebSocket или отсутствие terminal event означают ошибку. Они не являются
+признаком `online` и не разрешают переход к demo success.
 
-| Переменная | По умолчанию | Описание |
-| :--- | :--- | :--- |
-| `HERMES_URL` / `HERMES_WEBUI_URL` | `http://127.0.0.1:8787` | Базовый URL-адрес демона Hermes Agent / Hermes WebUI. |
-| `HERMES_API_KEY` | *(пусто)* | Опциональный ключ авторизации (Bearer token) при защищенном доступе к Hermes. |
-| `HERMES_ENABLED` | `true` | Флаг включения интеграции Hermes (`true` / `false`). |
+## Целевой адаптер XASS AI
 
-### Пример в `.env`:
+1. XASS запускает или обнаруживает только локальный доверенный runtime, не создавая
+   новые credentials и не меняя сетевые или security-настройки.
+2. Endpoint и одноразовый/process token берутся из подтверждённого ready-файла;
+   токен не логируется, не отправляется на backend/Telegram и не сохраняется в UI.
+3. После успешного `/api/health` адаптер открывает token-authenticated `/api/ws`.
+4. UI создаёт или выбирает сессию, отправляет prompt и показывает только реальные
+   delta/complete события.
+5. Tool execution остаётся в существующих XASS allowlist/confirmation границах.
+   Ответ модели сам по себе не является разрешением на команду ПК.
+6. При любой ошибке адаптер закрывает текущую операцию честным статусом
+   `unavailable`/`error`; синтетический ответ запрещён.
 
-```env
-# Hermes Agent & WebUI Integration
-HERMES_URL=http://127.0.0.1:8787
-HERMES_WEBUI_URL=http://127.0.0.1:8787
-HERMES_API_KEY=
-HERMES_ENABLED=true
-```
+Платный API fallback запрещён. Telegram-бот не переносится. Телефонный AI
+transport пока не согласован и не реализован.
 
----
+## Текущие поверхности
 
-## API Эндпоинты
+| Поверхность | Честный статус |
+|---|---|
+| Native Windows | Main Navigation page и точный loopback WebSocket adapter реализованы на уровне source. Send отключён, пока owned authenticated runtime не привязан. C# build/live exchange не проверены. |
+| Python/Tk Windows | Угадываемые REST пути, ложный online и переход во внешний Web UI удалены. Клиент проверяет exact health, но честно блокирует prompt без owned token transport. |
+| Backend/Telegram | Exact health работает fail-closed; status отдельно сообщает `interactive_available: false`. Все mutating AI routes требуют owner auth и одноразовый action proof. Публичные bot-команды называются `/ai*`; старые `/hermes*` принимаются только для совместимости. Telegram AI дополнительно ограничен `owner_user_id` и не принимает первую глобальную runtime-сессию: используются только сессии, созданные этой owner-only поверхностью. |
+| Mini App | Экран не загружает сессии и не включает prompt/quick actions без явного `interactive_available: true`; demo response и фиктивный статус удалены. |
+| iOS | `HermesService` различает проверенный health и интерактивный transport. Без явного `interactive_available: true` экран, создание сессий и отправка сообщений остаются заблокированы. Прямого phone-to-PC transport нет. |
 
-Все эндпоинты защищены проверкой прав владельца (`require_mini_owner`) и доступны через Mini App и мобильные клиенты:
+Ни одна из этих поверхностей не должна публиковать chain-of-thought. Пользователю
+можно показывать краткий проверяемый результат, статус tool call и диагностическую
+ошибку без скрытых рассуждений модели.
 
-| Метод | Путь | Описание |
-| :--- | :--- | :--- |
-| `GET` | `/api/mini/hermes/status` | Проверка здоровья: статус (`online` / `offline`), активная модель, задержка (мс), количество сессий. |
-| `GET` | `/api/mini/hermes/sessions` | Список доступных диалоговых сессий с временем обновления и счетчиками сообщений. |
-| `POST` | `/api/mini/hermes/sessions` | Создание новой диалоговой сессии (опционально с заголовком `title`). |
-| `POST` | `/api/mini/hermes/chat` | Отправка сообщения агенту. Возвращает ответ, мысли (`thought`), вызовы инструментов и токены. |
-| `GET` | `/api/mini/hermes/skills` | Список доступных навыков и инструментов агента. |
-| `POST` | `/api/mini/hermes/skill-run` | Запуск определенного навыка (`skill_name`) с параметрами. |
-| `GET` | `/api/mini/hermes/config` | Текущие настройки Hermes (URL, активность, маскированный ключ). |
-| `POST` | `/api/mini/hermes/config` | Обновление настроек подключения к Hermes на лету. |
+Native adapter проверяет exact health `ok: true`, затем выполняет
+`session.create` → `prompt.submit`, принимает только delta/complete своей сессии и
+буферизует UI-обновления по 75 мс. Runtime binding пока получает port из
+ready-файла и private in-memory token; launch/discovery/PID attach отсутствуют.
+Завершать разрешено только `Process`, который запустил и которым владеет XASS.
 
-### Формат запроса чата (`POST /api/mini/hermes/chat`):
+## Acceptance gates
 
-```json
-{
-  "session_id": "default",
-  "message": "Проверь статус серверов и заблокируй рабочий ПК",
-  "model": "nous-hermes-3"
-}
-```
-
-### Формат ответа:
-
-```json
-{
-  "ok": true,
-  "reply": "ПК успешно заблокирован, все службы работают в штатном режиме.",
-  "thought": "Анализирую состояние устройств... Вызываю инструмент lock_desktop...",
-  "tools": [
-    { "name": "lock_desktop", "status": "executed", "summary": "Экран ПК заблокирован" }
-  ],
-  "tokens": 420,
-  "model": "nous-hermes-3"
-}
-```
-
----
-
-## Команды Telegram-бота
-
-В Telegram-боте владельца доступны команды для взаимодействия с агентом:
-
-- `/hermes <запрос>` — отправить текстовый запрос Hermes Agent и получить ответ в чате.
-- `/hermes_status` — проверить статус демона Hermes, текущую задержку, активную модель и версию.
-- `/hermes_sessions` — посмотреть список активных сессий и историю.
-- `/hermes_new` — сбросить контекст и открыть новую сессию диалога.
-- В панели `/panel` доступна кнопка **🤖 Hermes Agent** для быстрого перехода к статусу и шаблонам команд.
-
----
-
-## Интерфейсы клиентов
-
-### 1. Telegram Mini App
-- **Вкладка Hermes AI**: полноэкранный чат с поддержкой форматирования Markdown, подсветки синтаксиса и копирования блоков кода.
-- **Индикатор статуса**: бейдж в шапке (`online`, `thinking`, `offline`) с автообновлением.
-- **Переключатель моделей**: выбор между `nous-hermes-3`, `hermes-reasoning`, `hermes-function-calling`.
-- **Thought Drawer**: раскрывающийся аккордеон с ходом мысли модели и деталями вызовов API.
-- **Быстрый запуск**: чип «Гермес AI» на главном экране Mini App для мгновенного перехода к диалогу.
-
-### 2. iOS-приложение (SwiftUI)
-- Нативный экран `HermesView` с поддержкой VoiceOver и Dynamic Island при выполнении длительных рассуждений.
-- Сервисный слой `HermesService` для фоновой синхронизации и оффлайн-кэширования.
-
-### 3. Windows PC-клиент
-- Меню в системном трее (`pystray`):
-  - Статус демона Hermes (Online / Offline).
-  - Быстрый переход в Hermes WebUI (`http://127.0.0.1:8787`).
-  - Диалог быстрого ввода промпта.
-- Обработка входящих команд сервера: `hermes_prompt` и `hermes_status`.
+- Реальный 0.22.2 runtime запускается на ephemeral loopback port и выдаёт ready-файл.
+- Health version/commit проверены, token не появляется в логах или process output.
+- `session.create` → `prompt.submit` → delta → complete работает в Native Windows.
+- 401/404/disconnect/timeout/malformed event дают honest error без cached/demo success.
+- Повторный prompt, отмена, закрытие окна и завершение runtime не подвешивают UI.
+- Tool call проходит существующее XASS подтверждение и не исполняется только по
+  тексту модели.
+- Отдельный design/authorization review определяет, нужен ли телефонный transport;
+  до этого iOS/Telegram AI остаются blocked.
+- Полная MIT attribution сохранена в
+  [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
+- Матрица общего покрытия: [native parity ledger](windows/native-parity-coverage.md).

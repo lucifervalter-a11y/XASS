@@ -14,6 +14,20 @@ public static class AppearanceResources
             var brush = (SolidColorBrush)resources[source];
             foreach (string name in names) resources[name] = brush;
         }
+        Alias("XassPageBackgroundBrush", "ApplicationPageBackgroundThemeBrush", "SolidBackgroundFillColorBaseBrush");
+        Alias("XassCardBackgroundBrush", "CardBackgroundFillColorDefaultBrush", "LayerFillColorDefaultBrush");
+        Alias("XassHoverBrush", "SubtleFillColorSecondaryBrush", "ControlFillColorSecondaryBrush");
+        Alias("XassBorderBrush", "CardStrokeColorDefaultBrush", "ControlStrokeColorDefaultBrush", "DividerStrokeColorDefaultBrush");
+        Alias("XassSidebarBrush", "NavigationViewDefaultPaneBackground");
+        Alias("XassFieldBrush", "ControlFillColorDefaultBrush", "TextControlBackground");
+        Alias("XassWellBrush", "ControlFillColorTertiaryBrush");
+        Alias("XassTextBrush", "TextFillColorPrimaryBrush");
+        Alias("XassMutedTextBrush", "TextFillColorSecondaryBrush", "TextFillColorTertiaryBrush");
+        Alias("XassNavForegroundBrush", "NavigationViewItemForeground", "NavigationViewItemForegroundPointerOver",
+            "NavigationViewItemForegroundPressed", "NavigationViewItemForegroundSelected");
+        Alias("XassNavActiveBrush", "NavigationViewItemBackgroundPointerOver", "NavigationViewItemBackgroundPressed");
+        Alias("XassNavSelectedBrush", "NavigationViewItemBackgroundSelected", "NavigationViewItemBackgroundSelectedPointerOver",
+            "NavigationViewItemBackgroundSelectedPressed");
         Alias("XassAccentFillBrush", "AccentFillColorDefaultBrush", "AccentFillColorSelectedTextBackgroundBrush",
             "SliderTrackValueFill", "ToggleSwitchFillOn", "CheckBoxCheckBackgroundFillChecked",
             "ProgressBarForeground", "TextControlSelectionHighlightColor", "ToggleButtonBackgroundChecked");

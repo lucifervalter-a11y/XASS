@@ -55,8 +55,11 @@ def archive_cursor(config: dict[str, Any]) -> int:
 
 def archive_status(config: dict[str, Any]) -> dict[str, Any]:
     root = archive_root(config)
-    cursor = archive_cursor(config)
     state = _read_state(config)
+    try:
+        cursor = max(0, int(state.get("cursor") or 0))
+    except (ValueError, TypeError):
+        cursor = 0
     try:
         database_size = (root / DB_FILE).stat().st_size
     except OSError:
@@ -443,8 +446,16 @@ def conversation_rows(config: dict[str, Any], limit: int = 200) -> list[dict[str
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
-            """SELECT m.*, (SELECT COUNT(*) FROM media x WHERE x.message_id=m.id AND x.saved=1) AS media_count
-            FROM messages m ORDER BY m.id DESC LIMIT ?""",
+            """WITH recent AS (
+                SELECT * FROM messages ORDER BY id DESC LIMIT ?
+            ), media_counts AS (
+                SELECT x.message_id, COUNT(*) AS media_count
+                FROM media x JOIN recent r ON r.id=x.message_id
+                WHERE x.saved=1 GROUP BY x.message_id
+            )
+            SELECT r.*, COALESCE(c.media_count, 0) AS media_count
+            FROM recent r LEFT JOIN media_counts c ON c.message_id=r.id
+            ORDER BY r.id DESC""",
             (max(1, min(int(limit), 2000)),),
         ).fetchall()
         return [dict(row) for row in rows]

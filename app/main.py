@@ -1398,7 +1398,7 @@ app.include_router(build_music_router(settings, require_mini_owner, _public_orig
 app.include_router(build_native_router(settings, require_mini_owner))
 app.include_router(build_native_dashboard_router(settings, require_mini_owner))
 app.include_router(build_music_storage_router(settings, require_mini_owner, _require_pwa_action_proof))
-app.include_router(build_hermes_router(settings, require_mini_owner))
+app.include_router(build_hermes_router(settings, require_mini_owner, _require_pwa_action_proof))
 
 
 @app.get("/api/pwa/config")

@@ -1,5 +1,6 @@
 """Tk timer shutdown regressions; no agent, networking or playback."""
 import sys
+import threading
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -91,6 +92,27 @@ class DesktopShutdownTests(unittest.TestCase):
         self.assertEqual(tuple(self.root.tk.call("after", "info")), ())
         pump.close.assert_called_once()
         child.destroy()
+
+    def test_local_music_close_never_waits_for_native_device_on_tk(self):
+        started, release = threading.Event(), threading.Event()
+        worker_ids = []
+        player = Mock()
+
+        def blocked_close():
+            worker_ids.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+
+        player.close.side_effect = blocked_close
+        self.app._local_music = player
+        try:
+            desktop.XassDesktop._close_local_music(self.app)
+            self.assertTrue(started.wait(1))
+            self.assertIsNone(self.app._local_music)
+            self.assertNotEqual(worker_ids, [threading.get_ident()])
+        finally:
+            release.set()
+            self.app._local_music_close_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

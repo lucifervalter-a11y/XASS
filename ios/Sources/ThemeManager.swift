@@ -301,7 +301,7 @@ public struct ThemeSelectorView: View {
                         .font(.title2.weight(.bold))
                         .foregroundStyle(.white)
 
-                    Text("Выберите палитру интерфейса XASS. Тема применяется ко всем вкладкам, виджетам и агенту Hermes.")
+                    Text("Выберите палитру интерфейса XASS. Тема применяется ко всем вкладкам, виджетам и XASS AI.")
                         .font(.subheadline)
                         .foregroundStyle(themeManager.currentTheme.secondaryTextColor)
                 }

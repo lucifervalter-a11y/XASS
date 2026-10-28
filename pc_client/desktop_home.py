@@ -303,10 +303,16 @@ def build_home(app: Any) -> None:
     tk.Frame(event_card, bg=LINE, height=1).pack(fill="x")
     event_rows = tk.Frame(event_card, bg=CARD)
     event_rows.pack(fill="x")
+    rendered_events: tuple[str, ...] | None = None
 
     def render_events() -> None:
+        nonlocal rendered_events
         if not event_rows.winfo_exists():
             return
+        signature = tuple(app.history[-2:])
+        if signature == rendered_events:
+            return
+        rendered_events = signature
         for child in event_rows.winfo_children():
             child.destroy()
         recent = app.history[-2:][::-1]

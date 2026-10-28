@@ -210,7 +210,7 @@ public struct HermesActivityWidgetView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text("Hermes Agent")
+                    Text("XASS AI")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.white)
                     Spacer()
@@ -245,7 +245,7 @@ public struct HermesLiveActivity: Widget {
                     HStack(spacing: 6) {
                         Image(systemName: "sparkles")
                             .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
-                        Text("Hermes")
+                        Text("XASS AI")
                             .font(.headline)
                     }
                 }

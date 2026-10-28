@@ -226,7 +226,7 @@ public sealed partial class MainWindow
     {
         bool dark = RootGrid.ActualTheme == ElementTheme.Dark;
         uint surface = dark ? 0x16191Fu : 0xFAFAFCu;
-        uint fallback = AccentPalette.TryParse(appearance.Accent,out uint custom) ? custom : 0x75658Fu;
+        uint fallback = ResolveAppearanceAccent();
         var palette = coverPalette ?? new CoverPalette(fallback, fallback);
         musicBackdrop.GradientStops.Clear();
         if (appearanceAccessibility.HighContrast)

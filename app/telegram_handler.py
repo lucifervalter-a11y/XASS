@@ -177,6 +177,11 @@ class TelegramUpdateHandler:
         self.music_ingest: TelegramMusicIngest | None = None
         self.hermes_service: HermesService | None = None
         self.hermes_active_sessions: dict[int, str] = {}
+        # Session ids returned by the shared runtime are not an ownership proof.
+        # Only sessions created through this owner-only Telegram surface may be
+        # selected here; the mapping is intentionally process-local and starts
+        # empty after a restart.
+        self.hermes_owned_sessions: dict[int, set[str]] = {}
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -276,6 +281,8 @@ class TelegramUpdateHandler:
 
         command = text.split()[0].lower()
         if command in (".hermes", ".ai"):
+            if not is_owner(user_id, self.settings):
+                return False
             await self._handle_hermes_prompt_command(session, config, chat_id, user_id, text)
             return True
         if command in (".theme", ".themes"):
@@ -944,19 +951,28 @@ class TelegramUpdateHandler:
         config = await get_or_create_app_config(session, self.settings)
         command = text.split()[0].split("@")[0].lower()
 
-        if command == "/hermes":
+        ai_commands = {
+            "/ai", "/hermes", "/ai_status", "/hermes_status",
+            "/ai_sessions", "/hermes_sessions", "/ai_session", "/ai_sess",
+            "/hermes_session", "/hermes_sess", "/ai_new", "/hermes_new",
+        }
+        if command in ai_commands and not is_owner(user_id, self.settings):
+            await self._safe_send(chat_id, "Доступ к XASS AI разрешён только владельцу.")
+            return
+
+        if command in ("/ai", "/hermes"):
             await self._handle_hermes_prompt_command(session, config, chat_id, user_id, text)
             return
-        if command == "/hermes_status":
+        if command in ("/ai_status", "/hermes_status"):
             await self._handle_hermes_status_command(session, config, chat_id, user_id)
             return
-        if command == "/hermes_sessions":
+        if command in ("/ai_sessions", "/hermes_sessions"):
             await self._handle_hermes_sessions_command(session, config, chat_id, user_id)
             return
-        if command in ("/hermes_session", "/hermes_sess"):
+        if command in ("/ai_session", "/ai_sess", "/hermes_session", "/hermes_sess"):
             await self._handle_hermes_switch_session_command(session, config, chat_id, user_id, text)
             return
-        if command == "/hermes_new":
+        if command in ("/ai_new", "/hermes_new"):
             await self._handle_hermes_new_session_command(session, config, chat_id, user_id)
             return
         if command in ("/theme", "/themes"):
@@ -2444,6 +2460,14 @@ class TelegramUpdateHandler:
             return
 
         config = await get_or_create_app_config(session, self.settings)
+
+        if (data.startswith("hermes:") or data == "panel:hermes") and not is_owner(user_id, self.settings):
+            await self._safe_edit_or_send(
+                chat_id,
+                message_id,
+                "Доступ к XASS AI разрешён только владельцу.",
+            )
+            return
 
         if data.startswith(("hermes:", "theme:")) or data in ("panel:hermes", "panel:themes"):
             await self._handle_hermes_or_theme_callback(session, config, callback, data, chat_id, message_id, user_id)
@@ -5051,11 +5075,36 @@ class TelegramUpdateHandler:
     def _get_hermes_service(self) -> HermesService:
         if self.hermes_service is None:
             self.hermes_service = HermesService(
-                url=getattr(self.settings, "hermes_url", "http://127.0.0.1:8787"),
+                url=getattr(self.settings, "hermes_url", "http://127.0.0.1:9119"),
                 api_key=getattr(self.settings, "hermes_api_key", ""),
                 enabled=getattr(self.settings, "hermes_enabled", True),
             )
         return self.hermes_service
+
+    async def _require_xass_ai_owner(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        message_id: int | None = None,
+    ) -> bool:
+        if is_owner(user_id, self.settings):
+            return True
+        await self._safe_edit_or_send(
+            chat_id,
+            message_id,
+            "Доступ к XASS AI разрешён только владельцу.",
+        )
+        return False
+
+    def _remember_xass_ai_session(self, user_id: int, session_id: str) -> None:
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return
+        self.hermes_owned_sessions.setdefault(user_id, set()).add(normalized)
+        self.hermes_active_sessions[user_id] = normalized
+
+    def _owned_xass_ai_session_ids(self, user_id: int) -> set[str]:
+        return set(self.hermes_owned_sessions.get(user_id, set()))
 
     def _hermes_main_keyboard(self) -> dict[str, Any]:
         return {
@@ -5087,7 +5136,7 @@ class TelegramUpdateHandler:
             {"text": "🔄 Обновить", "callback_data": "hermes:sessions"},
         ])
         rows.append([
-            {"text": "🤖 Меню Hermes", "callback_data": "panel:hermes"},
+            {"text": "🤖 Меню XASS AI", "callback_data": "panel:hermes"},
             {"text": "◀️ В меню", "callback_data": "panel:home"},
         ])
         return {"inline_keyboard": rows}
@@ -5113,7 +5162,7 @@ class TelegramUpdateHandler:
         if row:
             rows.append(row)
         rows.append([
-            {"text": "🤖 Hermes Agent", "callback_data": "panel:hermes"},
+            {"text": "🤖 XASS AI", "callback_data": "panel:hermes"},
             {"text": "◀️ В меню", "callback_data": "panel:home"},
         ])
         return {"inline_keyboard": rows}
@@ -5162,22 +5211,24 @@ class TelegramUpdateHandler:
         user_id: int | None,
         text: str,
     ) -> None:
+        if not await self._require_xass_ai_owner(chat_id, user_id):
+            return
         parts = text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
             help_msg = (
-                "🤖 *Hermes Agent AI*\n"
+                "🤖 *XASS AI*\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 "Интеллектуальный агент для кодинга, задач и системного анализа.\n\n"
                 "💡 *Использование:*\n"
-                "`/hermes <ваш запрос>`\n\n"
+                "`/ai <ваш запрос>`\n\n"
                 "📌 *Примеры:*\n"
-                "• `/hermes проверь статус и нагрузку сервера`\n"
-                "• `/hermes напиши python скрипт для парсинга RSS`\n"
-                "• `/hermes помоги оптимизировать SQL запрос`\n\n"
+                "• `/ai проверь статус и нагрузку сервера`\n"
+                "• `/ai напиши python скрипт для парсинга RSS`\n"
+                "• `/ai помоги оптимизировать SQL запрос`\n\n"
                 "⚙️ *Команды управления:*\n"
-                "/hermes_status — проверка статуса и latency агента\n"
-                "/hermes_sessions — список доступных сессий\n"
-                "/hermes_new — начать новую сессию с чистого листа"
+                "/ai_status — проверка статуса и latency агента\n"
+                "/ai_sessions — список доступных сессий\n"
+                "/ai_new — начать новую сессию с чистого листа"
             )
             await self._safe_send(chat_id, help_msg, reply_markup=self._hermes_main_keyboard(), parse_mode="Markdown")
             return
@@ -5185,36 +5236,49 @@ class TelegramUpdateHandler:
         prompt = parts[1].strip()
         hermes = self._get_hermes_service()
 
-        uid = int(user_id or 0)
+        uid = int(user_id)
+        owned_session_ids = self._owned_xass_ai_session_ids(uid)
         session_id = self.hermes_active_sessions.get(uid)
+        if session_id not in owned_session_ids:
+            self.hermes_active_sessions.pop(uid, None)
+            session_id = None
         if not session_id:
             try:
-                sessions = await hermes.list_sessions()
-                if sessions:
-                    session_id = sessions[0].get("id") or "hermes-default"
-                else:
-                    new_sess = await hermes.create_session(title=f"Telegram ({uid})")
-                    session_id = new_sess.get("id") or "hermes-default"
-                self.hermes_active_sessions[uid] = session_id
+                new_sess = await hermes.create_session(title=f"Telegram ({uid})")
+                if not isinstance(new_sess, dict) or new_sess.get("mock") is True or new_sess.get("ok") is False:
+                    raise RuntimeError("XASS AI не подтвердил создание сессии")
+                session_id = str(new_sess.get("id") or "").strip()
+                if not session_id:
+                    raise RuntimeError("XASS AI не вернул ID сессии")
+                self._remember_xass_ai_session(uid, session_id)
             except Exception as exc:
-                logger.warning("Could not obtain session from Hermes: %s", exc)
-                session_id = "hermes-default"
-                self.hermes_active_sessions[uid] = session_id
+                logger.warning("Could not obtain session from XASS AI: %s", exc)
+                await self._safe_send(
+                    chat_id,
+                    "⚠️ *XASS AI недоступен*\n\n"
+                    f"{escape(str(exc))}\n\n"
+                    "Запрос не выполнен: реальная сессия не создана.",
+                    reply_markup=self._hermes_main_keyboard(),
+                    parse_mode="Markdown",
+                )
+                return
 
         try:
             res = await hermes.send_prompt(session_id=session_id, prompt=prompt)
-            reply_content = res.get("response") or res.get("text") or "Агент вернул пустой ответ."
+            if not isinstance(res, dict) or res.get("mock") is True or res.get("ok") is False:
+                raise RuntimeError("XASS AI не подтвердил выполнение запроса")
+            reply_value = res.get("response") or res.get("text")
+            if not isinstance(reply_value, str) or not reply_value.strip():
+                raise RuntimeError("XASS AI не подтвердил непустой ответ")
+            reply_content = reply_value.strip()
             tokens = res.get("tokens_used", 0)
-            is_mock = res.get("mock", False)
 
             footer_items = [f"Сессия: `{session_id}`"]
             if tokens:
                 footer_items.append(f"Токены: {tokens}")
-            if is_mock:
-                footer_items.append("⚠️ _(Fallback/Offline mode)_")
 
             footer = " • ".join(footer_items)
-            header = "🤖 *Hermes Agent:*"
+            header = "🤖 *XASS AI:*"
             kb = {
                 "inline_keyboard": [
                     [
@@ -5225,14 +5289,12 @@ class TelegramUpdateHandler:
             }
             await self._send_formatted_hermes_reply(chat_id, header, reply_content, footer, reply_markup=kb)
         except Exception as exc:
-            logger.exception("Hermes command error: %s", exc)
+            logger.exception("XASS AI command error: %s", exc)
             err_msg = (
-                "⚠️ *Hermes Agent недоступен или перегружен*\n\n"
+                "⚠️ *Интерактивный канал XASS AI недоступен*\n\n"
                 f"Ошибка: `{escape(str(exc))}`\n\n"
-                "💡 *Рекомендации:*\n"
-                "1. Проверьте запущен ли сервис Hermes: `/hermes_status`\n"
-                "2. Создайте новую сессию: `/hermes_new`\n"
-                f"3. Убедитесь, что сервер доступен по адресу: `{hermes.url}`"
+                "`/ai_status` проверяет только локальный runtime на хосте backend.\n"
+                "Без утверждённого WebSocket-токена и phone-to-PC транспорта запрос не выполняется."
             )
             await self._safe_send(chat_id, err_msg, reply_markup=self._hermes_main_keyboard(), parse_mode="Markdown")
 
@@ -5244,47 +5306,56 @@ class TelegramUpdateHandler:
         user_id: int | None,
         message_id: int | None = None,
     ) -> None:
+        if not await self._require_xass_ai_owner(chat_id, user_id, message_id):
+            return
         hermes = self._get_hermes_service()
         t0 = asyncio.get_event_loop().time()
         try:
             status = await hermes.get_status()
             latency_ms = round((asyncio.get_event_loop().time() - t0) * 1000, 1)
         except Exception as exc:
-            logger.warning("Error fetching Hermes status: %s", exc)
+            logger.warning("Error fetching XASS AI status: %s", exc)
             latency_ms = round((asyncio.get_event_loop().time() - t0) * 1000, 1)
             status = {
                 "online": False,
                 "enabled": hermes.enabled,
-                "version": "offline",
-                "active_model": "none",
+                "version": "",
+                "active_model": "",
                 "session_count": 0,
                 "details": str(exc),
             }
 
-        is_online = bool(status.get("online", False) or status.get("available", False))
-        status_badge = "🟢 В СЕТИ" if is_online else "🔴 ОФЛАЙН (Fallback)"
-        model = status.get("active_model") or status.get("model") or "hermes-3-llama-3.1-8b"
+        is_online = status.get("online") is True or status.get("available") is True
+        status_badge = "🟢 RUNTIME ПРОВЕРЕН" if is_online else "🔴 ОФЛАЙН"
+        runtime_model = status.get("active_model") or status.get("model")
+        model = "XASS AI" if runtime_model else "не сообщена"
         session_count = status.get("session_count", 0)
-        version = status.get("version", "v0.4.0")
-        uid = int(user_id or 0)
+        version = status.get("version") or "не сообщена"
+        uid = int(user_id)
         curr_session = self.hermes_active_sessions.get(uid, "не выбрана")
         latency_val = status.get("latency_ms") if status.get("latency_ms") is not None else latency_ms
 
         text = (
-            "🤖 *Статус Hermes Agent AI*\n"
+            "🤖 *Статус XASS AI*\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             f"Состояние: *{status_badge}*\n"
             f"Активная модель: `{model}`\n"
             f"Всего сессий: *{session_count}*\n"
             f"Задержка (latency): `{latency_val} мс`\n"
-            f"URL агента: `{hermes.url}`\n"
+            f"URL на хосте backend: `{hermes.url}`\n"
             f"Версия агента: `{version}`\n"
             f"Текущая сессия чата: `{curr_session}`\n"
         )
-        if not is_online:
+        if is_online:
             text += (
-                "\n_ℹ️ Сервер недоступен, запросы обрабатываются локальным fallback-адаптером._\n"
-                "_Для подключения агента запустите Hermes на 8787 или настройте HERMES_URL._"
+                "\n_ℹ️ Health-проверка успешна, но интерактивный канал backend/телефон "
+                "не подключён без process-lifetime WebSocket-токена._"
+            )
+        else:
+            text += (
+                "\n_ℹ️ Локальный XASS AI на хосте backend недоступен; запросы не выполняются._\n"
+                "_Запустите локальный runtime на 9119 или исправьте локальный URL XASS AI. "
+                "Настройка телефона сама по себе не подключает AI на ПК._"
             )
 
         kb = {
@@ -5312,21 +5383,30 @@ class TelegramUpdateHandler:
         user_id: int | None,
         message_id: int | None = None,
     ) -> None:
+        if not await self._require_xass_ai_owner(chat_id, user_id, message_id):
+            return
         hermes = self._get_hermes_service()
-        uid = int(user_id or 0)
+        uid = int(user_id)
         active_sid = self.hermes_active_sessions.get(uid)
+        owned_ids = self._owned_xass_ai_session_ids(uid)
+        if active_sid not in owned_ids:
+            self.hermes_active_sessions.pop(uid, None)
+            active_sid = None
+        load_error: str | None = None
         try:
-            sessions = await hermes.list_sessions()
+            listed_sessions = await hermes.list_sessions()
+            sessions = [
+                item
+                for item in listed_sessions
+                if str(item.get("id") or "").strip() in owned_ids
+            ]
         except Exception as exc:
-            logger.warning("Could not list Hermes sessions: %s", exc)
+            logger.warning("Could not list XASS AI sessions: %s", exc)
             sessions = []
-
-        if not active_sid and sessions:
-            active_sid = sessions[0].get("id")
-            self.hermes_active_sessions[uid] = active_sid
+            load_error = str(exc)
 
         lines = [
-            "📋 *Сессии диалогов Hermes Agent*",
+            "📋 *Сессии диалогов XASS AI*",
             "━━━━━━━━━━━━━━━━━━━━━",
         ]
         if active_sid:
@@ -5334,8 +5414,10 @@ class TelegramUpdateHandler:
         else:
             lines.append("Активная сессия не выбрана.\n")
 
-        if not sessions:
-            lines.append("Сессий пока нет. Начните новый диалог с помощью /hermes_new.")
+        if load_error:
+            lines.append(f"⚠️ Список недоступен: `{escape(load_error)}`")
+        elif not sessions:
+            lines.append("Сессий пока нет. Начните новый диалог с помощью /ai_new.")
         else:
             for idx, s in enumerate(sessions[:8], start=1):
                 sid = s.get("id") or ""
@@ -5344,7 +5426,7 @@ class TelegramUpdateHandler:
                 marker = "⭐ " if sid == active_sid else f"{idx}. "
                 lines.append(f"{marker}*{title}*\n   ID: `{sid}` • Сообщений: {count}")
 
-        lines.append("\n_Нажмите кнопку ниже, чтобы переключить сессию, или отправьте:_ `/hermes_session <id>`")
+        lines.append("\n_Нажмите кнопку ниже, чтобы переключить сессию, или отправьте:_ `/ai_session <id>`")
         kb = self._hermes_sessions_keyboard(sessions, active_sid)
         await self._safe_edit_or_send(chat_id, message_id, "\n".join(lines), reply_markup=kb, parse_mode="Markdown")
 
@@ -5357,22 +5439,42 @@ class TelegramUpdateHandler:
         text: str,
         message_id: int | None = None,
     ) -> None:
+        if not await self._require_xass_ai_owner(chat_id, user_id, message_id):
+            return
         parts = text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            await self._safe_send(chat_id, "Укажите ID сессии: `/hermes_session <id>`", parse_mode="Markdown")
+            await self._safe_send(chat_id, "Укажите ID сессии: `/ai_session <id>`", parse_mode="Markdown")
             return
         target_id = parts[1].strip()
-        uid = int(user_id or 0)
+        uid = int(user_id)
+        if target_id not in self._owned_xass_ai_session_ids(uid):
+            await self._safe_send(chat_id, "Сессия XASS AI с таким ID недоступна.")
+            return
+        try:
+            available_ids = {
+                str(item.get("id") or "")
+                for item in await self._get_hermes_service().list_sessions()
+            }
+        except Exception as exc:
+            await self._safe_send(
+                chat_id,
+                f"⚠️ Не удалось проверить сессию XASS AI: `{escape(str(exc))}`",
+                parse_mode="Markdown",
+            )
+            return
+        if target_id not in available_ids:
+            await self._safe_send(chat_id, "Сессия XASS AI с таким ID не найдена.")
+            return
         self.hermes_active_sessions[uid] = target_id
         msg = (
             f"✅ *Активная сессия переключена!*\n\n"
             f"ID сессии: `{target_id}`\n\n"
-            "Все последующие команды `/hermes <запрос>` будут направляться в эту сессию."
+            "Все последующие команды `/ai <запрос>` будут направляться в эту сессию."
         )
         kb = {
             "inline_keyboard": [
                 [{"text": "📋 Список сессий", "callback_data": "hermes:sessions"}],
-                [{"text": "🤖 Меню Hermes", "callback_data": "panel:hermes"}],
+                [{"text": "🤖 Меню XASS AI", "callback_data": "panel:hermes"}],
             ]
         }
         await self._safe_edit_or_send(chat_id, message_id, msg, reply_markup=kb, parse_mode="Markdown")
@@ -5385,30 +5487,36 @@ class TelegramUpdateHandler:
         user_id: int | None,
         message_id: int | None = None,
     ) -> None:
+        if not await self._require_xass_ai_owner(chat_id, user_id, message_id):
+            return
         hermes = self._get_hermes_service()
-        uid = int(user_id or 0)
+        uid = int(user_id)
         now_str = datetime.now(timezone.utc).strftime("%d.%m %H:%M")
         title = f"Telegram Чат {now_str}"
         try:
             new_sess = await hermes.create_session(title=title)
-            new_id = new_sess.get("id") or f"hermes-{secrets.token_hex(4)}"
-            self.hermes_active_sessions[uid] = new_id
+            if not isinstance(new_sess, dict) or new_sess.get("mock") is True or new_sess.get("ok") is False:
+                raise RuntimeError("XASS AI не подтвердил создание сессии")
+            new_id = str(new_sess.get("id") or "").strip()
+            if not new_id:
+                raise RuntimeError("XASS AI не вернул ID сессии")
+            self._remember_xass_ai_session(uid, new_id)
             text = (
-                "✨ *Новая сессия Hermes Agent создана!*\n"
+                "✨ *Новая сессия XASS AI создана!*\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 f"• ID сессии: `{new_id}`\n"
                 f"• Название: *{title}*\n\n"
                 "Контекст диалога очищен. Теперь вы можете задавать вопросы:\n"
-                "`/hermes <ваш запрос>`"
+                "`/ai <ваш запрос>`"
             )
         except Exception as exc:
-            logger.exception("Failed to create new Hermes session: %s", exc)
-            text = f"⚠️ Не удалось создать сессию Hermes: `{exc}`"
+            logger.exception("Failed to create new XASS AI session: %s", exc)
+            text = f"⚠️ Не удалось создать сессию XASS AI: `{escape(str(exc))}`"
 
         kb = {
             "inline_keyboard": [
                 [{"text": "📋 К списку сессий", "callback_data": "hermes:sessions"}],
-                [{"text": "🤖 Меню Hermes", "callback_data": "panel:hermes"}],
+                [{"text": "🤖 Меню XASS AI", "callback_data": "panel:hermes"}],
             ]
         }
         await self._safe_edit_or_send(chat_id, message_id, text, reply_markup=kb, parse_mode="Markdown")
@@ -5508,15 +5616,19 @@ class TelegramUpdateHandler:
         if chat_id is None:
             return
 
+        if data.startswith("hermes:") or data == "panel:hermes":
+            if not await self._require_xass_ai_owner(chat_id, user_id, message_id):
+                return
+
         if data in ("panel:hermes", "hermes:menu"):
             text = (
-                "🤖 *Hermes Agent AI*\n"
+                "🤖 *XASS AI*\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
-                "Центр управления интеллектуальным агентом Hermes.\n\n"
-                "• Отправить запрос: `/hermes <промпт>`\n"
-                "• Статус и задержка: `/hermes_status`\n"
-                "• Сессии диалогов: `/hermes_sessions`\n"
-                "• Новая сессия: `/hermes_new`"
+                "Центр управления локальным интеллектуальным агентом XASS.\n\n"
+                "• Отправить запрос: `/ai <промпт>`\n"
+                "• Статус и задержка: `/ai_status`\n"
+                "• Сессии диалогов: `/ai_sessions`\n"
+                "• Новая сессия: `/ai_new`"
             )
             await self._safe_edit_or_send(
                 chat_id,

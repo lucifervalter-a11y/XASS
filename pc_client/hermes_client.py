@@ -1,94 +1,189 @@
-"""Client library for local Hermes Agent AI integration.
+"""Fail-closed client for the locally installed XASS AI runtime.
 
-Communicates with the local Hermes daemon (default: http://127.0.0.1:8787).
-Supports health/status checks, prompt and task dispatch, and WebUI navigation.
+The supported runtime exposes a read-only health document over HTTP. Interactive
+prompts use an authenticated WebSocket session whose process-lifetime token is
+not available to this desktop client. This module therefore never guesses REST
+or OpenAI-compatible endpoints and never reports an unverified prompt as sent.
 """
 from __future__ import annotations
 
+import ipaddress
+import json
+import math
 import time
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
+
 import httpx
 
-DEFAULT_HERMES_URL = "http://127.0.0.1:8787"
+
+DEFAULT_HERMES_URL = "http://127.0.0.1:9119"
+HEALTH_PATH = "/api/health"
+SUPPORTED_HERMES_VERSION = "0.22.2"
+SUPPORTED_HERMES_COMMIT = "d923a5eb487a17c0a68801bba9ef0f56c81040a8"
+MAX_HEALTH_BYTES = 64 * 1024
+_HEALTH_KEYS = frozenset({"ok", "version", "displayVersion", "commit", "auth_required"})
 
 
 def normalize_hermes_url(candidate: str | None) -> str:
-    """Normalize and validate local/remote Hermes instance URL."""
+    """Return a canonical HTTP origin for a loopback-only XASS AI daemon."""
     raw = str(candidate or "").strip()
     if not raw:
         return DEFAULT_HERMES_URL
-    if not (raw.startswith("http://") or raw.startswith("https://")):
+    if "://" not in raw:
         raw = f"http://{raw}"
-    parts = urlsplit(raw)
-    scheme = parts.scheme.lower() or "http"
-    netloc = parts.netloc.rstrip("/")
-    if not netloc:
-        return DEFAULT_HERMES_URL
-    return f"{scheme}://{netloc}"
+    try:
+        parts = urlsplit(raw)
+        port = 9119 if parts.port is None else parts.port
+    except ValueError as exc:
+        raise ValueError("Некорректный локальный адрес XASS AI") from exc
+    if parts.scheme.lower() != "http" or parts.username is not None or parts.password is not None:
+        raise ValueError("XASS AI поддерживает только локальный HTTP-адрес")
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        raise ValueError("В адресе XASS AI нужен только локальный origin без пути")
+    hostname = (parts.hostname or "").rstrip(".").casefold()
+    if not hostname:
+        raise ValueError("Не указан локальный адрес XASS AI")
+    if hostname == "localhost":
+        canonical_host = "localhost"
+    else:
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError as exc:
+            raise ValueError("XASS AI разрешён только на loopback-адресе") from exc
+        if not address.is_loopback:
+            raise ValueError("XASS AI разрешён только на loopback-адресе")
+        canonical_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    if not 1 <= port <= 65535:
+        raise ValueError("Некорректный локальный порт XASS AI")
+    return f"http://{canonical_host}:{port}"
 
 
 def get_hermes_webui_url(config: dict[str, Any] | None = None) -> str:
-    """Return URL for the Hermes WebUI interface."""
+    """Return the validated loopback URL for the XASS AI Web UI."""
     cfg = config or {}
     custom = cfg.get("hermes_webui_url") or cfg.get("hermes_url")
     return normalize_hermes_url(custom)
 
 
-def check_hermes_status(hermes_url: str = DEFAULT_HERMES_URL, timeout: float = 2.5) -> dict[str, Any]:
-    """Check connectivity and state of the local Hermes daemon."""
-    base_url = normalize_hermes_url(hermes_url)
-    started = time.perf_counter()
-
-    # Try common health check endpoints
-    probe_paths = ("/health", "/status", "/api/status", "/")
-    last_error: str | None = None
-
-    for path in probe_paths:
-        target = f"{base_url}{path}"
-        try:
-            with httpx.Client(timeout=timeout, trust_env=False) as client:
-                response = client.get(target, headers={"Accept": "application/json, text/plain, */*"})
-                latency_ms = (time.perf_counter() - started) * 1000
-
-                # Any 2xx or 3xx or 4xx (except transport failure) indicates the HTTP service is alive
-                if response.status_code < 500:
-                    details: dict[str, Any] = {}
-                    try:
-                        parsed = response.json()
-                        if isinstance(parsed, dict):
-                            details = parsed
-                    except Exception:
-                        details = {"content_type": response.headers.get("content-type", "")}
-
-                    return {
-                        "online": True,
-                        "status": "online",
-                        "status_label": "В сети",
-                        "url": base_url,
-                        "endpoint": path,
-                        "status_code": response.status_code,
-                        "latency_ms": round(latency_ms, 1),
-                        "details": details,
-                    }
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            last_error = f"Соединение отклонено: {exc}"
-            # No point in probing other paths if the port itself is not reachable
-            break
-        except httpx.HTTPError as exc:
-            last_error = str(exc)
-            continue
-        except Exception as exc:
-            last_error = str(exc)
-            break
-
-    return {
+def _offline(
+    base_url: str,
+    error: str,
+    *,
+    code: str,
+    status_code: int | None = None,
+    latency_ms: float = 0.0,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "online": False,
+        "ok": False,
         "status": "offline",
         "status_label": "Не в сети",
         "url": base_url,
-        "error": last_error or "Служба не отвечает",
-        "latency_ms": 0.0,
+        "endpoint": HEALTH_PATH,
+        "error": error,
+        "error_code": code,
+        "latency_ms": round(latency_ms, 1),
+    }
+    if status_code is not None:
+        result["status_code"] = status_code
+    return result
+
+
+def _validated_health(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or frozenset(payload) != _HEALTH_KEYS:
+        return None
+    if payload.get("ok") is not True or payload.get("version") != SUPPORTED_HERMES_VERSION:
+        return None
+    display_version = payload.get("displayVersion")
+    commit = payload.get("commit")
+    auth_required = payload.get("auth_required")
+    if (
+        not isinstance(display_version, str)
+        or not display_version.strip()
+        or not isinstance(commit, str)
+        or not commit.strip()
+        or commit.strip() != SUPPORTED_HERMES_COMMIT
+        or len(commit) > 128
+        or not isinstance(auth_required, bool)
+    ):
+        return None
+    return {
+        "version": SUPPORTED_HERMES_VERSION,
+        "display_version": display_version.strip(),
+        "commit": commit.strip(),
+        "auth_required": auth_required,
+    }
+
+
+def check_hermes_status(hermes_url: str = DEFAULT_HERMES_URL, timeout: float = 2.5) -> dict[str, Any]:
+    """Verify the exact XASS AI 0.22.2 health contract on loopback."""
+    try:
+        base_url = normalize_hermes_url(hermes_url)
+    except ValueError as exc:
+        return _offline(DEFAULT_HERMES_URL, str(exc), code="invalid_url")
+    try:
+        requested_timeout = float(timeout)
+    except (TypeError, ValueError):
+        requested_timeout = 2.5
+    if not math.isfinite(requested_timeout):
+        requested_timeout = 2.5
+    requested_timeout = min(10.0, max(0.1, requested_timeout))
+    started = time.perf_counter()
+    body = bytearray()
+    status_code = 0
+    try:
+        with httpx.Client(timeout=requested_timeout, trust_env=False, follow_redirects=False) as client:
+            with client.stream(
+                "GET",
+                f"{base_url}{HEALTH_PATH}",
+                headers={"Accept": "application/json"},
+            ) as response:
+                status_code = response.status_code
+                latency_ms = (time.perf_counter() - started) * 1000
+                if status_code != 200:
+                    return _offline(
+                        base_url,
+                        f"XASS AI не прошёл проверку состояния (HTTP {status_code})",
+                        code="http_status",
+                        status_code=status_code,
+                        latency_ms=latency_ms,
+                    )
+                for chunk in response.iter_bytes():
+                    if len(body) + len(chunk) > MAX_HEALTH_BYTES:
+                        return _offline(
+                            base_url,
+                            "Ответ локальной службы XASS AI превышает допустимый размер",
+                            code="health_too_large",
+                            status_code=status_code,
+                            latency_ms=latency_ms,
+                        )
+                    body.extend(chunk)
+    except httpx.HTTPError:
+        return _offline(base_url, "Локальная служба XASS AI не отвечает", code="transport_error")
+    latency_ms = (time.perf_counter() - started) * 1000
+    try:
+        health = _validated_health(json.loads(bytes(body).decode("utf-8")))
+    except (UnicodeError, ValueError, TypeError):
+        health = None
+    if health is None:
+        return _offline(
+            base_url,
+            f"Обнаружена неподдерживаемая локальная служба; требуется XASS AI {SUPPORTED_HERMES_VERSION}",
+            code="incompatible_health",
+            status_code=status_code,
+            latency_ms=latency_ms,
+        )
+    return {
+        "online": True,
+        "ok": True,
+        "status": "online",
+        "status_label": "В сети",
+        "url": base_url,
+        "endpoint": HEALTH_PATH,
+        "status_code": status_code,
+        "latency_ms": round(latency_ms, 1),
+        "details": health,
     }
 
 
@@ -96,137 +191,54 @@ def send_hermes_prompt(
     prompt: str,
     hermes_url: str = DEFAULT_HERMES_URL,
     timeout: float = 60.0,
-    **kwargs: Any,
 ) -> dict[str, Any]:
-    """Forward a prompt or task to the local Hermes daemon and return response."""
-    base_url = normalize_hermes_url(hermes_url)
+    """Fail closed until a verified WebSocket session token is available."""
     prompt_text = str(prompt or "").strip()
+    try:
+        base_url = normalize_hermes_url(hermes_url)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "online": False,
+            "error": str(exc),
+            "error_code": "invalid_url",
+            "prompt": prompt_text,
+            "url": DEFAULT_HERMES_URL,
+        }
     if not prompt_text:
         return {
             "ok": False,
-            "online": True,
-            "error": "Запрос не может быть пустым",
+            "online": False,
+            "error": "Введите запрос для XASS AI",
+            "error_code": "empty_prompt",
             "prompt": "",
             "url": base_url,
         }
-
-    # Verify daemon is reachable first
-    status = check_hermes_status(base_url, timeout=min(3.0, timeout))
+    try:
+        prompt_timeout = float(timeout)
+    except (TypeError, ValueError):
+        prompt_timeout = 60.0
+    if not math.isfinite(prompt_timeout):
+        prompt_timeout = 60.0
+    status = check_hermes_status(base_url, timeout=min(3.0, max(0.1, prompt_timeout)))
     if not status.get("online"):
         return {
             "ok": False,
             "online": False,
-            "error": f"Hermes Agent AI недоступен на {base_url} ({status.get('error', 'offline')})",
+            "error": status.get("error") or "Локальная служба XASS AI недоступна",
+            "error_code": status.get("error_code") or "service_unavailable",
             "prompt": prompt_text,
             "url": base_url,
         }
-
-    started = time.perf_counter()
-
-    # Candidate endpoints for Hermes AI agent dispatch:
-    # 1) /api/prompt (custom agent daemon)
-    # 2) /prompt
-    # 3) /v1/chat/completions (OpenAI compatible)
-    # 4) /run (generic task runner)
-    attempts = [
-        (
-            f"{base_url}/api/prompt",
-            {"prompt": prompt_text, **kwargs},
-        ),
-        (
-            f"{base_url}/prompt",
-            {"prompt": prompt_text, **kwargs},
-        ),
-        (
-            f"{base_url}/v1/chat/completions",
-            {
-                "model": kwargs.get("model", "hermes"),
-                "messages": [{"role": "user", "content": prompt_text}],
-                **{k: v for k, v in kwargs.items() if k != "model"},
-            },
-        ),
-        (
-            f"{base_url}/run",
-            {"input": prompt_text, "task": prompt_text, **kwargs},
-        ),
-    ]
-
-    last_error: str | None = None
-    last_response: httpx.Response | None = None
-
-    for target_url, payload in attempts:
-        try:
-            with httpx.Client(timeout=timeout, trust_env=False) as client:
-                response = client.post(
-                    target_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json", "Accept": "application/json, text/plain, */*"},
-                )
-                last_response = response
-
-                if response.status_code == 404:
-                    # Endpoint doesn't exist on this Hermes server, try next candidate
-                    continue
-
-                if response.is_success:
-                    latency_ms = (time.perf_counter() - started) * 1000
-                    response_text = ""
-                    raw_data: Any = None
-
-                    try:
-                        raw_data = response.json()
-                        if isinstance(raw_data, dict):
-                            # OpenAI format
-                            choices = raw_data.get("choices")
-                            if isinstance(choices, list) and choices:
-                                msg = choices[0].get("message") or {}
-                                response_text = str(msg.get("content") or choices[0].get("text") or "")
-                            elif "response" in raw_data:
-                                response_text = str(raw_data["response"])
-                            elif "output" in raw_data:
-                                response_text = str(raw_data["output"])
-                            elif "result" in raw_data:
-                                response_text = str(raw_data["result"])
-                            elif "text" in raw_data:
-                                response_text = str(raw_data["text"])
-                            else:
-                                response_text = str(raw_data)
-                        elif isinstance(raw_data, str):
-                            response_text = raw_data
-                        else:
-                            response_text = str(raw_data)
-                    except Exception:
-                        response_text = response.text
-
-                    return {
-                        "ok": True,
-                        "online": True,
-                        "prompt": prompt_text,
-                        "response": response_text.strip(),
-                        "url": base_url,
-                        "endpoint": target_url,
-                        "status_code": response.status_code,
-                        "latency_ms": round(latency_ms, 1),
-                        "details": raw_data,
-                    }
-                else:
-                    last_error = f"Ошибка HTTP {response.status_code}: {response.text[:200]}"
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            return {
-                "ok": False,
-                "online": False,
-                "error": f"Потеряна связь с Hermes Agent AI: {exc}",
-                "prompt": prompt_text,
-                "url": base_url,
-            }
-        except Exception as exc:
-            last_error = str(exc)
-
     return {
         "ok": False,
         "online": True,
-        "error": last_error or "Ни один из стандартных эндпоинтов Hermes (/api/prompt, /v1/chat/completions) не ответил успешно",
+        "supported": False,
+        "error": (
+            "XASS AI работает, но защищённый канал выполнения "
+            "сейчас недоступен в этом клиенте."
+        ),
+        "error_code": "websocket_token_unavailable",
         "prompt": prompt_text,
         "url": base_url,
-        "status_code": last_response.status_code if last_response else None,
     }

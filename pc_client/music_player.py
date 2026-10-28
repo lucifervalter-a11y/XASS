@@ -36,6 +36,7 @@ MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 MAX_DOWNLOAD_SECONDS = 120
 MAX_SERVER_ARTWORK_BYTES = 512 * 1024
 SAMPLE_RATE = 44100
+DEVICE_CLOSE_WAIT_SECONDS = 1.0
 
 
 class MusicError(ValueError):
@@ -615,6 +616,9 @@ class MusicPlayer:
         self._pending = None
         self._device = None
         self._stream = None
+        self._device_close_event = threading.Event()
+        self._device_close_event.set()
+        self._device_close_thread: threading.Thread | None = None
         self._progress = {"position": 0.0, "ended": False, "error": ""}
         self._path: Path | None = None
         self._ephemeral = False
@@ -682,14 +686,14 @@ class MusicPlayer:
                 if self._progress["error"]:
                     self._error = self._progress["error"]
                     self._state = "error"
-                    self._release_device()
+                    self._release_device_async()
                 elif self._progress["ended"]:
                     self._state = "ended"
-                    self._release_device()
+                    self._release_device_async()
                     self._release_ownership()
                 elif self._device is not None and not self._device.running:
                     self._state, self._error = "error", "Аудиовыход отключён. Выберите доступное устройство"
-                    self._release_device()
+                    self._release_device_async()
             return {"state": self._state, "track_id": self._track_id, "output_id": self._output_id,
                     "position_sec": round(min(self._duration, self._progress["position"])
                         if self._duration else self._progress["position"], 2),
@@ -704,13 +708,59 @@ class MusicPlayer:
         with self._lock:
             return {"lyrics": self._lyrics, "artwork": self._artwork}
 
+    def _take_playback_resources(self):
+        device, self._device = self._device, None
+        stream, self._stream = self._stream, None
+        return device, stream
+
+    @staticmethod
+    def _close_playback_resources(device, stream) -> None:
+        try:
+            if device is not None:
+                device.close()
+        except Exception:
+            pass
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
     def _release_device(self):
-        if self._device is not None:
-            device, self._device = self._device, None
-            device.close()
-        if self._stream is not None:
-            stream, self._stream = self._stream, None
-            stream.close()
+        self._close_playback_resources(*self._take_playback_resources())
+
+    def _release_device_async(self) -> None:
+        device, stream = self._take_playback_resources()
+        if device is None and stream is None:
+            return
+        completed = threading.Event()
+
+        def close_resources() -> None:
+            try:
+                self._close_playback_resources(device, stream)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(
+            target=close_resources,
+            name="xass-music-device-close",
+            daemon=True,
+        )
+        self._device_close_event = completed
+        self._device_close_thread = worker
+        worker.start()
+
+    def _wait_for_device_close(self) -> None:
+        completed = self._device_close_event
+        if completed.is_set():
+            return
+        # Tk normally owns the Python main thread.  It must never wait for a
+        # native WASAPI close; desktop playback opens are dispatched to the
+        # local command pump instead.  Fail closed if a legacy caller tries.
+        if threading.current_thread() is threading.main_thread():
+            raise MusicError("Аудиоустройство ещё освобождается. Повторите попытку")
+        if not completed.wait(DEVICE_CLOSE_WAIT_SECONDS):
+            raise MusicError("Аудиоустройство не успело освободиться. Повторите попытку")
 
     def _discard_track(self):
         self._release_device()
@@ -747,6 +797,7 @@ class MusicPlayer:
             decoder.close()
 
     def _start_at(self, position: float):
+        self._wait_for_device_close()
         self._claim_ownership()
         self._release_device()
         try:
@@ -767,6 +818,7 @@ class MusicPlayer:
             self._device.start(stream)
         except Exception as exc:
             self._release_device()
+            self._release_ownership()
             self._state = "error"
             self._error = str(exc) if isinstance(exc, MusicError) else "Не удалось открыть аудиовыход Windows"
             raise MusicError(self._error) from None

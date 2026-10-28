@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     vk_now_playing_refresh_minutes: int = 2
 
     hermes_url: str = Field(
-        default="http://127.0.0.1:8787",
+        default="http://127.0.0.1:9119",
         validation_alias=AliasChoices("hermes_url", "hermes_webui_url"),
     )
     hermes_api_key: str = ""
@@ -240,9 +240,9 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_hermes_url(cls, value: Any) -> str:
         if value is None:
-            return "http://127.0.0.1:8787"
+            return "http://127.0.0.1:9119"
         text = str(value).strip().rstrip("/")
-        return text or "http://127.0.0.1:8787"
+        return text or "http://127.0.0.1:9119"
 
     @field_validator("hermes_api_key", mode="before")
     @classmethod

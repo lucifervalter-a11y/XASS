@@ -177,6 +177,147 @@ class RenderWorkTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_archive_shell_is_ready_while_status_and_sqlite_run_off_tk(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app.root = self.root
+        app.content = tk.Frame(self.root, bg=desktop_app.BG)
+        app.content.pack(fill="both", expand=True)
+        app.config = {"archive_folder": str(Path(tempfile.gettempdir()) / "xass-archive-perf")}
+        app.current_view = "archive"
+        app._view_revision = 9
+        app._closing = False
+        app._archive_moving = False
+        app._archive_cancel = threading.Event()
+        app._archive_poll = None
+        app._archive_render_after = None
+        app.archive_state_var = tk.StringVar(self.root)
+        app._header = lambda title, subtitle, kicker="": tk.Label(app.content, text=title).pack()
+        app._card = lambda parent, padding=0: tk.Frame(parent, bg=desktop_app.CARD, padx=padding, pady=padding)
+        app._button = lambda parent, text, command, kind="secondary": tk.Button(parent, text=text, command=command)
+        app._flow_actions = lambda _parent: None
+        started, release = threading.Event(), threading.Event()
+        worker_ids = []
+
+        def slow_status(_config):
+            worker_ids.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+            return {"folder": "archive", "cursor": 1, "database_size": 0, "free_bytes": 0}
+
+        try:
+            with patch.object(desktop_app, "archive_status", side_effect=slow_status), \
+                    patch.object(desktop_app, "conversation_rows", return_value=[]):
+                app._build_archive()
+                self.assertTrue(started.wait(1))
+                self.assertNotEqual(worker_ids, [threading.get_ident()])
+                self.root.update_idletasks()
+                self.assertIn("Загрузка", app.archive_state_var.get())
+                app.current_view = "settings"
+                app._view_revision += 1
+                release.set()
+                self.assertTrue(app._archive_load_job.done.wait(2))
+                self.root.update()
+                self.assertIn("Загрузка", app.archive_state_var.get())
+        finally:
+            release.set()
+
+    def test_archive_rows_render_in_bounded_batches(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app.root = self.root
+        app.current_view = "archive"
+        app._view_revision = 3
+        app._closing = False
+        app._archive_render_after = None
+        app.archive_state_var = tk.StringVar(self.root)
+        app._card = lambda parent, padding=0: tk.Frame(parent, bg=desktop_app.CARD, padx=padding, pady=padding)
+        app._style_scrolled_text = lambda _widget: None
+        body = tk.Frame(self.root, bg=desktop_app.BG)
+        body.pack()
+        rows = [{"id": index, "chat_id": 1, "text_content": f"row-{index}"} for index in range(100)]
+        status = {"folder": "archive", "cursor": 100, "database_size": 0, "free_bytes": 0}
+
+        app._render_archive_snapshot(body, 3, status, rows, "")
+        initial = app.archive_messages.text.get("1.0", "end")
+        self.assertEqual(initial.count("row-"), 32)
+        deadline = time.monotonic() + 2
+        while app.archive_messages.text.get("1.0", "end").count("row-") < 100 and time.monotonic() < deadline:
+            self.root.update()
+        self.assertEqual(app.archive_messages.text.get("1.0", "end").count("row-"), 100)
+
+    def test_archive_cleanup_runs_off_tk_and_rejects_duplicate_start(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app.root = self.root
+        app.config = {}
+        app.current_view = "archive"
+        app._view_revision = 4
+        app._closing = False
+        app._archive_cleanup_running = False
+        app._archive_cleanup_generation = 0
+        app._archive_cleanup_poll = None
+        app.archive_state_var = tk.StringVar(self.root)
+        app._log = Mock()
+        app.show_view = Mock()
+        started, release = threading.Event(), threading.Event()
+        worker_ids = []
+
+        def slow_cleanup(_config, *, force=False):
+            worker_ids.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+            return {"removed_files": 2, "freed_bytes": 30}
+
+        try:
+            with patch.object(desktop_app.messagebox, "askyesno", return_value=True) as confirm, \
+                    patch.object(desktop_app, "cleanup_archive", side_effect=slow_cleanup):
+                app.cleanup_archive_files()
+                self.assertTrue(started.wait(1))
+                app.cleanup_archive_files()
+                self.assertEqual(confirm.call_count, 1)
+                self.assertNotEqual(worker_ids, [threading.get_ident()])
+                release.set()
+                self.assertTrue(app._archive_cleanup_job.done.wait(2))
+                deadline = time.monotonic() + 2
+                while app._archive_cleanup_running and time.monotonic() < deadline:
+                    self.root.update()
+                self.assertFalse(app._archive_cleanup_running)
+                app._log.assert_called_once()
+                app.show_view.assert_called_once_with("archive")
+        finally:
+            release.set()
+
+    def test_log_drain_is_bounded_and_home_refresh_is_coalesced(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app.root = self.root
+        app.preview = True
+        app._closing = False
+        app.current_view = "overview"
+        app.log_queue = queue.Queue()
+        app.history = []
+        app._home_events_refresh_after = None
+        app._render_home_events = Mock()
+        for index in range(200):
+            app.log_queue.put(f"line-{index}")
+
+        app._drain_logs()
+
+        self.assertEqual(len(app.history), desktop_app.LOG_DRAIN_BATCH)
+        self.assertEqual(app.log_queue.qsize(), 200 - desktop_app.LOG_DRAIN_BATCH)
+        self.root.update_idletasks()
+        app._render_home_events.assert_called_once()
+
+    def test_server_theme_alias_does_not_trigger_full_rebuild(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app.sync_server_theme_var = tk.BooleanVar(self.root, value=True)
+        app.theme_var = tk.StringVar(self.root, value=desktop_app.THEME_CYBER)
+        app.set_theme = Mock()
+
+        app._sync_server_theme({"server_theme": "cyberpunk"})
+        app.set_theme.assert_not_called()
+        app._sync_server_theme({"server_theme": "not-a-theme"})
+        app.set_theme.assert_not_called()
+        app._sync_server_theme({"server_theme": "matrix"})
+        app.set_theme.assert_called_once_with(desktop_app.THEME_MATRIX, save=True)
+
     @staticmethod
     def _label_texts(widget):
         rows = []
@@ -194,6 +335,35 @@ class SystemSamplingTests(unittest.TestCase):
         app._metrics_results = queue.Queue(maxsize=1)
         app.root = Mock()
         return app
+
+    def test_log_persistence_and_shutdown_never_wait_on_slow_disk(self):
+        app = desktop_app.XassDesktop.__new__(desktop_app.XassDesktop)
+        app._closing = False
+        app._log_persist_queue = queue.Queue(maxsize=4)
+        entered, release = threading.Event(), threading.Event()
+        writer_ids = []
+
+        def slow_append(_line):
+            writer_ids.append(threading.get_ident())
+            entered.set()
+            release.wait(2)
+
+        with patch.object(desktop_app, "append_log", side_effect=slow_append):
+            writer = threading.Thread(target=app._persist_logs, daemon=True)
+            app._log_persist_thread = writer
+            writer.start()
+            app._queue_persisted_log("line")
+            self.assertTrue(entered.wait(1))
+            started = time.monotonic()
+            app._closing = True
+            app._stop_log_persistence()
+            app._stop_log_persistence()
+            self.assertLess(time.monotonic() - started, 0.1)
+            release.set()
+            writer.join(timeout=1)
+
+        self.assertFalse(writer.is_alive())
+        self.assertNotEqual(writer_ids, [threading.get_ident()])
 
     def test_metrics_are_collected_off_tk_thread_and_never_overlap(self):
         app = self.make_app()

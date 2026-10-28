@@ -6,6 +6,26 @@
  </ResourceDictionary.MergedDictionaries>
   <!-- Mutable shared brushes let open controls update without rebuilding pages.
        Windows contrast colors are applied by MainWindow.Appearance.cs. -->
+  <SolidColorBrush x:Key="XassPageBackgroundBrush" Color="#F3F3F3"/>
+  <SolidColorBrush x:Key="XassCardBackgroundBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="XassHoverBrush" Color="#09000000"/>
+  <SolidColorBrush x:Key="XassBorderBrush" Color="#18000000"/>
+  <SolidColorBrush x:Key="XassSidebarBrush" Color="#F9F9F9"/>
+  <SolidColorBrush x:Key="XassFieldBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="XassWellBrush" Color="#F0F0F0"/>
+  <SolidColorBrush x:Key="XassTextBrush" Color="#1A1A1A"/>
+  <SolidColorBrush x:Key="XassMutedTextBrush" Color="#616161"/>
+  <SolidColorBrush x:Key="XassNavForegroundBrush" Color="#616161"/>
+  <SolidColorBrush x:Key="XassNavActiveBrush" Color="#09000000"/>
+  <SolidColorBrush x:Key="XassNavSelectedBrush" Color="#12000000"/>
+  <SolidColorBrush x:Key="XassNoteBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="XassSidebarCardBrush" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="XassSidebarBorderBrush" Color="#18000000"/>
+  <SolidColorBrush x:Key="XassAccentSoftBrush" Color="#3A86D8"/>
+  <SolidColorBrush x:Key="XassLilacBrush" Color="#8B73A8"/>
+  <SolidColorBrush x:Key="XassSuccessBrush" Color="#0F7B0F"/>
+  <SolidColorBrush x:Key="XassWarningBrush" Color="#9D5D00"/>
+  <SolidColorBrush x:Key="XassErrorBrush" Color="#C42B1C"/>
   <SolidColorBrush x:Key="XassAccentFillBrush" Color="#005FB8"/>
   <SolidColorBrush x:Key="XassAccentForegroundBrush" Color="#FFFFFF"/>
   <SolidColorBrush x:Key="XassAccentHoverBrush" Color="#0056A6"/>
@@ -21,8 +41,8 @@
   <SolidColorBrush x:Key="AccentButtonBorderBrushPointerOver" Color="#FFFFFF"/>
   <SolidColorBrush x:Key="AccentButtonBorderBrushPressed" Color="#FFFFFF"/>
   <Style x:Key="XassCard" TargetType="Border">
-   <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}"/>
-   <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}"/>
+   <Setter Property="Background" Value="{StaticResource XassCardBackgroundBrush}"/>
+   <Setter Property="BorderBrush" Value="{StaticResource XassBorderBrush}"/>
    <Setter Property="BorderThickness" Value="1"/>
    <Setter Property="CornerRadius" Value="16"/>
    <Setter Property="Padding" Value="24"/>
@@ -31,7 +51,7 @@
    <Setter Property="FontSize" Value="11"/>
    <Setter Property="FontWeight" Value="SemiBold"/>
    <Setter Property="CharacterSpacing" Value="140"/>
-   <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}"/>
+   <Setter Property="Foreground" Value="{StaticResource XassMutedTextBrush}"/>
   </Style>
  </ResourceDictionary></Application.Resources>
 </Application>

@@ -47,18 +47,18 @@ from desktop_sections import build_connection, build_updates, build_commands
 try:
     from themes import (
         ALL_THEMES, THEME_CYBER, THEME_TOKYO, THEME_NORDIC, THEME_MATRIX, THEME_CLASSIC,
-        apply_theme_colors, get_theme, resolve_theme_name,
+        THEME_ALIASES, apply_theme_colors, get_theme, resolve_theme_name,
     )
     from hermes_client import (
-        DEFAULT_HERMES_URL, check_hermes_status, get_hermes_webui_url, send_hermes_prompt,
+        DEFAULT_HERMES_URL, check_hermes_status, send_hermes_prompt,
     )
 except ModuleNotFoundError:
     from pc_client.themes import (
         ALL_THEMES, THEME_CYBER, THEME_TOKYO, THEME_NORDIC, THEME_MATRIX, THEME_CLASSIC,
-        apply_theme_colors, get_theme, resolve_theme_name,
+        THEME_ALIASES, apply_theme_colors, get_theme, resolve_theme_name,
     )
     from pc_client.hermes_client import (
-        DEFAULT_HERMES_URL, check_hermes_status, get_hermes_webui_url, send_hermes_prompt,
+        DEFAULT_HERMES_URL, check_hermes_status, send_hermes_prompt,
     )
 
 import psutil
@@ -116,6 +116,9 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parent
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+LOG_DRAIN_BATCH = 64
+LOG_DRAIN_IDLE_MS = 120
+LOG_DRAIN_BACKLOG_MS = 16
 
 
 def miniapp_entry_url(server: str, config: Any) -> str:
@@ -173,6 +176,56 @@ def connection_snapshot(
     if age > max(45, interval * 3 + 15):
         state = "stale"
     return {"state": state, "age": age, "latency_ms": max(0, latency)}
+
+
+class ArchiveSnapshotJob:
+    """Read archive metadata and SQLite rows without blocking Tk."""
+
+    def __init__(self, config: dict[str, Any], *, limit: int = 500) -> None:
+        self.done = threading.Event()
+        self.status: dict[str, Any] = {}
+        self.rows: list[dict[str, Any]] = []
+        self.error = ""
+        self.thread = threading.Thread(
+            target=self._run,
+            args=(dict(config), max(1, min(int(limit), 2000))),
+            name="xass-archive-view",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _run(self, config: dict[str, Any], limit: int) -> None:
+        try:
+            self.status = archive_status(config)
+            self.rows = conversation_rows(config, limit)
+        except Exception as exc:
+            self.error = str(exc)[:500]
+        finally:
+            self.done.set()
+
+
+class ArchiveCleanupJob:
+    """Apply archive cleanup policy away from the Tk event loop."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.done = threading.Event()
+        self.result = {"removed_files": 0, "freed_bytes": 0}
+        self.error = ""
+        self.thread = threading.Thread(
+            target=self._run,
+            args=(dict(config),),
+            name="xass-archive-cleanup",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _run(self, config: dict[str, Any]) -> None:
+        try:
+            self.result = cleanup_archive(config, force=True)
+        except Exception as exc:
+            self.error = str(exc)[:500]
+        finally:
+            self.done.set()
 
 
 class ResponsiveColumns(tk.Frame):
@@ -336,10 +389,18 @@ class XassDesktop:
         self._update_notice = ""
         self._archive_cancel = threading.Event()
         self._archive_moving = False
+        self._archive_cleanup_running = False
+        self._archive_cleanup_generation = 0
+        self._archive_poll: str | None = None
+        self._archive_render_after: str | None = None
+        self._archive_cleanup_poll: str | None = None
         self.tray_icon: Any | None = None
         self._expected_stop_pids: set[int] = set()
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self._log_persist_queue: queue.Queue[str | None] = queue.Queue(maxsize=2048)
+        self._log_persist_thread: threading.Thread | None = None
         self.history: list[str] = []
+        self._home_events_refresh_after: str | None = None
         self.current_view = "overview"
         self.nav_buttons: dict[str, NavButton] = {}
         self._seen_reveal: int | None = None
@@ -395,6 +456,13 @@ class XassDesktop:
         apply_theme_colors(self.theme_var.get())
 
         self._build_shell()
+        if not preview:
+            self._log_persist_thread = threading.Thread(
+                target=self._persist_logs,
+                name="xass-desktop-log-writer",
+                daemon=True,
+            )
+            self._log_persist_thread.start()
         self.set_theme(self.theme_var.get(), save=False, initial=True)
         if not preview:
             self._setup_tray()
@@ -493,7 +561,14 @@ class XassDesktop:
         shell = tk.Frame(self.root, bg=BG)
         shell.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=252)
+        # Keep the navigation's physical size stable across Windows DPI modes.
+        # A fixed 252-pixel rail clips the longer localized labels once Tk's
+        # point fonts scale to 150% or 200%.
+        try:
+            sidebar_width = max(252, int(round(self.root.winfo_fpixels("2.625i"))))
+        except tk.TclError:
+            sidebar_width = 252
+        self.sidebar = tk.Frame(shell, bg=SIDEBAR, width=sidebar_width)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
@@ -534,7 +609,7 @@ class XassDesktop:
                 ("connection", "Подключение", "link"),
             )),
             ("Агент AI", (
-                ("hermes", "Hermes AI", "terminal"),
+                ("hermes", "XASS AI", "terminal"),
             )),
             ("Библиотека", (
                 ("files", "Файлы", "folder"),
@@ -582,7 +657,7 @@ class XassDesktop:
                 button.bind("<FocusIn>", lambda _event, item=button: self._reveal_navigation(item), add="+")
                 self.nav_buttons[key] = button
 
-        self.sidebar.configure(width=260)
+        self.sidebar.configure(width=sidebar_width)
 
         footer = tk.Frame(self.sidebar, bg=SIDEBAR)
         footer.pack(side="bottom", fill="x", padx=12, pady=(6, 12))
@@ -688,7 +763,7 @@ class XassDesktop:
 
     def show_view(self, name: str) -> None:
         self._view_revision = int(getattr(self, "_view_revision", 0)) + 1
-        for attr in ("_file_poll", "_file_render_after"):
+        for attr in ("_file_poll", "_file_render_after", "_archive_poll", "_archive_render_after"):
             callback = getattr(self, attr, None)
             if callback:
                 try:
@@ -833,11 +908,11 @@ class XassDesktop:
         build_home(self)
 
     def _build_hermes(self) -> None:
-        """Dedicated WinUI 3 view for Hermes Agent AI with live daemon telemetry and prompt runner."""
-        top = page_header(self.content, "Hermes Agent AI", "Автономный ИИ-ассистент, запуск навыков и среда выполнения агента", kicker="АГЕНТ")
+        """Build the XASS AI health and protected prompt view."""
+        top = page_header(self.content, "XASS AI", "Локальный ИИ-помощник и проверенное состояние установленной службы", kicker="AI")
         top.pack(fill="x", pady=(0, 20))
 
-        # Status & Overview Banner
+        # Status and overview banner
         banner = self._card(self.content, padding=18)
         banner.pack(fill="x", pady=(0, 16))
 
@@ -846,26 +921,26 @@ class XassDesktop:
         icon_badge(b_top, "terminal", size=24, color=ACCENT).pack(side="left", padx=(0, 14))
         b_info = tk.Frame(b_top, bg=CARD)
         b_info.pack(side="left", fill="x", expand=True)
-        tk.Label(b_info, text="Hermes AI Daemon Core", bg=CARD, fg=TEXT, font=winui_font("subtitle", 14)).pack(anchor="w")
+        tk.Label(b_info, text="XASS AI", bg=CARD, fg=TEXT, font=winui_font("subtitle", 14)).pack(anchor="w")
         status_sub = tk.Frame(b_info, bg=CARD)
         status_sub.pack(anchor="w", pady=(3, 0))
         dot_color = GREEN if self._hermes_online else RED
-        dot_text = "● В сети (127.0.0.1:8787)" if self._hermes_online else "● Оффлайн / Демон не обнаружен"
+        configured_url = self.hermes_url_var.get().strip() or DEFAULT_HERMES_URL
+        dot_text = f"● В сети ({configured_url})" if self._hermes_online else "● Не в сети"
         self._hermes_view_dot = tk.Label(status_sub, text=dot_text, bg=CARD, fg=dot_color, font=winui_font("caption_strong", 10))
         self._hermes_view_dot.pack(side="left")
 
         # Action buttons on banner
         btn_row = tk.Frame(b_top, bg=CARD)
         btn_row.pack(side="right")
-        self._button(btn_row, "Проверить статус", self._check_hermes_daemon_now, kind="secondary").pack(side="left", padx=(0, 8))
-        self._button(btn_row, "Открыть Web UI", self.open_hermes_webui, kind="primary").pack(side="left")
+        self._button(btn_row, "Проверить статус", self._check_hermes_daemon_now, kind="secondary").pack(side="left")
 
         # Main prompt execution workspace
         work_card = self._card(self.content, padding=20)
         work_card.pack(fill="both", expand=True, pady=(0, 16))
 
         tk.Label(work_card, text="Интерактивный запуск задач и команд", bg=CARD, fg=TEXT, font=winui_font("subtitle", 13)).pack(anchor="w", pady=(0, 6))
-        tk.Label(work_card, text="Отправляйте команды, системные запросы и запускайте автономные сценарии через локального агента Hermes.", bg=CARD, fg=MUTED, font=winui_font("body", 10), wraplength=700, justify="left").pack(anchor="w", pady=(0, 14))
+        tk.Label(work_card, text="Команды доступны только через подтверждённый защищённый канал XASS AI.", bg=CARD, fg=MUTED, font=winui_font("body", 10), wraplength=700, justify="left").pack(anchor="w", pady=(0, 14))
 
         # Quick preset pills
         presets_frame = tk.Frame(work_card, bg=CARD)
@@ -923,12 +998,16 @@ class XassDesktop:
         self.hermes_view_status_lbl.pack(side="right")
 
         # Output console
-        tk.Label(work_card, text="Журнал ответов и цепочка рассуждений (Chain of Thought):", bg=CARD, fg=MUTED, font=winui_font("caption_strong", 9)).pack(anchor="w", pady=(0, 6))
+        tk.Label(work_card, text="Ответы XASS AI:", bg=CARD, fg=MUTED, font=winui_font("caption_strong", 9)).pack(anchor="w", pady=(0, 6))
         self.hermes_view_output = DarkScrolledText(work_card, height=14)
         self.hermes_view_output.pack(fill="both", expand=True)
         self._style_scrolled_text(self.hermes_view_output)
         self.hermes_view_output.configure(state="normal")
-        self.hermes_view_output.insert("end", "Hermes Agent AI готов к работе.\nВведите запрос выше или выберите один из быстрых сценариев.\n")
+        self.hermes_view_output.insert(
+            "end",
+            "XASS AI проверяет локальную службу.\n"
+            "Защищённый канал выполнения пока недоступен в этом клиенте.\n",
+        )
         self.hermes_view_output.configure(state="disabled")
 
     def _set_hermes_view_prompt(self, text: str) -> None:
@@ -944,15 +1023,18 @@ class XassDesktop:
             self.hermes_view_output.configure(state="disabled")
 
     def _check_hermes_daemon_now(self) -> None:
+        url = self.hermes_url_var.get().strip() if hasattr(self, "hermes_url_var") else DEFAULT_HERMES_URL
+        url = url or DEFAULT_HERMES_URL
+
         def worker() -> None:
-            url = self.hermes_url_var.get() if hasattr(self, "hermes_url_var") else DEFAULT_HERMES_URL
             status = check_hermes_status(url)
-            online = status.get("online", False)
+            online = status.get("online") is True
+            verified_url = str(status.get("url") or url)
             def update_ui() -> None:
                 self._hermes_online = online
                 if hasattr(self, "_hermes_view_dot") and self._hermes_view_dot.winfo_exists():
                     self._hermes_view_dot.configure(
-                        text="● В сети (127.0.0.1:8787)" if online else "● Оффлайн / Демон не обнаружен",
+                        text=f"● В сети ({verified_url})" if online else "● Не в сети",
                         fg=GREEN if online else RED,
                     )
                 if hasattr(self, "hermes_dot_label") and self.hermes_dot_label.winfo_exists():
@@ -984,18 +1066,22 @@ class XassDesktop:
             self.hermes_view_status_lbl.configure(text="Выполнение запроса...")
 
         def worker() -> None:
-            result = send_hermes_prompt(prompt, daemon_url=url)
+            result = send_hermes_prompt(prompt, hermes_url=url)
             def done() -> None:
+                ok = result.get("ok") is True
+                error = str(result.get("error") or "Запрос XASS AI недоступен")
                 if hasattr(self, "hermes_view_run_btn") and self.hermes_view_run_btn.winfo_exists():
                     self.hermes_view_run_btn.configure(state="normal", text="Отправить задачу")
                 if hasattr(self, "hermes_view_status_lbl") and self.hermes_view_status_lbl.winfo_exists():
                     lat = result.get("latency_ms", 0.0)
-                    self.hermes_view_status_lbl.configure(text=f"Завершено за {lat:.1f} мс" if lat else "Завершено")
+                    self.hermes_view_status_lbl.configure(
+                        text=(f"Завершено за {lat:.1f} мс" if lat else "Завершено") if ok else "Запрос недоступен"
+                    )
                 if hasattr(self, "hermes_view_output") and self.hermes_view_output.winfo_exists():
                     self.hermes_view_output.configure(state="normal")
                     now = datetime.now().strftime("%H:%M:%S")
                     self.hermes_view_output.insert("end", f"\n[{now}] > {prompt}\n")
-                    resp = result.get("response", "")
+                    resp = str(result.get("response") or "") if ok else f"XASS AI: {error}"
                     self.hermes_view_output.insert("end", f"{resp}\n")
                     self.hermes_view_output.see("end")
                     self.hermes_view_output.configure(state="disabled")
@@ -1547,7 +1633,7 @@ class XassDesktop:
         self._button(runtime, "Выбрать папку архива", self.choose_archive_folder, kind="ghost").pack(fill="x", pady=(9, 0))
         self._field(runtime, "Лимит архива, ГБ (пусто — без лимита)", self.archive_max_gb_var)
         self._field(runtime, "Хранить медиа, дней (пусто — бессрочно)", self.archive_retention_days_var)
-        self._field(runtime, "URL сервиса Hermes Agent AI", self.hermes_url_var)
+        self._field(runtime, "Локальный URL XASS AI", self.hermes_url_var)
         self._button(runtime, "Сохранить настройки", self.save_settings, kind="primary").pack(fill="x", pady=(20, 0))
 
         maintenance = self._card(columns, padding=23)
@@ -1569,13 +1655,13 @@ class XassDesktop:
         self._button(maintenance, "Проверить обновление", self.check_update, kind="ghost").pack(fill="x", pady=(22, 9))
         self._button(maintenance, "Перезапустить агент", self.restart_agent).pack(fill="x")
 
-        # Appearance & Hermes AI full-width card
+        # Appearance and XASS AI full-width card
         app_card = self._card(self.content, padding=23)
         app_card.pack(fill="x", pady=(16, 0))
 
         tk.Label(app_card, text="Оформление и Агент", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w")
-        tk.Label(app_card, text="Тема интерфейса и Hermes AI", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(8, 4))
-        tk.Label(app_card, text="Переключение цветовой схемы клиента XASS и управление локальным агентом Hermes AI.", bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 14))
+        tk.Label(app_card, text="Тема интерфейса и XASS AI", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(8, 4))
+        tk.Label(app_card, text="Переключение цветовой схемы клиента и состояние локальной службы XASS AI.", bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 14))
 
         theme_columns = ResponsiveColumns(app_card, bg=CARD, breakpoint=850)
         theme_columns.pack(fill="x")
@@ -1618,7 +1704,7 @@ class XassDesktop:
         )
         sync_check.pack(anchor="w", pady=(6, 0))
 
-        tk.Label(theme_right, text="Hermes Agent AI (порт 8787):", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 8))
+        tk.Label(theme_right, text="XASS AI (локальный порт 9119):", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 8))
         hermes_status_box = tk.Frame(theme_right, bg=CARD)
         hermes_status_box.pack(fill="x", pady=(0, 10))
         self.hermes_dot_label = tk.Label(hermes_status_box, text="●", bg=CARD, fg=GREEN if self._hermes_online else RED, font=("Segoe UI", 10))
@@ -1629,7 +1715,6 @@ class XassDesktop:
         hermes_actions = tk.Frame(theme_right, bg=CARD)
         hermes_actions.pack(fill="x")
         self._button(hermes_actions, "Запустить задачу агента", self.open_hermes_prompt_dialog, kind="primary").pack(side="left")
-        self._button(hermes_actions, "Открыть WebUI", self.open_hermes_webui, kind="ghost").pack(side="left", padx=(8, 0))
         self._button(hermes_actions, "Проверить", lambda: self._check_hermes_status_async(self._on_hermes_checked), kind="ghost").pack(side="left", padx=(8, 0))
         self._flow_actions(hermes_actions)
 
@@ -1793,19 +1878,10 @@ class XassDesktop:
 
     def _build_archive(self) -> None:
         self._header("Архив сообщений", "Тексты и файлы чатов остаются на этом компьютере, даже если в Telegram их уже нет.", "Сообщения")
-        status = archive_status(self.config)
+        self.archive_state_var.set("Загрузка локального архива…")
         summary = self._card(self.content, padding=18)
         summary.pack(fill="x", pady=(0, 14))
         tk.Label(summary, text="Локальное хранилище", bg=CARD, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(anchor="w")
-        sync_state = "ожидает повторной доставки" if status.get("pending_retry") else "синхронизирован"
-        last_sync = str(status.get("last_sync_at") or "никогда").replace("T", " ")[:19]
-        error_line = f"\nПоследняя ошибка: {status.get('last_error')}" if status.get("last_error") else ""
-        self.archive_state_var.set(
-            f"Папка: {status.get('folder')}\nСинхронизировано событий: {status.get('cursor', 0)} · "
-            f"Индекс: {int(status.get('database_size', 0)) / 1024:.1f} КБ\n"
-            f"Состояние: {sync_state} · последняя синхронизация: {last_sync} · "
-            f"свободно {int(status.get('free_bytes', 0)) / (1024 ** 3):.1f} ГБ{error_line}"
-        )
         tk.Label(summary, textvariable=self.archive_state_var, bg=CARD, fg=MUTED, justify="left", font=("Segoe UI", 11)).pack(anchor="w", pady=(8, 14))
         actions = tk.Frame(summary, bg=CARD)
         actions.pack(fill="x")
@@ -1817,16 +1893,64 @@ class XassDesktop:
             self._button(actions, "Отменить перенос", self._archive_cancel.set, kind="danger").pack(side="right")
         self._flow_actions(actions)
 
-        rows = conversation_rows(self.config, 500)
+        body = tk.Frame(self.content, bg=BG)
+        body.pack(fill="both", expand=True)
+        revision = self._view_revision
+        job = ArchiveSnapshotJob(self.config, limit=500)
+        self._archive_load_job = job
+
+        def alive() -> bool:
+            return (
+                not self._closing
+                and self.current_view == "archive"
+                and self._view_revision == revision
+                and body.winfo_exists()
+            )
+
+        def poll() -> None:
+            if not alive():
+                self._archive_poll = None
+                return
+            if not job.done.is_set():
+                self._archive_poll = self.root.after(25, poll)
+                return
+            self._archive_poll = None
+            self._render_archive_snapshot(body, revision, job.status, job.rows, job.error)
+
+        self._archive_poll = self.root.after(25, poll)
+
+    def _render_archive_snapshot(
+        self,
+        body: tk.Frame,
+        revision: int,
+        status: dict[str, Any],
+        rows: list[dict[str, Any]],
+        error: str,
+    ) -> None:
+        if self._closing or self.current_view != "archive" or self._view_revision != revision or not body.winfo_exists():
+            return
+        if error:
+            self.archive_state_var.set(f"Не удалось загрузить архив: {error}")
+            EmptyState(body, "Архив недоступен", "Повторите попытку позже.", icon="archive").pack(fill="x")
+            return
+        sync_state = "ожидает повторной доставки" if status.get("pending_retry") else "синхронизирован"
+        last_sync = str(status.get("last_sync_at") or "никогда").replace("T", " ")[:19]
+        error_line = f"\nПоследняя ошибка: {status.get('last_error')}" if status.get("last_error") else ""
+        self.archive_state_var.set(
+            f"Папка: {status.get('folder')}\nСинхронизировано событий: {status.get('cursor', 0)} · "
+            f"Индекс: {int(status.get('database_size', 0)) / 1024:.1f} КБ\n"
+            f"Состояние: {sync_state} · последняя синхронизация: {last_sync} · "
+            f"свободно {int(status.get('free_bytes', 0)) / (1024 ** 3):.1f} ГБ{error_line}"
+        )
         if not rows:
             EmptyState(
-                self.content,
+                body,
                 "Архив ещё пуст",
                 "Тексты и вложения появятся здесь, когда этот компьютер выбран целью хранения в Mini App. Папка и синхронизация настраиваются выше.",
                 icon="archive",
             ).pack(fill="x")
             return
-        log_card = self._card(self.content, padding=2)
+        log_card = self._card(body, padding=2)
         log_card.pack(fill="both", expand=True)
         self.archive_messages = DarkScrolledText(
             log_card,
@@ -1842,19 +1966,37 @@ class XassDesktop:
         )
         self.archive_messages.pack(fill="both", expand=True)
         self._style_scrolled_text(self.archive_messages)
-        for row in reversed(rows):
-            timestamp = str(row.get("message_date") or row.get("updated_at") or "").replace("T", " ")[:16]
-            title = row.get("chat_title") or row.get("from_username") or row.get("chat_id")
-            marker = "  [УДАЛЕНО]" if row.get("deleted") else ""
-            if row.get("forwarded_from"):
-                marker += f"  [ПЕРЕСЛАНО ОТ {row.get('forwarded_from')}]"
-            if row.get("reply_to_message_id"):
-                marker += f"  [ОТВЕТ НА #{row.get('reply_to_message_id')}]"
-            direction = "→" if row.get("direction") == "outgoing" else "←"
-            text = str(row.get("text_content") or "Медиа / сообщение без текста").replace("\n", " ")
-            media = f"  · файлов: {row.get('media_count')}" if row.get("media_count") else ""
-            self.archive_messages.insert("end", f"{timestamp}  {direction} {title}{marker}{media}\n{text}\n\n")
-        self.archive_messages.configure(state="disabled")
+        rendered = list(reversed(rows))
+
+        def render_batch(index: int = 0) -> None:
+            self._archive_render_after = None
+            if (
+                self._closing
+                or self.current_view != "archive"
+                or self._view_revision != revision
+                or not body.winfo_exists()
+                or not self.archive_messages.winfo_exists()
+            ):
+                return
+            for row in rendered[index:index + 32]:
+                timestamp = str(row.get("message_date") or row.get("updated_at") or "").replace("T", " ")[:16]
+                title = row.get("chat_title") or row.get("from_username") or row.get("chat_id")
+                marker = "  [УДАЛЕНО]" if row.get("deleted") else ""
+                if row.get("forwarded_from"):
+                    marker += f"  [ПЕРЕСЛАНО ОТ {row.get('forwarded_from')}]"
+                if row.get("reply_to_message_id"):
+                    marker += f"  [ОТВЕТ НА #{row.get('reply_to_message_id')}]"
+                direction = "→" if row.get("direction") == "outgoing" else "←"
+                text = str(row.get("text_content") or "Медиа / сообщение без текста").replace("\n", " ")
+                media = f"  · файлов: {row.get('media_count')}" if row.get("media_count") else ""
+                self.archive_messages.insert("end", f"{timestamp}  {direction} {title}{marker}{media}\n{text}\n\n")
+            next_index = index + 32
+            if next_index < len(rendered):
+                self._archive_render_after = self.root.after(1, lambda: render_batch(next_index))
+            else:
+                self.archive_messages.configure(state="disabled")
+
+        render_batch()
 
     def choose_archive_folder(self) -> None:
         selected = filedialog.askdirectory(parent=self.root, title="Папка локального архива XASS", initialdir=str(archive_root(self.config)))
@@ -1954,15 +2096,45 @@ class XassDesktop:
             subprocess.Popen(["xdg-open", str(folder)])
 
     def cleanup_archive_files(self) -> None:
+        if self._archive_cleanup_running:
+            return
         if not messagebox.askyesno(
             "XASS",
             "Удалить локальные медиафайлы архива? Тексты сообщений останутся. Это действие нельзя отменить.",
             parent=self.root,
         ):
             return
-        result = cleanup_archive(self.config, force=True)
-        self._log(f"Очищено локальных файлов: {result['removed_files']}, освобождено: {result['freed_bytes']} байт")
-        self.show_view("archive")
+        self._archive_cleanup_running = True
+        self._archive_cleanup_generation += 1
+        generation = self._archive_cleanup_generation
+        revision = self._view_revision
+        self.archive_state_var.set("Очистка локальных медиафайлов…")
+        job = ArchiveCleanupJob(self.config)
+        self._archive_cleanup_job = job
+
+        def poll() -> None:
+            if self._closing or generation != self._archive_cleanup_generation:
+                self._archive_cleanup_poll = None
+                return
+            if not job.done.is_set():
+                self._archive_cleanup_poll = self.root.after(40, poll)
+                return
+            self._archive_cleanup_poll = None
+            self._archive_cleanup_running = False
+            if job.error:
+                self._log(f"Не удалось очистить архив: {job.error}")
+                if self.current_view == "archive" and self._view_revision == revision:
+                    self.archive_state_var.set(f"Ошибка очистки: {job.error}")
+                return
+            result = job.result
+            self._log(
+                f"Очищено локальных файлов: {result['removed_files']}, "
+                f"освобождено: {result['freed_bytes']} байт"
+            )
+            if self.current_view == "archive" and self._view_revision == revision:
+                self.show_view("archive")
+
+        self._archive_cleanup_poll = self.root.after(40, poll)
 
     def _clear_log_view(self) -> None:
         if hasattr(self, "full_log") and self.full_log.winfo_exists():
@@ -2264,14 +2436,8 @@ class XassDesktop:
             self.agent_pid_var.set("—")
             self.latency_var.set("—")
             self._set_status("Остановлен" if self.config.get("api_key") else "Требуется подключение", AMBER)
-        # Sync server theme if requested
-        sync_var = getattr(self, "sync_server_theme_var", None)
-        theme_v = getattr(self, "theme_var", None)
         payload_dict = payload if isinstance(locals().get("payload"), dict) else {}
-        if sync_var is not None and sync_var.get() and payload_dict:
-            srv_theme = payload_dict.get("server_theme") or payload_dict.get("theme")
-            if srv_theme and (theme_v is None or srv_theme != theme_v.get()):
-                self.set_theme(str(srv_theme), save=True)
+        self._sync_server_theme(payload_dict)
 
         # Periodic Hermes status poll
         now = time.time()
@@ -2284,6 +2450,24 @@ class XassDesktop:
         except Exception:
             pass
         self.root.after(750, self._refresh_agent_status)
+
+    def _sync_server_theme(self, payload: dict[str, Any]) -> None:
+        """Apply only a real canonical theme change, not aliases or casing churn."""
+        sync_var = getattr(self, "sync_server_theme_var", None)
+        theme_var = getattr(self, "theme_var", None)
+        if sync_var is None or not sync_var.get() or not isinstance(payload, dict):
+            return
+        server_theme = payload.get("server_theme") or payload.get("theme")
+        if not server_theme:
+            return
+        raw_server = str(server_theme).strip().lower()
+        known_names = {name.lower() for name in ALL_THEMES}
+        if raw_server not in THEME_ALIASES and raw_server not in known_names:
+            return
+        canonical_server = resolve_theme_name(raw_server)
+        canonical_current = resolve_theme_name(theme_var.get()) if theme_var is not None else ""
+        if canonical_server != canonical_current:
+            self.set_theme(canonical_server, save=True)
 
     def _surface_cast_playback(self) -> None:
         if getattr(self, "_closing", False) or getattr(self, "preview", False):
@@ -2653,22 +2837,86 @@ class XassDesktop:
         self._schedule_start(120)
 
     def _drain_logs(self) -> None:
-        try:
-            while True:
-                self._log(self.log_queue.get_nowait())
-        except queue.Empty:
-            pass
-        self.root.after(120, self._drain_logs)
+        processed = 0
+        while processed < LOG_DRAIN_BATCH:
+            try:
+                line = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._log(line, refresh_home=False)
+            processed += 1
+        if processed:
+            self._schedule_home_events_refresh()
+        delay = LOG_DRAIN_BACKLOG_MS if not self.log_queue.empty() else LOG_DRAIN_IDLE_MS
+        self.root.after(delay, self._drain_logs)
 
-    def _log(self, line: str) -> None:
+    def _persist_logs(self) -> None:
+        while True:
+            line = self._log_persist_queue.get()
+            if line is None:
+                return
+            append_log(line)
+
+    def _queue_persisted_log(self, line: str) -> None:
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self._log_persist_queue.put_nowait(line)
+        except queue.Full:
+            try:
+                self._log_persist_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._log_persist_queue.put_nowait(line)
+            except queue.Full:
+                pass
+
+    def _stop_log_persistence(self) -> None:
+        writer = getattr(self, "_log_persist_thread", None)
+        pending = getattr(self, "_log_persist_queue", None)
+        if writer is None or pending is None:
+            return
+        # Mark the writer stopped before queuing the sentinel so repeated Tk
+        # destroy callbacks stay idempotent.  Never join here: append_log may
+        # currently be waiting on slow disk I/O and this method runs on Tk.
+        self._log_persist_thread = None
+        try:
+            pending.put_nowait(None)
+        except queue.Full:
+            try:
+                pending.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                pending.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def _schedule_home_events_refresh(self) -> None:
+        if self._closing or self.current_view != "overview":
+            return
+        if self._home_events_refresh_after is not None:
+            return
+
+        def refresh() -> None:
+            self._home_events_refresh_after = None
+            if self._closing or self.current_view != "overview":
+                return
+            callback = getattr(self, "_render_home_events", None)
+            if callback is not None:
+                callback()
+
+        self._home_events_refresh_after = self.root.after_idle(refresh)
+
+    def _log(self, line: str, *, refresh_home: bool = True) -> None:
         stamped = f"{datetime.now().strftime('%H:%M:%S')}  {line}"
         if not self.preview:
-            append_log(stamped)
+            self._queue_persisted_log(stamped)
         self.history.append(stamped)
         self.history = self.history[-1000:]
-        refresh_home = getattr(self, "_render_home_events", None)
         if refresh_home:
-            refresh_home()
+            self._schedule_home_events_refresh()
         if "Скачивание" in line or "Повторная загрузка" in line:
             self.update_detail_var.set(line.strip())
         elif "heartbeat failed" in line:
@@ -2691,9 +2939,8 @@ class XassDesktop:
             image = Image.open(icon_path).convert("RGBA")
             menu = pystray.Menu(
                 pystray.MenuItem("Открыть XASS", lambda _icon, _item: self.root.after(0, self._show_from_tray), default=True),
-                pystray.MenuItem("Hermes Agent AI", pystray.Menu(
+                pystray.MenuItem("XASS AI", pystray.Menu(
                     pystray.MenuItem(self._tray_hermes_status_text, None, enabled=False),
-                    pystray.MenuItem("Открыть Hermes WebUI", lambda _icon, _item: self.root.after(0, self.open_hermes_webui)),
                     pystray.MenuItem("Запустить задачу агента", lambda _icon, _item: self.root.after(0, self.open_hermes_prompt_dialog)),
                 )),
                 pystray.MenuItem("Проверить соединение", lambda _icon, _item: self.root.after(0, self.check_connection)),
@@ -2726,8 +2973,14 @@ class XassDesktop:
     def _close_local_music(self) -> None:
         player = getattr(self, "_local_music", None)
         if player is not None:
-            player.close()
             self._local_music = None
+            closer = threading.Thread(
+                target=player.close,
+                name="xass-desktop-music-close",
+                daemon=True,
+            )
+            self._local_music_close_thread = closer
+            closer.start()
 
     def _install_after_guard(self) -> None:
         # Workers and tray callbacks use root.after to re-enter Tk. Closing the
@@ -2758,6 +3011,7 @@ class XassDesktop:
 
     def _cancel_after_callbacks(self) -> None:
         self._closing = True
+        self._stop_log_persistence()
         # Tk.destroy removes Python Tcl commands, not the pending Tcl timers.
         # Cancel this interpreter's timers first, including widget paint jobs.
         try:
@@ -2769,10 +3023,11 @@ class XassDesktop:
                 self.root.tk.call("after", "cancel", timer)
         except (tk.TclError, RuntimeError):
             pass
-        pump = getattr(self, "_music_cast_pump", None)
-        if pump is not None:
-            pump.close()
-            self._music_cast_pump = None
+        for attr in ("_music_cast_pump", "_music_local_pump"):
+            pump = getattr(self, attr, None)
+            if pump is not None:
+                pump.close()
+                setattr(self, attr, None)
 
     def close(self) -> None:
         if self.preview:
@@ -2820,9 +3075,14 @@ class XassDesktop:
             from hermes_client import get_hermes_webui_url
         except ModuleNotFoundError:
             from pc_client.hermes_client import get_hermes_webui_url
-        url = get_hermes_webui_url(self.config)
+        try:
+            current_url = self.hermes_url_var.get().strip() if hasattr(self, "hermes_url_var") else ""
+            url = get_hermes_webui_url({"hermes_url": current_url or DEFAULT_HERMES_URL})
+        except ValueError as exc:
+            messagebox.showerror("XASS AI", str(exc), parent=self.root)
+            return
         webbrowser.open(url)
-        self._log(f"Открыт Hermes WebUI: {url}")
+        self._log(f"Открыт XASS AI Web UI: {url}")
 
     def open_hermes_prompt_dialog(self) -> None:
         self._show_from_tray()
@@ -2837,23 +3097,33 @@ class XassDesktop:
         self._hermes_dialog = HermesPromptDialog(self)
 
     def _check_hermes_status_async(self, callback: Callable[[dict[str, Any]], None] | None = None) -> None:
+        url = str(
+            getattr(self, "hermes_url_var", None)
+            and self.hermes_url_var.get().strip()
+            or self.config.get("hermes_url")
+            or DEFAULT_HERMES_URL
+        )
+
         def worker() -> None:
             try:
                 from hermes_client import check_hermes_status
             except ModuleNotFoundError:
                 from pc_client.hermes_client import check_hermes_status
-            url = str(getattr(self, "hermes_url_var", None) and self.hermes_url_var.get().strip() or self.config.get("hermes_url") or DEFAULT_HERMES_URL)
             res = check_hermes_status(url, timeout=2.0)
-            self._hermes_online = bool(res.get("online"))
-            if callback is not None:
-                try:
-                    self.root.after(0, lambda: callback(res))
-                except (tk.TclError, AttributeError):
-                    pass
+
+            def apply_result() -> None:
+                self._hermes_online = res.get("online") is True
+                if callback is not None:
+                    callback(res)
+
+            try:
+                self.root.after(0, apply_result)
+            except (tk.TclError, AttributeError):
+                pass
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_hermes_checked(self, res: dict[str, Any]) -> None:
-        online = bool(res.get("online"))
+        online = res.get("online") is True
         self._hermes_online = online
         if online:
             lat = res.get("latency_ms", 0)
@@ -2942,12 +3212,12 @@ class XassDesktop:
 
 
 class HermesPromptDialog(tk.Toplevel):
-    """Quick prompt dialog for executing agent tasks on the local Hermes daemon."""
+    """Quick prompt dialog for the local XASS AI service."""
 
     def __init__(self, app: XassDesktop) -> None:
         super().__init__(app.root)
         self.app = app
-        self.title("Hermes Agent AI — Задача")
+        self.title("XASS AI — Запрос")
         self.configure(bg=BG)
         self.transient(app.root)
         if winui_frame is not None:
@@ -2965,7 +3235,7 @@ class HermesPromptDialog(tk.Toplevel):
         icon_badge(header, "terminal", size=24, color=ACCENT).pack(side="left", padx=(0, 12))
         title_box = tk.Frame(header, bg=CARD)
         title_box.pack(side="left", fill="x", expand=True)
-        tk.Label(title_box, text="Hermes Agent AI", bg=CARD, fg=TEXT, font=winui_font("subtitle", 16)).pack(anchor="w")
+        tk.Label(title_box, text="XASS AI", bg=CARD, fg=TEXT, font=winui_font("subtitle", 16)).pack(anchor="w")
 
         # Live Status
         self.status_var = tk.StringVar(value="Проверка связи…")
@@ -2999,8 +3269,6 @@ class HermesPromptDialog(tk.Toplevel):
         actions.pack(fill="x", pady=(0, 14))
         self.run_btn = ModernButton(actions, text="Запустить задачу", command=self.run_task, bg=ACCENT, fg="#12131c", activebackground=ACCENT_SOFT, padx=16, pady=8)
         self.run_btn.pack(side="left")
-        self.webui_btn = ModernButton(actions, text="Открыть Hermes WebUI", command=self.open_webui, bg=HOVER, fg=TEXT, padx=14, pady=8)
-        self.webui_btn.pack(side="left", padx=(8, 0))
         self.check_btn = ModernButton(actions, text="Обновить статус", command=self.refresh_status, bg=HOVER, fg=TEXT, padx=12, pady=8)
         self.check_btn.pack(side="left", padx=(8, 0))
         self.close_btn = ModernButton(actions, text="Закрыть", command=self.destroy, bg=HOVER, fg=MUTED, padx=12, pady=8)
@@ -3044,7 +3312,7 @@ class HermesPromptDialog(tk.Toplevel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_status(self, res: dict[str, Any]) -> None:
-        online = bool(res.get("online"))
+        online = res.get("online") is True
         self.app._hermes_online = online
         if online:
             lat = res.get("latency_ms", 0)
@@ -3054,21 +3322,18 @@ class HermesPromptDialog(tk.Toplevel):
             self.status_var.set(f"Не в сети ({res.get('url')})")
             self.status_dot.configure(fg=RED)
 
-    def open_webui(self) -> None:
-        self.app.open_hermes_webui()
-
     def run_task(self) -> None:
         if self._executing:
             return
         prompt = self.prompt_entry.get("1.0", "end").strip()
         if not prompt:
-            messagebox.showwarning("Hermes Agent AI", "Введите текст задачи или prompt", parent=self)
+            messagebox.showwarning("XASS AI", "Введите текст запроса", parent=self)
             return
 
         self._executing = True
         self.run_btn.configure(state="disabled", text="Выполняется…")
         self.output_text.delete("1.0", "end")
-        self.output_text.insert("end", "▶ Отправка запроса в Hermes Agent AI…\n\n")
+        self.output_text.insert("end", "▶ Проверка запроса XASS AI…\n\n")
 
         url = self.app.hermes_url_var.get().strip() or DEFAULT_HERMES_URL
 
@@ -3089,16 +3354,16 @@ class HermesPromptDialog(tk.Toplevel):
         self._executing = False
         self.run_btn.configure(state="normal", text="Запустить задачу")
         self.output_text.delete("1.0", "end")
-        if result.get("ok"):
+        if result.get("ok") is True:
             resp = result.get("response", "")
             lat = result.get("latency_ms", 0)
             self.output_text.insert("end", f"✓ Завершено за {lat:.0f} мс\n\n{resp}\n")
             preview = (result.get("prompt", "")[:50] + "…") if len(result.get("prompt", "")) > 50 else result.get("prompt", "")
-            self.app._log(f"Hermes задача выполнена: {preview}")
+            self.app._log(f"XASS AI: запрос выполнен: {preview}")
         else:
             err = result.get("error", "Неизвестная ошибка")
-            self.output_text.insert("end", f"✗ Ошибка выполнения:\n{err}\n\nУбедитесь, что служба Hermes запущена на {result.get('url', DEFAULT_HERMES_URL)}")
-            self.app._log(f"Hermes ошибка: {err}")
+            self.output_text.insert("end", f"✗ Запрос недоступен:\n{err}\n\nЛокальный адрес: {result.get('url', DEFAULT_HERMES_URL)}")
+            self.app._log(f"XASS AI: {err}")
 
 def main() -> None:
     if "--desktop-process-sample" in sys.argv:

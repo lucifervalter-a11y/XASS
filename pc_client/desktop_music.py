@@ -75,10 +75,12 @@ def _send_cast(command: str, payload: dict | None = None) -> dict:
 
 
 class CastCommandPump:
-    """Serialize remote controls away from Tk and collapse volume drags."""
+    """Serialize controls away from Tk and collapse high-frequency gestures."""
 
-    def __init__(self, sender=None) -> None:
+    def __init__(self, sender=None, *, collapse_commands=None, error_message: str = "") -> None:
         self._sender = sender or _send_cast
+        self._collapse_commands = frozenset(collapse_commands or {"music_volume"})
+        self._error_message = error_message or "Не удалось связаться с плеером компьютера"
         self._condition = threading.Condition()
         self._queue = deque()
         self._results = deque(maxlen=64)
@@ -98,7 +100,7 @@ class CastCommandPump:
             item = (sequence, *request)
             # A pointer drag can produce hundreds of callbacks per second. Only
             # the most recent consecutive volume request has observable value.
-            if command == "music_volume" and self._queue and self._queue[-1][1] == command:
+            if command in self._collapse_commands and self._queue and self._queue[-1][1] == command:
                 self._queue[-1] = item
             else:
                 self._queue.append(item)
@@ -130,7 +132,7 @@ class CastCommandPump:
             except MusicError as exc:
                 error = str(exc)
             except Exception:
-                error = "Не удалось связаться с плеером компьютера"
+                error = self._error_message
             with self._condition:
                 self._active = False
                 if command == "music_volume":
@@ -248,7 +250,7 @@ class LocalOpenJob:
             if self.cancelled.is_set():
                 self.snapshot = {"state": "stopped"}
                 return
-            self.snapshot = player.play_local(path)
+            self.snapshot = player.play_local(path, cancelled=self.cancelled.is_set)
             if self.cancelled.is_set():
                 # A phone/agent cast may become live while the file decoder or
                 # WASAPI device is opening. Stop from this worker, never Tk.
@@ -1074,6 +1076,16 @@ def build_music(app) -> None:
         previous_pump.close()
     cast_pump = CastCommandPump()
     app._music_cast_pump = cast_pump
+    previous_local_pump = getattr(app, "_music_local_pump", None)
+    if previous_local_pump is not None:
+        previous_local_pump.close()
+    local_pump = CastCommandPump(
+        sender=lambda command, payload: player.command(command, payload, {}),
+        collapse_commands={"music_volume", "music_seek", "music_status"},
+        error_message="Не удалось выполнить локальную команду плеера",
+    )
+    app._music_local_pump = local_pump
+    local_control = {"submitted": 0}
 
     def silence_local_for_cast() -> None:
         status = cast_state["status"]
@@ -1113,8 +1125,14 @@ def build_music(app) -> None:
             return shown
         opening = getattr(app, "_local_music_job", None)
         opening_active = opening is not None and not opening.done.is_set()
-        shown = dict(_local_snapshot(player, opening, cast_state["local_snapshot"]))
-        if not opening_active:
+        local_busy = local_pump.busy()
+        if local_busy:
+            shown = dict(cast_state["local_snapshot"])
+            shown.setdefault("state", "idle")
+            shown.setdefault("volume", 70)
+        else:
+            shown = dict(_local_snapshot(player, opening, cast_state["local_snapshot"]))
+        if not opening_active and not local_busy:
             cast_state["local_snapshot"] = dict(shown)
             notes = _player_notes(player)
             cast_state["local_presentation"] = dict(notes)
@@ -1256,6 +1274,27 @@ def build_music(app) -> None:
                 cast_state["hold_refresh_until"] = time.monotonic() + 0.9
                 notice.set("")
 
+    def submit_local(command: str, payload: dict | None = None) -> None:
+        values = dict(payload or {})
+        sequence = local_pump.submit(command, values)
+        if sequence is None:
+            notice.set("Локальный плеер уже закрывается")
+            return
+        local_control["submitted"] = sequence
+        base = cast_state["local_snapshot"] or {"state": "idle", "volume": 70}
+        cast_state["local_snapshot"] = _optimistic_cast(base, command, values)
+        notice.set("")
+
+    def apply_local_results() -> None:
+        for sequence, _command, _payload, response, error in local_pump.drain():
+            if error:
+                if sequence >= local_control["submitted"]:
+                    notice.set(error)
+                continue
+            if sequence >= local_control["submitted"] and isinstance(response, dict):
+                cast_state["local_snapshot"] = dict(response)
+                notice.set("")
+
     def refresh_cast(*, force: bool = False) -> None:
         if not stage.winfo_exists():
             return
@@ -1276,12 +1315,8 @@ def build_music(app) -> None:
             else:
                 notice.set("Дождитесь открытия трека")
             return
-        try:
-            notice.set("")
-            player.command(command, {}, {})
-            reveal()
-        except MusicError as exc:
-            notice.set(str(exc))
+        submit_local(command)
+        reveal()
 
     def toggle() -> None:
         if cast_drives():
@@ -1293,7 +1328,7 @@ def build_music(app) -> None:
             elif state == "error":
                 cast_control("music_stop")
             return
-        state = str(player.snapshot().get("state") or "idle")
+        state = str(shown_snapshot().get("state") or "idle")
         if state == "playing":
             control("music_pause")
         elif state in {"paused", "ended"}:
@@ -1308,12 +1343,8 @@ def build_music(app) -> None:
         if active_opening() is not None:
             notice.set("Дождитесь открытия трека")
             return
-        try:
-            notice.set("")
-            player.command("music_seek", {"position_sec": seconds}, {})
-            reveal()
-        except MusicError as exc:
-            notice.set(str(exc))
+        submit_local("music_seek", {"position_sec": seconds})
+        reveal()
 
     def control_volume(value: float) -> None:
         if cast_drives():
@@ -1322,10 +1353,7 @@ def build_music(app) -> None:
         if active_opening() is not None:
             notice.set("Дождитесь открытия трека")
             return
-        try:
-            player.command("music_volume", {"volume": value}, {})
-        except MusicError as exc:
-            notice.set(str(exc))
+        submit_local("music_volume", {"volume": value})
 
     stage = MusicStage(app.content, player, {
         "toggle": toggle,
@@ -1367,7 +1395,7 @@ def build_music(app) -> None:
     open_button.pack(side="left")
 
     def update_local_controls() -> None:
-        state = "disabled" if cast_drives() or active_opening() is not None else "normal"
+        state = "disabled" if cast_drives() or active_opening() is not None or local_pump.busy() else "normal"
         for button in (previous_button, next_button, open_button):
             button.configure(state=state)
 
@@ -1586,11 +1614,15 @@ def build_music(app) -> None:
     def tick() -> None:
         if app.current_view != "music" or not stage.winfo_exists():
             cast_pump.close()
+            local_pump.close()
             if getattr(app, "_music_cast_pump", None) is cast_pump:
                 app._music_cast_pump = None
+            if getattr(app, "_music_local_pump", None) is local_pump:
+                app._music_local_pump = None
             app._music_poll = None
             return
         apply_cast_results()
+        apply_local_results()
         refresh_cast()
         catalog_job = getattr(app, "_music_catalog_job", None)
         if catalog_job is not None and catalog_job.done.is_set():

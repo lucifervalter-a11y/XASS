@@ -102,11 +102,11 @@ public struct ContentView: View {
                 tag: 2
             )
             .tabItem {
-                Label("Hermes", systemImage: "sparkles")
+                Label("XASS AI", systemImage: "sparkles")
             }
             .tag(2)
             .accessibilityIdentifier("tab-hermes")
-            .accessibilityLabel("Вкладка Hermes ИИ-Агент")
+            .accessibilityLabel("Вкладка XASS AI")
             .badge(hermes.isThinking ? "●" : nil)
 
             tabItemView(
