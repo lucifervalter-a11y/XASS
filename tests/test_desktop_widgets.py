@@ -14,7 +14,10 @@ class DecorationTests(unittest.TestCase):
         image = rounded_image(120, 60, fill=CARD, radius=12, border_color=ACCENT)
         self.assertEqual(image.getpixel((0, 0))[3], 0)
         self.assertEqual(image.getpixel((60, 30)), (43, 43, 47, 255))
-        self.assertTrue(any(0 < alpha < 255 for alpha in image.getchannel("A").getdata()))
+        alpha_channel = image.getchannel("A")
+        alpha_data = getattr(alpha_channel, "get_flattened_data", None)
+        alphas = list(alpha_data() if alpha_data is not None else alpha_channel.getdata())
+        self.assertTrue(any(0 < alpha < 255 for alpha in alphas))
 
     def test_every_navigation_and_status_icon_has_visible_monoline_pixels(self):
         for name in ("home", "monitor", "link", "folder", "archive", "journal", "update", "settings",

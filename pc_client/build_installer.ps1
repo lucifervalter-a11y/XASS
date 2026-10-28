@@ -105,7 +105,9 @@ $WorkRoot = Join-Path $ClientRoot "build"
     --collect-data tkinterdnd2 `
     --collect-all cryptography `
     --collect-all miniaudio `
+    --collect-all pywinstyles `
     --hidden-import pystray._win32 `
+    --hidden-import winui_frame `
     --distpath $DistRoot `
     --workpath $WorkRoot `
     --specpath $WorkRoot `

@@ -27,9 +27,18 @@ from urllib.parse import urlsplit, urlunsplit
 from desktop_widgets import (
     ACCENT, ACCENT_SOFT, AMBER, BG, CARD, FIELD, GREEN, HOVER, LINE, MUTED, RED, SIDEBAR, TEXT,
     EmptyState, ModernButton, NavButton, RoundedPanel, icon_badge, page_header,
+    winui_font, WinUICard, winui_badge,
 )
 CARD_HOVER = HOVER
 ACCENT_HOVER = ACCENT_SOFT
+
+try:
+    import winui_frame
+except ModuleNotFoundError:
+    try:
+        from pc_client import winui_frame
+    except ModuleNotFoundError:
+        winui_frame = None
 from desktop_home import build_home
 from desktop_music import build_music
 from music_player import MusicPlayer
@@ -234,16 +243,19 @@ def _configure_windows_process() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XASS.Desktop.Agent")
     except Exception:
         pass
-    try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-    except Exception:
+    if winui_frame is not None:
+        winui_frame.configure_winui_dpi_awareness(None)
+    else:
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
         except Exception:
             try:
-                ctypes.windll.user32.SetProcessDPIAware()
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except Exception:
-                pass
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except Exception:
+                    pass
 
 
 def _resource_path(relative: str) -> Path:
@@ -255,6 +267,8 @@ class XassDesktop:
         self.root = root
         self.preview = preview
         self._install_after_guard()
+        if winui_frame is not None:
+            winui_frame.configure_winui_dpi_awareness(self.root)
         self.root.title("XASS — предпросмотр" if preview else "XASS")
         screen_width = max(960, self.root.winfo_screenwidth())
         screen_height = max(700, self.root.winfo_screenheight())
@@ -264,13 +278,13 @@ class XassDesktop:
         self.root.minsize(900, 620)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.option_add("*Font", ("Segoe UI", 10))
-        self.root.after(250, self._style_window_frame)
+        self.root.option_add("*Font", winui_font("body", 10))
+        self.root.after(100, self._style_window_frame)
         self.root.option_add("*Scrollbar.background", CARD_HOVER)
         self.root.option_add("*Scrollbar.troughColor", BG)
         self.root.option_add("*Scrollbar.activeBackground", ACCENT)
         self.root.option_add("*Scrollbar.borderWidth", 0)
-        self.root.option_add("*Scrollbar.width", 11)
+        self.root.option_add("*Scrollbar.width", 8)
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -286,7 +300,7 @@ class XassDesktop:
             bordercolor=BG,
             arrowcolor=MUTED,
             relief="flat",
-            width=11,
+            width=8,
         )
         style.map("XASS.Vertical.TScrollbar", background=[("active", ACCENT)])
         style.configure("XASS.Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD, bordercolor=FIELD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6)
@@ -436,36 +450,35 @@ class XassDesktop:
         return button
 
     def _card(self, parent: tk.Misc, *, padding: int = 20, border_color: str = LINE) -> tk.Frame:
+        parent_bg = getattr(parent, "cget", lambda k: BG)("bg")
         return RoundedPanel(
             parent,
             bg=CARD,
+            parent_bg=parent_bg,
             padx=padding,
             pady=padding,
             border_color=border_color,
-            radius=16,
+            radius=12,
         )
 
     def _style_window_frame(self) -> None:
-        """Keep native resize/snap/accessibility while matching the dark shell."""
+        """Apply WinUI 3 window framing: Mica Alt/Acrylic, rounded corners, theme border & caption."""
         if os.name != "nt":
             return
         try:
-            parent = ctypes.windll.user32.GetParent
-            parent.argtypes, parent.restype = [ctypes.c_void_p], ctypes.c_void_p
-            self.root.update_idletasks()
-            hwnd = parent(self.root.winfo_id())
-            setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
-            setter.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
-            caption_color = 0x00181414
-            try:
-                pal = get_theme(getattr(self, "theme_var", None) and self.theme_var.get())
-                if "DWM_CAPTION" in pal:
-                    caption_color = int(pal["DWM_CAPTION"], 16)
-            except Exception:
-                pass
-            for attribute, value in ((19, 1), (20, 1), (35, caption_color), (36, 0x00F7F5F5), (33, 2)):
-                setting = ctypes.c_int(value)
-                setter(hwnd, attribute, ctypes.byref(setting), ctypes.sizeof(setting))
+            theme_name = self.theme_var.get() if hasattr(self, "theme_var") else None
+            if winui_frame is not None:
+                winui_frame.apply_winui_window_styling(self.root, theme_name=theme_name)
+            else:
+                self.root.update_idletasks()
+                hwnd = ctypes.windll.user32.GetAncestor(self.root.winfo_id(), 2) or ctypes.windll.user32.GetParent(self.root.winfo_id())
+                setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
+                setter.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+                pal = get_theme(theme_name)
+                caption_color = int(pal.get("DWM_CAPTION", "0x00181414"), 16)
+                for attribute, value in ((20, 1), (35, caption_color), (36, 0x00F7F5F5), (33, 2), (38, 4)):
+                    setting = ctypes.c_int(value)
+                    setter(hwnd, attribute, ctypes.byref(setting), ctypes.sizeof(setting))
         except (AttributeError, OSError, tk.TclError):
             pass  # Older Windows keeps its native non-client frame.
 
@@ -513,11 +526,15 @@ class XassDesktop:
         self.navigation_content.bind("<Configure>", self._on_navigation_content_configure)
         self.navigation_canvas.bind("<Configure>", self._on_navigation_canvas_configure)
 
+        palette = get_theme(getattr(self, "theme_var", None) and self.theme_var.get())
         groups = (
             ("Управление", (
                 ("overview", "Главный экран", "home"),
                 ("computer", "Этот компьютер", "monitor"),
                 ("connection", "Подключение", "link"),
+            )),
+            ("Агент AI", (
+                ("hermes", "Hermes AI", "terminal"),
             )),
             ("Библиотека", (
                 ("files", "Файлы", "folder"),
@@ -536,7 +553,7 @@ class XassDesktop:
                 text=group.upper(),
                 bg=SIDEBAR,
                 fg="#8d8d9a",
-                font=("Segoe UI Semibold", 8),
+                font=winui_font("caption_strong", 8),
                 anchor="w",
             ).pack(fill="x", padx=22, pady=((8 if index else 2), 2))
             for key, label, icon in items:
@@ -547,28 +564,32 @@ class XassDesktop:
                     command=lambda item=key: self.show_view(item),
                     anchor="w",
                     bg=SIDEBAR,
-                    fg="#a3a3b0",
-                    activebackground="#2a2a34",
+                    fg=palette.get("NAV_FG", "#a3a3b0"),
+                    activebackground=palette.get("NAV_ACTIVE_BG", "#2a2a34"),
                     activeforeground=TEXT,
-                    selectedbackground="#24242e",
+                    selectedbackground=palette.get("NAV_SELECTED_BG", "#24242e"),
+                    parent_bg=SIDEBAR,
                     relief="flat",
                     borderwidth=0,
                     padx=14,
                     pady=8,
                     cursor="hand2",
-                    font=("Segoe UI Semibold", 11),
+                    font=winui_font("body_strong", 11),
                     icon_size=20,
+                    radius=6,
                 )
                 button.pack(fill="x", padx=10, pady=1)
                 button.bind("<FocusIn>", lambda _event, item=button: self._reveal_navigation(item), add="+")
                 self.nav_buttons[key] = button
 
-        self.sidebar.configure(width=max(252, max(button.winfo_reqwidth() for button in self.nav_buttons.values())
-                                         + 20 + navigation_scrollbar.winfo_reqwidth()))
+        self.sidebar.configure(width=260)
 
         footer = tk.Frame(self.sidebar, bg=SIDEBAR)
         footer.pack(side="bottom", fill="x", padx=12, pady=(6, 12))
-        chip = RoundedPanel(footer, bg="#1c1c24", parent_bg=SIDEBAR, radius=14, padx=12, pady=10, border_color="#2e2e3a")
+        sidebar_card = palette.get("SIDEBAR_CARD", "#1c1c24")
+        sidebar_border = palette.get("SIDEBAR_BORDER", "#2e2e3a")
+        chip = RoundedPanel(footer, bg=sidebar_card, parent_bg=SIDEBAR, radius=12, padx=12, pady=10, border_color=sidebar_border)
+        self.sidebar_chip = chip
         chip.pack(fill="x")
         status_row = tk.Frame(chip, bg="#1c1c24")
         status_row.pack(fill="x")
@@ -695,6 +716,8 @@ class XassDesktop:
             self._build_updates()
         elif name == "settings":
             self._build_settings()
+        elif name == "hermes":
+            self._build_hermes()
         elif name in {"journal", "diagnostics"}:
             self._build_diagnostics()
         else:
@@ -808,6 +831,179 @@ class XassDesktop:
 
     def _build_overview(self) -> None:
         build_home(self)
+
+    def _build_hermes(self) -> None:
+        """Dedicated WinUI 3 view for Hermes Agent AI with live daemon telemetry and prompt runner."""
+        top = page_header(self.content, "Hermes Agent AI", "Автономный ИИ-ассистент, запуск навыков и среда выполнения агента", kicker="АГЕНТ")
+        top.pack(fill="x", pady=(0, 20))
+
+        # Status & Overview Banner
+        banner = self._card(self.content, padding=18)
+        banner.pack(fill="x", pady=(0, 16))
+
+        b_top = tk.Frame(banner, bg=CARD)
+        b_top.pack(fill="x")
+        icon_badge(b_top, "terminal", size=24, color=ACCENT).pack(side="left", padx=(0, 14))
+        b_info = tk.Frame(b_top, bg=CARD)
+        b_info.pack(side="left", fill="x", expand=True)
+        tk.Label(b_info, text="Hermes AI Daemon Core", bg=CARD, fg=TEXT, font=winui_font("subtitle", 14)).pack(anchor="w")
+        status_sub = tk.Frame(b_info, bg=CARD)
+        status_sub.pack(anchor="w", pady=(3, 0))
+        dot_color = GREEN if self._hermes_online else RED
+        dot_text = "● В сети (127.0.0.1:8787)" if self._hermes_online else "● Оффлайн / Демон не обнаружен"
+        self._hermes_view_dot = tk.Label(status_sub, text=dot_text, bg=CARD, fg=dot_color, font=winui_font("caption_strong", 10))
+        self._hermes_view_dot.pack(side="left")
+
+        # Action buttons on banner
+        btn_row = tk.Frame(b_top, bg=CARD)
+        btn_row.pack(side="right")
+        self._button(btn_row, "Проверить статус", self._check_hermes_daemon_now, kind="secondary").pack(side="left", padx=(0, 8))
+        self._button(btn_row, "Открыть Web UI", self.open_hermes_webui, kind="primary").pack(side="left")
+
+        # Main prompt execution workspace
+        work_card = self._card(self.content, padding=20)
+        work_card.pack(fill="both", expand=True, pady=(0, 16))
+
+        tk.Label(work_card, text="Интерактивный запуск задач и команд", bg=CARD, fg=TEXT, font=winui_font("subtitle", 13)).pack(anchor="w", pady=(0, 6))
+        tk.Label(work_card, text="Отправляйте команды, системные запросы и запускайте автономные сценарии через локального агента Hermes.", bg=CARD, fg=MUTED, font=winui_font("body", 10), wraplength=700, justify="left").pack(anchor="w", pady=(0, 14))
+
+        # Quick preset pills
+        presets_frame = tk.Frame(work_card, bg=CARD)
+        presets_frame.pack(fill="x", pady=(0, 12))
+        tk.Label(presets_frame, text="Быстрые сценарии:", bg=CARD, fg=MUTED, font=winui_font("caption_strong", 9)).pack(side="left", padx=(0, 10))
+
+        presets = [
+            ("Диагностика ПК", "Выполни полную диагностику системы, проверь память, процессор и дисковое пространство."),
+            ("Очистка кэша", "Проанализируй временные файлы и дай рекомендации по очистке диска."),
+            ("Статус сети", "Проверь сетевые интерфейсы, задержку и доступность сервера XASS."),
+            ("Анализ логов", "Изучи последние записи журнала XASS и выдели предупреждения."),
+        ]
+        for title, pr_text in presets:
+            ModernButton(
+                presets_frame,
+                text=title,
+                command=lambda t=pr_text: self._set_hermes_view_prompt(t),
+                bg=FIELD,
+                fg=TEXT,
+                parent_bg=CARD,
+                activebackground=HOVER,
+                activeforeground=TEXT,
+                font=winui_font("caption", 9),
+                padx=10,
+                pady=5,
+                radius=6,
+                border_color=LINE,
+            ).pack(side="left", padx=4)
+
+        # Prompt input field
+        input_box = RoundedPanel(work_card, bg=FIELD, parent_bg=CARD, radius=8, padx=12, pady=10, border_color=LINE)
+        input_box.pack(fill="x", pady=(0, 12))
+        self.hermes_view_input = tk.Entry(
+            input_box,
+            bg=FIELD,
+            fg=TEXT,
+            insertbackground=TEXT,
+            selectbackground=ACCENT,
+            relief="flat",
+            borderwidth=0,
+            font=winui_font("body", 11),
+        )
+        self.hermes_view_input.pack(fill="x")
+        self.hermes_view_input.bind("<Return>", lambda _e: self._run_hermes_view_prompt())
+        self.hermes_view_input.bind("<FocusIn>", lambda _e: input_box.configure(border_color=ACCENT))
+        self.hermes_view_input.bind("<FocusOut>", lambda _e: input_box.configure(border_color=LINE))
+
+        # Control row
+        ctrl_row = tk.Frame(work_card, bg=CARD)
+        ctrl_row.pack(fill="x", pady=(0, 14))
+        self.hermes_view_run_btn = self._button(ctrl_row, "Отправить задачу", self._run_hermes_view_prompt, kind="primary")
+        self.hermes_view_run_btn.pack(side="left")
+        self._button(ctrl_row, "Очистить вывод", self._clear_hermes_view_output, kind="secondary").pack(side="left", padx=10)
+        self.hermes_view_status_lbl = tk.Label(ctrl_row, text="", bg=CARD, fg=MUTED, font=winui_font("caption", 9))
+        self.hermes_view_status_lbl.pack(side="right")
+
+        # Output console
+        tk.Label(work_card, text="Журнал ответов и цепочка рассуждений (Chain of Thought):", bg=CARD, fg=MUTED, font=winui_font("caption_strong", 9)).pack(anchor="w", pady=(0, 6))
+        self.hermes_view_output = DarkScrolledText(work_card, height=14)
+        self.hermes_view_output.pack(fill="both", expand=True)
+        self._style_scrolled_text(self.hermes_view_output)
+        self.hermes_view_output.configure(state="normal")
+        self.hermes_view_output.insert("end", "Hermes Agent AI готов к работе.\nВведите запрос выше или выберите один из быстрых сценариев.\n")
+        self.hermes_view_output.configure(state="disabled")
+
+    def _set_hermes_view_prompt(self, text: str) -> None:
+        if hasattr(self, "hermes_view_input") and self.hermes_view_input.winfo_exists():
+            self.hermes_view_input.delete(0, "end")
+            self.hermes_view_input.insert(0, text)
+            self.hermes_view_input.focus_set()
+
+    def _clear_hermes_view_output(self) -> None:
+        if hasattr(self, "hermes_view_output") and self.hermes_view_output.winfo_exists():
+            self.hermes_view_output.configure(state="normal")
+            self.hermes_view_output.delete("1.0", "end")
+            self.hermes_view_output.configure(state="disabled")
+
+    def _check_hermes_daemon_now(self) -> None:
+        def worker() -> None:
+            url = self.hermes_url_var.get() if hasattr(self, "hermes_url_var") else DEFAULT_HERMES_URL
+            status = check_hermes_status(url)
+            online = status.get("online", False)
+            def update_ui() -> None:
+                self._hermes_online = online
+                if hasattr(self, "_hermes_view_dot") and self._hermes_view_dot.winfo_exists():
+                    self._hermes_view_dot.configure(
+                        text="● В сети (127.0.0.1:8787)" if online else "● Оффлайн / Демон не обнаружен",
+                        fg=GREEN if online else RED,
+                    )
+                if hasattr(self, "hermes_dot_label") and self.hermes_dot_label.winfo_exists():
+                    self.hermes_dot_label.configure(
+                        text="● В сети" if online else "● Недоступен",
+                        fg=GREEN if online else RED,
+                    )
+                if hasattr(self, "hermes_view_status_lbl") and self.hermes_view_status_lbl.winfo_exists():
+                    lat = status.get("latency_ms", 0.0)
+                    self.hermes_view_status_lbl.configure(
+                        text=f"Статус обновлён: {'В сети' if online else 'Оффлайн'} ({lat:.1f} мс)" if lat else "Статус обновлён"
+                    )
+            try:
+                self.root.after(0, update_ui)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_hermes_view_prompt(self) -> None:
+        if not hasattr(self, "hermes_view_input") or not self.hermes_view_input.winfo_exists():
+            return
+        prompt = self.hermes_view_input.get().strip()
+        if not prompt:
+            return
+        url = self.hermes_url_var.get() if hasattr(self, "hermes_url_var") else DEFAULT_HERMES_URL
+        if hasattr(self, "hermes_view_run_btn") and self.hermes_view_run_btn.winfo_exists():
+            self.hermes_view_run_btn.configure(state="disabled", text="Выполнение...")
+        if hasattr(self, "hermes_view_status_lbl") and self.hermes_view_status_lbl.winfo_exists():
+            self.hermes_view_status_lbl.configure(text="Выполнение запроса...")
+
+        def worker() -> None:
+            result = send_hermes_prompt(prompt, daemon_url=url)
+            def done() -> None:
+                if hasattr(self, "hermes_view_run_btn") and self.hermes_view_run_btn.winfo_exists():
+                    self.hermes_view_run_btn.configure(state="normal", text="Отправить задачу")
+                if hasattr(self, "hermes_view_status_lbl") and self.hermes_view_status_lbl.winfo_exists():
+                    lat = result.get("latency_ms", 0.0)
+                    self.hermes_view_status_lbl.configure(text=f"Завершено за {lat:.1f} мс" if lat else "Завершено")
+                if hasattr(self, "hermes_view_output") and self.hermes_view_output.winfo_exists():
+                    self.hermes_view_output.configure(state="normal")
+                    now = datetime.now().strftime("%H:%M:%S")
+                    self.hermes_view_output.insert("end", f"\n[{now}] > {prompt}\n")
+                    resp = result.get("response", "")
+                    self.hermes_view_output.insert("end", f"{resp}\n")
+                    self.hermes_view_output.see("end")
+                    self.hermes_view_output.configure(state="disabled")
+            try:
+                self.root.after(0, done)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_computer(self) -> None:
         self._header("Этот компьютер", "Агент, ресурсы и соединение с сервером", "Устройство")
@@ -2728,6 +2924,12 @@ class XassDesktop:
                         activeforeground=palette["TEXT"],
                         parent_bg=palette["SIDEBAR"],
                     )
+            if hasattr(self, "sidebar_chip") and self.sidebar_chip.winfo_exists():
+                self.sidebar_chip.configure(
+                    bg=palette.get("SIDEBAR_CARD", "#1c1c24"),
+                    parent_bg=palette["SIDEBAR"],
+                    border_color=palette.get("SIDEBAR_BORDER", "#2e2e3a"),
+                )
             if hasattr(self, "body_canvas") and self.body_canvas.winfo_exists():
                 self.body_canvas.configure(bg=palette["BG"])
             if hasattr(self, "content") and self.content.winfo_exists():
@@ -2748,11 +2950,13 @@ class HermesPromptDialog(tk.Toplevel):
         self.title("Hermes Agent AI — Задача")
         self.configure(bg=BG)
         self.transient(app.root)
+        if winui_frame is not None:
+            winui_frame.apply_winui_dialog_styling(self, theme_name=app.theme_var.get())
         self.minsize(580, 500)
         self.geometry("660x540")
         self._executing = False
 
-        card = RoundedPanel(self, bg=CARD, parent_bg=BG, radius=16, padx=24, pady=20, border_color=LINE)
+        card = RoundedPanel(self, bg=CARD, parent_bg=BG, radius=12, padx=24, pady=20, border_color=LINE)
         card.pack(fill="both", expand=True, padx=16, pady=16)
 
         # Header
@@ -2761,15 +2965,15 @@ class HermesPromptDialog(tk.Toplevel):
         icon_badge(header, "terminal", size=24, color=ACCENT).pack(side="left", padx=(0, 12))
         title_box = tk.Frame(header, bg=CARD)
         title_box.pack(side="left", fill="x", expand=True)
-        tk.Label(title_box, text="Hermes Agent AI", bg=CARD, fg=TEXT, font=("Segoe UI Semibold", 16)).pack(anchor="w")
+        tk.Label(title_box, text="Hermes Agent AI", bg=CARD, fg=TEXT, font=winui_font("subtitle", 16)).pack(anchor="w")
 
         # Live Status
         self.status_var = tk.StringVar(value="Проверка связи…")
         status_row = tk.Frame(title_box, bg=CARD)
         status_row.pack(anchor="w", pady=(3, 0))
-        self.status_dot = tk.Label(status_row, text="●", bg=CARD, fg=GREEN if app._hermes_online else RED, font=("Segoe UI", 9))
+        self.status_dot = tk.Label(status_row, text="●", bg=CARD, fg=GREEN if app._hermes_online else RED, font=winui_font("caption", 9))
         self.status_dot.pack(side="left")
-        self.status_lbl = tk.Label(status_row, textvariable=self.status_var, bg=CARD, fg=MUTED, font=("Segoe UI", 9))
+        self.status_lbl = tk.Label(status_row, textvariable=self.status_var, bg=CARD, fg=MUTED, font=winui_font("caption", 9))
         self.status_lbl.pack(side="left", padx=(6, 0))
 
         # Prompt entry

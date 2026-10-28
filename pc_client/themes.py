@@ -4,6 +4,28 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+def hex_to_colorref(hex_color: str | int) -> int:
+    """Convert hex color (#RRGGBB or 0x00BBGGRR) to Win32 COLORREF (0x00BBGGRR)."""
+    if isinstance(hex_color, int):
+        return hex_color
+    raw = str(hex_color).strip()
+    if raw.startswith("0x") or raw.startswith("0X"):
+        try:
+            return int(raw, 16)
+        except ValueError:
+            return 0
+    clean = raw.lstrip("#")
+    if len(clean) == 6:
+        try:
+            r = int(clean[0:2], 16)
+            g = int(clean[2:4], 16)
+            b = int(clean[4:6], 16)
+            return (b << 16) | (g << 8) | r
+        except ValueError:
+            return 0
+    return 0
+
+
 # Standard theme names
 THEME_CYBER = "Cyber"
 THEME_TOKYO = "Tokyo"
@@ -45,6 +67,9 @@ THEMES: dict[str, dict[str, str]] = {
         "NAV_ACTIVE_BG": "#2a2a34",
         "NAV_SELECTED_BG": "#24242e",
         "DWM_CAPTION": "0x00181414",
+        "DWM_BORDER": "0x003a2e2e",
+        "DWM_TEXT": "0x00f7f5f5",
+        "BACKDROP": "mica_alt",
     },
     THEME_CYBER: {
         "BG": "#0d1017",
@@ -69,6 +94,9 @@ THEMES: dict[str, dict[str, str]] = {
         "NAV_ACTIVE_BG": "#1f2738",
         "NAV_SELECTED_BG": "#1a2232",
         "DWM_CAPTION": "0x00120c09",
+        "DWM_BORDER": "0x003d2a23",
+        "DWM_TEXT": "0x00fcf6f0",
+        "BACKDROP": "acrylic",
     },
     THEME_TOKYO: {
         "BG": "#1a1b26",
@@ -93,6 +121,9 @@ THEMES: dict[str, dict[str, str]] = {
         "NAV_ACTIVE_BG": "#2a2f47",
         "NAV_SELECTED_BG": "#23273c",
         "DWM_CAPTION": "0x001e1616",
+        "DWM_BORDER": "0x00593b34",
+        "DWM_TEXT": "0x00f5cac0",
+        "BACKDROP": "mica",
     },
     THEME_NORDIC: {
         "BG": "#242933",
@@ -117,6 +148,9 @@ THEMES: dict[str, dict[str, str]] = {
         "NAV_ACTIVE_BG": "#343b49",
         "NAV_SELECTED_BG": "#2c3340",
         "DWM_CAPTION": "0x002a221e",
+        "DWM_BORDER": "0x004f4039",
+        "DWM_TEXT": "0x00f4effc",
+        "BACKDROP": "mica",
     },
     THEME_MATRIX: {
         "BG": "#0a0f0d",
@@ -141,6 +175,9 @@ THEMES: dict[str, dict[str, str]] = {
         "NAV_ACTIVE_BG": "#16231b",
         "NAV_SELECTED_BG": "#121c16",
         "DWM_CAPTION": "0x00070906",
+        "DWM_BORDER": "0x00232b1c",
+        "DWM_TEXT": "0x00ebf8e0",
+        "BACKDROP": "acrylic",
     },
 }
 

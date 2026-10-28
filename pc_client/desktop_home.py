@@ -11,7 +11,7 @@ from typing import Any
 from PIL import Image, ImageChops, ImageOps, ImageTk
 
 from desktop_widgets import (
-    ACCENT as BLUE, BG, CARD, LILAC, LINE, MUTED, TEXT, EmptyState, ModernButton, RoundedPanel, icon_badge, icon_image, rounded_image,
+    ACCENT as BLUE, BG, CARD, LILAC, LINE, MUTED, TEXT, EmptyState, ModernButton, RoundedPanel, icon_badge, icon_image, rounded_image, winui_font,
 )
 
 CARD_NAME = "red!"
@@ -84,8 +84,8 @@ class HomeHero(tk.Canvas):
             with Image.open(path) as source:
                 self._source = source.convert("RGB")
         self._art = self.create_image(0, 0, anchor="nw")
-        self._heading = self.create_text(32, 110, anchor="w", fill=TEXT, font=("Segoe UI Semibold", 27))
-        self._description = self.create_text(32, 158, anchor="nw", text="", fill="#c6c6ce", font=("Segoe UI", 12))
+        self._heading = self.create_text(32, 110, anchor="w", fill=TEXT, font=winui_font("display", 26))
+        self._description = self.create_text(32, 158, anchor="nw", text="", fill="#c6c6ce", font=winui_font("body", 12))
         self._clock = None
         self.open_button = ModernButton(self, text="Открыть Mini App", command=app.open_miniapp,
                                        bg=BLUE, fg="#12131c", activebackground="#9aafff", parent_bg="#000000",
@@ -205,16 +205,16 @@ def build_home(app: Any) -> None:
     icon_badge(status, "monitor", size=28).pack(side="left", padx=(0, 16))
     copy = tk.Frame(status, bg=CARD)
     copy.pack(side="left", fill="x", expand=True)
-    tk.Label(copy, text="Состояние", bg=CARD, fg=BLUE, font=("Segoe UI Semibold", 9)).pack(anchor="w")
+    tk.Label(copy, text="Состояние", bg=CARD, fg=BLUE, font=winui_font("caption_strong", 9)).pack(anchor="w")
     title = tk.Frame(copy, bg=CARD)
     title.pack(fill="x", pady=(4, 0))
-    app.hero_dot = tk.Label(title, text="●", bg=CARD, fg=app.status_color, font=("Segoe UI", 11))
+    app.hero_dot = tk.Label(title, text="●", bg=CARD, fg=app.status_color, font=winui_font("body", 11))
     app.hero_dot.pack(side="left", padx=(0, 8))
     app.home_connection_text = tk.StringVar()
-    app.hero_status = tk.Label(title, textvariable=app.home_connection_text, bg=CARD, fg=app.status_color, font=("Segoe UI Semibold", 15))
+    app.hero_status = tk.Label(title, textvariable=app.home_connection_text, bg=CARD, fg=app.status_color, font=winui_font("subtitle", 15))
     app.hero_status.pack(side="left")
     detail = tk.StringVar()
-    tk.Label(copy, textvariable=detail, bg=CARD, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", pady=(3, 0))
+    tk.Label(copy, textvariable=detail, bg=CARD, fg=MUTED, font=winui_font("body", 11)).pack(anchor="w", pady=(3, 0))
 
     def status_changed() -> None:
         value = app.connection_var.get()

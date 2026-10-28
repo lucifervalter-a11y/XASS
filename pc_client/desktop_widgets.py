@@ -15,6 +15,76 @@ FIELD, WELL, NOTE = "#1a1a1e", "#35353f", "#1a1a1e"
 TEXT, MUTED, ACCENT, ACCENT_SOFT = "#f5f5f7", "#b1b1bb", "#829cff", "#9aafff"
 LILAC, GREEN, AMBER, RED = "#c495f4", "#61c554", "#efb65c", "#f36b76"
 
+# ---------------------------------------------------------------------------
+# WinUI 3 Typography System (Fluent Design System 2.0 / Windows App SDK)
+# Detects Segoe UI Variable fonts (Display, Text, Small) with Segoe UI fallback.
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _detect_winui_fonts() -> dict[str, str]:
+    families = set()
+    try:
+        root = tk._default_root
+        if root is not None:
+            families = set(tkfont.families(root))
+    except Exception:
+        pass
+    if not families:
+        try:
+            dummy = tk.Tk()
+            dummy.withdraw()
+            families = set(tkfont.families(dummy))
+            dummy.destroy()
+        except Exception:
+            pass
+
+    has_variable = "Segoe UI Variable Text" in families
+    return {
+        "display": "Segoe UI Variable Display" if has_variable else ("Segoe UI Semibold" if "Segoe UI Semibold" in families else "Segoe UI"),
+        "text": "Segoe UI Variable Text" if has_variable else "Segoe UI",
+        "small": "Segoe UI Variable Small" if has_variable else "Segoe UI",
+        "code": "Cascadia Code" if "Cascadia Code" in families else "Consolas",
+    }
+
+
+def winui_font(role: str = "body", size: int | None = None, weight: str | None = None) -> tuple:
+    """Return an optimal WinUI 3 font specification tuple (family, size, [weight])."""
+    fonts = _detect_winui_fonts()
+    role_lower = role.lower()
+    if role_lower in ("display", "hero"):
+        fam = fonts["display"]
+        sz = size or 22
+        wt = weight or "bold"
+    elif role_lower in ("title", "header"):
+        fam = fonts["display"]
+        sz = size or 18
+        wt = weight or "bold"
+    elif role_lower in ("subtitle", "section"):
+        fam = fonts["text"]
+        sz = size or 13
+        wt = weight or "bold"
+    elif role_lower in ("body_strong", "button", "bold"):
+        fam = fonts["text"]
+        sz = size or 10
+        wt = weight or "bold"
+    elif role_lower in ("caption", "small"):
+        fam = fonts["small"]
+        sz = size or 8
+        wt = weight or "normal"
+    elif role_lower in ("caption_strong", "badge"):
+        fam = fonts["small"]
+        sz = size or 8
+        wt = weight or "bold"
+    elif role_lower in ("code", "mono"):
+        fam = fonts["code"]
+        sz = size or 9
+        wt = weight or "normal"
+    else:  # default body
+        fam = fonts["text"]
+        sz = size or 10
+        wt = weight or "normal"
+
+    return (fam, sz, wt) if wt and wt != "normal" else (fam, sz)
+
 
 def _parent_background(parent):
     try:
@@ -191,32 +261,32 @@ def page_header(parent, title, subtitle="", *, kicker="", bg=None):
         if height < 8:
             return
         bar.delete("rule")
-        bar.create_rectangle(0, 3, 3, height - 3, fill=ACCENT, outline=ACCENT, tags="rule")
+        bar.create_line(1.5, 3, 1.5, height - 3, fill=ACCENT, width=3, capstyle="round", tags="rule")
 
     bar.bind("<Configure>", paint_rule)
     copy = tk.Frame(top, bg=stage)
     copy.pack(side="left", fill="x", expand=True)
     if kicker:
         tk.Label(copy, text=kicker, bg=stage, fg=ACCENT, anchor="w", justify="left",
-                 font=("Segoe UI Semibold", 9)).pack(fill="x", pady=(0, 3))
+                 font=winui_font("caption_strong", 9)).pack(fill="x", pady=(0, 3))
     tk.Label(copy, text=title, bg=stage, fg=TEXT, anchor="w", justify="left",
-             font=("Segoe UI Semibold", 24)).pack(fill="x")
+             font=winui_font("display", 24)).pack(fill="x")
     if subtitle:
         tk.Label(copy, text=subtitle, bg=stage, fg=MUTED, anchor="w", justify="left",
-                 font=("Segoe UI", 11)).pack(fill="x", pady=(6, 0))
+                 font=winui_font("body", 11)).pack(fill="x", pady=(6, 0))
     return top
 
 
 def quiet_note(parent, text, *, icon="shield", bg=None, pady=(16, 0), color=ACCENT):
     """Inset note under a page, for warnings that should not look like another form."""
     stage = bg or _parent_background(parent)
-    panel = RoundedPanel(parent, bg=NOTE, parent_bg=stage, radius=14, padx=16, pady=14, border_color="#333342")
+    panel = RoundedPanel(parent, bg=NOTE, parent_bg=stage, radius=12, padx=16, pady=14, border_color="#333342")
     panel.pack(fill="x", pady=pady)
     row = tk.Frame(panel, bg=NOTE)
     row.pack(fill="x")
-    icon_badge(row, icon, size=20, color=color, radius=14).pack(side="left", anchor="n", padx=(0, 12))
+    icon_badge(row, icon, size=20, color=color, radius=12).pack(side="left", anchor="n", padx=(0, 12))
     tk.Label(row, text=text, bg=NOTE, fg=MUTED, justify="left", anchor="w", wraplength=680,
-             font=("Segoe UI", 11)).pack(side="left", fill="x", expand=True)
+             font=winui_font("body", 11)).pack(side="left", fill="x", expand=True)
     return panel
 
 
@@ -230,20 +300,20 @@ class EmptyState(tk.Frame):
         super().__init__(parent, bg=stage if framed else surface, highlightthickness=0, borderwidth=0)
         host = self
         if framed:
-            host = RoundedPanel(self, bg=surface, parent_bg=stage, radius=16, padx=28, pady=28, border_color=LINE)
+            host = RoundedPanel(self, bg=surface, parent_bg=stage, radius=14, padx=28, pady=28, border_color=LINE)
             host.pack(fill="x")
         else:
             self.configure(padx=6, pady=8)
         color = RED if tone == "danger" else ACCENT
         icon_badge(host, icon, size=28, color=color).pack(anchor="w")
         tk.Label(host, text=title, bg=surface, fg=TEXT, anchor="w", justify="left",
-                 font=("Segoe UI Semibold", 16)).pack(fill="x", pady=(14, 4))
+                 font=winui_font("title", 16)).pack(fill="x", pady=(14, 4))
         tk.Label(host, text=message, bg=surface, fg=MUTED, anchor="w", justify="left",
-                 font=("Segoe UI", 11), wraplength=560).pack(fill="x")
+                 font=winui_font("body", 11), wraplength=560).pack(fill="x")
         if command is not None and action:
             ModernButton(host, text=action, command=command, bg=ACCENT, fg="#12131c",
                          activebackground=ACCENT_SOFT, padx=16, pady=9,
-                         font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(16, 0))
+                         font=winui_font("button", 10), radius=6).pack(anchor="w", pady=(16, 0))
 
 
 class RoundedPanel(tk.Frame):
@@ -304,10 +374,12 @@ class RoundedPanel(tk.Frame):
     def _paint(self):
         self._paint_job = None
         width, height = self.winfo_width(), self.winfo_height()
-        key = (width, height, self._fill, self._radius, self._border_color, self._border_width)
+        key = (width, height, self._fill, self._radius, self._border_color, self._border_width, self._parent_bg)
         if width < 2 or height < 2 or key == self._last_paint:
             return
         self._last_paint = key
+        if self._background.cget("bg") != self._parent_bg:
+            self._background.configure(bg=self._parent_bg)
         self._background_image = ImageTk.PhotoImage(rounded_image(width, height, fill=self._fill,
             radius=self._radius, border_color=self._border_color, border_width=self._border_width), master=self)
         self._background.delete("all")
@@ -550,7 +622,7 @@ class NavButton(ModernButton):
         self._nav_muted = options.get("fg", MUTED)
         defaults = dict(bg=self._nav_selected if active else self._nav_normal, fg=TEXT if active else self._nav_muted,
             activebackground=HOVER, activeforeground=TEXT, anchor="w", padx=16, pady=9,
-            font=("Segoe UI Semibold", 11), icon=icon, icon_size=22, radius=10)
+            font=winui_font("body_strong", 11), icon=icon, icon_size=20, radius=6)
         defaults.update(options)
         super().__init__(parent, text, command, **defaults)
         self._values["active"] = active
@@ -579,7 +651,42 @@ class NavButton(ModernButton):
     def _paint(self):
         if not super()._paint():
             return
-        if self._nav_active and self.winfo_height() > 4:
-            center = self.winfo_height() / 2
-            self.create_line(2, center - 10, 2, center + 10, fill=LILAC, width=3,
+        if self._nav_active and self.winfo_height() > 6:
+            height = self.winfo_height()
+            pill_h = min(16, height - 10)
+            center = height / 2
+            # WinUI 3 Navigation View Selection Indicator (3px wide vertical pill, rounded caps)
+            self.create_line(3, center - pill_h / 2, 3, center + pill_h / 2, fill=ACCENT, width=3,
                              capstyle="round", tags="active-indicator")
+
+
+class WinUICard(RoundedPanel):
+    """WinUI 3 standard elevated surface card (8px radius, subtle border stroke)."""
+    def __init__(self, parent, *, bg=CARD, parent_bg=None, radius=8,
+                 border_color=LINE, border_width=1, padx=18, pady=16, **options):
+        super().__init__(parent, bg=bg, parent_bg=parent_bg, radius=radius,
+                         border_color=border_color, border_width=border_width,
+                         padx=padx, pady=pady, **options)
+
+
+def winui_badge(parent, text: str, *, tone: str = "accent", size: int = 9,
+                bg: str | None = None, fg: str | None = None) -> RoundedPanel:
+    """WinUI 3 rounded pill badge for status, tags, and micro-counters."""
+    tones = {
+        "accent": (ACCENT, "#12131c"),
+        "green": (GREEN, "#0b2010"),
+        "amber": (AMBER, "#251a05"),
+        "red": (RED, "#ffffff"),
+        "muted": (WELL, MUTED),
+    }
+    fill, text_color = tones.get(tone, (ACCENT, "#12131c"))
+    if bg:
+        fill = bg
+    if fg:
+        text_color = fg
+    host = _parent_background(parent)
+    pill = RoundedPanel(parent, bg=fill, parent_bg=host, radius=12, padx=8, pady=3, border_width=0)
+    label = tk.Label(pill, text=text, bg=fill, fg=text_color,
+                     font=winui_font("caption_strong", size))
+    label.pack()
+    return pill
