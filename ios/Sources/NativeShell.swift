@@ -391,6 +391,19 @@ enum NativeShellSheet: Hashable, Identifiable {
     var body: some View {
             List {
                 Section("Сервер") { Text(store.api.origin.url.absoluteString).textSelection(.enabled); Button("Обновить данные") { store.run { await store.refresh() } } }
+                Section("Оформление") {
+                    NavigationLink {
+                        ThemeSelectorView()
+                    } label: {
+                        HStack {
+                            Label("Тема оформления", systemImage: "paintpalette")
+                            Spacer()
+                            Text(ThemeManager.shared.currentTheme.displayName)
+                                .foregroundStyle(XASSStyle.secondary)
+                        }
+                    }
+                    .accessibilityIdentifier("settingsThemeSelector")
+                }
                 Section("Приложение") {
                     NavigationLink { NativeStorageView(store: store) } label: { Label("Хранение", systemImage: "externaldrive") }
                     Button { store.showEnrollment = true } label: { Label(store.enrolled ? "Защищённый ключ iPhone привязан" : "Привязать ключ iPhone", systemImage: "lock.shield") }

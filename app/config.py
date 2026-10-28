@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Annotated, Any
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     vk_access_token: str = ""
     vk_api_version: str = "5.199"
     vk_now_playing_refresh_minutes: int = 2
+
+    hermes_url: str = Field(
+        default="http://127.0.0.1:8787",
+        validation_alias=AliasChoices("hermes_url", "hermes_webui_url"),
+    )
+    hermes_api_key: str = ""
+    hermes_enabled: bool = True
 
     telegram_webhook_path: str = "change-me-webhook-path"
     telegram_secret_token: str = ""
@@ -228,6 +235,32 @@ class Settings(BaseSettings):
             return 8
         parsed = int(value)
         return max(6, min(parsed, 24))
+
+    @field_validator("hermes_url", mode="before")
+    @classmethod
+    def _normalize_hermes_url(cls, value: Any) -> str:
+        if value is None:
+            return "http://127.0.0.1:8787"
+        text = str(value).strip().rstrip("/")
+        return text or "http://127.0.0.1:8787"
+
+    @field_validator("hermes_api_key", mode="before")
+    @classmethod
+    def _normalize_hermes_api_key(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @field_validator("hermes_enabled", mode="before")
+    @classmethod
+    def _normalize_hermes_enabled(cls, value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
 
     def validate_security(self) -> list[str]:
         """Returns list of security warnings for dangerous default values."""

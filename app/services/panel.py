@@ -40,6 +40,10 @@ def main_panel_keyboard() -> dict:
                 {"text": "🗂 Проекты", "callback_data": "panel:projects"},
                 {"text": "🆕 Обновление", "callback_data": "panel:update"},
             ],
+            [
+                {"text": "🤖 Hermes Agent", "callback_data": "panel:hermes"},
+                {"text": "🎨 Сменить тему", "callback_data": "panel:themes"},
+            ],
         ]
     }
 
@@ -96,7 +100,10 @@ def panel_text() -> str:
         "/pc     — состояние ПК\n"
         "/chats  — сохранённые переписки\n"
         "/deleted — удалённые сообщения\n"
-        "/archive — локальный архив на ПК"
+        "/archive — локальный архив на ПК\n"
+        "/hermes — 🤖 диалог с Hermes Agent\n"
+        "/hermes_status — статус и задержка Hermes\n"
+        "/theme — 🎨 смена темы оформления"
     )
 
 
@@ -118,6 +125,14 @@ def dot_commands_help_text() -> str:
         "/quote <текст>    — добавить цитату\n"
         "/quotes           — список цитат\n"
         "/quotedel <id>    — удалить цитату\n\n"
+        "🤖 Hermes Agent AI\n"
+        "/hermes <запрос>  — отправить запрос Hermes\n"
+        "/hermes_status    — статус и задержка агента\n"
+        "/hermes_sessions  — список сессий диалогов\n"
+        "/hermes_new       — начать новую сессию\n\n"
+        "🎨 Темы оформления\n"
+        "/theme <тема>     — переключить тему (cyber, tokyo, nordic, matrix, sunset, glass)\n"
+        "/theme            — выбор темы кнопками\n\n"
         "————————————————————————\n"
         ".help   — эта справка\n\n"
         "📱 Мини-приложение: /webapp\n"

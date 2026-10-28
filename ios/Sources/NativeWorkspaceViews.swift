@@ -128,6 +128,8 @@ import SwiftUI
                     }
                 }
                 Section {
+                    NavigationLink { HermesView(hermes: HermesService(api: store.api), store: store) } label: { Label("Hermes AI Агент", systemImage: "sparkles") }.accessibilityIdentifier("nativeToolsHermes")
+                    NavigationLink { ThemeSelectorView() } label: { Label("Тема оформления", systemImage: "paintpalette") }.accessibilityIdentifier("nativeToolsTheme")
                     NavigationLink { NativeDiagnosticLogView() } label: { Label("Журнал приложения", systemImage: "doc.text.magnifyingglass") }.accessibilityIdentifier("nativeToolsAppDiagnostics")
                     NavigationLink { NativeSettingsView(app: app, store: store) } label: { Label("Настройки приложения", systemImage: "gearshape") }.accessibilityIdentifier("nativeToolsSettings")
                 }

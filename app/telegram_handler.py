@@ -82,6 +82,13 @@ from app.services.projects_bot import ProjectsBotService
 from app.services.quotes_store import add_quote, delete_quote, load_quotes
 from app.services.restart_notice import clear_restart_notice, save_restart_notice
 from app.services.weather_card import build_weather_card, build_weather_links
+from app.services.hermes import HermesService
+from app.services.projects_store import (
+    VALID_THEMES,
+    load_site_config,
+    save_site_config,
+    append_audit_log as append_projects_audit_log,
+)
 from app.services.updater import (
     CommitInfo,
     UpdateStatus,
@@ -114,6 +121,46 @@ NON_TRACK_STATUS_MARKERS = (
 )
 
 
+
+THEMES_DATA: dict[str, dict[str, str]] = {
+    "cyber": {
+        "name": "Cyber OLED",
+        "icon": "⚡",
+        "accent": "#376dff",
+        "desc": "Глубокий OLED-чёрный, неоновый синий и электрический фиолетовый",
+    },
+    "tokyo": {
+        "name": "Tokyo Night",
+        "icon": "🌃",
+        "accent": "#ff007f",
+        "desc": "Полуночный индиго, неоновая маджента и киберпанк-циан",
+    },
+    "nordic": {
+        "name": "Nordic Frost",
+        "icon": "❄️",
+        "accent": "#38bdf8",
+        "desc": "Арктический тёмный сланец, ледяной циан и морозные рамки",
+    },
+    "matrix": {
+        "name": "Matrix Terminal",
+        "icon": "📟",
+        "accent": "#10b981",
+        "desc": "Обсидиановый зелёный, изумрудный фосфор и мятное свечение",
+    },
+    "sunset": {
+        "name": "Sunset Amber",
+        "icon": "🌅",
+        "accent": "#f59e0b",
+        "desc": "Тёмный титан, тёплое янтарное золото и багровый закат",
+    },
+    "glass": {
+        "name": "Liquid Glass",
+        "icon": "💎",
+        "accent": "#818cf8",
+        "desc": "Полупрозрачные стеклянные панели, глубокий блюр и призматические грани",
+    },
+}
+
 class TelegramUpdateHandler:
     def __init__(self, settings: Settings, bot_client: TelegramBotClient | None):
         self.settings = settings
@@ -128,6 +175,8 @@ class TelegramUpdateHandler:
         self.update_jobs: dict[int, asyncio.Task[Any]] = {}
         self.start_shortcut_hint_sent: set[int] = set()
         self.music_ingest: TelegramMusicIngest | None = None
+        self.hermes_service: HermesService | None = None
+        self.hermes_active_sessions: dict[int, str] = {}
         self.projects_service = ProjectsBotService(
             settings=settings,
             bot_client=bot_client,
@@ -226,6 +275,12 @@ class TelegramUpdateHandler:
             return False
 
         command = text.split()[0].lower()
+        if command in (".hermes", ".ai"):
+            await self._handle_hermes_prompt_command(session, config, chat_id, user_id, text)
+            return True
+        if command in (".theme", ".themes"):
+            await self._handle_theme_command(session, config, chat_id, user_id, text)
+            return True
         if command == ".mute":
             if not is_owner(user_id, self.settings):
                 return False
@@ -888,6 +943,25 @@ class TelegramUpdateHandler:
 
         config = await get_or_create_app_config(session, self.settings)
         command = text.split()[0].split("@")[0].lower()
+
+        if command == "/hermes":
+            await self._handle_hermes_prompt_command(session, config, chat_id, user_id, text)
+            return
+        if command == "/hermes_status":
+            await self._handle_hermes_status_command(session, config, chat_id, user_id)
+            return
+        if command == "/hermes_sessions":
+            await self._handle_hermes_sessions_command(session, config, chat_id, user_id)
+            return
+        if command in ("/hermes_session", "/hermes_sess"):
+            await self._handle_hermes_switch_session_command(session, config, chat_id, user_id, text)
+            return
+        if command == "/hermes_new":
+            await self._handle_hermes_new_session_command(session, config, chat_id, user_id)
+            return
+        if command in ("/theme", "/themes"):
+            await self._handle_theme_command(session, config, chat_id, user_id, text)
+            return
 
         if not self.settings.telegram_management_buttons and command == "/help":
             await self._safe_send(chat_id, dot_commands_help_text())
@@ -2371,12 +2445,19 @@ class TelegramUpdateHandler:
 
         config = await get_or_create_app_config(session, self.settings)
 
+        if data.startswith(("hermes:", "theme:")) or data in ("panel:hermes", "panel:themes"):
+            await self._handle_hermes_or_theme_callback(session, config, callback, data, chat_id, message_id, user_id)
+            return
+
         if not self.settings.telegram_management_buttons:
             if chat_id is not None:
                 await self._safe_edit_or_send(chat_id, message_id, "Управление перенесено в мини-приложение XASS.", {"inline_keyboard": []})
                 await self._send_miniapp_entry(chat_id, config)
             return
 
+        if data.startswith(("hermes:", "theme:")) or data in ("panel:hermes", "panel:themes"):
+            await self._handle_hermes_or_theme_callback(session, config, callback, data, chat_id, message_id, user_id)
+            return
         if data in ("panel", "panel:home"):
             await self._safe_edit_or_send(chat_id, message_id, panel_text(), self._main_kb(config))
             return
@@ -4966,6 +5047,518 @@ class TelegramUpdateHandler:
         if not sent:
             await self._safe_send(chat_id, "Медиа не удалось отправить (нет локального файла и доступа по file_id).")
 
+
+    def _get_hermes_service(self) -> HermesService:
+        if self.hermes_service is None:
+            self.hermes_service = HermesService(
+                url=getattr(self.settings, "hermes_url", "http://127.0.0.1:8787"),
+                api_key=getattr(self.settings, "hermes_api_key", ""),
+                enabled=getattr(self.settings, "hermes_enabled", True),
+            )
+        return self.hermes_service
+
+    def _hermes_main_keyboard(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 Статус агента", "callback_data": "hermes:status"},
+                    {"text": "📋 Сессии", "callback_data": "hermes:sessions"},
+                ],
+                [
+                    {"text": "➕ Новая сессия", "callback_data": "hermes:new"},
+                    {"text": "🎨 Сменить тему", "callback_data": "panel:themes"},
+                ],
+                [
+                    {"text": "◀️ В главное меню", "callback_data": "panel:home"},
+                ],
+            ]
+        }
+
+    def _hermes_sessions_keyboard(self, sessions: list[dict[str, Any]], active_session_id: str | None) -> dict[str, Any]:
+        rows: list[list[dict[str, str]]] = []
+        for s in sessions[:6]:
+            sid = str(s.get("id") or "")
+            title = str(s.get("title") or "Сессия")[:22]
+            is_active = (sid == active_session_id)
+            btn_text = f"⭐ {title}" if is_active else f"💬 {title}"
+            rows.append([{"text": btn_text, "callback_data": f"hermes:switch:{sid}"}])
+        rows.append([
+            {"text": "➕ Новая сессия", "callback_data": "hermes:new"},
+            {"text": "🔄 Обновить", "callback_data": "hermes:sessions"},
+        ])
+        rows.append([
+            {"text": "🤖 Меню Hermes", "callback_data": "panel:hermes"},
+            {"text": "◀️ В меню", "callback_data": "panel:home"},
+        ])
+        return {"inline_keyboard": rows}
+
+    def _themes_keyboard(self, current_theme: str | None = None) -> dict[str, Any]:
+        meta_items = [
+            ("cyber", "⚡ Cyber OLED"),
+            ("tokyo", "🌃 Tokyo Night"),
+            ("nordic", "❄️ Nordic Frost"),
+            ("matrix", "📟 Matrix"),
+            ("sunset", "🌅 Sunset Amber"),
+            ("glass", "💎 Liquid Glass"),
+        ]
+        rows: list[list[dict[str, str]]] = []
+        current_lower = (current_theme or "").lower()
+        row: list[dict[str, str]] = []
+        for key, label in meta_items:
+            text = f"✓ {label}" if key == current_lower else label
+            row.append({"text": text, "callback_data": f"theme:{key}"})
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([
+            {"text": "🤖 Hermes Agent", "callback_data": "panel:hermes"},
+            {"text": "◀️ В меню", "callback_data": "panel:home"},
+        ])
+        return {"inline_keyboard": rows}
+
+    async def _send_formatted_hermes_reply(
+        self,
+        chat_id: int,
+        header: str,
+        body: str,
+        footer: str = "",
+        reply_markup: dict | None = None,
+    ) -> None:
+        full_text = f"{header}\n\n{body}"
+        if footer:
+            full_text += f"\n\n{footer}"
+
+        max_len = 3800
+        if len(full_text) <= max_len:
+            chunks = [full_text]
+        else:
+            lines = full_text.split("\n")
+            chunks = []
+            current = ""
+            for line in lines:
+                if len(current) + len(line) + 1 > max_len:
+                    if current:
+                        chunks.append(current)
+                    current = line
+                else:
+                    current = f"{current}\n{line}" if current else line
+            if current:
+                chunks.append(current)
+
+        for i, chunk in enumerate(chunks):
+            markup = reply_markup if i == len(chunks) - 1 else None
+            try:
+                await self._safe_send(chat_id, chunk, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                await self._safe_send(chat_id, chunk, reply_markup=markup, parse_mode=None)
+
+    async def _handle_hermes_prompt_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+    ) -> None:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            help_msg = (
+                "🤖 *Hermes Agent AI*\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "Интеллектуальный агент для кодинга, задач и системного анализа.\n\n"
+                "💡 *Использование:*\n"
+                "`/hermes <ваш запрос>`\n\n"
+                "📌 *Примеры:*\n"
+                "• `/hermes проверь статус и нагрузку сервера`\n"
+                "• `/hermes напиши python скрипт для парсинга RSS`\n"
+                "• `/hermes помоги оптимизировать SQL запрос`\n\n"
+                "⚙️ *Команды управления:*\n"
+                "/hermes_status — проверка статуса и latency агента\n"
+                "/hermes_sessions — список доступных сессий\n"
+                "/hermes_new — начать новую сессию с чистого листа"
+            )
+            await self._safe_send(chat_id, help_msg, reply_markup=self._hermes_main_keyboard(), parse_mode="Markdown")
+            return
+
+        prompt = parts[1].strip()
+        hermes = self._get_hermes_service()
+
+        uid = int(user_id or 0)
+        session_id = self.hermes_active_sessions.get(uid)
+        if not session_id:
+            try:
+                sessions = await hermes.list_sessions()
+                if sessions:
+                    session_id = sessions[0].get("id") or "hermes-default"
+                else:
+                    new_sess = await hermes.create_session(title=f"Telegram ({uid})")
+                    session_id = new_sess.get("id") or "hermes-default"
+                self.hermes_active_sessions[uid] = session_id
+            except Exception as exc:
+                logger.warning("Could not obtain session from Hermes: %s", exc)
+                session_id = "hermes-default"
+                self.hermes_active_sessions[uid] = session_id
+
+        try:
+            res = await hermes.send_prompt(session_id=session_id, prompt=prompt)
+            reply_content = res.get("response") or res.get("text") or "Агент вернул пустой ответ."
+            tokens = res.get("tokens_used", 0)
+            is_mock = res.get("mock", False)
+
+            footer_items = [f"Сессия: `{session_id}`"]
+            if tokens:
+                footer_items.append(f"Токены: {tokens}")
+            if is_mock:
+                footer_items.append("⚠️ _(Fallback/Offline mode)_")
+
+            footer = " • ".join(footer_items)
+            header = "🤖 *Hermes Agent:*"
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "➕ Новая сессия", "callback_data": "hermes:new"},
+                        {"text": "📋 Сессии", "callback_data": "hermes:sessions"},
+                    ]
+                ]
+            }
+            await self._send_formatted_hermes_reply(chat_id, header, reply_content, footer, reply_markup=kb)
+        except Exception as exc:
+            logger.exception("Hermes command error: %s", exc)
+            err_msg = (
+                "⚠️ *Hermes Agent недоступен или перегружен*\n\n"
+                f"Ошибка: `{escape(str(exc))}`\n\n"
+                "💡 *Рекомендации:*\n"
+                "1. Проверьте запущен ли сервис Hermes: `/hermes_status`\n"
+                "2. Создайте новую сессию: `/hermes_new`\n"
+                f"3. Убедитесь, что сервер доступен по адресу: `{hermes.url}`"
+            )
+            await self._safe_send(chat_id, err_msg, reply_markup=self._hermes_main_keyboard(), parse_mode="Markdown")
+
+    async def _handle_hermes_status_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        message_id: int | None = None,
+    ) -> None:
+        hermes = self._get_hermes_service()
+        t0 = asyncio.get_event_loop().time()
+        try:
+            status = await hermes.get_status()
+            latency_ms = round((asyncio.get_event_loop().time() - t0) * 1000, 1)
+        except Exception as exc:
+            logger.warning("Error fetching Hermes status: %s", exc)
+            latency_ms = round((asyncio.get_event_loop().time() - t0) * 1000, 1)
+            status = {
+                "online": False,
+                "enabled": hermes.enabled,
+                "version": "offline",
+                "active_model": "none",
+                "session_count": 0,
+                "details": str(exc),
+            }
+
+        is_online = bool(status.get("online", False) or status.get("available", False))
+        status_badge = "🟢 В СЕТИ" if is_online else "🔴 ОФЛАЙН (Fallback)"
+        model = status.get("active_model") or status.get("model") or "hermes-3-llama-3.1-8b"
+        session_count = status.get("session_count", 0)
+        version = status.get("version", "v0.4.0")
+        uid = int(user_id or 0)
+        curr_session = self.hermes_active_sessions.get(uid, "не выбрана")
+        latency_val = status.get("latency_ms") if status.get("latency_ms") is not None else latency_ms
+
+        text = (
+            "🤖 *Статус Hermes Agent AI*\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Состояние: *{status_badge}*\n"
+            f"Активная модель: `{model}`\n"
+            f"Всего сессий: *{session_count}*\n"
+            f"Задержка (latency): `{latency_val} мс`\n"
+            f"URL агента: `{hermes.url}`\n"
+            f"Версия агента: `{version}`\n"
+            f"Текущая сессия чата: `{curr_session}`\n"
+        )
+        if not is_online:
+            text += (
+                "\n_ℹ️ Сервер недоступен, запросы обрабатываются локальным fallback-адаптером._\n"
+                "_Для подключения агента запустите Hermes на 8787 или настройте HERMES_URL._"
+            )
+
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "➕ Новая сессия", "callback_data": "hermes:new"},
+                    {"text": "📋 Сессии", "callback_data": "hermes:sessions"},
+                ],
+                [
+                    {"text": "🔄 Обновить статус", "callback_data": "hermes:status"},
+                    {"text": "🎨 Сменить тему", "callback_data": "panel:themes"},
+                ],
+                [
+                    {"text": "◀️ В меню", "callback_data": "panel:home"},
+                ],
+            ]
+        }
+        await self._safe_edit_or_send(chat_id, message_id, text, reply_markup=kb, parse_mode="Markdown")
+
+    async def _handle_hermes_sessions_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        message_id: int | None = None,
+    ) -> None:
+        hermes = self._get_hermes_service()
+        uid = int(user_id or 0)
+        active_sid = self.hermes_active_sessions.get(uid)
+        try:
+            sessions = await hermes.list_sessions()
+        except Exception as exc:
+            logger.warning("Could not list Hermes sessions: %s", exc)
+            sessions = []
+
+        if not active_sid and sessions:
+            active_sid = sessions[0].get("id")
+            self.hermes_active_sessions[uid] = active_sid
+
+        lines = [
+            "📋 *Сессии диалогов Hermes Agent*",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if active_sid:
+            lines.append(f"⭐ Текущая активная: `{active_sid}`\n")
+        else:
+            lines.append("Активная сессия не выбрана.\n")
+
+        if not sessions:
+            lines.append("Сессий пока нет. Начните новый диалог с помощью /hermes_new.")
+        else:
+            for idx, s in enumerate(sessions[:8], start=1):
+                sid = s.get("id") or ""
+                title = s.get("title") or "Сессия"
+                count = s.get("message_count", 0)
+                marker = "⭐ " if sid == active_sid else f"{idx}. "
+                lines.append(f"{marker}*{title}*\n   ID: `{sid}` • Сообщений: {count}")
+
+        lines.append("\n_Нажмите кнопку ниже, чтобы переключить сессию, или отправьте:_ `/hermes_session <id>`")
+        kb = self._hermes_sessions_keyboard(sessions, active_sid)
+        await self._safe_edit_or_send(chat_id, message_id, "\n".join(lines), reply_markup=kb, parse_mode="Markdown")
+
+    async def _handle_hermes_switch_session_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+        message_id: int | None = None,
+    ) -> None:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await self._safe_send(chat_id, "Укажите ID сессии: `/hermes_session <id>`", parse_mode="Markdown")
+            return
+        target_id = parts[1].strip()
+        uid = int(user_id or 0)
+        self.hermes_active_sessions[uid] = target_id
+        msg = (
+            f"✅ *Активная сессия переключена!*\n\n"
+            f"ID сессии: `{target_id}`\n\n"
+            "Все последующие команды `/hermes <запрос>` будут направляться в эту сессию."
+        )
+        kb = {
+            "inline_keyboard": [
+                [{"text": "📋 Список сессий", "callback_data": "hermes:sessions"}],
+                [{"text": "🤖 Меню Hermes", "callback_data": "panel:hermes"}],
+            ]
+        }
+        await self._safe_edit_or_send(chat_id, message_id, msg, reply_markup=kb, parse_mode="Markdown")
+
+    async def _handle_hermes_new_session_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        message_id: int | None = None,
+    ) -> None:
+        hermes = self._get_hermes_service()
+        uid = int(user_id or 0)
+        now_str = datetime.now(timezone.utc).strftime("%d.%m %H:%M")
+        title = f"Telegram Чат {now_str}"
+        try:
+            new_sess = await hermes.create_session(title=title)
+            new_id = new_sess.get("id") or f"hermes-{secrets.token_hex(4)}"
+            self.hermes_active_sessions[uid] = new_id
+            text = (
+                "✨ *Новая сессия Hermes Agent создана!*\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• ID сессии: `{new_id}`\n"
+                f"• Название: *{title}*\n\n"
+                "Контекст диалога очищен. Теперь вы можете задавать вопросы:\n"
+                "`/hermes <ваш запрос>`"
+            )
+        except Exception as exc:
+            logger.exception("Failed to create new Hermes session: %s", exc)
+            text = f"⚠️ Не удалось создать сессию Hermes: `{exc}`"
+
+        kb = {
+            "inline_keyboard": [
+                [{"text": "📋 К списку сессий", "callback_data": "hermes:sessions"}],
+                [{"text": "🤖 Меню Hermes", "callback_data": "panel:hermes"}],
+            ]
+        }
+        await self._safe_edit_or_send(chat_id, message_id, text, reply_markup=kb, parse_mode="Markdown")
+
+    async def _handle_theme_command(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+        message_id: int | None = None,
+    ) -> None:
+        site_cfg_path = Path(self.settings.site_config_json_path)
+        current_cfg = load_site_config(site_cfg_path)
+        current_theme = current_cfg.get("theme", "cyber").lower()
+
+        parts = text.split(maxsplit=1)
+        if len(parts) >= 2 and parts[1].strip():
+            candidate = parts[1].strip().lower()
+            if candidate in THEMES_DATA:
+                meta = THEMES_DATA[candidate]
+                current_cfg["theme"] = candidate
+                current_cfg["accent_color"] = meta["accent"]
+                save_site_config(site_cfg_path, current_cfg)
+                if user_id:
+                    try:
+                        append_projects_audit_log(
+                            Path(self.settings.projects_audit_log_path),
+                            user_id,
+                            "theme_switch",
+                            {"theme": candidate, "accent": meta["accent"]},
+                        )
+                    except Exception:
+                        pass
+
+                reply_text = (
+                    f"🎨 *Тема успешно изменена на {meta['name']}!* {meta['icon']}\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• Описание: {meta['desc']}\n"
+                    f"• Акцент: `{meta['accent']}`\n\n"
+                    "✅ Новый визуальный стиль применён для мини-приложения XASS, сайта и профиля."
+                )
+                await self._safe_edit_or_send(
+                    chat_id,
+                    message_id,
+                    reply_text,
+                    reply_markup=self._themes_keyboard(candidate),
+                    parse_mode="Markdown",
+                )
+                return
+            else:
+                valid_list = ", ".join(f"`{k}`" for k in THEMES_DATA.keys())
+                err_text = (
+                    f"⚠️ Неизвестная тема: `{parts[1].strip()}`\n\n"
+                    f"Доступные темы: {valid_list}\n\n"
+                    "Выберите тему с помощью кнопок ниже:"
+                )
+                await self._safe_edit_or_send(
+                    chat_id,
+                    message_id,
+                    err_text,
+                    reply_markup=self._themes_keyboard(current_theme),
+                    parse_mode="Markdown",
+                )
+                return
+
+        lines = [
+            "🎨 *Выбор темы оформления XASS*",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"Текущая тема: *{THEMES_DATA.get(current_theme, {}).get('name', current_theme)}* {THEMES_DATA.get(current_theme, {}).get('icon', '')}\n",
+            "Доступные темы:",
+        ]
+        for key, meta in THEMES_DATA.items():
+            check = "✓ " if key == current_theme else "• "
+            lines.append(f"{check}{meta['icon']} *{meta['name']}* (`{key}`)\n   _{meta['desc']}_")
+
+        lines.append("\n_Выберите тему кнопками ниже или отправьте:_ `/theme <название>`")
+        await self._safe_edit_or_send(
+            chat_id,
+            message_id,
+            "\n".join(lines),
+            reply_markup=self._themes_keyboard(current_theme),
+            parse_mode="Markdown",
+        )
+
+    async def _handle_hermes_or_theme_callback(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        callback: dict[str, Any],
+        data: str,
+        chat_id: int | None,
+        message_id: int | None,
+        user_id: int | None,
+    ) -> None:
+        if chat_id is None:
+            return
+
+        if data in ("panel:hermes", "hermes:menu"):
+            text = (
+                "🤖 *Hermes Agent AI*\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "Центр управления интеллектуальным агентом Hermes.\n\n"
+                "• Отправить запрос: `/hermes <промпт>`\n"
+                "• Статус и задержка: `/hermes_status`\n"
+                "• Сессии диалогов: `/hermes_sessions`\n"
+                "• Новая сессия: `/hermes_new`"
+            )
+            await self._safe_edit_or_send(
+                chat_id,
+                message_id,
+                text,
+                reply_markup=self._hermes_main_keyboard(),
+                parse_mode="Markdown",
+            )
+            return
+
+        if data == "hermes:status":
+            await self._handle_hermes_status_command(session, config, chat_id, user_id, message_id=message_id)
+            return
+
+        if data == "hermes:sessions":
+            await self._handle_hermes_sessions_command(session, config, chat_id, user_id, message_id=message_id)
+            return
+
+        if data == "hermes:new":
+            await self._handle_hermes_new_session_command(session, config, chat_id, user_id, message_id=message_id)
+            return
+
+        if data.startswith("hermes:switch:"):
+            target_sid = data.split("hermes:switch:", 1)[1].strip()
+            text_cmd = f"/hermes_session {target_sid}"
+            await self._handle_hermes_switch_session_command(
+                session, config, chat_id, user_id, text_cmd, message_id=message_id
+            )
+            return
+
+        if data in ("panel:themes", "theme:menu"):
+            await self._handle_theme_command(session, config, chat_id, user_id, "/theme", message_id=message_id)
+            return
+
+        if data.startswith("theme:"):
+            target_theme = data.split("theme:", 1)[1].strip()
+            text_cmd = f"/theme {target_theme}"
+            await self._handle_theme_command(
+                session, config, chat_id, user_id, text_cmd, message_id=message_id
+            )
+            return
+
     async def _safe_edit_or_send(
         self,
         chat_id: int | None,
@@ -4977,8 +5570,16 @@ class TelegramUpdateHandler:
     ) -> None:
         if chat_id is None or not self.bot_client:
             return
-        if not self.settings.telegram_management_buttons and reply_markup:
-            reply_markup = {"inline_keyboard": []}
+        if not self.settings.telegram_management_buttons and reply_markup and "inline_keyboard" in reply_markup:
+            has_hermes_or_theme = any(
+                any(
+                    str(btn.get("callback_data") or "").startswith(("hermes:", "theme:", "panel:hermes", "panel:themes"))
+                    for btn in row
+                )
+                for row in reply_markup.get("inline_keyboard", [])
+            )
+            if not has_hermes_or_theme:
+                reply_markup = {"inline_keyboard": []}
         if message_id is not None:
             try:
                 await self.bot_client.edit_message_text(
@@ -5018,7 +5619,15 @@ class TelegramUpdateHandler:
         if not self.bot_client:
             return
         if not self.settings.telegram_management_buttons and reply_markup and "inline_keyboard" in reply_markup:
-            reply_markup = None
+            has_hermes_or_theme = any(
+                any(
+                    str(btn.get("callback_data") or "").startswith(("hermes:", "theme:", "panel:hermes", "panel:themes"))
+                    for btn in row
+                )
+                for row in reply_markup.get("inline_keyboard", [])
+            )
+            if not has_hermes_or_theme:
+                reply_markup = None
         try:
             await self.bot_client.send_message(
                 chat_id,

@@ -14,22 +14,30 @@
 <link rel="stylesheet" href="/assets/miniapp-core.css?v=0100">
 <link rel="stylesheet" href="/assets/miniapp-control-center.css?v=0160">
 <link rel="stylesheet" href="/assets/miniapp-music.css?v=0170">
+<link rel="stylesheet" href="/assets/miniapp-hermes.css?v=0170">
+<link rel="stylesheet" href="/assets/miniapp-themes.css?v=0170">
+<script>
+(function(){try{var t=localStorage.getItem('xass_theme')||'cyber';document.documentElement.setAttribute('data-theme',t);var a=localStorage.getItem('xass_accent');if(a&&/^#[0-9a-f]{6}$/i.test(a)){document.documentElement.style.setProperty('--user-accent',a);document.documentElement.style.setProperty('--user-accent-soft',a+'d0');document.documentElement.style.setProperty('--user-accent-glow','0 0 24px '+a+'66');}}catch(e){}})();
+</script>
 </head>
 <body>
 <div class="screen" id="gate"><div class="loader" id="loader"><div class="spin"></div><span>Подключение к XASS…</span></div><div class="login" id="login"><img src="/assets/xass-app-icon-512.png" alt="XASS"><h1>XASS</h1><p>Войдите Telegram-аккаунтом владельца, чтобы управлять системой с iPhone и рабочего стола.</p><div class="widget" id="telegramWidget"></div><button class="btn primary passkey-login" id="passkeyLoginBtn">Войти с Face ID / Passkey</button><div class="ios-help">На iPhone после входа: «Поделиться» → «На экран Домой». XASS откроется как отдельное приложение.</div></div><div class="deny" id="deny"><h2>Нет доступа</h2><p id="denyText">Не удалось подключиться.</p><button class="btn" id="retryBtn">Повторить</button></div></div>
 <div class="screen confirm-screen" id="confirmScreen" role="dialog" aria-modal="true" aria-labelledby="confirmTitle"><div class="confirm-card"><h2 id="confirmTitle">Подтвердите действие</h2><p id="confirmText"></p><div class="confirm-actions"><button class="btn" id="confirmCancel">Отмена</button><button class="btn danger" id="confirmYes">Продолжить</button></div></div></div>
 <div class="screen crop-screen" id="cropScreen" role="dialog" aria-modal="true" aria-labelledby="cropTitle"><div class="crop-card"><h2 id="cropTitle">Кадрирование аватара</h2><p class="row-sub">Настройте масштаб и положение. На сервер отправится только квадрат 512×512.</p><canvas id="avatarCropCanvas" width="512" height="512"></canvas><div class="crop-controls"><label class="crop-control"><span>Масштаб</span><input id="cropZoom" type="range" min="1" max="3" step="0.01" value="1"></label><label class="crop-control"><span>По горизонтали</span><input id="cropX" type="range" min="-100" max="100" step="1" value="0"></label><label class="crop-control"><span>По вертикали</span><input id="cropY" type="range" min="-100" max="100" step="1" value="0"></label></div><div class="confirm-actions" style="margin-top:18px"><button class="btn" id="cropCancel">Отмена</button><button class="btn primary" id="cropApply">Обрезать и загрузить</button></div></div></div>
+<div class="screen theme-modal-screen" id="themeModal" role="dialog" aria-modal="true" aria-labelledby="themeModalTitle"><div class="theme-modal-card"><div class="theme-modal-head"><div><h2 id="themeModalTitle">Оформление XASS</h2><p class="row-sub">Выберите стиль интерфейса и акцентный цвет</p></div><button class="btn theme-modal-close" id="themeModalClose" type="button" aria-label="Закрыть">×</button></div><div class="theme-grid" id="themeModalGrid"></div><div class="setup-divider" style="margin:16px 0"></div><div class="theme-accent-section"><div class="label" style="margin-bottom:8px"><span>Акцентный цвет (независимый)</span><button class="btn-link" id="modalResetAccentBtn" type="button">По умолчанию</button></div><div class="theme-accent-picker-row"><input class="color-input theme-color-input" id="modalThemeAccentPicker" type="color" value="#376dff" aria-label="Выбор акцентного цвета"><div class="theme-swatches" id="modalThemeSwatches"></div></div><div class="row-sub" style="margin-top:8px">Тонкая настройка акцента поверх выбранной темы.</div></div></div></div>
 <div class="toast" id="toast"></div>
 <main class="wrap" id="app" hidden>
- <header class="head"><div class="brand"><img src="/assets/xass-app-icon-192.png" alt=""><span>XASS</span></div><div class="head-state"><span class="dot" id="headDot"></span><span id="headStatus">Подключение</span><span class="head-version" id="headVersion">—</span></div></header>
+ <header class="head"><div class="brand"><img src="/assets/xass-app-icon-192.png" alt=""><span>XASS</span></div><div class="head-actions"><button class="theme-quick-btn" id="themeQuickBtn" type="button" aria-label="Сменить тему" title="Оформление и темы"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="13.5" cy="6.5" r=".7" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".7" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".7" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".7" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg><span>Тема</span><span class="theme-btn-dot" id="headThemeDot"></span></button><div class="head-state"><span class="dot" id="headDot"></span><span id="headStatus">Подключение</span><span class="head-version" id="headVersion">—</span></div></div></header>
 
  <section class="view on" id="view-home">
   <div class="intro"><div class="eyebrow">Личный центр управления</div><h1 id="helloTitle">Система в сети.</h1><p>Сервер, устройства, музыка и сайт — в одном спокойном интерфейсе.</p></div>
   <div class="quick-actions" role="toolbar" aria-label="Быстрые действия">
+   <button class="quick-chip hermes-quick-chip" id="quickHermes" type="button" data-view="hermes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1-4-4v-2a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><path d="M9 10h.01M15 10h.01M9 14h6"/></svg>Гермес AI</button>
    <button class="quick-chip" id="quickLockAll" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Лок всех ПК</button>
    <button class="quick-chip" id="quickAway" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg><span id="quickAwayLabel">Не в сети</span></button>
    <button class="quick-chip" id="quickCheckPC" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Проверить ПК</button>
    <button class="quick-chip" id="quickOpenMusic" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>Плеер</button>
+   <button class="quick-chip" id="quickThemeBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="13.5" cy="6.5" r=".7" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".7" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".7" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".7" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>Тема</button>
   </div>
   <div class="section"><div class="section-head"><h2 class="section-title">Состояние</h2><span class="section-note" id="appVersion">—</span></div><div class="metrics" id="homeMetrics"></div></div>
   <div class="section"><div class="section-head"><h2 class="section-title">Устройства</h2><button class="btn" data-view="tools">Управление</button></div><div class="line-list" id="homeDevices"></div></div>
@@ -38,7 +46,115 @@
   <div class="section"><div class="feature feature-grid"><div><div class="eyebrow">Сейчас играет · <span id="homeSource">—</span></div><div class="weather-value" id="homeTrack">Нет свежих данных</div><div class="weather-detail" id="homeTrackHint">Музыкальный поиск доступен в отдельном разделе.</div></div><img class="feature-mark" src="/assets/xass-app-icon-192.png" alt=""></div></div>
  </section>
 
- <section class="view" id="view-music">
+  <section class="view" id="view-hermes">
+  <div class="intro hermes-intro">
+   <div class="eyebrow"><span class="hermes-badge-glow">HERMES 3 · AI AGENT</span></div>
+   <div class="hermes-hero-title">
+    <h1>Hermes Agent AI</h1>
+    <div class="hermes-status-badge online" id="hermesStatusPill" title="Статус агента">
+     <span class="hermes-status-dot"></span>
+     <span id="hermesStatusText">В сети</span>
+    </div>
+   </div>
+   <p>Автономный ИИ-ассистент XASS: управление сервером, анализ логов, выполнение команд и скриптов в реальном времени.</p>
+  </div>
+
+  <div class="section hermes-toolbar-section">
+   <div class="hermes-controls-bar">
+    <div class="hermes-control-group">
+     <label class="label" for="hermesModelSelect">Модель</label>
+     <div class="hermes-select-wrap">
+      <select class="input hermes-select" id="hermesModelSelect">
+       <option value="nous-hermes-3">Nous Hermes 3 (Llama-3.1 70B)</option>
+       <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
+       <option value="gpt-4o">GPT-4o Omnichannel</option>
+       <option value="local-ollama">Local Ollama (Hermes / Qwen)</option>
+       <option value="deepseek-r1">DeepSeek R1 Reasoner</option>
+      </select>
+     </div>
+    </div>
+
+    <div class="hermes-control-group">
+     <label class="label" for="hermesSessionSelect">Сессия</label>
+     <div class="hermes-session-selector">
+      <select class="input hermes-select" id="hermesSessionSelect">
+       <option value="default">Главный диалог</option>
+      </select>
+      <button class="btn blue hermes-new-session-btn" id="hermesNewSessionBtn" type="button" title="Новая сессия">
+       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+       <span>Новая</span>
+      </button>
+     </div>
+    </div>
+
+    <div class="hermes-token-stat">
+     <span class="label">Контекст</span>
+     <div class="hermes-token-pill" id="hermesTokenPill" title="Использовано токенов в текущей сессии">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+      <span id="hermesTokenText">0 / 128k</span>
+     </div>
+    </div>
+   </div>
+  </div>
+
+  <div class="section hermes-chat-section">
+   <div class="hermes-chat-wrapper">
+    <div class="hermes-chat-history" id="hermesChatHistory" role="log" aria-live="polite">
+     <!-- Filled dynamically by miniapp-hermes.js -->
+    </div>
+
+    <div class="hermes-typing-indicator" id="hermesTypingIndicator" style="display: none;">
+     <div class="hermes-typing-inner">
+      <div class="hermes-status-dot pulse"></div>
+      <span class="hermes-typing-text">Гермес анализирует контекст и выполняет инструменты…</span>
+      <div class="hermes-dots">
+       <span></span><span></span><span></span>
+      </div>
+     </div>
+    </div>
+
+    <div class="hermes-prompt-area">
+     <div class="hermes-quick-chips" role="toolbar" aria-label="Быстрые команды Гермеса">
+      <button type="button" class="hermes-action-chip" data-hermes-prompt="Проверить состояние сервера XASS, нагрузку CPU, RAM и активные службы">
+       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+       Проверить сервер
+      </button>
+      <button type="button" class="hermes-action-chip" data-hermes-prompt="Проведи глубокий анализ последних логов и журнала событий на ошибки и аномалии">
+       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+       Анализ логов
+      </button>
+      <button type="button" class="hermes-action-chip" data-hermes-prompt="Напиши production-ready скрипт автоматического бэкапа и мониторинга для XASS">
+       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+       Написать скрипт
+      </button>
+      <button type="button" class="hermes-action-chip" data-hermes-prompt="Выполни комплексный аудит безопасности: Passkey, открытые порты, конфигурация и SSH">
+       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+       Аудит безопасности
+      </button>
+      <button type="button" class="hermes-action-chip" data-hermes-prompt="Проверь доступность всех подключённых Windows ПК-агентов и статус локальных архивов">
+       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
+       Статус ПК
+      </button>
+     </div>
+
+     <form class="hermes-input-box" id="hermesChatForm" onsubmit="return false;">
+      <textarea class="input hermes-textarea" id="hermesPromptInput" rows="1" maxlength="8000" placeholder="Спросите Гермеса или дайте команду серверу… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+      <div class="hermes-input-actions">
+       <button class="btn hermes-clear-chat-btn" id="hermesClearSessionBtn" type="button" title="Очистить сообщения текущей сессии">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+       </button>
+       <button class="btn primary hermes-send-btn" id="hermesSendBtn" type="submit" aria-label="Отправить запрос Гермесу">
+        <svg class="send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <div class="send-spin" style="display:none"></div>
+       </button>
+      </div>
+     </form>
+    </div>
+   </div>
+  </div>
+ </section>
+
+<section class="view" id="view-music">
   <div id="xassMusic"></div>
   <details class="setup-details xm-legacy"><summary>Источники, поиск и подключения</summary><div class="detail-body">
   <div class="section"><div class="section-head"><h2 class="section-title">Источник «Сейчас играет»</h2><span class="section-note" id="musicFreshness">LIVE</span></div><div class="seg" id="sourceSeg"><button data-source="pc_agent">ПК</button><button data-source="iphone">iPhone</button><button data-source="vk">VK</button></div><div class="feature"><div class="eyebrow" id="musicSourceLabel">Источник</div><div class="weather-value" id="musicNow">Нет свежих данных</div><div class="weather-detail" id="musicEmptyHint">Источник пока не прислал трек. Поиск ниже всё равно работает.</div></div></div>
@@ -49,6 +165,23 @@
 
  <section class="view" id="view-tools">
   <div class="intro"><div class="eyebrow">Инструменты</div><h1>Управление без потерь.</h1><p>Настройки бота, Windows-агенты, блокировка экрана и обслуживание сервера.</p></div>
+  <div class="section" id="themeSection">
+   <div class="section-head"><h2 class="section-title">Оформление</h2><span class="section-note" id="currentThemeNote">CYBER</span></div>
+   <div class="setup-card theme-showcase-card">
+    <div class="setup-title">Темы и визуальный стиль</div>
+    <p class="setup-note">Переключайте интерфейс на лету. Все карточки, плеер, консоль и меню мгновенно адаптируются под выбранную цветовую гамму.</p>
+    <div class="theme-grid" id="toolsThemeGrid"></div>
+    <div class="setup-divider" style="margin:16px 0"></div>
+    <div class="theme-accent-section">
+     <div class="label" style="margin-bottom:8px"><span>Акцентный цвет (независимый)</span><button class="btn-link" id="toolsResetAccentBtn" type="button">Сбросить к теме</button></div>
+     <div class="theme-accent-picker-row">
+      <input class="color-input theme-color-input" id="toolsThemeAccentPicker" type="color" value="#376dff" aria-label="Выбор акцентного цвета">
+      <div class="theme-swatches" id="toolsThemeSwatches"></div>
+     </div>
+     <div class="row-sub" style="margin-top:8px">Меняет основной цвет кнопок, графиков, подсветки и плеера поверх любой темы.</div>
+    </div>
+   </div>
+  </div>
   <div class="section"><div class="section-head"><h2 class="section-title">Бот</h2><span class="section-note">OWNER</span></div><div class="line-list"><div class="row"><div class="row-main"><div class="row-title">Сохранение сообщений</div><div class="row-sub" id="saveModeDesc">—</div></div><button class="btn" id="saveModeBtn">Сменить</button></div><div class="row"><div class="row-main"><div class="row-title">Тихие часы</div><div class="row-sub" id="quietDesc">—</div></div><button class="toggle" id="quietToggle" aria-label="Тихие часы"></button></div><div class="row"><div class="row-main"><div class="row-title">Режим «Не в сети»</div><div class="row-sub" id="awayDesc">—</div></div><button class="toggle" id="awayToggle" aria-label="Режим не в сети"></button></div></div><div class="field"><label class="label"><span>Текст автоответа</span><span id="awayCount">0</span></label><textarea class="input" id="awayMessage" maxlength="4000" placeholder="Напишите полный автоответ…"></textarea><button class="btn blue" id="awaySaveBtn" style="width:100%;margin-top:9px">Сохранить автоответ</button></div></div>
   <div class="section"><div class="section-head"><h2 class="section-title">Сценарии</h2><span class="section-note">AUTOMATION</span></div><div class="line-list" id="scenarioList"></div><details class="setup-details" style="margin-top:12px"><summary>Новый пользовательский сценарий</summary><div class="detail-body"><input class="input" id="scenarioName" maxlength="120" placeholder="Название сценария"><div class="form-grid" style="margin-top:10px"><input class="input" id="scenarioIcon" maxlength="32" value="bolt" placeholder="Иконка: bolt"><input class="color-input" id="scenarioColor" type="color" value="#376dff"><label class="field"><span class="label">Задержка между шагами, сек.</span><input class="input" id="scenarioDelay" type="number" min="0" max="3600" value="0"></label><label class="field"><span class="label">Ежедневное расписание</span><input class="input" id="scenarioSchedule" type="time"></label></div><div class="field"><div class="label"><span>Устройства</span><span>пусто = все</span></div><div class="channel-list" id="scenarioDevices"></div></div><div class="line-list" style="margin-top:10px"><label class="row"><input type="checkbox" id="scenarioAway"><span class="row-main"><span class="row-title">Включить «Не в сети»</span></span></label><label class="row"><input type="checkbox" id="scenarioReturn"><span class="row-main"><span class="row-title">Выключить «Не в сети»</span></span></label><label class="row"><input type="checkbox" id="scenarioQuiet"><span class="row-main"><span class="row-title">Включить тихие часы</span></span></label><label class="row"><input type="checkbox" id="scenarioQuietOff"><span class="row-main"><span class="row-title">Выключить тихие часы</span></span></label><label class="row"><input type="checkbox" id="scenarioCheck"><span class="row-main"><span class="row-title">Проверить все ПК</span></span></label><label class="row"><input type="checkbox" id="scenarioLock"><span class="row-main"><span class="row-title">Заблокировать все ПК</span></span></label><label class="row"><input type="checkbox" id="scenarioUpdate"><span class="row-main"><span class="row-title">Обновить все ПК</span></span></label></div><label class="row"><input type="checkbox" id="scenarioEnabled" checked><span class="row-main"><span class="row-title">Сценарий включён</span></span></label><button class="btn blue" id="scenarioSaveBtn" style="width:100%;margin-top:10px">Сохранить сценарий</button></div></details></div>
   <div class="section"><div class="section-head"><h2 class="section-title">iPhone и веб‑приложение</h2><span class="section-note">ONE TAP</span></div><div class="setup-card"><div class="setup-title">Вход одной ссылкой</div><p class="setup-note">Укажите публичный HTTPS‑адрес XASS. Ссылка действует 10 минут и только один раз: откройте её в Safari, затем добавьте XASS на экран «Домой».</p><div class="field"><label class="label" for="pwaPublicUrl"><span>Публичный адрес сервера</span><span>HTTPS</span></label><input class="input mono" id="pwaPublicUrl" inputmode="url" autocomplete="url" placeholder="https://xass.example"></div><button class="btn primary" id="createIosLinkBtn" style="width:100%;margin-top:10px">Создать ссылку для iPhone</button><div class="pair-link-panel" id="iosPairPanel"><label class="label" for="iosPairLink"><span>Одноразовая ссылка</span><span>Не пересылайте</span></label><input class="pwa-url mono" id="iosPairLink" readonly aria-label="Одноразовая ссылка XASS"><div class="pair-expiry" id="iosPairExpiry"></div><div class="toolbar" style="margin-top:12px"><button class="btn" id="copyIosPairLinkBtn">Копировать</button><button class="btn blue" id="shareIosPairLinkBtn">Открыть / отправить</button></div></div><div class="setup-divider"></div><div class="security-card"><div class="security-icon">◉</div><div class="setup-title">Face ID / Passkey</div><p class="setup-note">После первого входа через Telegram добавьте биометрический ключ. На iPhone используется Face ID или Touch ID, на Windows — Windows Hello.</p><button class="btn primary" id="registerPasskeyBtn" style="width:100%;margin-top:12px">Добавить Face ID / Passkey</button><div class="security-list" id="passkeyList"></div></div><div class="setup-divider"></div><details class="setup-details"><summary>Настройка кнопки Telegram и BotFather</summary><div class="detail-body"><p class="setup-note" id="domainNotice">Это дополнительная настройка кнопки внутри Telegram. На вход iPhone по одноразовой ссылке она не влияет.</p><input class="pwa-url" id="botFatherDomain" readonly aria-label="Домен для BotFather"><div class="readiness" id="domainReadiness"><div class="ready-row" data-ready="bot_username"><span class="ready-icon">·</span><span>Бот определён</span></div><div class="ready-row" data-ready="owner_user_id"><span class="ready-icon">·</span><span>OWNER_USER_ID настроен</span></div><div class="ready-row" data-ready="https"><span class="ready-icon">·</span><span>HTTPS доступен</span></div></div><div class="toolbar"><button class="btn" id="copyDomainBtn">Копировать домен</button><button class="btn blue" id="openBotFatherBtn">Открыть BotFather</button></div><ol class="steps"><li>В @BotFather отправьте <b>/setdomain</b> и выберите бота XASS.</li><li>Отправьте только домен из поля выше — без https:// и пути.</li><li>Кнопка Mini App обновляется автоматически после создания ссылки.</li></ol></div></details></div></div>
@@ -80,7 +213,8 @@
 
 <nav class="tabs" id="tabs" hidden><div class="tabs-inner">
  <button class="tab on" data-view="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m3 11 9-8 9 8v9H3z"/><path d="M9 20v-6h6v6"/></svg>Главная</button>
- <button class="tab" data-view="music"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>Музыка</button>
+  <button class="tab" data-view="hermes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1-4-4v-2a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><circle cx="9" cy="11" r="1.5" fill="currentColor"/><circle cx="15" cy="11" r="1.5" fill="currentColor"/><path d="M9 15h6"/><path d="M12 2v3M5 12H2M22 12h-3"/></svg>Гермес</button>
+<button class="tab" data-view="music"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>Музыка</button>
  <button class="tab" data-view="site"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Сайт</button>
  <button class="tab" data-view="tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="8"/></svg>Инструменты</button>
  <button class="tab" data-view="weather"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 17h10a4 4 0 0 0 0-8 6 6 0 0 0-11-1A4.5 4.5 0 0 0 7 17Z"/></svg>Погода</button>
@@ -186,7 +320,7 @@ function renderActionAudit(list=[]){const labels={agent_command:'Команда 
 async function loadAudit(){const params=new URLSearchParams({limit:'100'}),fields={device:'auditDevice',action:'auditAction',source:'auditSource',result:'auditResult',date_from:'auditFrom',date_to:'auditTo'};for(const [key,id] of Object.entries(fields)){const value=$(id).value;if(value)params.set(key,value)}const r=await api('audit?'+params);if(r.data?.ok)renderActionAudit(r.data.items||[]);else toast(r.data?.detail||'Не удалось загрузить журнал')}$('auditApply').onclick=loadAudit;
 function renderArchiveSummary(a={}){$('archiveSummary').innerHTML=[['Сообщения',a.messages||0],['Удалено',a.deleted||0],['Медиа',a.media||0],['ПК-хранилища',a.targets||0]].map(([name,value])=>'<div class="archive-number"><b>'+esc(value)+'</b><span>'+name+'</span></div>').join('')}
 function renderBoot(data){state.boot=data;state.owner=!!data.user?.is_owner;const version=data.app_version||'';$('appVersion').textContent='XASS '+version;$('headVersion').textContent=version||'—';$('headStatus').textContent='В сети';$('headDot').className='dot ok';$('helloTitle').textContent=(data.user?.first_name?'Привет, '+data.user.first_name+'.':'Система в сети.');$('homeMetrics').innerHTML=metricHtml(data.metrics);$('serverMetrics').innerHTML=metricHtml(data.metrics);$('homeDevices').innerHTML=deviceHtml((data.sources||[]).slice(0,3));$('homeDevices').classList.add('soft');$('deviceList').innerHTML=deviceHtml(data.sources||[],true);bindCommands();renderSettings(data.settings);renderScenarios(data.scenarios||[]);renderMusic(data.status);renderWeather(data.status?.weather);renderInstaller(data.windows_installer||{});renderPasskeys(data.passkeys||[]);renderActionAudit(data.admin_actions||[]);renderArchiveSummary(data.archive||{});$('vkAppId').value=data.vk_app_id||'';$('pwaUrl').value=state.iosPairLink||'Создайте одноразовую ссылку для iPhone';$('botFatherDomain').value=location.hostname;$('homeOpenSite').href=location.origin+'/profile.php';$('serviceList').innerHTML=Object.entries(data.services||{}).map(([name,value])=>'<div class="row"><div class="row-main"><div class="row-title">'+esc(name)+'</div></div><span class="status '+(value==='active'?'':'off')+'">'+esc(value)+'</span></div>').join('')||'<div class="empty">Сервисы не настроены.</div>';$('gate').style.display='none';$('app').hidden=false;$('tabs').hidden=false;$('logoutBtn').style.display=state.pwa?'inline-block':'none';loadPwaReadiness();loadConversations();document.dispatchEvent(new CustomEvent('xass:boot',{detail:data}))}
-let bootPromise=null;function loadBoot(){if(bootPromise)return bootPromise;const appVisible=!$('app').hidden;bootPromise=api('bootstrap').then(r=>{if(r.status!==200||!r.data?.ok)throw new Error(r.data?.detail||'Нет доступа');renderBoot(r.data);renderDeviceList();renderSystemStatus(r.data.system_status||{});renderScenarioDevices();$('logoutAllBtn').style.display=state.pwa?'inline-block':'none';const shortcut=location.hash.replace(/^#/,'');if(['tools','music'].includes(shortcut))showView(shortcut)}).catch(error=>{if(appVisible){$('headStatus').textContent='Нет связи с сервером';$('headDot').className='dot bad';toast(error.message||'Не удалось обновить данные')}else showDeny(error.message)}).finally(()=>{bootPromise=null});return bootPromise}
+let bootPromise=null;function loadBoot(){if(bootPromise)return bootPromise;const appVisible=!$('app').hidden;bootPromise=api('bootstrap').then(r=>{if(r.status!==200||!r.data?.ok)throw new Error(r.data?.detail||'Нет доступа');renderBoot(r.data);renderDeviceList();renderSystemStatus(r.data.system_status||{});renderScenarioDevices();$('logoutAllBtn').style.display=state.pwa?'inline-block':'none';const shortcut=location.hash.replace(/^#/,'');if(['tools','music','hermes'].includes(shortcut))showView(shortcut)}).catch(error=>{if(appVisible){$('headStatus').textContent='Нет связи с сервером';$('headDot').className='dot bad';toast(error.message||'Не удалось обновить данные')}else showDeny(error.message)}).finally(()=>{bootPromise=null});return bootPromise}
 function showDeny(text){$('loader').style.display='none';$('login').style.display='none';$('deny').style.display='block';$('denyText').textContent=text||'Не удалось подключиться.'}
 function showView(name){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('on',v.id==='view-'+name));document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.dataset.view===name));scrollTo({top:0,behavior:'smooth'});if(name==='site'&&!state.site)loadSite();if(name==='tools'){loadUpdateStatus();loadNotifications()}document.dispatchEvent(new CustomEvent('xass:view',{detail:{name}}))}
 document.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>{const leavingSite=document.getElementById('view-site').classList.contains('on')&&button.dataset.view!=='site'&&state.profileDirty;if(leavingSite)return ask('Есть несохранённые изменения профиля. Перейти без сохранения?',ok=>ok&&showView(button.dataset.view));showView(button.dataset.view)});$('retryBtn').onclick=()=>location.reload();$('refreshBtn').onclick=loadBoot;
@@ -348,6 +482,8 @@ demo||initData?loadBoot():initPwa();
 <script src="/assets/xass-e2e.js?v=0140"></script>
 <script src="/assets/miniapp-control-center.js?v=0191"></script>
 <script src="/assets/miniapp-music.js?v=0170"></script>
+<script src="/assets/miniapp-hermes.js?v=0170"></script>
 <script src="/assets/miniapp-server-migration.js?v=0140"></script>
 <script src="/assets/miniapp-device-key.js?v=0140"></script>
+<script src="/assets/miniapp-themes.js?v=0170"></script>
 </body></html>

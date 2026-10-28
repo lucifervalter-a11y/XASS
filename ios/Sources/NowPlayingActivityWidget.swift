@@ -194,12 +194,105 @@ public struct XASSHomeWidget: Widget {
     }
 }
 
+public struct HermesActivityWidgetView: View {
+    let context: ActivityViewContext<HermesActivityAttributes>
+
+    public var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(red: 21 / 255, green: 27 / 255, blue: 38 / 255))
+                Image(systemName: "sparkles")
+                    .font(.title3)
+                    .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+            }
+            .frame(width: 44, height: 44)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Hermes Agent")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Text(context.state.statusPhase)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+                }
+
+                Text(context.state.stepDescription.isEmpty ? context.state.queryPreview : context.state.stepDescription)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(1)
+
+                ProgressView(value: context.state.progress)
+                    .tint(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+            }
+        }
+        .padding(14)
+        .background(Color(red: 10 / 255, green: 13 / 255, blue: 20 / 255))
+    }
+}
+
+public struct HermesLiveActivity: Widget {
+    public init() {}
+
+    public var body: some WidgetConfiguration {
+        ActivityConfiguration(for: HermesActivityAttributes.self) { context in
+            HermesActivityWidgetView(context: context)
+        } dynamicIsland: { context in
+            DynamicIsland {
+                DynamicIslandExpandedRegion(.leading) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+                        Text("Hermes")
+                            .font(.headline)
+                    }
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    Text(context.state.statusPhase)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+                }
+                DynamicIslandExpandedRegion(.bottom) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(context.state.stepDescription.isEmpty ? context.state.queryPreview : context.state.stepDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        ProgressView(value: context.state.progress)
+                            .tint(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+                    }
+                    .padding(.top, 4)
+                }
+            } compactLeading: {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+            } compactTrailing: {
+                if context.state.isThinking {
+                    Image(systemName: "ellipsis")
+                        .font(.caption2)
+                        .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+                } else {
+                    Image(systemName: "checkmark")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                }
+            } minimal: {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(Color(red: 0 / 255, green: 210 / 255, blue: 255 / 255))
+            }
+        }
+    }
+}
+
 @main
 public struct XASSWidgetBundle: WidgetBundle {
     public init() {}
     public var body: some Widget {
         NowPlayingLiveActivity()
         XASSHomeWidget()
+        HermesLiveActivity()
     }
 }
 

@@ -1,0 +1,805 @@
+/* ==========================================================================
+   XASS Multi-Theme Engine: 6 Premium Interface Themes
+   Cyber | Tokyo Night | Nordic Frost | Matrix | Sunset Amber | Liquid Glass
+   ========================================================================== */
+
+:root {
+  /* Dynamic mapped accents with fallback to theme accent */
+  --accent: var(--user-accent, var(--theme-accent, #376dff));
+  --accent-soft: var(--user-accent-soft, var(--theme-accent-soft, #8bb0ff));
+  --accent-glow: var(--user-accent-glow, var(--theme-accent-glow, 0 0 22px rgba(55, 109, 255, 0.45)));
+
+  /* System aliases */
+  --blue: var(--accent);
+  --blue-soft: var(--accent-soft);
+  --cc-blue: var(--accent);
+  --cc-blue-soft: var(--accent-soft);
+  --xm-blue: var(--accent);
+
+  /* Surface & structure defaults */
+  --bg: var(--theme-bg, #000000);
+  --surface: var(--theme-surface, #080b11);
+  --surface2: var(--theme-surface2, #0e1420);
+  --card: var(--theme-card, #090e17);
+  --card-hover: var(--theme-card-hover, #111a2b);
+  --card-bg: var(--theme-card-bg, linear-gradient(145deg, rgba(20, 32, 54, 0.78), rgba(7, 11, 18, 0.96)));
+  --card-border: var(--theme-card-border, rgba(55, 109, 255, 0.18));
+  --card-blur: var(--theme-card-blur, 16px);
+  --line: var(--theme-line, #1c2637);
+  --text: var(--theme-text, #f5f7fb);
+  --text-muted: var(--theme-text-muted, #8a94a6);
+  --muted: var(--text-muted);
+  --blue-bright: var(--theme-blue-bright, #4f80ff);
+  --tab-bg: var(--theme-tab-bg, rgba(9, 13, 21, 0.92));
+  --tab-border: var(--theme-tab-border, rgba(55, 109, 255, 0.22));
+  --head-bg: var(--theme-head-bg, rgba(0, 0, 0, 0.88));
+  --btn-bg: var(--theme-btn-bg, #0d1421);
+  --btn-border: var(--theme-btn-border, #223147);
+  --input-bg: var(--theme-input-bg, #080c13);
+  --input-border: var(--theme-input-border, #1d283b);
+
+  /* Layer bindings for Control Center & Music */
+  --cc-card: var(--card);
+  --cc-card-raised: var(--surface2);
+  --cc-line: var(--line);
+  --xm-bg: var(--bg);
+  --xm-surface: var(--surface);
+  --xm-line: var(--line);
+  --xm-text: var(--text);
+  --xm-muted: var(--text-muted);
+}
+
+/* ==========================================================================
+   1. CYBER (OLED Cyber Dark)
+   ========================================================================== */
+:root:not([data-theme]),
+[data-theme="cyber"],
+html[data-theme="cyber"] {
+  --theme-bg: #000000;
+  --theme-bg-gradient: radial-gradient(ellipse 90% 45% at 50% -12%, rgba(55, 109, 255, 0.22), transparent 65%),
+                       radial-gradient(ellipse 60% 30% at 85% 90%, rgba(139, 92, 246, 0.15), transparent 60%),
+                       #000000;
+  --theme-surface: #080b11;
+  --theme-surface2: #0e1420;
+  --theme-card: #090e17;
+  --theme-card-hover: #111a2b;
+  --theme-card-bg: linear-gradient(145deg, rgba(20, 32, 54, 0.78), rgba(7, 11, 18, 0.96));
+  --theme-card-border: rgba(55, 109, 255, 0.18);
+  --theme-card-blur: 16px;
+  --theme-line: #1c2637;
+  --theme-text: #f5f7fb;
+  --theme-text-muted: #8a94a6;
+  --theme-blue-bright: #4f80ff;
+  --theme-accent: #376dff;
+  --theme-accent-soft: #8bb0ff;
+  --theme-accent-glow: 0 0 24px rgba(55, 109, 255, 0.5);
+  --theme-secondary: #8b5cf6;
+  --theme-tab-bg: rgba(9, 13, 21, 0.92);
+  --theme-tab-border: rgba(55, 109, 255, 0.22);
+  --theme-head-bg: rgba(0, 0, 0, 0.88);
+  --theme-btn-bg: #0d1421;
+  --theme-btn-border: #223147;
+  --theme-btn-primary-bg: linear-gradient(135deg, #2b5fe8, #4f80ff);
+  --input-bg: #080c13;
+  --input-border: #1d283b;
+  --theme-focus-ring: rgba(55, 109, 255, 0.28);
+  --theme-chip-hover-bg: rgba(55, 109, 255, 0.16);
+}
+
+/* ==========================================================================
+   2. TOKYO (Tokyo Night)
+   ========================================================================== */
+[data-theme="tokyo"],
+html[data-theme="tokyo"] {
+  --theme-bg: #090d16;
+  --theme-bg-gradient: radial-gradient(ellipse 85% 50% at 50% -10%, rgba(255, 0, 127, 0.18), transparent 65%),
+                       radial-gradient(ellipse 70% 40% at 90% 85%, rgba(0, 240, 255, 0.14), transparent 60%),
+                       #090d16;
+  --theme-surface: #101526;
+  --theme-surface2: #182035;
+  --theme-card: #12182b;
+  --theme-card-hover: #1c243f;
+  --theme-card-bg: linear-gradient(145deg, rgba(29, 37, 64, 0.82), rgba(13, 17, 30, 0.96));
+  --theme-card-border: rgba(255, 0, 127, 0.22);
+  --theme-card-blur: 16px;
+  --theme-line: #26314f;
+  --theme-text: #f8f9fe;
+  --theme-text-muted: #9ea9c8;
+  --theme-blue-bright: #00f0ff;
+  --theme-accent: #ff007f;
+  --theme-accent-soft: #ff66b2;
+  --theme-accent-glow: 0 0 24px rgba(255, 0, 127, 0.5);
+  --theme-secondary: #00f0ff;
+  --theme-tab-bg: rgba(14, 18, 32, 0.92);
+  --theme-tab-border: rgba(255, 0, 127, 0.26);
+  --theme-head-bg: rgba(9, 13, 22, 0.88);
+  --theme-btn-bg: #151b2e;
+  --theme-btn-border: #2e3859;
+  --theme-btn-primary-bg: linear-gradient(135deg, #e60073, #ff2a9d);
+  --input-bg: #0e1220;
+  --input-border: #27314d;
+  --theme-focus-ring: rgba(255, 0, 127, 0.28);
+  --theme-chip-hover-bg: rgba(255, 0, 127, 0.18);
+}
+
+/* ==========================================================================
+   3. NORDIC (Nordic Frost)
+   ========================================================================== */
+[data-theme="nordic"],
+html[data-theme="nordic"] {
+  --theme-bg: #0c111d;
+  --theme-bg-gradient: radial-gradient(ellipse 90% 50% at 50% -14%, rgba(56, 189, 248, 0.18), transparent 70%),
+                       radial-gradient(ellipse 60% 35% at 20% 90%, rgba(147, 197, 253, 0.1), transparent 60%),
+                       #0c111d;
+  --theme-surface: #111827;
+  --theme-surface2: #172236;
+  --theme-card: #131d2e;
+  --theme-card-hover: #1b2940;
+  --theme-card-bg: linear-gradient(145deg, rgba(23, 37, 59, 0.84), rgba(12, 18, 30, 0.96));
+  --theme-card-border: rgba(56, 189, 248, 0.22);
+  --theme-card-blur: 16px;
+  --theme-line: #22334d;
+  --theme-text: #f8fafc;
+  --theme-text-muted: #94a3b8;
+  --theme-blue-bright: #38bdf8;
+  --theme-accent: #38bdf8;
+  --theme-accent-soft: #7dd3fc;
+  --theme-accent-glow: 0 0 24px rgba(56, 189, 248, 0.48);
+  --theme-secondary: #818cf8;
+  --theme-tab-bg: rgba(14, 21, 35, 0.92);
+  --theme-tab-border: rgba(56, 189, 248, 0.25);
+  --theme-head-bg: rgba(12, 17, 29, 0.88);
+  --theme-btn-bg: #141f33;
+  --theme-btn-border: #283d5e;
+  --theme-btn-primary-bg: linear-gradient(135deg, #0284c7, #38bdf8);
+  --input-bg: #0e1625;
+  --input-border: #23354f;
+  --theme-focus-ring: rgba(56, 189, 248, 0.28);
+  --theme-chip-hover-bg: rgba(56, 189, 248, 0.18);
+}
+
+/* ==========================================================================
+   4. MATRIX (Matrix Terminal)
+   ========================================================================== */
+[data-theme="matrix"],
+html[data-theme="matrix"] {
+  --theme-bg: #050a06;
+  --theme-bg-gradient: radial-gradient(ellipse 90% 50% at 50% -12%, rgba(16, 185, 129, 0.18), transparent 65%),
+                       radial-gradient(ellipse 60% 30% at 85% 90%, rgba(5, 150, 105, 0.1), transparent 60%),
+                       #050a06;
+  --theme-surface: #09140d;
+  --theme-surface2: #0f2216;
+  --theme-card: #0a170e;
+  --theme-card-hover: #122919;
+  --theme-card-bg: linear-gradient(145deg, rgba(16, 38, 24, 0.84), rgba(7, 18, 11, 0.96));
+  --theme-card-border: rgba(16, 185, 129, 0.24);
+  --theme-card-blur: 16px;
+  --theme-line: #1a3b25;
+  --theme-text: #eefcf4;
+  --theme-text-muted: #82a891;
+  --theme-blue-bright: #34d399;
+  --theme-accent: #10b981;
+  --theme-accent-soft: #6ee7b7;
+  --theme-accent-glow: 0 0 24px rgba(16, 185, 129, 0.5);
+  --theme-secondary: #059669;
+  --theme-tab-bg: rgba(7, 18, 11, 0.92);
+  --theme-tab-border: rgba(16, 185, 129, 0.26);
+  --theme-head-bg: rgba(5, 10, 6, 0.88);
+  --theme-btn-bg: #0d1e13;
+  --theme-btn-border: #1f452b;
+  --theme-btn-primary-bg: linear-gradient(135deg, #059669, #10b981);
+  --input-bg: #07130a;
+  --input-border: #1a3d24;
+  --theme-focus-ring: rgba(16, 185, 129, 0.28);
+  --theme-chip-hover-bg: rgba(16, 185, 129, 0.18);
+}
+
+/* ==========================================================================
+   5. SUNSET (Sunset Amber)
+   ========================================================================== */
+[data-theme="sunset"],
+html[data-theme="sunset"] {
+  --theme-bg: #120e0c;
+  --theme-bg-gradient: radial-gradient(ellipse 85% 50% at 50% -12%, rgba(245, 158, 11, 0.18), transparent 65%),
+                       radial-gradient(ellipse 65% 35% at 85% 85%, rgba(244, 63, 94, 0.14), transparent 60%),
+                       #120e0c;
+  --theme-surface: #1a1310;
+  --theme-surface2: #261b17;
+  --theme-card: #1d1512;
+  --theme-card-hover: #2b1e19;
+  --theme-card-bg: linear-gradient(145deg, rgba(42, 28, 23, 0.86), rgba(19, 13, 11, 0.96));
+  --theme-card-border: rgba(245, 158, 11, 0.24);
+  --theme-card-blur: 16px;
+  --theme-line: #3a271e;
+  --theme-text: #fff9f2;
+  --theme-text-muted: #b39f93;
+  --theme-blue-bright: #fbbf24;
+  --theme-accent: #f59e0b;
+  --theme-accent-soft: #fcd34d;
+  --theme-accent-glow: 0 0 24px rgba(245, 158, 11, 0.5);
+  --theme-secondary: #f43f5e;
+  --theme-tab-bg: rgba(22, 16, 13, 0.92);
+  --theme-tab-border: rgba(245, 158, 11, 0.26);
+  --theme-head-bg: rgba(18, 14, 12, 0.88);
+  --theme-btn-bg: #211713;
+  --theme-btn-border: #422b21;
+  --theme-btn-primary-bg: linear-gradient(135deg, #d97706, #f59e0b);
+  --input-bg: #160f0d;
+  --input-border: #3a251b;
+  --theme-focus-ring: rgba(245, 158, 11, 0.28);
+  --theme-chip-hover-bg: rgba(245, 158, 11, 0.18);
+}
+
+/* ==========================================================================
+   6. GLASS (Liquid Glassmorphism)
+   ========================================================================== */
+[data-theme="glass"],
+html[data-theme="glass"] {
+  --theme-bg: #060814;
+  --theme-bg-gradient: radial-gradient(ellipse 85% 50% at 20% -10%, rgba(99, 102, 241, 0.24), transparent 60%),
+                       radial-gradient(ellipse 75% 45% at 85% 30%, rgba(236, 72, 153, 0.18), transparent 60%),
+                       radial-gradient(ellipse 70% 40% at 50% 95%, rgba(56, 189, 248, 0.18), transparent 60%),
+                       #060814;
+  --surface: rgba(255, 255, 255, 0.05);
+  --surface2: rgba(255, 255, 255, 0.09);
+  --card: rgba(18, 23, 40, 0.55);
+  --card-hover: rgba(28, 36, 62, 0.7);
+  --card-bg: linear-gradient(135deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.02)), rgba(18, 23, 40, 0.55);
+  --card-border: rgba(255, 255, 255, 0.18);
+  --card-blur: 30px;
+  --line: rgba(255, 255, 255, 0.13);
+  --theme-text: #fcfdff;
+  --theme-text-muted: #a5b0c7;
+  --theme-blue-bright: #a5b4fc;
+  --theme-accent: #818cf8;
+  --theme-accent-soft: #a5b4fc;
+  --theme-accent-glow: 0 0 28px rgba(129, 140, 248, 0.55);
+  --theme-secondary: #ec4899;
+  --theme-tab-bg: rgba(15, 19, 36, 0.72);
+  --theme-tab-border: rgba(255, 255, 255, 0.2);
+  --theme-head-bg: rgba(6, 8, 20, 0.72);
+  --theme-btn-bg: rgba(255, 255, 255, 0.07);
+  --theme-btn-border: rgba(255, 255, 255, 0.15);
+  --theme-btn-primary-bg: linear-gradient(135deg, #4f46e5, #818cf8);
+  --input-bg: rgba(255, 255, 255, 0.06);
+  --input-border: rgba(255, 255, 255, 0.15);
+  --theme-focus-ring: rgba(129, 140, 248, 0.32);
+  --theme-chip-hover-bg: rgba(129, 140, 248, 0.22);
+}
+
+/* ==========================================================================
+   UI Components & Layer Styling with Theme Variables
+   ========================================================================== */
+
+/* Atmosphere & Base Background */
+html {
+  background: var(--bg) !important;
+}
+
+body {
+  background: var(--theme-bg-gradient, #000) !important;
+  background-attachment: fixed !important;
+  background-repeat: no-repeat !important;
+  background-size: cover !important;
+  color: var(--text) !important;
+  transition: background 0.35s ease, color 0.25s ease;
+}
+
+/* Header */
+.head {
+  background: var(--head-bg) !important;
+  border-bottom-color: var(--line) !important;
+  backdrop-filter: blur(20px) !important;
+  -webkit-backdrop-filter: blur(20px) !important;
+}
+
+/* Floating Dock */
+.tabs {
+  background: var(--tab-bg) !important;
+  border-color: var(--tab-border) !important;
+  backdrop-filter: blur(24px) !important;
+  -webkit-backdrop-filter: blur(24px) !important;
+  box-shadow: 0 14px 45px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.09) !important;
+}
+
+.tab.on {
+  background: rgba(255, 255, 255, 0.07) !important;
+  color: var(--accent-soft) !important;
+}
+
+.tab.on svg {
+  filter: drop-shadow(0 0 8px var(--accent)) !important;
+}
+
+/* Cards across Home, Music, Tools, Weather, Site */
+.feature,
+.pwa-card,
+.setup-card,
+.home-site,
+.cc-overview-card,
+.cc-hub-card,
+.cc-panel,
+.profile-preview,
+.metrics,
+.line-list.soft,
+.quote,
+.project,
+.login-readiness,
+.confirm-card,
+.crop-card,
+.cc-card,
+.xm-mini,
+.xm-dialog,
+.save-dock,
+.cc-agent-row {
+  background: var(--card-bg) !important;
+  border-color: var(--card-border) !important;
+  backdrop-filter: blur(var(--card-blur, 16px)) !important;
+  -webkit-backdrop-filter: blur(var(--card-blur, 16px)) !important;
+  transition: transform 0.22s cubic-bezier(0.2, 0.72, 0.2, 1),
+              border-color 0.22s ease,
+              box-shadow 0.22s ease,
+              background 0.22s ease;
+}
+
+.feature:hover,
+.pwa-card:hover,
+.setup-card:hover,
+.home-site:hover,
+.cc-hub-card:hover,
+.cc-agent-row:hover {
+  border-color: var(--accent) !important;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4), var(--accent-glow) !important;
+}
+
+.cc-hub-card.active {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px var(--accent), var(--accent-glow) !important;
+}
+
+.cc-hub-icon {
+  color: var(--accent-soft) !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+.cc-overlay {
+  background: var(--theme-bg-gradient, #000) !important;
+}
+
+.cc-overlay-head {
+  background: var(--head-bg) !important;
+  border-bottom-color: var(--line) !important;
+  backdrop-filter: blur(20px) !important;
+  -webkit-backdrop-filter: blur(20px) !important;
+}
+
+.cc-action {
+  background: var(--surface2) !important;
+  border-color: var(--line) !important;
+  color: var(--text) !important;
+}
+
+.cc-action:hover {
+  border-color: var(--accent) !important;
+  color: var(--accent-soft) !important;
+}
+
+/* Metrics */
+.metric-bar {
+  background: var(--surface2) !important;
+}
+
+.metric-bar i {
+  background: linear-gradient(90deg, var(--accent), var(--accent-soft)) !important;
+  box-shadow: var(--accent-glow) !important;
+}
+
+/* Inputs & Form Fields */
+.input,
+.pwa-url,
+textarea.input,
+select.input {
+  background: var(--input-bg) !important;
+  border-color: var(--input-border) !important;
+  color: var(--text) !important;
+  transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+}
+
+.input:focus,
+.pwa-url:focus,
+textarea.input:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--theme-focus-ring, rgba(55, 109, 255, 0.28)) !important;
+}
+
+/* Buttons */
+.btn {
+  background: var(--btn-bg) !important;
+  border-color: var(--btn-border) !important;
+  color: var(--text) !important;
+}
+
+.btn:hover {
+  border-color: var(--accent-soft) !important;
+}
+
+.btn.primary {
+  background: var(--theme-btn-primary-bg, linear-gradient(135deg, var(--accent), var(--accent-soft))) !important;
+  border-color: var(--accent) !important;
+  box-shadow: var(--accent-glow) !important;
+  color: #fff !important;
+}
+
+.btn.blue {
+  border-color: var(--accent) !important;
+  color: var(--accent-soft) !important;
+}
+
+.quick-chip {
+  background: rgba(255, 255, 255, 0.04) !important;
+  border-color: var(--line) !important;
+  color: var(--text) !important;
+}
+
+.quick-chip:hover {
+  background: var(--theme-chip-hover-bg, rgba(55, 109, 255, 0.16)) !important;
+  border-color: var(--accent) !important;
+  color: var(--accent-soft) !important;
+}
+
+.quick-chip svg {
+  color: var(--accent-soft) !important;
+}
+
+.toggle.on {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+}
+
+.seg button.on {
+  background: var(--surface2) !important;
+  color: #fff !important;
+  box-shadow: inset 0 -2px var(--accent) !important;
+}
+
+.home-site svg {
+  color: var(--accent-soft) !important;
+}
+
+/* Music Integration */
+#xassMusic .xm-primary,
+#xassMusic #xmMainPlay {
+  background: var(--theme-btn-primary-bg, var(--accent)) !important;
+  border-color: var(--accent) !important;
+  box-shadow: var(--accent-glow) !important;
+  color: #fff !important;
+}
+
+#xassMusic .xm-tabs button[aria-selected=true] {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+  color: #fff !important;
+}
+
+#xassMusic .xm-active,
+#xassMusic .xm-selected .xm-track-play strong,
+#xassMusic #xmRateBtn {
+  color: var(--accent-soft) !important;
+}
+
+#xassMusic .xm-progress input,
+#xassMusic .xm-volume input {
+  background: linear-gradient(to right, var(--accent) var(--xm-range, 0%), var(--line) var(--xm-range, 0%)) !important;
+}
+
+#xassMusic .xm-progress input::-webkit-slider-thumb,
+#xassMusic .xm-volume input::-webkit-slider-thumb {
+  background: var(--accent) !important;
+}
+
+#xassMusic .xm-progress input::-moz-range-thumb,
+#xassMusic .xm-volume input::-moz-range-thumb {
+  background: var(--accent) !important;
+}
+
+.bubble.out {
+  border-left: 2px solid var(--accent);
+}
+
+.home-site-arrow {
+  color: var(--accent-soft);
+}
+
+/* ==========================================================================
+   Header Action & Theme Button
+   ========================================================================== */
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.theme-quick-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 20px;
+  padding: 6px 11px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.2, 0.72, 0.2, 1);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.theme-quick-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: var(--accent);
+  color: var(--accent-soft);
+  transform: translateY(-1px);
+}
+
+.theme-quick-btn svg {
+  width: 15px;
+  height: 15px;
+  color: var(--accent-soft);
+  flex-shrink: 0;
+}
+
+.theme-btn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Theme Grid & Live Preview Cards
+   ========================================================================== */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+
+@media (max-width: 580px) {
+  .theme-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.theme-card-option {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.22s cubic-bezier(0.2, 0.72, 0.2, 1);
+  overflow: hidden;
+}
+
+.theme-card-option:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.theme-card-option.active {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px var(--accent), var(--accent-glow) !important;
+}
+
+.theme-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.theme-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.theme-card-badge {
+  display: none;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: var(--accent);
+  color: #fff;
+  padding: 2px 7px;
+  border-radius: 20px;
+}
+
+.theme-card-option.active .theme-card-badge {
+  display: inline-block;
+}
+
+.theme-card-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin-bottom: 12px;
+}
+
+.theme-preview-palette {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  margin-top: auto;
+}
+
+.theme-swatch-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  flex-shrink: 0;
+}
+
+.theme-swatch-dot.glow {
+  box-shadow: 0 0 7px currentColor;
+}
+
+.theme-preview-name {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-left: auto;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* ==========================================================================
+   Accent Picker & Quick Swatches
+   ========================================================================== */
+.theme-accent-section {
+  margin-top: 16px;
+}
+
+.theme-accent-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.theme-color-input {
+  width: 48px;
+  height: 44px;
+  padding: 3px;
+  border-radius: 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.theme-swatches {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.theme-accent-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  position: relative;
+  outline: none;
+}
+
+.theme-accent-swatch:hover {
+  transform: scale(1.15);
+}
+
+.theme-accent-swatch.active {
+  border-color: #fff !important;
+  transform: scale(1.18);
+  box-shadow: 0 0 12px currentColor;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--accent-soft);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.btn-link:hover {
+  color: #fff;
+}
+
+/* ==========================================================================
+   Floating Theme Modal (Modal / Bottom Sheet)
+   ========================================================================== */
+.theme-modal-screen {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.78);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 150;
+}
+
+.theme-modal-screen.show {
+  display: flex;
+  animation: themeEnter 0.22s ease both;
+}
+
+@keyframes themeEnter {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+
+.theme-modal-card {
+  width: min(560px, 100%);
+  max-height: 90vh;
+  max-height: 90dvh;
+  overflow-y: auto;
+  border-radius: 20px;
+  padding: 24px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.7);
+}
+
+.theme-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.theme-modal-head h2 {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.theme-modal-close {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  font-size: 22px;
+  line-height: 1;
+  border-radius: 50%;
+  flex-shrink: 0;
+}

@@ -22,8 +22,11 @@ DEFAULT_PROJECTS: list[dict[str, Any]] = []
 DEFAULT_SITE_CONFIG = {
     "projects_background": {"type": "image", "src": ""},
     "accent_color": "#376dff",
+    "theme": "cyber",
     "widgets": ["about", "quotes", "music", "weather", "projects", "contacts"],
 }
+
+VALID_THEMES = ("cyber", "tokyo", "nordic", "matrix", "sunset", "glass")
 
 SITE_WIDGETS = ("about", "quotes", "music", "weather", "projects", "contacts")
 
@@ -196,9 +199,13 @@ def normalize_site_config(raw: Any) -> dict[str, Any]:
             widgets.append(name)
     if not widgets:
         widgets = list(SITE_WIDGETS)
+    theme = _to_text(raw.get("theme"), "cyber").lower()
+    if theme not in VALID_THEMES:
+        theme = "cyber"
     return {
         "projects_background": {"type": bg_type, "src": bg_src},
         "accent_color": accent_color,
+        "theme": theme,
         "widgets": widgets,
     }
 

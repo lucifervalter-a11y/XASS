@@ -143,6 +143,18 @@ struct BrandMark: View {
         NavigationStack {
             Form {
                 Section("Сервер") { Text(app.origin?.url.absoluteString ?? "Не выбран").textSelection(.enabled) }
+                Section("Оформление") {
+                    NavigationLink {
+                        ThemeSelectorView()
+                    } label: {
+                        HStack {
+                            Label("Тема оформления", systemImage: "paintpalette")
+                            Spacer()
+                            Text(ThemeManager.shared.currentTheme.displayName)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 Section("Защита") {
                     Label("Face ID или код-пароль при каждом возвращении", systemImage: "lock.shield")
                     Text("Ключ входа хранится в Keychain этого iPhone. При смене сервера управление и воспроизведение остановятся, вход нужно будет подтвердить заново.").font(.caption).foregroundStyle(.secondary)

@@ -1,0 +1,861 @@
+/* Hermes AI Agent Module for XASS Mini App
+   Glassmorphism, Neon Violet/Cyan Micro-glow, Thought Drawers, and Interactive Chat
+   Version: 0.17.0
+*/
+
+:root {
+  --hermes-accent: #8b5cf6;
+  --hermes-accent-soft: #a78bfa;
+  --hermes-accent-rgb: 139, 92, 246;
+  --hermes-cyan: #38bdf8;
+  --hermes-cyan-rgb: 56, 189, 248;
+  --hermes-surface: rgba(14, 18, 27, 0.85);
+  --hermes-surface2: rgba(18, 25, 38, 0.92);
+  --hermes-line: rgba(139, 92, 246, 0.22);
+  --hermes-text: #f8fafc;
+  --hermes-muted: #94a3b8;
+  --hermes-green: #34d399;
+  --hermes-amber: #fbbf24;
+  --hermes-red: #f87171;
+}
+
+/* Ensure 6 navigation tabs fit evenly across modern mobile and desktop screens */
+.tabs-inner {
+  grid-template-columns: repeat(6, 1fr) !important;
+}
+
+@media (max-width: 480px) {
+  .tabs {
+    width: min(calc(100% - 10px), 640px) !important;
+    padding: 4px 2px !important;
+  }
+  .tab {
+    min-height: 52px !important;
+    font-size: 8px !important;
+    gap: 2px !important;
+    padding: 2px 1px !important;
+  }
+  .tab svg {
+    width: 18px !important;
+    height: 18px !important;
+  }
+}
+
+/* Quick chip on Home View */
+.quick-chip.hermes-quick-chip {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.18), rgba(55, 109, 255, 0.18)) !important;
+  border-color: rgba(139, 92, 246, 0.38) !important;
+  color: #ddd6fe !important;
+  box-shadow: 0 2px 12px rgba(139, 92, 246, 0.15);
+}
+.quick-chip.hermes-quick-chip:hover {
+  border-color: rgba(167, 139, 250, 0.7) !important;
+  box-shadow: 0 4px 18px rgba(139, 92, 246, 0.3);
+  transform: translateY(-1px);
+}
+.quick-chip.hermes-quick-chip svg {
+  color: #a78bfa !important;
+}
+
+/* Intro and Hero Header */
+.hermes-intro {
+  position: relative;
+  overflow: hidden;
+}
+.hermes-badge-glow {
+  display: inline-block;
+  font: 700 10px/1 "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 0.14em;
+  padding: 4px 9px;
+  border-radius: 99px;
+  background: rgba(139, 92, 246, 0.14);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  color: #c4b5fd;
+  text-shadow: 0 0 10px rgba(139, 92, 246, 0.5);
+}
+.hermes-hero-title {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 10px 0 12px;
+}
+.hermes-hero-title h1 {
+  margin: 0 !important;
+  font-size: clamp(30px, 7vw, 48px);
+  background: linear-gradient(135deg, #ffffff 40%, #c4b5fd 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.hermes-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(10px);
+  transition: all 0.25s ease;
+}
+.hermes-status-badge.online {
+  border-color: rgba(52, 211, 153, 0.4);
+  color: #6ee7b7;
+  box-shadow: 0 0 14px rgba(52, 211, 153, 0.2);
+}
+.hermes-status-badge.thinking {
+  border-color: rgba(139, 92, 246, 0.5);
+  color: #c4b5fd;
+  box-shadow: 0 0 16px rgba(139, 92, 246, 0.35);
+}
+.hermes-status-badge.offline {
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fde68a;
+}
+.hermes-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.hermes-status-badge.online .hermes-status-dot {
+  box-shadow: 0 0 8px #34d399;
+}
+.hermes-status-badge.thinking .hermes-status-dot {
+  box-shadow: 0 0 10px #8b5cf6;
+  animation: hermesPulseDot 1.2s ease-in-out infinite alternate;
+}
+@keyframes hermesPulseDot {
+  0% { transform: scale(0.9); opacity: 0.6; }
+  100% { transform: scale(1.4); opacity: 1; }
+}
+
+/* Hermes Controls Bar */
+.hermes-toolbar-section {
+  padding-top: 18px !important;
+  padding-bottom: 18px !important;
+}
+.hermes-controls-bar {
+  display: grid;
+  grid-template-columns: minmax(200px, 1.4fr) minmax(220px, 1.6fr) auto;
+  gap: 14px;
+  align-items: end;
+}
+@media (max-width: 680px) {
+  .hermes-controls-bar {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+}
+.hermes-control-group {
+  display: flex;
+  flex-direction: column;
+}
+.hermes-select-wrap, .hermes-session-selector {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.hermes-select {
+  border-radius: 12px;
+  background: rgba(12, 16, 25, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--text);
+  font-size: 13px !important;
+  cursor: pointer;
+  height: 44px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.hermes-select:focus {
+  border-color: var(--hermes-accent);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2);
+}
+.hermes-new-session-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  border-radius: 12px;
+  padding: 0 14px;
+  white-space: nowrap;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.hermes-new-session-btn svg {
+  width: 16px;
+  height: 16px;
+}
+.hermes-token-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+@media (max-width: 680px) {
+  .hermes-token-stat {
+    align-items: flex-start;
+  }
+}
+.hermes-token-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 12px;
+  background: rgba(139, 92, 246, 0.08);
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  color: #c4b5fd;
+  font: 600 12px/1 "Cascadia Mono", Consolas, monospace;
+}
+.hermes-token-pill svg {
+  width: 14px;
+  height: 14px;
+  color: #a78bfa;
+}
+
+/* Chat Section Wrapper */
+.hermes-chat-section {
+  padding-top: 14px !important;
+  padding-bottom: 24px !important;
+  border-bottom: 0 !important;
+}
+.hermes-chat-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Chat History Area */
+.hermes-chat-history {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 320px;
+  max-height: calc(100vh - 360px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 4px 16px;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+@media (min-height: 800px) {
+  .hermes-chat-history {
+    max-height: 520px;
+  }
+}
+
+/* Scrollbar */
+.hermes-chat-history::-webkit-scrollbar {
+  width: 6px;
+}
+.hermes-chat-history::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+.hermes-chat-history::-webkit-scrollbar-thumb {
+  background: rgba(139, 92, 246, 0.25);
+  border-radius: 99px;
+}
+.hermes-chat-history::-webkit-scrollbar-thumb:hover {
+  background: rgba(139, 92, 246, 0.45);
+}
+
+/* Welcome Hero Box */
+.hermes-welcome-card {
+  padding: 24px;
+  border-radius: 16px;
+  background: linear-gradient(145deg, rgba(20, 24, 38, 0.75), rgba(11, 14, 22, 0.9));
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  text-align: center;
+  margin: 12px 0;
+}
+.hermes-welcome-icon {
+  width: 58px;
+  height: 58px;
+  margin: 0 auto 14px;
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(56, 189, 248, 0.15));
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  box-shadow: 0 0 24px rgba(139, 92, 246, 0.3);
+  color: #c4b5fd;
+}
+.hermes-welcome-icon svg {
+  width: 32px;
+  height: 32px;
+}
+.hermes-welcome-card h3 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #fff;
+}
+.hermes-welcome-card p {
+  color: var(--hermes-muted);
+  font-size: 13px;
+  max-width: 480px;
+  margin: 0 auto 16px;
+  line-height: 1.6;
+}
+.hermes-features-list {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.hermes-feat-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+/* Message Rows & Bubbles */
+.hermes-msg-row {
+  display: flex;
+  width: 100%;
+}
+.hermes-msg-row.user {
+  justify-content: flex-end;
+}
+.hermes-msg-row.agent {
+  justify-content: flex-start;
+}
+
+/* User Bubble */
+.hermes-bubble-user {
+  max-width: 82%;
+  padding: 13px 17px;
+  border-radius: 18px 18px 4px 18px;
+  background: linear-gradient(135deg, rgba(55, 109, 255, 0.28), rgba(75, 124, 255, 0.15));
+  border: 1px solid rgba(91, 141, 255, 0.38);
+  box-shadow: 0 6px 22px rgba(55, 109, 255, 0.15);
+  color: #f8fafc;
+  font-size: 14px;
+  line-height: 1.55;
+  word-break: break-word;
+  position: relative;
+}
+.hermes-user-meta {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 5px;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.5);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+/* Agent Bubble */
+.hermes-bubble-agent {
+  width: 100%;
+  max-width: 100%;
+  padding: 18px 20px;
+  border-radius: 18px 18px 18px 4px;
+  background: linear-gradient(155deg, rgba(16, 21, 32, 0.94), rgba(9, 13, 21, 0.97));
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  border-left: 3px solid #8b5cf6;
+  box-shadow: 0 12px 35px rgba(0, 0, 0, 0.4), 0 0 24px rgba(139, 92, 246, 0.08);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  word-break: break-word;
+}
+.hermes-agent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.hermes-agent-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.hermes-agent-icon-badge {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.35), rgba(56, 189, 248, 0.25));
+  border: 1px solid rgba(139, 92, 246, 0.5);
+  display: grid;
+  place-items: center;
+  color: #c4b5fd;
+}
+.hermes-agent-icon-badge svg {
+  width: 15px;
+  height: 15px;
+}
+.hermes-agent-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: #fff;
+  letter-spacing: -0.01em;
+}
+.hermes-model-tag {
+  font: 10px/1 "Cascadia Mono", Consolas, monospace;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(139, 92, 246, 0.12);
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  color: #c4b5fd;
+}
+.hermes-agent-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.hermes-copy-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--hermes-muted);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+.hermes-copy-btn:hover {
+  background: rgba(139, 92, 246, 0.18);
+  border-color: rgba(139, 92, 246, 0.4);
+  color: #fff;
+}
+.hermes-copy-btn svg {
+  width: 15px;
+  height: 15px;
+}
+.hermes-copy-btn.copied {
+  color: #34d399 !important;
+  border-color: rgba(52, 211, 153, 0.5) !important;
+  background: rgba(52, 211, 153, 0.12) !important;
+}
+
+/* Thought Process Drawer */
+.hermes-thought {
+  margin: 12px 0 16px;
+  border-radius: 12px;
+  background: rgba(8, 12, 18, 0.75);
+  border: 1px solid rgba(139, 92, 246, 0.22);
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+.hermes-thought[open] {
+  border-color: rgba(139, 92, 246, 0.42);
+  box-shadow: 0 4px 18px rgba(139, 92, 246, 0.1);
+}
+.hermes-thought summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #cbd5e1;
+  background: rgba(139, 92, 246, 0.06);
+  user-select: none;
+  transition: background 0.18s;
+}
+.hermes-thought summary::-webkit-details-marker {
+  display: none;
+}
+.hermes-thought summary:hover {
+  background: rgba(139, 92, 246, 0.12);
+}
+.thought-icon {
+  font-size: 14px;
+}
+.thought-title {
+  flex: 1;
+}
+.thought-badge {
+  font: 10px/1 "Cascadia Mono", Consolas, monospace;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: rgba(139, 92, 246, 0.16);
+  color: #c4b5fd;
+}
+.thought-arrow {
+  width: 14px;
+  height: 14px;
+  color: var(--hermes-muted);
+  transition: transform 0.2s ease;
+}
+.hermes-thought[open] .thought-arrow {
+  transform: rotate(90deg);
+}
+.hermes-thought-body {
+  padding: 12px 14px;
+  border-top: 1px solid rgba(139, 92, 246, 0.15);
+  font: 12px/1.6 "Cascadia Mono", Consolas, monospace;
+  color: #cbd5e1;
+  background: rgba(5, 8, 12, 0.6);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* Tool Execution Cards */
+.hermes-tool-card {
+  margin: 10px 0;
+  border-radius: 10px;
+  background: rgba(12, 16, 25, 0.9);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  overflow: hidden;
+}
+.hermes-tool-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(56, 189, 248, 0.08);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.18);
+  font-size: 11px;
+}
+.hermes-tool-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: #7dd3fc;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+.hermes-tool-badge {
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.hermes-tool-badge.ok {
+  background: rgba(52, 211, 153, 0.18);
+  color: #34d399;
+}
+.hermes-tool-badge.run {
+  background: rgba(251, 191, 36, 0.18);
+  color: #fbbf24;
+}
+.hermes-tool-content {
+  padding: 10px 12px;
+  font: 11px/1.55 "Cascadia Mono", Consolas, monospace;
+  color: #94a3b8;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+/* Agent Bubble Content & Markdown */
+.hermes-bubble-content {
+  color: #e2e8f0;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.hermes-bubble-content p {
+  margin: 0 0 10px;
+}
+.hermes-bubble-content p:last-child {
+  margin-bottom: 0;
+}
+.hermes-bubble-content h1,
+.hermes-bubble-content h2,
+.hermes-bubble-content h3,
+.hermes-bubble-content h4 {
+  color: #fff;
+  font-weight: 600;
+  margin: 16px 0 8px;
+  line-height: 1.3;
+}
+.hermes-bubble-content h1 { font-size: 20px; }
+.hermes-bubble-content h2 { font-size: 17px; }
+.hermes-bubble-content h3 { font-size: 15px; }
+.hermes-bubble-content ul,
+.hermes-bubble-content ol {
+  margin: 8px 0 12px 20px;
+  padding: 0;
+}
+.hermes-bubble-content li {
+  margin: 4px 0;
+}
+.hermes-bubble-content hr {
+  border: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin: 16px 0;
+}
+.hermes-bubble-content blockquote {
+  margin: 10px 0;
+  padding: 8px 14px;
+  border-left: 3px solid var(--hermes-accent);
+  background: rgba(139, 92, 246, 0.08);
+  color: #cbd5e1;
+  border-radius: 0 8px 8px 0;
+}
+.hermes-bubble-content strong {
+  color: #fff;
+  font-weight: 600;
+}
+.hermes-bubble-content code:not(pre code) {
+  font: 12px "Cascadia Mono", Consolas, monospace;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #f1f5f9;
+}
+
+/* Code Blocks */
+.hermes-code-block {
+  margin: 12px 0 14px;
+  border-radius: 12px;
+  background: #06090e;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.hermes-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font: 11px "Cascadia Mono", Consolas, monospace;
+  color: var(--hermes-muted);
+}
+.hermes-code-copy-btn {
+  border: 0;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  transition: all 0.18s;
+}
+.hermes-code-copy-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+.hermes-code-block pre {
+  margin: 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font: 12.5px/1.55 "Cascadia Mono", Consolas, monospace;
+  color: #e2e8f0;
+}
+.hermes-code-block code {
+  font-family: inherit;
+}
+
+/* Agent Bubble Footer */
+.hermes-agent-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  color: var(--hermes-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+/* Typing Indicator */
+.hermes-typing-indicator {
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: rgba(14, 19, 29, 0.85);
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  width: max-content;
+  max-width: 90%;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+  animation: enter 0.2s ease both;
+}
+.hermes-typing-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: #c4b5fd;
+}
+.hermes-dots {
+  display: flex;
+  gap: 4px;
+}
+.hermes-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #a78bfa;
+  animation: hermesBounce 1.2s infinite ease-in-out;
+}
+.hermes-dots span:nth-child(2) { animation-delay: 0.2s; }
+.hermes-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes hermesBounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+  40% { transform: translateY(-5px); opacity: 1; }
+}
+
+/* Prompt Input Area & Quick Chips */
+.hermes-prompt-area {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: rgba(9, 13, 20, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  padding: 12px 14px;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.35);
+}
+
+/* Quick Action Chips */
+.hermes-quick-chips {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.hermes-quick-chips::-webkit-scrollbar {
+  display: none;
+}
+.hermes-action-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 13px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #cbd5e1;
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.hermes-action-chip:hover {
+  background: rgba(139, 92, 246, 0.16);
+  border-color: rgba(139, 92, 246, 0.45);
+  color: #fff;
+  transform: translateY(-1px);
+}
+.hermes-action-chip:active {
+  transform: scale(0.96);
+}
+.hermes-action-chip svg {
+  width: 13px;
+  height: 13px;
+  color: #a78bfa;
+}
+
+/* Input Box & Textarea */
+.hermes-input-box {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+.hermes-textarea {
+  min-height: 48px;
+  max-height: 160px;
+  border-radius: 12px;
+  background: rgba(15, 20, 30, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #fff;
+  padding: 12px 14px;
+  font-size: 14px !important;
+  line-height: 1.5;
+  resize: none;
+  flex: 1;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.hermes-textarea:focus {
+  border-color: var(--hermes-accent);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.25);
+}
+.hermes-textarea::placeholder {
+  color: #64748b;
+  font-size: 13px;
+}
+.hermes-input-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.hermes-clear-chat-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--hermes-muted);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: all 0.18s;
+  flex-shrink: 0;
+}
+.hermes-clear-chat-btn:hover {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+.hermes-clear-chat-btn svg {
+  width: 17px;
+  height: 17px;
+}
+.hermes-send-btn {
+  width: 48px;
+  height: 44px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #7c3aed, #4f46e5) !important;
+  border: 1px solid rgba(139, 92, 246, 0.6) !important;
+  color: #fff !important;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(124, 58, 237, 0.35);
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+.hermes-send-btn:hover:not(:disabled) {
+  box-shadow: 0 6px 24px rgba(124, 58, 237, 0.55);
+  transform: translateY(-1px);
+}
+.hermes-send-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+.hermes-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.hermes-send-btn svg {
+  width: 18px;
+  height: 18px;
+}
+.send-spin {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}

@@ -2,10 +2,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum XASSStyle {
-    static let background = Color.black
-    static let surface = Color(red: 22 / 255, green: 25 / 255, blue: 30 / 255)
-    static let accent = Color(red: 52 / 255, green: 120 / 255, blue: 246 / 255)
-    static let secondary = Color(red: 0.67, green: 0.69, blue: 0.73)
+    static var background: Color { ThemeManager.shared.currentTheme.backgroundColor }
+    static var surface: Color { ThemeManager.shared.currentTheme.cardColor }
+    static var accent: Color { ThemeManager.shared.currentTheme.accentColor }
+    static var secondary: Color { ThemeManager.shared.currentTheme.secondaryTextColor }
+    static var glowingTint: Color { ThemeManager.shared.currentTheme.glowingTintColor }
+    static var border: Color { ThemeManager.shared.currentTheme.borderColor }
 }
 
 @MainActor struct TrackArtwork: View {

@@ -30,6 +30,7 @@ from app.music_api import build_router as build_music_router
 from app.native_api import build_router as build_native_router, consume_native_proof
 from app.native_dashboard_api import build_router as build_native_dashboard_router
 from app.music_storage_api import build_router as build_music_storage_router
+from app.hermes_api import build_router as build_hermes_router
 from app.schemas import (
     AgentPairClaimPayload,
     AgentPairClaimResponse,
@@ -1397,6 +1398,7 @@ app.include_router(build_music_router(settings, require_mini_owner, _public_orig
 app.include_router(build_native_router(settings, require_mini_owner))
 app.include_router(build_native_dashboard_router(settings, require_mini_owner))
 app.include_router(build_music_storage_router(settings, require_mini_owner, _require_pwa_action_proof))
+app.include_router(build_hermes_router(settings, require_mini_owner))
 
 
 @app.get("/api/pwa/config")
