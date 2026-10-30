@@ -29,7 +29,7 @@ ROOT = Path("/home/red/serverredus")
 REQUIRED_SOURCE = ("app", "index.php", "proxy.php")
 OPTIONAL_SOURCE = ("miniapp.php", "assets/miniapp-hermes.css", "assets/miniapp-hermes.js")
 OPERATIONS = {".github/workflows/checks.yml", ".github/workflows/server-route-diagnostics.yml",
-              "deploy/backend_only_deploy.py"}
+              "deploy/backend_only_deploy.py", "deploy/nginx_private_guard.py"}
 
 
 class DeployError(RuntimeError):
