@@ -108,4 +108,170 @@ final class BackgroundDownloadTests: XCTestCase {
         let restored = try DownloadLedger(root: root)
         XCTAssertTrue(restored.canReplayCommit(restored.entries[0]))
     }
+
+    @MainActor func testHeldTicketReplyAfterCancelCannotRecreateLedgerJob() throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = try DownloadLedger(root: root), refreshes = DownloadTicketRefreshes()
+        var item = job(); item.phase = .paused; try ledger.save([item])
+        var held: ((Result<String, Error>) -> Void)?
+        var received = 0
+        refreshes.request(for: item.id, stillCurrent: { ledger.entries.contains { $0.id == item.id } },
+            issue: { held = $0 }) { _ in
+                received += 1
+                try! ledger.save([item]) // The former enqueue would resurrect this job.
+            }
+        refreshes.invalidate(item.id); try ledger.save([])
+        held?(.success("https://download.invalid/fresh-ticket"))
+        XCTAssertEqual(received, 0); XCTAssertTrue(ledger.entries.isEmpty)
+    }
+
+    @MainActor func testHeldTicketReplyAfterPauseCannotRestartDownloadOrShowLateError() throws {
+        let refreshes = DownloadTicketRefreshes(), id = UUID()
+        var phase: DownloadPhase = .failed
+        var held: ((Result<String, Error>) -> Void)?
+        var received = 0
+        refreshes.request(for: id, stillCurrent: { true }, issue: { held = $0 }) { _ in
+            received += 1; phase = .queued
+        }
+        refreshes.invalidate(id); phase = .paused
+        held?(.success("fresh-ticket")); held?(.failure(XASSErr.invalidMedia))
+        XCTAssertEqual(received, 0); XCTAssertEqual(phase, .paused)
+    }
+
+    @MainActor func testDoubleTicketRetryAcceptsOnlyNewestHeldReplyExactlyOnce() {
+        let refreshes = DownloadTicketRefreshes(), id = UUID()
+        var held: [(Result<String, Error>) -> Void] = [], accepted: [String] = []
+        for _ in 0..<2 {
+            refreshes.request(for: id, stillCurrent: { true }, issue: { held.append($0) }) { result in
+                if let url = try? result.get() { accepted.append(url) }
+            }
+        }
+        held[1](.success("new-ticket")); held[0](.success("stale-ticket"))
+        held[1](.success("duplicate-reply"))
+        XCTAssertEqual(accepted, ["new-ticket"])
+    }
+
+    @MainActor func testHeldTicketReplyRequiresSameLedgerJobAndAccountAfterRelaunchOrLogout() {
+        let refreshes = DownloadTicketRefreshes(), id = UUID(), account = UUID()
+        var currentJob: UUID? = id, currentAccount = account
+        var held: [(Result<String, Error>) -> Void] = [], accepted = 0
+        let begin = {
+            refreshes.request(for: id, stillCurrent: { currentJob == id && currentAccount == account },
+                issue: { held.append($0) }) { _ in accepted += 1 }
+        }
+        begin(); currentJob = UUID(); held[0](.success("other-job"))
+        currentJob = id; begin(); currentAccount = UUID(); held[1](.success("other-account"))
+        currentAccount = account; begin(); refreshes.invalidateAll(); held[2](.success("logged-out"))
+        XCTAssertEqual(accepted, 0)
+    }
+
+    func testOneHourTicketResumesAtTwentyMinutesWithoutChangingOpaqueResumeData() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000), bytes = Data([0, 255, 10, 3, 78])
+        let ticket = try DownloadTicket(url: "https://download.invalid/signed", expiresIn: 3600, receivedAt: now)
+        let secret = BackgroundDownloadSecret(url: ticket.url, issuedAt: now, resume: bytes, expiresAt: ticket.expiresAt)
+        let stored = try JSONEncoder().encode(secret)
+        let restored = try JSONDecoder().decode(BackgroundDownloadSecret.self, from: stored)
+        XCTAssertTrue(restored.canResume(at: now.addingTimeInterval(20 * 60)))
+        XCTAssertEqual(restored.resume, bytes)
+        XCTAssertEqual(restored.url, ticket.url)
+        XCTAssertFalse(restored.canResume(at: now.addingTimeInterval(3600)))
+        XCTAssertFalse(restored.canResume(at: now.addingTimeInterval(3601)))
+        XCTAssertEqual(restored.resume, bytes, "Expiry checks never rewrite opaque URLSession data")
+    }
+
+    func testOldSecretWithoutExpiryKeepsFifteenMinuteCompatibilityWindow() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let old = BackgroundDownloadSecret(url: "https://download.invalid/old", issuedAt: now, resume: Data([1, 2]))
+        let encoded = try JSONEncoder().encode(old)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("expiresAt"))
+        let restored = try JSONDecoder().decode(BackgroundDownloadSecret.self, from: encoded)
+        XCTAssertTrue(restored.canResume(at: now.addingTimeInterval(899)))
+        XCTAssertFalse(restored.canResume(at: now.addingTimeInterval(900)))
+        XCTAssertFalse(restored.canResume(at: now.addingTimeInterval(1200)))
+        XCTAssertFalse(restored.canResume(at: now.addingTimeInterval(-1)))
+    }
+
+    func testTicketExpiryRejectsMalformedAndUnboundedServerValues() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let invalidLifetimes: [Any] = [-1, 0, Double.nan, Double.infinity, 86401, "3600", true, NSNull()]
+        for value in invalidLifetimes {
+            XCTAssertThrowsError(try DownloadTicket(url: "fixture", expiresIn: value, receivedAt: now))
+        }
+        XCTAssertEqual(try DownloadTicket(url: "fixture", expiresIn: 3600, receivedAt: now).expiresAt,
+                       now.addingTimeInterval(3600))
+        XCTAssertEqual(try DownloadTicket(url: "legacy", expiresIn: nil, receivedAt: now).expiresAt,
+                       now.addingTimeInterval(900))
+        let invalid = BackgroundDownloadSecret(url: "fixture", issuedAt: now, resume: nil, expiresAt: now.addingTimeInterval(86401))
+        XCTAssertFalse(invalid.canResume(at: now))
+        let invalidDates: [Any] = [-1, Double.infinity, Date().timeIntervalSince1970 + 86401, true]
+        for value in invalidDates {
+            XCTAssertThrowsError(try NativeAudioCommand(["action": "download", "trackId": 1, "downloadExpiresAt": value]))
+        }
+    }
+
+    func testFastResumeWaitsForHeldCancellationAndStartsWithItsOpaqueData() {
+        let id = UUID(); var pauses = DownloadPauseEpochs()
+        let epoch = pauses.begin(id), bytes = Data([7, 9, 2, 1])
+        var saved: Data?, startedWith: Data?, starts = 0
+        let callback: (Data?) -> Void = { data in
+            guard let resume = pauses.finish(id, epoch: epoch) else { return }
+            saved = data
+            if resume { starts += 1; startedWith = saved }
+        }
+        XCTAssertTrue(pauses.requestResume(id))
+        XCTAssertTrue(pauses.requestResume(id), "Repeated Continue coalesces into one intent")
+        XCTAssertEqual(starts, 0); XCTAssertNil(saved)
+        callback(bytes); callback(Data([0]))
+        XCTAssertEqual(starts, 1); XCTAssertEqual(startedWith, bytes)
+        XCTAssertFalse(pauses.isPending(id))
+    }
+
+    func testRepeatedPauseClearsResumeIntentButKeepsHeldCancellationData() {
+        let id = UUID(); var pauses = DownloadPauseEpochs()
+        let epoch = pauses.begin(id), bytes = Data([9, 4])
+        var saved: Data?, starts = 0
+        let callback: (Data?) -> Void = { data in
+            guard let resume = pauses.finish(id, epoch: epoch) else { return }
+            saved = data; if resume { starts += 1 }
+        }
+        XCTAssertTrue(pauses.requestResume(id))
+        pauses.keepPaused(id)
+        XCTAssertTrue(pauses.accepts(id, epoch: epoch))
+        callback(bytes)
+        XCTAssertEqual(saved, bytes); XCTAssertEqual(starts, 0)
+        XCTAssertFalse(pauses.isPending(id))
+    }
+
+    func testCancelledOrLoggedOutHeldPauseCannotResumeOrAttachBytesToNewJob() {
+        for _ in 0..<2 {
+            let id = UUID(); var pauses = DownloadPauseEpochs()
+            let epoch = pauses.begin(id)
+            var saves = 0, starts = 0
+            let callback = {
+                guard let resume = pauses.finish(id, epoch: epoch) else { return }
+                saves += 1; if resume { starts += 1 }
+            }
+            XCTAssertTrue(pauses.requestResume(id))
+            pauses.invalidate(id) // cancel/logout/new enqueue retire this task.
+            let newer = pauses.begin(id)
+            callback()
+            XCTAssertTrue(pauses.accepts(id, epoch: newer))
+            XCTAssertEqual(saves, 0); XCTAssertEqual(starts, 0)
+        }
+    }
+
+    func testMissingSecretCancellationStillClearsPendingResumeState() {
+        let id = UUID(); var pauses = DownloadPauseEpochs()
+        let epoch = pauses.begin(id)
+        XCTAssertTrue(pauses.requestResume(id))
+        let secretAvailable = false
+        let callback = {
+            guard let _ = pauses.finish(id, epoch: epoch) else { return }
+            guard secretAvailable else { return }
+            XCTFail("Missing secret must not start network work")
+        }
+        callback()
+        XCTAssertFalse(pauses.isPending(id))
+        XCTAssertFalse(pauses.requestResume(id), "A later explicit retry can request a fresh ticket")
+    }
 }

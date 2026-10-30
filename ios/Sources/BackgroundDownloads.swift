@@ -1,6 +1,38 @@
 import Foundation
 import UIKit
 
+struct DownloadTicket {
+    static let legacyLifetime: TimeInterval = 15 * 60
+    static let maximumLifetime: TimeInterval = 24 * 3600
+    let url: String
+    let expiresAt: Date
+    init(url: String, expiresIn: Any?, receivedAt: Date = Date()) throws {
+        let lifetime: TimeInterval
+        if let raw = expiresIn {
+            guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+                  value.doubleValue.isFinite, value.doubleValue > 0,
+                  value.doubleValue <= Self.maximumLifetime else { throw XASSErr.invalidMedia }
+            lifetime = value.doubleValue
+        } else { lifetime = Self.legacyLifetime }
+        self.url = url; expiresAt = receivedAt.addingTimeInterval(lifetime)
+    }
+}
+
+/// Kept only in Keychain. Optional expiry decodes pre-upgrade records using
+/// their original conservative 15-minute window, without changing resume data.
+struct BackgroundDownloadSecret: Codable {
+    let url: String
+    let issuedAt: Date
+    var resume: Data?
+    var expiresAt: Date? = nil
+    func canResume(at now: Date = Date()) -> Bool {
+        let expiry = expiresAt ?? issuedAt.addingTimeInterval(DownloadTicket.legacyLifetime)
+        let lifetime = expiry.timeIntervalSince(issuedAt)
+        return lifetime.isFinite && lifetime > 0 && lifetime <= DownloadTicket.maximumLifetime
+            && now >= issuedAt && now < expiry
+    }
+}
+
 enum DownloadPhase: String, Codable {
     case queued, downloading, paused, failed, committing
 }
@@ -25,12 +57,28 @@ struct BackgroundDownload: Codable, Identifiable {
 /// Pause -> resume/new ticket -> pause must never attach the first task's
 /// opaque URLSession resume blob to the second ticket.
 struct DownloadPauseEpochs {
-    private var values: [UUID: UUID] = [:]
+    private struct Pending { let epoch: UUID; var wantsResume = false }
+    private var values: [UUID: Pending] = [:]
     mutating func begin(_ id: UUID) -> UUID {
-        let epoch = UUID(); values[id] = epoch; return epoch
+        let epoch = UUID(); values[id] = Pending(epoch: epoch); return epoch
     }
     mutating func invalidate(_ id: UUID) { values.removeValue(forKey: id) }
-    func accepts(_ id: UUID, epoch: UUID) -> Bool { values[id] == epoch }
+    func accepts(_ id: UUID, epoch: UUID) -> Bool { values[id]?.epoch == epoch }
+    func isPending(_ id: UUID) -> Bool { values[id] != nil }
+    mutating func requestResume(_ id: UUID) -> Bool {
+        guard var pending = values[id] else { return false }
+        pending.wantsResume = true; values[id] = pending; return true
+    }
+    mutating func keepPaused(_ id: UUID) {
+        guard var pending = values[id] else { return }
+        pending.wantsResume = false; values[id] = pending
+    }
+    /// Consume the matching cancellation even if its secret/job disappeared.
+    /// nil is a stale callback; false is a completed pause without resume intent.
+    mutating func finish(_ id: UUID, epoch: UUID) -> Bool? {
+        guard let pending = values[id], pending.epoch == epoch else { return nil }
+        values.removeValue(forKey: id); return pending.wantsResume
+    }
 }
 
 /// The durable index contains metadata only. Download URLs and opaque resume
@@ -104,7 +152,6 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
     static let identifier = "app.xass.mobile.music-downloads.v1"
     static let changed = Notification.Name("XASSBackgroundDownloadsChanged")
     static let shared = BackgroundDownloads()
-    private struct Secret: Codable { let url: String; let issuedAt: Date; var resume: Data? }
     private var ledger: DownloadLedger?
     private var running: [UUID: URLSessionDownloadTask] = [:]
     private var pauseEpochs = DownloadPauseEpochs()
@@ -174,7 +221,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         }
     }
     func entries(for origin: ServerOrigin) -> [BackgroundDownload] { ledger?.entries.filter { $0.origin == origin.url.absoluteString } ?? [] }
-    func enqueue(origin: ServerOrigin, track: DownloadedTrack, url: URL) throws {
+    func enqueue(origin: ServerOrigin, track: DownloadedTrack, url: URL, expiresAt: Date? = nil) throws {
         guard let ledger, track.id > 0, track.id <= Int(Int32.max), track.title.count <= 300, track.artist.count <= 300,
               track.duration.isFinite, track.duration >= 0, track.duration <= 86400,
               (try? origin.mediaURL(url.absoluteString, trackID: track.id)) != nil else { throw XASSErr.invalidMedia }
@@ -185,7 +232,9 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         let previousSecret = SecureStore.load(key(item.id))
         item.track = track; item.phase = .queued; item.message = nil; item.taskID = nil
         item.received = 0; item.expected = 0
-        try saveSecret(Secret(url: url.absoluteString, issuedAt: Date(), resume: nil), id: item.id)
+        let secret = BackgroundDownloadSecret(url: url.absoluteString, issuedAt: Date(), resume: nil, expiresAt: expiresAt)
+        guard secret.canResume() else { throw XASSErr.invalidMedia }
+        try saveSecret(secret, id: item.id)
         var values = ledger.entries.filter { $0.id != item.id }; values.append(item)
         do { try ledger.save(values) } catch {
             if let previousSecret { try? SecureStore.save(previousSecret, name: key(item.id)) }
@@ -209,8 +258,15 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             guard update(item) else { return false }
             commit(item); return true
         }
-        guard !item.active, let secret = secret(id),
-              Date().timeIntervalSince(secret.issuedAt) < 15 * 60 else { return false }
+        guard !item.active else { return false }
+        // URLSession has not supplied its opaque resume data yet. Record the
+        // user's intent without launching a second download from byte zero.
+        if pauseEpochs.requestResume(id) {
+            item.message = "Сохраняю прогресс перед продолжением…"
+            if !update(item) { pauseEpochs.keepPaused(id); return false }
+            return true
+        }
+        guard let secret = secret(id), secret.canResume() else { return false }
         item.phase = .queued; item.message = nil
         guard update(item) else { return false }
         pauseEpochs.invalidate(id); schedule(); return true
@@ -222,16 +278,27 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         if ledger?.canReplayCommit(item) == true { return }
         item.phase = .paused; item.message = nil; item.taskID = nil
         guard update(item) else { return }
-        let epoch = pauseEpochs.begin(id)
+        if pauseEpochs.isPending(id) {
+            // Repeated Pause cancels only queued resume intent, not the still
+            // valid cancellation callback holding the original byte position.
+            pauseEpochs.keepPaused(id); schedule(); return
+        }
         if let task = running.removeValue(forKey: id) {
+            let epoch = pauseEpochs.begin(id)
             task.cancel { data in
                 DispatchQueue.main.async {
-                    guard self.pauseEpochs.accepts(id, epoch: epoch),
-                          self.ledger?.entries.first(where: { $0.id == id })?.phase == .paused,
+                    guard let wantsResume = self.pauseEpochs.finish(id, epoch: epoch) else { return }
+                    defer { self.schedule() }
+                    guard var current = self.ledger?.entries.first(where: { $0.id == id }), current.phase == .paused,
                           var secret = self.secret(id) else { return }
                     secret.resume = data.flatMap { $0.count <= 2 * 1024 * 1024 ? $0 : nil }
-                    try? self.saveSecret(secret, id: id)
-                    self.pauseEpochs.invalidate(id); self.schedule()
+                    do { try self.saveSecret(secret, id: id) }
+                    catch { self.fail(id, "Не удалось сохранить прогресс. Повторите загрузку."); return }
+                    if wantsResume && current.origin == self.allowedOrigin {
+                        if secret.canResume() { current.phase = .queued; current.message = nil }
+                        else { current.phase = .failed; current.message = "Для продолжения нужна новая ссылка. Нажмите «Повторить»." }
+                        self.update(current)
+                    }
                 }
             }
         }
@@ -241,7 +308,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         if allowedOrigin == origin.url.absoluteString { allowedOrigin = nil }
         for item in entries(for: origin) {
             pause(item.id)
-            if forgetSecrets { SecureStore.remove(key(item.id)) }
+            if forgetSecrets { pauseEpochs.invalidate(item.id); SecureStore.remove(key(item.id)) }
         }
     }
     func cancel(_ id: UUID) {
@@ -255,8 +322,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         guard reconciled, let ledger, let allowedOrigin else { return }
         for var item in ledger.entries where item.phase == .queued && item.origin == allowedOrigin {
             guard running.count < 2 else { break }
-            guard let origin = try? ServerOrigin(item.origin), let secret = secret(item.id),
-                  Date().timeIntervalSince(secret.issuedAt) < 15 * 60,
+            guard let origin = try? ServerOrigin(item.origin), let secret = secret(item.id), secret.canResume(),
                   let url = try? origin.mediaURL(secret.url, trackID: item.track.id) else {
                 fail(item.id, "Для продолжения нужна новая ссылка. Нажмите «Повторить»."); continue
             }
@@ -275,11 +341,11 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         }
     }
     private func key(_ id: UUID) -> String { "music-download-" + id.uuidString }
-    private func secret(_ id: UUID) -> Secret? {
+    private func secret(_ id: UUID) -> BackgroundDownloadSecret? {
         guard let data = SecureStore.load(key(id)), data.count <= 3 * 1024 * 1024 else { return nil }
-        return try? JSONDecoder().decode(Secret.self, from: data)
+        return try? JSONDecoder().decode(BackgroundDownloadSecret.self, from: data)
     }
-    private func saveSecret(_ value: Secret, id: UUID) throws { try SecureStore.save(JSONEncoder().encode(value), name: key(id)) }
+    private func saveSecret(_ value: BackgroundDownloadSecret, id: UUID) throws { try SecureStore.save(JSONEncoder().encode(value), name: key(id)) }
     @discardableResult private func update(_ item: BackgroundDownload) -> Bool {
         guard let ledger, let index = ledger.entries.firstIndex(where: { $0.id == item.id }) else { return false }
         var values = ledger.entries; values[index] = item

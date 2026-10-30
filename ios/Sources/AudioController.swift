@@ -14,6 +14,26 @@ struct DownloadedTrack: Codable, Identifiable {
     var bridge: [String: Any] { ["trackId": id, "title": title, "artist": artist, "duration": duration] }
 }
 
+/// Fence asynchronous ticket refreshes separately from URLSession callbacks.
+/// Cancelling/pausing a job or requesting a newer ticket retires the old reply;
+/// neither a late success nor a late error may resurrect the removed download.
+@MainActor final class DownloadTicketRefreshes {
+    private var epochs: [UUID: UUID] = [:]
+    func invalidate(_ id: UUID) { epochs.removeValue(forKey: id) }
+    func invalidateAll() { epochs.removeAll() }
+    func request<Value>(for id: UUID, stillCurrent: @escaping () -> Bool,
+                 issue: (@escaping (Result<Value, Error>) -> Void) -> Void,
+                 complete: @escaping (Result<Value, Error>) -> Void) {
+        let epoch = UUID(); epochs[id] = epoch
+        issue { [weak self] result in
+            guard let self, self.epochs[id] == epoch else { return }
+            self.epochs.removeValue(forKey: id)
+            guard stillCurrent() else { return }
+            complete(result)
+        }
+    }
+}
+
 struct OfflineLibrary {
     let directory: URL
     init(origin: ServerOrigin) throws {
@@ -56,6 +76,7 @@ struct NativeAudioCommand {
     let title: String
     let artist: String
     let rawURL: String
+    let downloadExpiresAt: Date?
     let session: [String: Any]?
     let queue: NativePlaybackQueue?
     static let actions: Set<String> = ["play", "pause", "resume", "stop", "seek", "volume", "download", "downloads", "route", "session", "queue", "next", "previous"]
@@ -75,6 +96,12 @@ struct NativeAudioCommand {
         title = String((body["title"] as? String ?? "Музыка XASS").prefix(300))
         artist = String((body["artist"] as? String ?? "").prefix(300))
         rawURL = body["url"] as? String ?? ""
+        if let raw = body["downloadExpiresAt"] {
+            guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+                  value.doubleValue.isFinite, value.doubleValue > 0,
+                  value.doubleValue <= Date().timeIntervalSince1970 + DownloadTicket.maximumLifetime else { throw XASSErr.invalidCommand }
+            downloadExpiresAt = Date(timeIntervalSince1970: value.doubleValue)
+        } else { downloadExpiresAt = nil }
         session = body["session"] as? [String: Any]
         queue = body["queue"] == nil ? nil : try NativePlaybackQueue(body["queue"], repeatMode: body["repeat"] as? String ?? "off")
     }
@@ -132,7 +159,7 @@ struct NativePlaybackQueue {
     var emit: (([String: Any]) -> Void)?
     var reportSession: (([String: Any]) -> Void)?
     var requestTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
-    var requestDownloadTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
+    var requestDownloadTicket: ((Int, @escaping (Result<DownloadTicket, Error>) -> Void) -> Void)?
     var canResumePlayback: () -> Bool = { true }
     private let player: AVPlayer
     private var loader: SecureMediaLoader?
@@ -140,6 +167,7 @@ struct NativePlaybackQueue {
     private var library: OfflineLibrary?
     private var downloadObserver: NSObjectProtocol?
     private var pendingPinIDs: Set<Int> = []
+    private let downloadTicketRefreshes = DownloadTicketRefreshes()
     private var timeObserver: Any?
     private var itemObserver: NSKeyValueObservation?
     private var playerObserver: NSKeyValueObservation?
@@ -592,6 +620,9 @@ struct NativePlaybackQueue {
     private func download(_ command: NativeAudioCommand) throws {
         guard let origin = origin, let library = library else { throw XASSErr.invalidOrigin }
         guard !downloadIDs.contains(command.trackID) else { return }
+        for item in BackgroundDownloads.shared.entries(for: origin) where item.track.id == command.trackID {
+            downloadTicketRefreshes.invalidate(item.id)
+        }
         if let cache = automaticCache, let entry = cachedTracks.first(where: { $0.id == command.trackID }) {
             pendingPinIDs.insert(command.trackID); refreshDownloads()
             let account = accountGeneration
@@ -615,7 +646,7 @@ struct NativePlaybackQueue {
         if let free = free, free < PrivateDownload.maxBytes + 32 * 1024 * 1024 { throw URLError(.cannotWriteToFile) }
         let track = DownloadedTrack(id: command.trackID, title: command.title, artist: command.artist,
             duration: self.trackID == command.trackID ? self.duration : 0)
-        try BackgroundDownloads.shared.enqueue(origin: origin, track: track, url: url)
+        try BackgroundDownloads.shared.enqueue(origin: origin, track: track, url: url, expiresAt: command.downloadExpiresAt)
         refreshDownloads()
     }
     private func refreshDownloads() {
@@ -625,18 +656,30 @@ struct NativePlaybackQueue {
         downloads = library?.tracks() ?? []
         emit?(["action": "downloads", "downloads": downloads.map(\.bridge)])
     }
-    func pauseDownload(_ id: UUID) { BackgroundDownloads.shared.pause(id); refreshDownloads() }
-    func cancelDownload(_ id: UUID) { BackgroundDownloads.shared.cancel(id); refreshDownloads() }
+    func pauseDownload(_ id: UUID) {
+        downloadTicketRefreshes.invalidate(id); BackgroundDownloads.shared.pause(id); refreshDownloads()
+    }
+    func cancelDownload(_ id: UUID) {
+        downloadTicketRefreshes.invalidate(id); BackgroundDownloads.shared.cancel(id); refreshDownloads()
+    }
     func retryDownload(_ item: BackgroundDownload) {
-        guard let origin, item.origin == origin.url.absoluteString else { return }
+        guard let origin, item.origin == origin.url.absoluteString,
+              let current = BackgroundDownloads.shared.entries(for: origin).first(where: { $0.id == item.id }),
+              !current.active else { return }
+        downloadTicketRefreshes.invalidate(item.id)
         if BackgroundDownloads.shared.resume(item.id) { refreshDownloads(); return }
         guard let requestDownloadTicket else { error = "Для новой ссылки подключитесь к серверу."; return }
         let account = accountGeneration
-        requestDownloadTicket(item.track.id) { [weak self] result in
-            guard let self, self.origin == origin, self.accountGeneration == account else { return }
+        downloadTicketRefreshes.request(for: item.id, stillCurrent: { [weak self] in
+            guard let self, self.origin == origin, self.accountGeneration == account,
+                  let saved = BackgroundDownloads.shared.entries(for: origin).first(where: { $0.id == item.id }) else { return false }
+            return !saved.active
+        }, issue: { done in requestDownloadTicket(item.track.id, done) }) { [weak self] result in
+            guard let self else { return }
             do {
-                let url = try origin.mediaURL(result.get(), trackID: item.track.id)
-                try BackgroundDownloads.shared.enqueue(origin: origin, track: item.track, url: url)
+                let ticket = try result.get()
+                let url = try origin.mediaURL(ticket.url, trackID: item.track.id)
+                try BackgroundDownloads.shared.enqueue(origin: origin, track: item.track, url: url, expiresAt: ticket.expiresAt)
                 self.refreshDownloads()
             } catch { self.error = "Не удалось продолжить загрузку. Проверьте связь с сервером." }
         }
@@ -646,6 +689,7 @@ struct NativePlaybackQueue {
         catch { self.error = "Не удалось удалить локальную копию." }
     }
     private func resetCache() {
+        downloadTicketRefreshes.invalidateAll()
         accountGeneration = UUID(); cacheGeneration = UUID(); cacheDownload?.cancel(); cacheDownload = nil; cacheDownloadID = nil
         automaticCache = nil; cachedTracks = []; cacheBytes = 0; recordedPlay = false
     }

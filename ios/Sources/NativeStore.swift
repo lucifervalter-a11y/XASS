@@ -161,7 +161,7 @@ import UIKit
         audio.requestDownloadTicket = { [weak self] id, done in
             Task { @MainActor in
                 guard let self else { done(.failure(OwnerAPIError.signedOut)); return }
-                do { done(.success(try await self.ticket(id, purpose: "download"))) } catch { done(.failure(error)) }
+                do { done(.success(try await self.downloadTicket(id))) } catch { done(.failure(error)) }
             }
         }
     }
@@ -571,6 +571,13 @@ import UIKit
     }
     func ticket(_ trackID: Int, purpose: String = "listen") async throws -> String {
         let result = try await api.request("/api/mini/music/tracks/\(trackID)/ticket", method: "POST", body: ["purpose": purpose])
+        return try ticketURL(result, trackID: trackID)
+    }
+    private func downloadTicket(_ trackID: Int) async throws -> DownloadTicket {
+        let result = try await api.request("/api/mini/music/tracks/\(trackID)/ticket", method: "POST", body: ["purpose": "download"])
+        return try DownloadTicket(url: ticketURL(result, trackID: trackID), expiresIn: result["expires_in"])
+    }
+    private func ticketURL(_ result: [String: Any], trackID: Int) throws -> String {
         guard let path = result["path"] as? String else { throw OwnerAPIError.invalidResponse }
         _ = try api.origin.mediaURL(path, trackID: trackID)
         var parts = URLComponents(url: api.origin.url.appendingPathComponent("proxy.php"), resolvingAgainstBaseURL: false)!
@@ -1333,8 +1340,12 @@ import UIKit
         if currentID == track.id && ownsSession { audio.stop(); ownsSession = false; currentID = nil }
     }
     func download(_ track: LibraryTrack) async throws {
-        let url = audio.cachedTracks.contains(where: { $0.id == track.id }) ? "" : try await ticket(track.id, purpose: "download")
-        audio.handle(try NativeAudioCommand(["action": "download", "trackId": track.id, "url": url, "title": track.title, "artist": track.artist]))
+        var body: [String: Any] = ["action": "download", "trackId": track.id, "url": "", "title": track.title, "artist": track.artist]
+        if !audio.cachedTracks.contains(where: { $0.id == track.id }) {
+            let ticket = try await downloadTicket(track.id)
+            body["url"] = ticket.url; body["downloadExpiresAt"] = ticket.expiresAt.timeIntervalSince1970
+        }
+        audio.handle(try NativeAudioCommand(body))
     }
     func importMusicFiles(_ urls: [URL]) {
         guard !isMusicImporting else { return }
