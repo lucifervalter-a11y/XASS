@@ -1,6 +1,9 @@
 name: Validate Windows release and beta installers
 
 on:
+  push:
+    branches:
+      - codex/xass-update-channels
   workflow_dispatch:
     inputs:
       expected_version:
@@ -19,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  EXPECTED_VERSION: ${{ inputs.expected_version }}
+  EXPECTED_VERSION: ${{ inputs.expected_version || '0.21.4' }}
   PYTHONUTF8: '1'
 
 jobs:
