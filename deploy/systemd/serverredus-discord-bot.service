@@ -1,0 +1,19 @@
+[Unit]
+Description=Serverredus Discord Voice Bot
+After=network.target serverredus-backend.service
+Wants=serverredus-backend.service
+
+[Service]
+Type=simple
+User=xass
+Group=www-data
+WorkingDirectory=/opt/serverredus
+EnvironmentFile=/opt/serverredus/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/serverredus/.venv/bin/python deploy/discord_voice_bot.py
+Restart=always
+RestartSec=3s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
