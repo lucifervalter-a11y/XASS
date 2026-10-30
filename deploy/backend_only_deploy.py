@@ -11,6 +11,7 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -29,35 +30,84 @@ ROOT = Path("/home/red/serverredus")
 REQUIRED_SOURCE = ("app", "index.php", "proxy.php")
 OPTIONAL_SOURCE = ("miniapp.php", "assets/miniapp-hermes.css", "assets/miniapp-hermes.js")
 OPERATIONS = {".github/workflows/checks.yml", ".github/workflows/server-route-diagnostics.yml",
-              "deploy/backend_only_deploy.py", "deploy/nginx_private_guard.py"}
+              "deploy/backend_only_deploy.py", "deploy/nginx_private_guard.py",
+              "deploy/backend_startup_diagnostics.py"}
 
 
 class DeployError(RuntimeError):
     pass
 
 
+class UnsettledCommandError(DeployError):
+    """A surviving command could still submit a future service job."""
+
+
 def run(root: Path, command: list[str], *, timeout: float = 30) -> bytes:
     """Never echo subprocess output/errors: they can contain private settings."""
-    with subprocess.Popen(command, cwd=root, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          start_new_session=os.name == "posix") as child:
+    # Popen.__exit__ calls wait() without a timeout. Do not use its context
+    # manager: a detached/privileged descendant can keep inherited pipes open.
+    child = subprocess.Popen(command, cwd=root, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+                             start_new_session=os.name == "posix")
+    try:
         try:
             out, _ = child.communicate(timeout=timeout)
         except BaseException:
-            if os.name == "posix":
-                try:
+            try:
+                if os.name == "posix":
                     os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                else:
+                    child.kill()
+            except OSError:
+                # A root-owned descendant may not be killable by this user.
+                # Cleanup must still finish within a bounded interval.
+                try:
+                    child.kill()
+                except OSError:
                     pass
-            else:
-                child.kill()
-            child.communicate()
+            try:
+                child.communicate(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            finally:
+                for stream in (child.stdout, child.stderr):
+                    if stream is not None:
+                        stream.close()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                raise UnsettledCommandError("Command cleanup did not settle; manual review required.") from None
             raise
         if child.returncode:
             raise DeployError("A bounded deployment command failed; private output was not printed.")
         if len(out) > 2 * 1024 * 1024:
             raise DeployError("Deployment command output exceeded the safety bound.")
         return out
+    finally:
+        for stream in (child.stdout, child.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def systemd_timeout_seconds(value: str) -> float:
+    """Parse bounded systemctl *USec values, not arbitrary unit expressions."""
+    if not value or len(value) > 80:
+        raise DeployError("Missing or unsupported systemd timeout; restart refused.")
+    if value.isdecimal():
+        seconds = int(value) / 1_000_000  # Raw D-Bus microseconds.
+    else:
+        units = {"us": .000001, "ms": .001, "s": 1, "min": 60, "h": 3600}
+        seconds, position = 0.0, 0
+        for match in re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*(us|ms|min|s|h)", value):
+            if value[position:match.start()].strip():
+                raise DeployError("Unsupported systemd timeout; restart refused.")
+            seconds += float(match.group(1)) * units[match.group(2)]
+            position = match.end()
+        if not position or value[position:].strip():
+            raise DeployError("Unsupported systemd timeout; restart refused.")
+    if not math.isfinite(seconds) or not 0 < seconds <= 300:
+        raise DeployError("Unbounded systemd timeout requires manual review.")
+    return seconds
 
 
 def no_links(path: Path) -> None:
@@ -285,8 +335,57 @@ class Deployment:
         if self.head() != revision:
             raise DeployError("Checkout did not reach the pinned revision.")
 
+    def service_properties(self, *names: str, timeout: float = 10) -> dict[str, str]:
+        raw = self.command("systemctl", "show", "serverredus-backend", "--no-pager", "--all",
+                           *("--property=" + name for name in names), timeout=timeout)
+        if len(raw) > 2048:
+            raise DeployError("Unexpected service state output; manual review required.")
+        try:
+            lines = raw.decode("ascii").splitlines()
+        except UnicodeError:
+            raise DeployError("Invalid service state encoding; manual review required.") from None
+        values = {}
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if not separator or key not in names or key in values:
+                raise DeployError("Unexpected service state properties; manual review required.")
+            values[key] = value.strip()
+        if set(values) != set(names):
+            raise DeployError("Incomplete service state properties; manual review required.")
+        return values
+
+    def get_restart_budget(self) -> int:
+        values = self.service_properties("TimeoutStartUSec", "TimeoutStopUSec")
+        budget = math.ceil(sum(systemd_timeout_seconds(values[name]) for name in values)) + 20
+        if budget > 300:
+            raise DeployError("Combined systemd restart budget exceeds 300s; manual review required.")
+        return budget
+
     def restart(self) -> None:
-        self.command("sudo", "-n", "systemctl", "restart", "serverredus-backend", timeout=60)
+        budget = self.get_restart_budget()
+        self.phase(f"backend restart budget {budget}s includes both systemd timeouts plus 20s grace")
+        self.command("sudo", "-n", "systemctl", "restart", "serverredus-backend", timeout=budget)
+
+    def wait_service_settled(self, *, timeout: float = 30) -> None:
+        """Read-only fence: never replace code under an unfinished systemd job."""
+        deadline = time.monotonic() + timeout
+        previous = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeployError("Service job did not settle; rollback checkout refused, manual review required.")
+            state = self.service_properties("ActiveState", "SubState", "Job", timeout=min(10, remaining))
+            active, sub, job = state["ActiveState"], state["SubState"], state["Job"]
+            if (not re.fullmatch(r"[a-z][a-z-]{0,39}", active)
+                    or not re.fullmatch(r"[a-z][a-z-]{0,39}", sub)
+                    or (job not in {"", "0"} and not re.fullmatch(r"[1-9][0-9]{0,9}", job))):
+                raise DeployError("Unknown service/job state; rollback checkout refused.")
+            settled = (active, sub) in {("active", "running"), ("inactive", "dead"), ("failed", "failed")}
+            snapshot = (active, sub) if settled and job in {"", "0"} else None
+            if snapshot is not None and snapshot == previous:
+                return
+            previous = snapshot
+            time.sleep(min(.5, max(0, deadline - time.monotonic())))
 
     def protect_config(self) -> None:
         """Explicit emergency permission-only repair. Never fetch configuration over HTTP."""
@@ -449,6 +548,9 @@ class Deployment:
                 raise DeployError("Public backend health response was not valid.")
 
     def rollback(self) -> None:
+        # Killing the systemctl client does NOT cancel a job already accepted by
+        # PID 1. Require two matching, no-job stable states before any checkout.
+        self.wait_service_settled()
         # Never overwrite new user edits or restore a DB snapshot over new messages.
         self.clean()
         if self.head() not in {BEFORE, self.target}:
@@ -469,6 +571,8 @@ class Deployment:
         self.validate()
         self.original_env = private_read(self.root / ".env")
         self.environment_access()
+        # Refuse unsupported/infinite unit timeouts before touching code/config.
+        self.get_restart_budget()
         try:
             self.original_branch = self.git("symbolic-ref", "--quiet", "HEAD").decode().strip()
         except DeployError:  # An already detached checkout has no original symbolic branch.
@@ -482,6 +586,7 @@ class Deployment:
         self.clean()
         if self.head() != BEFORE or private_read(self.root / ".env") != self.original_env:
             raise DeployError("Live code/configuration changed while preparing deployment.")
+        self.wait_service_settled()
         try:
             self.mutation_started = True
             self.phase("activate server-only overlay and preserve configuration metadata")
@@ -506,7 +611,10 @@ class Deployment:
                 "configuration_mode_after": f"{self.env_mode_after:04o}",
                 "discord_key_sha256": hashlib.sha256(PUBLIC_KEY.encode()).hexdigest(),
             }, indent=2).encode())
-        except BaseException:
+        except BaseException as failure:
+            if isinstance(failure, UnsettledCommandError):
+                print("[FAILED] A deployment command is still unsettled. No automatic rollback checkout; manual review required.", flush=True)
+                raise DeployError("Unsettled command requires manual review; code/config retained, no database restored.") from None
             # A second termination request cannot interrupt the recovery attempt.
             saved_handlers = {}
             for name in ("SIGTERM", "SIGHUP", "SIGINT"):
@@ -522,7 +630,7 @@ class Deployment:
             finally:
                 for sig, handler in saved_handlers.items():
                     signal.signal(sig, handler)
-            print("[ROLLBACK] Previous code/configuration bytes restored; private configuration permissions retained; backend healthy; database untouched.", flush=True)
+            print("[ROLLBACK] Previous code/.env bytes restored; private configuration permissions retained; backend healthy; database was not restored.", flush=True)
             raise DeployError("Server-only deployment failed and was rolled back.") from None
         print("[OK] Server-only overlay active; stable source/installers unchanged. Discord signed PING still requires portal verification.", flush=True)
 

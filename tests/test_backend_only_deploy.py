@@ -7,9 +7,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -119,6 +121,13 @@ class ScopeTests(GitFixture):
         self.assertEqual(self.item.head(), self.before)
         self.assertEqual((self.root / ".env").read_bytes(), self.original)
 
+    def test_only_exact_reviewed_startup_diagnostic_is_allowed(self):
+        self.changed_target("deploy/backend_startup_diagnostics.py", "reviewed diagnostic\n")
+        self.item.validate()
+        self.changed_target("deploy/other_startup_script.py", "unreviewed\n")
+        with self.assertRaises(deploy.DeployError):
+            self.item.validate()
+
     def test_protected_client_dependency_release_and_workflow_paths_rejected(self):
         for path in ("pc_client/agent.py", "requirements.txt", "data/releases/other.exe",
                      "agent/new.py", ".github/workflows/windows-agent.yml"):
@@ -159,6 +168,8 @@ class RecoveryTests(GitFixture):
         self.item.environment_access = Mock()
         self.item.restart = Mock()
         self.item.health = Mock()
+        self.item.get_restart_budget = Mock(return_value=200)
+        self.item.wait_service_settled = Mock()
 
     def fake_python(self, *args, **kwargs):
         self.calls.append(args)
@@ -241,6 +252,34 @@ class RecoveryTests(GitFixture):
         self.assertEqual(self.item.head(), self.before)
         self.assertEqual((self.root / ".env").read_bytes(), self.original)
         self.item.restart.assert_not_called()
+
+    def test_invalid_service_timeout_preflight_never_starts_mutation_or_backup(self):
+        self.item.get_restart_budget.side_effect = deploy.DeployError("unsupported timeout")
+        with self.assertRaisesRegex(deploy.DeployError, "unsupported timeout"):
+            self.execute_output()
+        self.assertFalse(self.item.mutation_started)
+        self.assertEqual(self.item.head(), self.before)
+        self.assertEqual(self.calls, [])
+        self.item.restart.assert_not_called()
+
+    def test_pending_initial_job_prevents_activation(self):
+        self.item.wait_service_settled.side_effect = deploy.DeployError("job still pending")
+        with self.assertRaisesRegex(deploy.DeployError, "job still pending"):
+            self.execute_output()
+        self.assertFalse(self.item.mutation_started)
+        self.assertEqual(self.item.head(), self.before)
+        self.assertEqual((self.root / ".env").read_bytes(), self.original)
+        self.item.restart.assert_not_called()
+
+    def test_unreaped_restart_client_never_enters_automatic_rollback(self):
+        self.item.restart.side_effect = deploy.UnsettledCommandError("client still alive")
+        with self.assertRaisesRegex(deploy.DeployError, "manual review"):
+            self.execute_output()
+        self.assertEqual(self.item.head(), self.target)
+        self.assertEqual(self.item.wait_service_settled.call_count, 1)  # Initial fence only.
+        self.item.restart.assert_called_once_with()
+        self.assertFalse((self.item.backup / "DEPLOYED.json").exists())
+        self.assert_runtime_untouched()
 
     def test_changed_source_package_rejected_before_restart_and_rolled_back(self):
         before = self.item.snapshot()
@@ -363,10 +402,12 @@ class TransportTests(unittest.TestCase):
 
     def test_only_backend_service_restart_and_health_real_401_required(self):
         item = deploy.Deployment(REPO, "a" * 40, "test")
-        item.command = Mock(return_value=b"")
-        item.restart()
+        item.command = Mock(side_effect=[b"TimeoutStartUSec=1min 30s\nTimeoutStopUSec=1min 30s\n", b""])
+        with redirect_stdout(io.StringIO()):
+            item.restart()
         self.assertEqual(item.command.call_args.args[:5],
                          ("sudo", "-n", "systemctl", "restart", "serverredus-backend"))
+        self.assertEqual(item.command.call_args.kwargs["timeout"], 200)
         item.command = Mock(side_effect=[b'{"status":"ok"}', b"401", b'{"status":"ok"}'])
         item.health(public=True)
         self.assertIn("--noproxy", item.command.call_args_list[0].args)
@@ -380,7 +421,7 @@ class TransportTests(unittest.TestCase):
         self.assertIn("default: inspect", workflow)
         self.assertIn("DEPLOY_BACKEND_ONLY_KEEP_CLIENTS", workflow)
         self.assertIn("HARDEN_PRIVATE_CONFIG", workflow)
-        self.assertIn("options: [inspect, protect-config, protect-storage, protect-web, deploy-backend-only]", workflow)
+        self.assertIn("options: [inspect, startup-diagnostics, protect-config, protect-storage, protect-web, deploy-backend-only]", workflow)
         self.assertIn("HARDEN_PRIVATE_STORAGE", workflow)
         self.assertIn("--protect-storage", workflow)
         self.assertIn("HARDEN_PRIVATE_WEB_FILES", workflow)
@@ -393,6 +434,136 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("gh release", workflow)
         self.assertNotIn("deploy/update.sh", workflow)
+
+
+class ServiceRecoveryFenceTests(unittest.TestCase):
+    def setUp(self):
+        self.item = deploy.Deployment(REPO, "a" * 40, "test")
+        self.item.clean = Mock()
+        self.item.head = Mock(return_value=deploy.BEFORE)
+        self.item.checkout = Mock()
+        self.item.python = Mock()
+        self.item.restart = Mock()
+        self.item.health = Mock()
+        self.item.original_env = b"safe-fixture"
+        self.item.new_env = b"other-fixture"
+
+    def rollback(self):
+        with patch.object(deploy, "private_read", return_value=b"safe-fixture"), \
+                patch.object(deploy, "atomic_private"), patch.object(deploy.time, "sleep"):
+            self.item.rollback()
+
+    def test_two_matching_stable_no_job_reads_are_required_before_checkout(self):
+        reads = [
+            {"ActiveState": "active", "SubState": "running", "Job": "24"},
+            {"ActiveState": "active", "SubState": "running", "Job": "0"},
+            {"ActiveState": "inactive", "SubState": "dead", "Job": ""},
+            {"ActiveState": "inactive", "SubState": "dead", "Job": "0"},
+        ]
+        def state(*_args, **_kwargs):
+            self.item.checkout.assert_not_called()
+            return reads.pop(0)
+        self.item.service_properties = Mock(side_effect=state)
+        self.rollback()
+        self.assertFalse(reads)
+        self.assertEqual(self.item.service_properties.call_count, 4)
+        self.item.checkout.assert_called_once_with(deploy.BEFORE)
+
+    def test_pending_job_prevents_rollback_checkout(self):
+        self.item.service_properties = Mock(return_value={"ActiveState": "deactivating", "SubState": "stop-sigterm", "Job": "99"})
+        with patch.object(deploy.time, "monotonic", side_effect=[0, 0, 0, 31]), self.assertRaises(deploy.DeployError):
+            self.rollback()
+        self.item.checkout.assert_not_called()
+        self.item.python.assert_not_called()
+        self.item.restart.assert_not_called()
+
+    def test_empty_job_does_not_allow_an_activating_or_auto_restart_state(self):
+        for active, sub in (("activating", "start"), ("activating", "auto-restart")):
+            self.item.service_properties = Mock(return_value={"ActiveState": active, "SubState": sub, "Job": ""})
+            with self.subTest(state=(active, sub)), patch.object(deploy.time, "monotonic", side_effect=[0, 0, 0, 31]), self.assertRaises(deploy.DeployError):
+                self.rollback()
+            self.item.checkout.assert_not_called()
+
+    def test_unknown_job_format_is_fail_closed(self):
+        self.item.service_properties = Mock(return_value={"ActiveState": "active", "SubState": "running", "Job": "unknown"})
+        with self.assertRaises(deploy.DeployError):
+            self.rollback()
+        self.item.checkout.assert_not_called()
+
+    def test_strict_show_output_rejects_missing_duplicate_or_unknown_properties(self):
+        for raw in (b"ActiveState=active\nSubState=running\n", b"Job=0\nJob=0\n",
+                    b"ActiveState=active\nSubState=running\nJob=0\nExtra=private\n"):
+            self.item.command = Mock(return_value=raw)
+            with self.subTest(raw=raw), self.assertRaises(deploy.DeployError):
+                self.item.service_properties("ActiveState", "SubState", "Job")
+
+    def test_restart_budget_accepts_systemctl_units_and_raw_microseconds(self):
+        for value in ("90s", "1min 30s", "90000000", "90000ms"):
+            self.assertEqual(deploy.systemd_timeout_seconds(value), 90)
+        self.item.service_properties = Mock(return_value={"TimeoutStartUSec": "90s", "TimeoutStopUSec": "90s"})
+        self.assertEqual(self.item.get_restart_budget(), 200)
+        for value in ("infinity", "", "0", "0s", "NaNs", "-1s", "90", "1d", "90s private", "1h"):
+            with self.subTest(value=value):
+                if value == "90":
+                    self.assertEqual(deploy.systemd_timeout_seconds(value), .00009)
+                else:
+                    with self.assertRaises(deploy.DeployError):
+                        deploy.systemd_timeout_seconds(value)
+        self.item.service_properties.return_value = {"TimeoutStartUSec": "200s", "TimeoutStopUSec": "100s"}
+        with self.assertRaises(deploy.DeployError):
+            self.item.get_restart_budget()
+
+
+class ProcessCleanupTests(unittest.TestCase):
+    def child(self):
+        child = Mock(pid=12345, returncode=0)
+        child.__enter__ = Mock()
+        child.__exit__ = Mock()
+        return child
+
+    def test_pipe_holding_descendant_does_not_trigger_unbounded_communicate_or_context_wait(self):
+        child = self.child()
+        child.communicate.side_effect = [subprocess.TimeoutExpired("fixture", .1), subprocess.TimeoutExpired("fixture", 2)]
+        with patch.object(deploy.subprocess, "Popen", return_value=child), \
+                patch.object(deploy.os, "killpg", create=True), self.assertRaises(subprocess.TimeoutExpired):
+            deploy.run(REPO, ["fixture"], timeout=.1)
+        self.assertEqual([call.kwargs["timeout"] for call in child.communicate.call_args_list], [.1, 2])
+        child.wait.assert_called_once_with(timeout=2)
+        child.stdout.close.assert_called()
+        child.stderr.close.assert_called()
+        child.__enter__.assert_not_called()
+        child.__exit__.assert_not_called()
+
+    def test_unreaped_child_is_bounded_and_requires_manual_review(self):
+        child = self.child()
+        child.communicate.side_effect = subprocess.TimeoutExpired("fixture", .1)
+        child.wait.side_effect = subprocess.TimeoutExpired("fixture", 2)
+        with patch.object(deploy.subprocess, "Popen", return_value=child), \
+                patch.object(deploy.os, "killpg", side_effect=PermissionError(), create=True), \
+                self.assertRaisesRegex(deploy.DeployError, "manual review"):
+            deploy.run(REPO, ["fixture"], timeout=.1)
+        child.kill.assert_called()
+        child.wait.assert_called_once_with(timeout=2)
+        child.__exit__.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Real detached pipe-holder check runs on POSIX CI")
+    def test_real_detached_grandchild_cannot_hold_the_runner_open(self):
+        script = ("import subprocess,sys,time; "
+                  "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'],start_new_session=True); "
+                  "print(p.pid,flush=True); time.sleep(20)")
+        started = time.monotonic()
+        detached_pid = None
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                deploy.run(REPO, [sys.executable, "-c", script], timeout=.5)
+            detached_pid = int(caught.exception.output.decode().strip())
+            self.assertLess(time.monotonic() - started, 5)
+        finally:
+            if detached_pid:
+                try:
+                    os.kill(detached_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class StorageProtectionTests(unittest.TestCase):
