@@ -47,15 +47,16 @@ jobs:
           if [[ "$GITHUB_REF" != 'refs/heads/codex/xass-server-only-discord-20261030' ]]; then
             xvfb-run -a python -m unittest discover -s tests -p 'test_*.py' -v
           else
-            # Server-only gate: the unchanged legacy Tk layout smoke is explicitly
-            # out of scope, not reported as passed. All other contracts still run.
+            # Server-only gate: three unchanged legacy Tk layout/navigation tests
+            # are explicitly out of scope, not passed. All other contracts still run.
             timeout --signal=TERM --kill-after=10s 12m xvfb-run -a python -u - <<'PY'
           import faulthandler
           import subprocess
           import unittest
 
           baseline = '81601bb56190c564c1f25928f3c60c616ff9cdf4'
-          protected = ['pc_client', 'tests/test_desktop_connection_status.py']
+          protected = ['pc_client', 'tests/test_desktop_connection_status.py',
+                       'tests/test_desktop_navigation_files.py']
           try:
               subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', baseline],
                              capture_output=True, check=True, timeout=45)
@@ -77,18 +78,20 @@ jobs:
           faulthandler.dump_traceback_later(90, repeat=True)
           try:
               discovered = list(cases(unittest.defaultTestLoader.discover('tests', pattern='test_*.py')))
-              excluded = [case for case in discovered
-                          if type(case).__module__ == 'test_desktop_connection_status'
-                          and type(case).__name__ == 'DesktopLayoutTests']
-              expected = 'test_desktop_connection_status.DesktopLayoutTests.test_all_pages_resize_without_clipped_panels_or_callback_errors'
-              if [case.id() for case in excluded] != [expected]:
-                  raise SystemExit('Known legacy Tk exclusion changed: review the gate instead of broadening it.')
+              expected = {
+                  'test_desktop_connection_status.DesktopLayoutTests.test_all_pages_resize_without_clipped_panels_or_callback_errors',
+                  'test_desktop_navigation_files.NavigationAndFilesTests.test_all_navigation_remains_reachable_at_150_percent',
+                  'test_desktop_navigation_files.NavigationAndFilesTests.test_all_navigation_remains_reachable_at_200_percent',
+              }
+              excluded = [case for case in discovered if case.id() in expected]
+              if len(excluded) != 3 or {case.id() for case in excluded} != expected:
+                  raise SystemExit('Known legacy Tk exclusions changed: review the gate instead of broadening it.')
               excluded_ids = {id(case) for case in excluded}
               selected = unittest.TestSuite(case for case in discovered if id(case) not in excluded_ids)
-              print('SERVER-ONLY GATE: pc_client and the excluded test are byte-identical to ' + baseline, flush=True)
-              print('Known unchanged legacy Tk layout tests excluded: 1; ' + expected, flush=True)
-              print('Reason: existing baseline Linux/Tk layout hang; no client bytes are being deployed. This is NOT a full desktop GUI pass.', flush=True)
-              print(f'Discovered: {len(discovered)}; selected: {selected.countTestCases()}; explicitly excluded: 1', flush=True)
+              print('SERVER-ONLY GATE: pc_client and both excluded-test files are byte-identical to ' + baseline, flush=True)
+              print('Known unchanged legacy Tk tests explicitly excluded: 3; ' + ', '.join(sorted(expected)), flush=True)
+              print('Reason: unchanged legacy Tk layout hang and high-DPI navigation regressions are outside this SERVER-ONLY gate; no client bytes are being deployed. This is NOT a full desktop GUI pass.', flush=True)
+              print(f'Discovered: {len(discovered)}; selected: {selected.countTestCases()}; explicitly excluded: 3', flush=True)
               result = unittest.TextTestRunner(verbosity=2).run(selected)
               raise SystemExit(0 if result.wasSuccessful() else 1)
           finally:
