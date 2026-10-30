@@ -1,351 +1,222 @@
-"""Automated tests for HermesService (app.services.hermes).
-
-Validates:
-1. HermesService.get_status() and check_health() with both live responses and graceful offline fallback.
-2. HermesService.send_prompt() with session creation, message sending, and token tracking.
-3. HermesService.list_skills() and skill execution (both live and fallback).
-4. HermesService.list_sessions() and create_session().
-5. HermesService configuration persistence (load_hermes_config / save_hermes_config).
-"""
+"""Security and verified-runtime tests for the XASS AI backend adapter."""
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 
+import app.services.hermes as hermes_module
 from app.services.hermes import (
+    DEFAULT_HERMES_URL,
+    HermesDependencyError,
     HermesService,
-    _default_sessions,
-    _default_skills,
+    HermesUnavailableError,
     get_hermes_service,
     load_hermes_config,
+    normalize_hermes_url,
     save_hermes_config,
 )
 
 
+VALID_HEALTH = {
+    "ok": True,
+    "version": "0.22.2",
+    "displayVersion": "Hermes Agent 0.22.2",
+    "commit": "d923a5eb487a17c0a68801bba9ef0f56c81040a8",
+    "auth_required": True,
+}
+
+
+def response(status_code: int, payload: object) -> httpx.Response:
+    return httpx.Response(
+        status_code,
+        json=payload,
+        request=httpx.Request("GET", "http://127.0.0.1:9119/api/health"),
+    )
+
+
+class FakeRuntimeClient:
+    def __init__(self, result: httpx.Response | None = None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.stream_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def stream(self, method: str, url: str, **kwargs: object) -> "FakeStreamContext":
+        self.stream_calls.append((method, url, kwargs))
+        return FakeStreamContext(self.result, self.error)
+
+
+class FakeStreamContext:
+    def __init__(self, result: httpx.Response | None, error: Exception | None) -> None:
+        self.result = result
+        self.error = error
+
+    async def __aenter__(self) -> httpx.Response:
+        if self.error is not None:
+            raise self.error
+        if self.result is None:
+            raise AssertionError("Fake runtime has no response")
+        return self.result
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+
+class HermesUrlPolicyTests(unittest.TestCase):
+    def test_default_and_loopback_origins_are_allowed(self) -> None:
+        self.assertEqual(normalize_hermes_url(None), DEFAULT_HERMES_URL)
+        self.assertEqual(normalize_hermes_url("localhost"), "http://localhost:9119")
+        self.assertEqual(normalize_hermes_url("http://127.0.0.2:9443/"), "http://127.0.0.2:9443")
+        self.assertEqual(normalize_hermes_url("http://[::1]"), "http://[::1]:9119")
+
+    def test_non_loopback_and_url_smuggling_are_rejected(self) -> None:
+        rejected = (
+            "http://10.0.0.8:9119",
+            "https://127.0.0.1:9119",
+            "http://localhost.example.com:9119",
+            "http://user:pass@127.0.0.1:9119",
+            "http://127.0.0.1:9119/admin",
+            "http://127.0.0.1:9119?next=http://example.com",
+            "ftp://127.0.0.1:9119",
+        )
+        for candidate in rejected:
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                normalize_hermes_url(candidate)
+
+
 class HermesServiceTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        self.mock_client = AsyncMock(spec=httpx.AsyncClient)
-        # By default mock client simulates offline/connection error unless overridden
-        self.mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Offline"))
-        self.mock_client.post = AsyncMock(side_effect=httpx.ConnectError("Offline"))
-        self.service = HermesService(
-            url="http://127.0.0.1:8787",
-            api_key="secret-key",
-            enabled=True,
-            client=self.mock_client,
-            default_model="hermes-3-llama-3.1-8b",
-        )
+    def service_with(self, client: FakeRuntimeClient, *, url: str = DEFAULT_HERMES_URL) -> HermesService:
+        return HermesService(url=url, api_key="must-not-be-sent", enabled=True, client=client)  # type: ignore[arg-type]
 
-    # -------------------------------------------------------------------------
-    # 1. Status & Health Checks
-    # -------------------------------------------------------------------------
-    async def test_get_status_live_success(self) -> None:
-        """When Hermes server responds 200, return live status."""
-        mock_response = httpx.Response(
+    async def test_health_requires_exact_verified_contract(self) -> None:
+        invalid_payloads = (
+            {},
+            {**VALID_HEALTH, "ok": False},
+            {**VALID_HEALTH, "version": "0.22.3"},
+            {**VALID_HEALTH, "commit": "00000000"},
+            {**VALID_HEALTH, "auth_required": False},
+            {**VALID_HEALTH, "extra": True},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                service = self.service_with(FakeRuntimeClient(response(200, payload)))
+                status_data = await service.get_status()
+                self.assertFalse(status_data["online"])
+                self.assertEqual(status_data["status"], "incompatible_health")
+                self.assertFalse(status_data["mock"])
+                self.assertFalse(status_data["interactive_available"])
+
+        client = FakeRuntimeClient(response(200, VALID_HEALTH))
+        status_data = await self.service_with(client).get_status()
+        self.assertTrue(status_data["online"])
+        self.assertEqual(status_data["version"], "0.22.2")
+        self.assertEqual(status_data["runtime_commit"], VALID_HEALTH["commit"])
+        self.assertEqual(status_data["active_model"], "")
+        self.assertEqual(status_data["session_count"], 0)
+        self.assertFalse(status_data["interactive_available"])
+        self.assertEqual(status_data["interactive_status"], "unsupported_transport")
+        self.assertEqual(client.stream_calls, [
+            ("GET", "http://127.0.0.1:9119/api/health", {"headers": {"Accept": "application/json"}})
+        ])
+
+    async def test_health_body_is_bounded_before_json_parse(self) -> None:
+        oversized = httpx.Response(
             200,
-            json={
-                "version": "hermes-agent-v1.2.0",
-                "active_model": "hermes-pro-70b",
-                "session_count": 8,
-            },
-            headers={"content-type": "application/json"},
-            request=httpx.Request("GET", "http://127.0.0.1:8787/api/status"),
+            content=b" " * ((64 * 1024) + 1),
+            request=httpx.Request("GET", "http://127.0.0.1:9119/api/health"),
         )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(return_value=mock_response)
-        self.service.client = mock_client
+        status_data = await self.service_with(FakeRuntimeClient(oversized)).get_status()
+        self.assertFalse(status_data["online"])
+        self.assertEqual(status_data["status"], "health_too_large")
 
-        status = await self.service.get_status()
-        self.assertTrue(status["online"])
-        self.assertTrue(status["enabled"])
-        self.assertFalse(status["mock"])
-        self.assertEqual(status["version"], "hermes-agent-v1.2.0")
-        self.assertEqual(status["active_model"], "hermes-pro-70b")
-        self.assertEqual(status["session_count"], 8)
-        self.assertEqual(status["status"], "online")
+    async def test_auth_not_found_and_server_errors_are_offline(self) -> None:
+        expected = {401: "unauthorized", 403: "unauthorized", 404: "not_found", 500: "upstream_error"}
+        for status_code, reason in expected.items():
+            with self.subTest(status_code=status_code):
+                service = self.service_with(FakeRuntimeClient(response(status_code, VALID_HEALTH)))
+                status_data = await service.get_status()
+                self.assertFalse(status_data["online"])
+                self.assertEqual(status_data["status"], reason)
 
-    async def test_get_status_offline_graceful_fallback(self) -> None:
-        """When Hermes server is unreachable, gracefully fall back to mock status without crashing."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
-        self.service.client = mock_client
+    async def test_disabled_unreachable_and_invalid_url_are_honest(self) -> None:
+        disabled = HermesService(enabled=False)
+        disabled_status = await disabled.get_status()
+        self.assertEqual(disabled_status["status"], "disabled")
+        self.assertFalse(disabled_status["mock"])
 
-        status = await self.service.get_status()
-        self.assertFalse(status["online"])
-        self.assertTrue(status["enabled"])
-        self.assertTrue(status["mock"])
-        self.assertEqual(status["status"], "offline_fallback")
-        self.assertIn("fallback", status["details"])
-        self.assertGreaterEqual(status["session_count"], 1)
+        offline = self.service_with(FakeRuntimeClient(error=httpx.ConnectError("offline")))
+        offline_status = await offline.get_status()
+        self.assertEqual(offline_status["status"], "unavailable")
+        self.assertEqual(offline_status["version"], "")
 
-    async def test_get_status_when_disabled(self) -> None:
-        """When Hermes is disabled, return disabled status immediately without HTTP calls."""
-        disabled_service = HermesService(enabled=False)
-        status = await disabled_service.get_status()
-        self.assertFalse(status["online"])
-        self.assertFalse(status["enabled"])
-        self.assertEqual(status["status"], "disabled")
-        self.assertTrue(status["mock"])
+        client = FakeRuntimeClient(response(200, VALID_HEALTH))
+        invalid = self.service_with(client, url="http://169.254.169.254/latest")
+        invalid_status = await invalid.get_status()
+        self.assertEqual(invalid_status["status"], "invalid_config")
+        self.assertEqual(client.stream_calls, [])
 
-    async def test_check_health_delegates_to_get_status(self) -> None:
-        """check_health() should mirror get_status()."""
-        health = await self.service.check_health()
-        self.assertIn("online", health)
-        self.assertIn("status", health)
+    async def test_offline_operations_raise_503_class_without_fabrication(self) -> None:
+        service = self.service_with(FakeRuntimeClient(error=httpx.ConnectError("offline")))
+        for operation in (
+            service.list_sessions(),
+            service.create_session("test"),
+            service.send_prompt("session", "prompt"),
+            service.list_skills(),
+            service.run_skill("system_metrics"),
+        ):
+            with self.assertRaises(HermesUnavailableError):
+                await operation
 
-    # -------------------------------------------------------------------------
-    # 2. Session Management
-    # -------------------------------------------------------------------------
-    async def test_list_sessions_live_success(self) -> None:
-        """list_sessions returns parsed sessions from live API."""
-        mock_sessions_data = [
-            {"id": "sess-live-1", "title": "Live Session 1", "message_count": 4, "model": "hermes-3-8b"},
-            {"id": "sess-live-2", "title": "Live Session 2", "message_count": 0, "model": "hermes-3-8b"},
-        ]
-        mock_response = httpx.Response(
-            200,
-            json={"sessions": mock_sessions_data},
-            request=httpx.Request("GET", "http://127.0.0.1:8787/api/sessions"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(return_value=mock_response)
-        self.service.client = mock_client
+    async def test_verified_runtime_operations_fail_closed_until_websocket_is_approved(self) -> None:
+        service = self.service_with(FakeRuntimeClient(response(200, VALID_HEALTH)))
+        for operation in (
+            service.list_sessions(),
+            service.create_session("test"),
+            service.send_prompt("session", "prompt"),
+            service.list_skills(),
+            service.run_skill("system_metrics"),
+        ):
+            with self.assertRaises(HermesDependencyError) as caught:
+                await operation
+            self.assertEqual(caught.exception.reason, "unsupported_transport")
 
-        sessions = await self.service.list_sessions()
-        self.assertEqual(len(sessions), 2)
-        self.assertEqual(sessions[0]["id"], "sess-live-1")
-        self.assertEqual(sessions[0]["message_count"], 4)
 
-    async def test_list_sessions_offline_fallback(self) -> None:
-        """list_sessions returns default seed sessions when offline."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(side_effect=httpx.ConnectTimeout("Timeout"))
-        self.service.client = mock_client
-
-        sessions = await self.service.list_sessions()
-        self.assertIsInstance(sessions, list)
-        self.assertGreaterEqual(len(sessions), 2)
-        self.assertIn("id", sessions[0])
-        self.assertIn("title", sessions[0])
-
-    async def test_create_session_live_success(self) -> None:
-        """create_session posts to live Hermes and returns new session."""
-        mock_response = httpx.Response(
-            201,
-            json={
-                "id": "sess-new-123",
-                "title": "Новая сессия пользователя",
-                "message_count": 0,
-                "model": "hermes-3-llama-3.1-8b",
-            },
-            request=httpx.Request("POST", "http://127.0.0.1:8787/api/sessions"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(return_value=mock_response)
-        self.service.client = mock_client
-
-        created = await self.service.create_session(title="Новая сессия пользователя")
-        self.assertEqual(created["id"], "sess-new-123")
-        self.assertEqual(created["title"], "Новая сессия пользователя")
-        self.assertFalse(created["mock"])
-
-    async def test_create_session_offline_fallback(self) -> None:
-        """create_session generates a mock session with unique id when offline."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("Refused"))
-        self.service.client = mock_client
-
-        created = await self.service.create_session(title="Офлайн сессия")
-        self.assertTrue(created["mock"])
-        self.assertTrue(created["id"].startswith("hermes-"))
-        self.assertEqual(created["title"], "Офлайн сессия")
-
-        # Session should be added to _mock_sessions
-        all_sessions = await self.service.list_sessions()
-        self.assertIn(created["id"], [s["id"] for s in all_sessions])
-
-    # -------------------------------------------------------------------------
-    # 3. Prompt Execution & Token Tracking
-    # -------------------------------------------------------------------------
-    async def test_send_prompt_live_success(self) -> None:
-        """send_prompt sends message to live Hermes and extracts tokens & tool calls."""
-        mock_response = httpx.Response(
-            200,
-            json={
-                "response": "Ответ от Гермеса: сервер работает стабильно.",
-                "tokens_used": 42,
-                "tool_calls": [{"tool": "system_metrics", "result": "ok"}],
-                "model": "hermes-3-llama-3.1-8b",
-            },
-            request=httpx.Request("POST", "http://127.0.0.1:8787/api/chat"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(return_value=mock_response)
-        self.service.client = mock_client
-
-        res = await self.service.send_prompt(
-            session_id="hermes-sess-001",
-            prompt="Проверь статус сервера",
-            model="hermes-3-llama-3.1-8b",
-        )
-        self.assertFalse(res["mock"])
-        self.assertEqual(res["response"], "Ответ от Гермеса: сервер работает стабильно.")
-        self.assertEqual(res["tokens_used"], 42)
-        self.assertEqual(len(res["tool_calls"]), 1)
-
-    async def test_send_prompt_offline_fallback_and_token_tracking(self) -> None:
-        """When offline, send_prompt generates contextual mock response and tracks tokens."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("Offline"))
-        self.service.client = mock_client
-
-        # Prompt about system metrics
-        res = await self.service.send_prompt(
-            session_id="hermes-sess-001",
-            prompt="Какая сейчас нагрузка на CPU и память?",
-        )
-        self.assertTrue(res["mock"])
-        self.assertIn("Hermes Agent:", res["response"])
-        self.assertGreater(res["tokens_used"], 0)
-        self.assertTrue(any(tc["tool"] == "system_metrics" for tc in res["tool_calls"]))
-
-        # Verify session message count was incremented
-        sessions = await self.service.list_sessions()
-        sess_001 = next(s for s in sessions if s["id"] == "hermes-sess-001")
-        self.assertGreater(sess_001["message_count"], 6)
-
-    async def test_send_prompt_creates_session_if_missing(self) -> None:
-        """If session_id does not exist, offline send_prompt registers it automatically."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("Offline"))
-        self.service.client = mock_client
-
-        new_sess_id = "sess-brand-new-999"
-        res = await self.service.send_prompt(
-            session_id=new_sess_id,
-            prompt="Привет, Гермес!",
-        )
-        self.assertTrue(res["mock"])
-        self.assertEqual(res["session_id"], new_sess_id)
-
-        sessions = await self.service.list_sessions()
-        self.assertIn(new_sess_id, [s["id"] for s in sessions])
-
-    # -------------------------------------------------------------------------
-    # 4. Skills Catalog & Execution
-    # -------------------------------------------------------------------------
-    async def test_list_skills_live_success(self) -> None:
-        """list_skills fetches skills from live API."""
-        live_skills = [
-            {"name": "custom_scanner", "description": "Custom scanner", "enabled": True}
-        ]
-        mock_response = httpx.Response(
-            200,
-            json=live_skills,
-            request=httpx.Request("GET", "http://127.0.0.1:8787/api/skills"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(return_value=mock_response)
-        self.service.client = mock_client
-
-        skills = await self.service.list_skills()
-        self.assertEqual(len(skills), 1)
-        self.assertEqual(skills[0]["name"], "custom_scanner")
-
-    async def test_list_skills_offline_returns_catalog(self) -> None:
-        """list_skills returns default catalog when offline."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Offline"))
-        self.service.client = mock_client
-
-        skills = await self.service.list_skills()
-        self.assertGreaterEqual(len(skills), 6)
-        names = [s["name"] for s in skills]
-        self.assertIn("system_metrics", names)
-        self.assertIn("service_control", names)
-        self.assertIn("music_diagnostics", names)
-        self.assertIn("database_health", names)
-        self.assertIn("web_search", names)
-        self.assertIn("log_inspector", names)
-
-    async def test_run_skill_live_success(self) -> None:
-        """run_skill calls skill run endpoint on live server."""
-        mock_response = httpx.Response(
-            200,
-            json={"status": "ok", "result": {"output": "100%"}},
-            request=httpx.Request("POST", "http://127.0.0.1:8787/api/skills/test_tool/run"),
-        )
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(return_value=mock_response)
-        self.service.client = mock_client
-
-        res = await self.service.run_skill("test_tool", {"param": 1})
-        self.assertTrue(res["ok"])
-        self.assertFalse(res["mock"])
-        self.assertEqual(res["skill"], "test_tool")
-
-    async def test_run_skill_offline_mock_dispatch(self) -> None:
-        """run_skill executes fallback handlers locally for standard tools."""
-        mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("Offline"))
-        self.service.client = mock_client
-
-        # system_metrics
-        res_metrics = await self.service.run_skill("system_metrics", {"top_processes": 3})
-        self.assertTrue(res_metrics["ok"])
-        self.assertIn("result", res_metrics)
-
-        # database_health
-        res_db = await self.service.run_skill("database_health", {"deep": False})
-        self.assertTrue(res_db["ok"])
-        self.assertEqual(res_db["result"]["status"], "healthy")
-
-        # web_search
-        res_search = await self.service.run_skill("web_search", {"query": "XASS Telegram"})
-        self.assertTrue(res_search["ok"])
-        self.assertGreater(len(res_search["result"]["results"]), 0)
-
-        # unknown tool fallback
-        res_unknown = await self.service.run_skill("non_existent_tool")
-        self.assertTrue(res_unknown["ok"])
-        self.assertTrue(res_unknown["mock"])
-
-    # -------------------------------------------------------------------------
-    # 5. Config Persistence & Factory
-    # -------------------------------------------------------------------------
-    def test_config_load_and_save(self) -> None:
-        """load_hermes_config and save_hermes_config work reliably and handle missing files."""
+class HermesConfigTests(unittest.TestCase):
+    def test_config_round_trip_and_corrupt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "hermes_config.json"
-            # Missing file
+            self.assertEqual(load_hermes_config(path), {})
+            payload = {
+                "hermes_url": DEFAULT_HERMES_URL,
+                "hermes_api_key": "secret",
+                "hermes_enabled": True,
+            }
+            expected = {
+                "hermes_url": DEFAULT_HERMES_URL,
+                "hermes_enabled": True,
+            }
+            self.assertEqual(save_hermes_config(path, payload), expected)
+            self.assertEqual(load_hermes_config(path), expected)
+            path.write_text("not-json", encoding="utf-8")
             self.assertEqual(load_hermes_config(path), {})
 
-            # Save
-            payload = {"url": "http://10.0.0.5:8787", "api_key": "abc", "enabled": True}
-            save_hermes_config(path, payload)
-            self.assertEqual(load_hermes_config(path), payload)
-
-            # Corrupt file safety
-            path.write_text("not a json", encoding="utf-8")
-            self.assertEqual(load_hermes_config(path), {})
-
-    def test_get_hermes_service_factory(self) -> None:
-        """get_hermes_service instantiates a configured HermesService instance."""
-        settings = SimpleNamespace(
-            hermes_url="http://custom-host:9999",
-            hermes_api_key="custom-key",
-            hermes_enabled=True,
-        )
-        svc = get_hermes_service(settings)
-        self.assertEqual(svc.url, "http://custom-host:9999")
-        self.assertEqual(svc.api_key, "custom-key")
-        self.assertTrue(svc.enabled)
+    def test_factory_defaults_to_port_9119_and_updates_existing_instance(self) -> None:
+        with patch.object(hermes_module, "_hermes_service_instance", None):
+            service = get_hermes_service()
+            self.assertEqual(service.url, DEFAULT_HERMES_URL)
+            settings = SimpleNamespace(
+                hermes_url="http://localhost:9119",
+                hermes_api_key="configured",
+                hermes_enabled=False,
+            )
+            self.assertIs(get_hermes_service(settings), service)
+            self.assertEqual(service.url, "http://localhost:9119")
+            self.assertEqual(service.api_key, "configured")
+            self.assertFalse(service.enabled)
 
 
 if __name__ == "__main__":

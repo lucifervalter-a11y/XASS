@@ -14,7 +14,7 @@
 <link rel="stylesheet" href="/assets/miniapp-core.css?v=0100">
 <link rel="stylesheet" href="/assets/miniapp-control-center.css?v=0160">
 <link rel="stylesheet" href="/assets/miniapp-music.css?v=0170">
-<link rel="stylesheet" href="/assets/miniapp-hermes.css?v=0170">
+<link rel="stylesheet" href="/assets/miniapp-hermes.css?v=0171">
 <link rel="stylesheet" href="/assets/miniapp-themes.css?v=0170">
 <script>
 (function(){try{var t=localStorage.getItem('xass_theme')||'cyber';document.documentElement.setAttribute('data-theme',t);var a=localStorage.getItem('xass_accent');if(a&&/^#[0-9a-f]{6}$/i.test(a)){document.documentElement.style.setProperty('--user-accent',a);document.documentElement.style.setProperty('--user-accent-soft',a+'d0');document.documentElement.style.setProperty('--user-accent-glow','0 0 24px '+a+'66');}}catch(e){}})();
@@ -32,7 +32,7 @@
  <section class="view on" id="view-home">
   <div class="intro"><div class="eyebrow">Личный центр управления</div><h1 id="helloTitle">Система в сети.</h1><p>Сервер, устройства, музыка и сайт — в одном спокойном интерфейсе.</p></div>
   <div class="quick-actions" role="toolbar" aria-label="Быстрые действия">
-   <button class="quick-chip hermes-quick-chip" id="quickHermes" type="button" data-view="hermes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1-4-4v-2a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><path d="M9 10h.01M15 10h.01M9 14h6"/></svg>Гермес AI</button>
+   <button class="quick-chip hermes-quick-chip" id="quickHermes" type="button" data-view="hermes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><path d="M9 10h.01M15 10h.01M9 14h6"/></svg>XASS AI</button>
    <button class="quick-chip" id="quickLockAll" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Лок всех ПК</button>
    <button class="quick-chip" id="quickAway" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg><span id="quickAwayLabel">Не в сети</span></button>
    <button class="quick-chip" id="quickCheckPC" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Проверить ПК</button>
@@ -48,15 +48,15 @@
 
   <section class="view" id="view-hermes">
   <div class="intro hermes-intro">
-   <div class="eyebrow"><span class="hermes-badge-glow">HERMES 3 · AI AGENT</span></div>
+   <div class="eyebrow"><span class="hermes-badge-glow">XASS AI · LOCAL AGENT</span></div>
    <div class="hermes-hero-title">
-    <h1>Hermes Agent AI</h1>
-    <div class="hermes-status-badge online" id="hermesStatusPill" title="Статус агента">
+    <h1>XASS AI</h1>
+    <div class="hermes-status-badge offline" id="hermesStatusPill" title="Статус XASS AI">
      <span class="hermes-status-dot"></span>
-     <span id="hermesStatusText">В сети</span>
+     <span id="hermesStatusText">Проверка…</span>
     </div>
    </div>
-   <p>Автономный ИИ-ассистент XASS: управление сервером, анализ логов, выполнение команд и скриптов в реальном времени.</p>
+   <p>Локальный runtime XASS AI проверяется отдельно. Диалоги и выполнение действий недоступны, пока не подключён подтверждённый WebSocket-транспорт.</p>
   </div>
 
   <div class="section hermes-toolbar-section">
@@ -64,12 +64,8 @@
     <div class="hermes-control-group">
      <label class="label" for="hermesModelSelect">Модель</label>
      <div class="hermes-select-wrap">
-      <select class="input hermes-select" id="hermesModelSelect" aria-label="Выбор языковой модели Hermes">
-       <option value="nous-hermes-3">Nous Hermes 3 (Llama-3.1 70B)</option>
-       <option value="claude-3-5-sonnet">Claude 3.5 Sonnet</option>
-       <option value="gpt-4o">GPT-4o Omnichannel</option>
-       <option value="local-ollama">Local Ollama (Hermes / Qwen)</option>
-       <option value="deepseek-r1">DeepSeek R1 Reasoner</option>
+      <select class="input hermes-select" id="hermesModelSelect" aria-label="Среда выполнения XASS AI" disabled>
+       <option value="xass-ai-local">XASS AI · local runtime</option>
       </select>
      </div>
     </div>
@@ -77,8 +73,8 @@
     <div class="hermes-control-group">
      <label class="label" for="hermesSessionSelect">Сессия</label>
      <div class="hermes-session-selector">
-      <select class="input hermes-select" id="hermesSessionSelect" aria-label="Выбор диалоговой сессии">
-       <option value="default">Главный диалог</option>
+      <select class="input hermes-select" id="hermesSessionSelect" aria-label="Выбор подтверждённой сессии XASS AI" disabled>
+       <option value="">Нет активных сессий</option>
       </select>
       <button class="btn blue hermes-new-session-btn" id="hermesNewSessionBtn" type="button" title="Новая сессия" aria-label="Создать новую сессию">
        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
@@ -91,7 +87,7 @@
      <span class="label">Контекст</span>
      <div class="hermes-token-pill" id="hermesTokenPill" title="Использовано токенов в текущей сессии">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-      <span id="hermesTokenText">0 / 128k</span>
+      <span id="hermesTokenText">—</span>
      </div>
     </div>
    </div>
@@ -106,7 +102,7 @@
     <div class="hermes-typing-indicator" id="hermesTypingIndicator" style="display: none;">
      <div class="hermes-typing-inner">
       <div class="hermes-status-dot pulse"></div>
-      <span class="hermes-typing-text">Гермес анализирует контекст и выполняет инструменты…</span>
+      <span class="hermes-typing-text">XASS AI выполняет запрос…</span>
       <div class="hermes-dots">
        <span></span><span></span><span></span>
       </div>
@@ -114,7 +110,7 @@
     </div>
 
     <div class="hermes-prompt-area">
-     <div class="hermes-quick-chips" role="toolbar" aria-label="Быстрые команды Гермеса">
+     <div class="hermes-quick-chips" role="toolbar" aria-label="Быстрые запросы XASS AI">
       <button type="button" class="hermes-action-chip" data-hermes-prompt="Проверить состояние сервера XASS, нагрузку CPU, RAM и активные службы">
        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
        Проверить сервер
@@ -138,12 +134,12 @@
      </div>
 
      <form class="hermes-input-box" id="hermesChatForm" onsubmit="return false;">
-      <textarea class="input hermes-textarea" id="hermesPromptInput" rows="1" maxlength="8000" placeholder="Спросите Гермеса или дайте команду серверу… (Enter — отправить, Shift+Enter — новая строка)" aria-label="Текст запроса для Hermes AI"></textarea>
+      <textarea class="input hermes-textarea" id="hermesPromptInput" rows="1" maxlength="8000" placeholder="Запрос для XASS AI (Enter — отправить, Shift+Enter — новая строка)" aria-label="Запрос для XASS AI" disabled></textarea>
       <div class="hermes-input-actions">
        <button class="btn hermes-clear-chat-btn" id="hermesClearSessionBtn" type="button" title="Очистить сообщения текущей сессии" aria-label="Очистить сообщения текущей сессии">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
        </button>
-       <button class="btn primary hermes-send-btn" id="hermesSendBtn" type="submit" aria-label="Отправить запрос Гермесу">
+       <button class="btn primary hermes-send-btn" id="hermesSendBtn" type="submit" aria-label="Отправить запрос XASS AI" disabled>
         <svg class="send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         <div class="send-spin" style="display:none"></div>
        </button>
@@ -213,7 +209,7 @@
 
 <nav class="tabs" id="tabs" hidden><div class="tabs-inner">
  <button class="tab on" data-view="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m3 11 9-8 9 8v9H3z"/><path d="M9 20v-6h6v6"/></svg>Главная</button>
-  <button class="tab" data-view="hermes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1-4-4v-2a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><circle cx="9" cy="11" r="1.5" fill="currentColor"/><circle cx="15" cy="11" r="1.5" fill="currentColor"/><path d="M9 15h6"/><path d="M12 2v3M5 12H2M22 12h-3"/></svg>Гермес</button>
+  <button class="tab" data-view="hermes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1-4-4v-2a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><circle cx="9" cy="11" r="1.5" fill="currentColor"/><circle cx="15" cy="11" r="1.5" fill="currentColor"/><path d="M9 15h6"/><path d="M12 2v3M5 12H2M22 12h-3"/></svg>XASS AI</button>
 <button class="tab" data-view="music"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>Музыка</button>
  <button class="tab" data-view="site"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Сайт</button>
  <button class="tab" data-view="tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="8"/></svg>Инструменты</button>
@@ -482,7 +478,7 @@ demo||initData?loadBoot():initPwa();
 <script src="/assets/xass-e2e.js?v=0140"></script>
 <script src="/assets/miniapp-control-center.js?v=0191"></script>
 <script src="/assets/miniapp-music.js?v=0170"></script>
-<script src="/assets/miniapp-hermes.js?v=0170"></script>
+<script src="/assets/miniapp-hermes.js?v=0171"></script>
 <script src="/assets/miniapp-server-migration.js?v=0140"></script>
 <script src="/assets/miniapp-device-key.js?v=0140"></script>
 <script src="/assets/miniapp-themes.js?v=0170"></script>

@@ -97,13 +97,15 @@ class MediaTicketBody(BaseModel):
 
 class ControlBody(BaseModel):
     source_name: str = Field(min_length=1, max_length=128)
-    action: Literal["outputs", "play", "pause", "resume", "stop", "seek", "volume", "status"]
+    action: Literal["outputs", "play", "prepare", "start_prepared", "pause", "resume", "stop", "seek", "volume", "status"]
     track_id: int | None = Field(default=None, gt=0)
     output_id: str = Field(default="default", max_length=256)
     position_sec: float = Field(default=0, ge=0, le=86400, allow_inf_nan=False)
     volume: int = Field(default=70, ge=0, le=100)
     expires_at: int | None = Field(default=None, gt=0)
     lan_url: str | None = Field(default=None, max_length=300)
+    handoff_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    handoff_revision: int | None = Field(default=None, ge=0)
 
 
 class AgentLibraryPlayBody(BaseModel):
@@ -200,7 +202,7 @@ def build_router(settings, require_owner, public_origin):
         response.headers["Cache-Control"] = "private, no-store"
         return {"ok": True, **(await discover_music_catalog(q, limit=limit))}
 
-    async def paired_agent(request: Request, session):
+    async def paired_agent(request: Request, session, *, lock=True):
         auth = await authenticate_agent_api_key(
             session,
             api_key=request.headers.get("x-api-key"),
@@ -216,7 +218,7 @@ def build_router(settings, require_owner, public_origin):
         credential = await session.get(AgentCredential, auth.credential_id)
         if credential is None or not credential.is_active or credential.source_name != auth.source_name:
             raise HTTPException(403, "Агент больше не привязан")
-        await ensure_agent_attached(session, auth.source_name)
+        await ensure_agent_attached(session, auth.source_name, lock=lock)
         return auth, credential
 
     def processing(upload_id):
@@ -729,7 +731,7 @@ def build_router(settings, require_owner, public_origin):
         sha, storage = track.sha256, track.storage_name
         await session.rollback()
         from app.services.music_artwork import store_external_thumbnail
-        from app.services.music_covers import adopted_catalog_names, display_cover
+        from app.services.music_covers import adopted_catalog_names, display_cover, remember_catalog_names
         try:
             jpeg = await display_cover(title, artist, album)
         except (OSError, ValueError, TypeError):
@@ -737,9 +739,7 @@ def build_router(settings, require_owner, public_origin):
         picked = adopted_catalog_names(title, artist, album)
         # Untagged file: keep the catalog's artist and title when they are exact.
         if picked:
-            await session.execute(update(MusicTrack).where(MusicTrack.id == track_id,
-                MusicTrack.deleted.is_(False), MusicTrack.title == title,
-                MusicTrack.artist == artist).values(artist=picked[0], title=picked[1]))
+            await remember_catalog_names(session, track_id, title, artist, picked)
             await session.commit()
         if not jpeg:
             raise HTTPException(404, "Обложка пока не найдена")
@@ -849,12 +849,25 @@ def build_router(settings, require_owner, public_origin):
     ):
         """Queue one catalog item on the calling paired PC, never return its ticket."""
 
-        auth, credential = await paired_agent(request, session)
+        auth, credential = await paired_agent(request, session, lock=False)
+        meta = await playback_meta(session)
+        await ensure_agent_attached(session, auth.source_name)
+        active = await session.get(MusicSession, 1)
+        if meta.transfer_id or (active and active.device != "agent:" + auth.source_name
+                and active.state in {"playing", "loading"}):
+            raise HTTPException(409, "Музыка уже играет на другом устройстве. Переключите её через «Где слушать», чтобы подтвердить остановку")
         track = await find_track(session, track_id)
-        if track.mime == "audio/mp4":
-            raise HTTPException(415, "Для воспроизведения на ПК выберите MP3, WAV, FLAC или OGG")
         trusted_sha256 = _trusted_track_sha256(track.sha256)
-        ticket = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=600)
+        source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == auth.source_name))
+        capabilities = ((source.last_payload or {}).get("music_player") or {}) if source else {}
+        variant = ""
+        if capabilities.get("supported_codecs"):
+            from app.services.music_compatibility import prepare_audio
+            prepared = await prepare_audio(root, track, capabilities["supported_codecs"])
+            trusted_sha256, variant = prepared["sha256"], prepared["variant"]
+        elif track.mime == "audio/mp4":
+            raise HTTPException(415, "Обновите агент для подготовки совместимого аудиоформата")
+        ticket = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=600, variant=variant)
         media_path = f"/agent/music/tracks/{track.id}/stream?ticket={ticket}"
         config = await session.get(AppConfig, 1)
         web_url = canonical_web_app_url(
@@ -882,22 +895,9 @@ def build_router(settings, require_owner, public_origin):
         if presentation["catalog_artwork"]:
             artwork_path = f"/agent/music/tracks/{track.id}/artwork?ticket={ticket}"
             command_payload.update(artwork_path=artwork_path, artwork_url=origin + artwork_path)
-        await session.execute(
-            update(AgentCommand)
-            .where(
-                AgentCommand.source_name == auth.source_name,
-                AgentCommand.command == "music_play",
-                AgentCommand.status == "pending",
-            )
-            .values(status="cancelled")
-        )
-        item = await enqueue_agent_command(
-            session,
-            source_name=auth.source_name,
-            command="music_play",
-            payload=command_payload,
-            actor_user_id=None,
-        )
+        from app.services.music_direct_start import reserve_direct_start
+        item = await reserve_direct_start(session, source_name=auth.source_name, action="play",
+            details=command_payload, actor_user_id=None, client_id="paired-desktop")
         return {"ok": True, "command_id": item.id, "status": item.status}
 
     @router.api_route("/agent/music/tracks/{track_id}/stream", methods=["GET", "HEAD"])
@@ -910,7 +910,13 @@ def build_router(settings, require_owner, public_origin):
             AgentCredential.api_key_hash == binding, AgentCredential.is_active.is_(True)))
         if credential is None:
             raise HTTPException(403, "Агент отвязан")
-        return await audio_response(await find_track(session, track_id), session)
+        track = await find_track(session, track_id)
+        if auth.get("variant"):
+            from app.services.music_compatibility import prepare_audio
+            prepared = await prepare_audio(root, track, [auth["variant"]], forced_codec=auth["variant"])
+            return FileResponse(prepared["path"], media_type=prepared["mime"],
+                headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
+        return await audio_response(track, session)
 
     @router.get("/agent/music/tracks/{track_id}/artwork")
     async def agent_artwork(track_id: int, request: Request, ticket: str = "", session=Depends(get_session)):
@@ -960,10 +966,32 @@ def build_router(settings, require_owner, public_origin):
 
     @router.post("/api/mini/music/control")
     async def control(payload: ControlBody, request: Request, user=Depends(require_owner), session=Depends(get_session)):
+        legacy_start = False
+        if payload.handoff_id is not None:
+            transfer = await session.get(MusicTransfer, payload.handoff_id)
+            target = (transfer.target or {}) if transfer else {}
+            phase_device = {"prepare": ("preparing", target.get("device")),
+                            "start_prepared": ("starting", target.get("device")),
+                            "pause": ("waiting", transfer.source_device if transfer else None),
+                            "stop": ("failed", target.get("device"))}.get(payload.action)
+            if (not transfer or payload.handoff_revision != target.get("attempt_revision") or not phase_device
+                    or transfer.status != phase_device[0] or "agent:" + payload.source_name != phase_device[1]):
+                raise HTTPException(409, "Команда не соответствует текущему этапу передачи")
+        elif payload.action in {"prepare", "start_prepared"}:
+            raise HTTPException(409, "Сначала создайте подтверждённую передачу звука")
+        if payload.action in {"play", "resume"} and payload.handoff_id is None:
+            meta = await playback_meta(session)
+            active = await session.scalar(select(MusicSession).where(MusicSession.id == 1)
+                .with_for_update().execution_options(populate_existing=True))
+            pending = await session.get(MusicTransfer, meta.transfer_id) if meta.transfer_id else None
+            legacy_start = bool(payload.action == "play" and pending and pending.status == "starting"
+                and pending.target.get("protocol", 1) == 1 and active and active.device == "agent:" + payload.source_name
+                and active.track_id == payload.track_id)
+            if (meta.transfer_id and not legacy_start) or (active and active.device != "agent:" + payload.source_name and active.state in {"playing", "loading"}):
+                raise HTTPException(409, "Сначала подтвердите передачу через «Где слушать»")
         source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == payload.source_name))
         if source is None or source.source_type != "PC_AGENT" or not music_source_live(source):
-            # A stale heartbeat answers at once: the phone falls back to its
-            # own player instead of waiting 25 s for a switched-off PC.
+            # Fail promptly; a missing heartbeat does not authorize another output.
             raise HTTPException(409, "Компьютер не в сети")
         credential = await session.scalar(select(AgentCredential).where(AgentCredential.source_name == source.source_name, AgentCredential.is_active.is_(True)))
         if credential is None:
@@ -974,16 +1002,30 @@ def build_router(settings, require_owner, public_origin):
         await ensure_agent_attached(session, source.source_name)
         if not isinstance((source.last_payload or {}).get("music_player"), dict):
             raise HTTPException(409, "Обновите агент XASS до версии 0.16.0 или новее")
+        if payload.action == "resume" and payload.handoff_id is None:
+            player = source.last_payload["music_player"]
+            if not active or active.device != "agent:" + source.source_name or player.get("track_id") != active.track_id:
+                raise HTTPException(409, "Трек на ПК изменился. Выберите его заново через «Где слушать»")
         details = {"output_id": payload.output_id, "volume": payload.volume, "position_sec": payload.position_sec,
                    "expires_at": min(int(time.time()) + 120, payload.expires_at or int(time.time()) + 120)}
-        if payload.action == "play":
+        if payload.handoff_id is not None:
+            details.update(handoff_id=payload.handoff_id, handoff_revision=payload.handoff_revision)
+        if payload.action == "start_prepared":
+            details["track_id"] = payload.track_id
+        if payload.action in {"play", "prepare"}:
             if payload.track_id is None:
                 raise HTTPException(400, "Выберите трек")
             track = await find_track(session, payload.track_id)
-            if track.mime == "audio/mp4":
-                raise HTTPException(415, "Для воспроизведения M4A на ПК загрузите версию MP3 или WAV")
             trusted_sha256 = _trusted_track_sha256(track.sha256)
-            value = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=600)
+            variant = ""
+            capabilities = (source.last_payload or {}).get("music_player") or {}
+            if payload.action == "prepare" or capabilities.get("supported_codecs"):
+                from app.services.music_compatibility import prepare_audio
+                prepared = await prepare_audio(root, track, capabilities.get("supported_codecs") or [])
+                trusted_sha256, variant = prepared["sha256"], prepared["variant"]
+            elif track.mime == "audio/mp4":
+                raise HTTPException(415, "Обновите агент для подготовки совместимого аудиоформата")
+            value = issue_ticket(settings, track.id, purpose="agent", binding=credential.api_key_hash, ttl=600, variant=variant)
             media_path = f"/agent/music/tracks/{track.id}/stream?ticket={value}"
             config = await session.get(AppConfig, 1)
             web_url = canonical_web_app_url(config.service_base_url if config else "", settings.profile_public_url, public_origin(request)[1])
@@ -998,14 +1040,21 @@ def build_router(settings, require_owner, public_origin):
                 artwork_path = f"/agent/music/tracks/{track.id}/artwork?ticket={value}"
                 details.update(artwork_path=artwork_path, artwork_url=origin + artwork_path)
             offered = canonical_lan_url(payload.lan_url, track.id) if payload.lan_url else None
-            if offered:
+            if offered and not variant:
                 details["lan_url"] = offered
+        if payload.action in {"play", "resume"} and payload.handoff_id is None and not legacy_start:
+            from app.services.music_direct_start import reserve_direct_start
+            item = await reserve_direct_start(session, source_name=source.source_name, action=payload.action,
+                details=details, actor_user_id=user.user_id)
+            return {"ok": True, "command_id": item.id, "status": item.status}
         # Superseded transient controls must not burst into playback after reconnect.
         if payload.action in {"play", "seek", "volume"}:
             await session.execute(update(AgentCommand).where(AgentCommand.source_name == source.source_name,
                 AgentCommand.command == "music_" + payload.action, AgentCommand.status == "pending").values(status="cancelled"))
         item = await enqueue_agent_command(session, source_name=source.source_name, command="music_" + payload.action,
-                                           payload=details, actor_user_id=user.user_id)
+                                           payload=details, actor_user_id=user.user_id,
+                                           idempotency_key=(f"handoff:{payload.handoff_id}:{payload.handoff_revision}:{payload.action}"
+                                                            if payload.handoff_id else None))
         return {"ok": True, "command_id": item.id, "status": item.status}
 
     @router.get("/api/mini/music/control/{command_id}")
@@ -1027,9 +1076,12 @@ def build_router(settings, require_owner, public_origin):
         transfer = await pending_handoff(session, payload.session_key)
         if transfer:
             raise HTTPException(409, {"code": "transfer_requested", "transfer_id": transfer.id,
+                                      "revision": transfer.target.get("attempt_revision", 0),
                                       "message": "Приостановите воспроизведение для переключения"})
         active_transfer = await session.get(MusicTransfer, meta.transfer_id) if meta.transfer_id else None
-        if active_transfer and active_transfer.status not in {"ready", "failed"}:
+        preparing_source_report = bool(active_transfer and active_transfer.status == "preparing"
+            and active_transfer.source_key == payload.session_key and not payload.takeover)
+        if active_transfer and active_transfer.status not in {"ready", "failed"} and not preparing_source_report:
             raise HTTPException(409, {"code": "transfer_pending", "message": "Дождитесь подтверждения переключения"})
         if payload.share_discord:
             raise HTTPException(409, "Для звука в Discord выберите виртуальный выход ПК; автоматическое подключение Discord не настроено")
@@ -1049,7 +1101,10 @@ def build_router(settings, require_owner, public_origin):
         if changed_player and item.state in {"playing", "loading"}:
             from app.music_playback import pc_source_released
             released = item.device.startswith("agent:") and await pc_source_released(session, item)
-            if not (payload.takeover and (payload.force or released)):
+            # Accept legacy `force` in the wire schema, but it is never proof
+            # that the old player stopped. Only its confirmed quiet state can
+            # release an audible lease without the handoff protocol.
+            if not (payload.takeover and released):
                 raise HTTPException(409, {"code": "transfer_required", "source_device": item.device,
                     "message": "Переключите устройство через «Где слушать», чтобы сохранить позицию и остановить старый плеер"})
             if item.device.startswith("agent:") and item.device != payload.device:
@@ -1067,17 +1122,21 @@ def build_router(settings, require_owner, public_origin):
         if item.session_key and item.session_key != payload.session_key and not payload.takeover:
             raise HTTPException(409, "Воспроизведение уже изменено на другом устройстве")
         queue_command = await session.get(AgentCommand, meta.queue_command_id) if meta.queue_command_id else None
+        from app.services.music_direct_start import direct_start_command
+        direct_owned = await direct_start_command(session, item, meta)
         agent_queue_owned = bool(item.device.startswith("agent:") and queue_command
             and queue_command.source_name == item.device[6:]
             and (queue_command.payload or {}).get("queue_managed") is True
             and queue_command.payload.get("queue_session_key") == item.session_key
             and queue_command.status in {"awaiting_media", "pending", "delivered", "completed", "failed"})
-        if agent_queue_owned and payload.model_fields_set & {"track_id", "device", "state", "position"}:
+        if (agent_queue_owned or (direct_owned and not takeover_from_pc)) and payload.model_fields_set & {"track_id", "device", "state", "position"}:
             # A controller may be polling a pre-transition snapshot. Only the
             # authenticated PC heartbeat can report queue playback state; even
             # a same-key browser must not overwrite an atomic next-track lease.
             raise HTTPException(409, {"code": "agent_playback_authoritative",
                 "message": "Состояние воспроизведения ПК обновляет агент. Обновите плеер; отправляйте отдельно только настройки очереди или публикации."})
+        if direct_owned and takeover_from_pc:
+            meta.queue_command_id = None
         if payload.share_site and not item.share_site:
             from app.services.profile_editor import load_profile
             previous = load_profile(Path(settings.profile_json_path)).get("now_listening_source") or "pc_agent"
@@ -1098,7 +1157,7 @@ def build_router(settings, require_owner, public_origin):
                 await control(ControlBody(source_name=stop_pc, action="stop",
                     expires_at=int(time.time()) + 60), request, user, session)
             except HTTPException:
-                pass  # Offline PC: nothing is audible there that the server could stop.
+                pass  # Prior fresh quiet heartbeat already proved release; STOP is cleanup only.
         from app.services.music_broadcast import sync_music_profile
         await sync_music_profile(session, settings)
         return {"ok": True, "session": await current_session(session)}

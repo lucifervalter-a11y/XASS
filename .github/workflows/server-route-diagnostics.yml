@@ -1,18 +1,37 @@
-name: Read-only server route diagnostics
+name: Server diagnostics and explicit backend-only deployment
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Read-only diagnostics by default; deployment is an explicit separate action
+        type: choice
+        options: [inspect, deploy-backend-only]
+        default: inspect
+      target_sha:
+        description: Full reviewed server-only overlay SHA (must equal this workflow revision)
+        type: string
+        default: ''
+      expected_before:
+        description: Confirm the already inspected live revision for deployment
+        type: string
+        default: ''
+      confirm:
+        description: For deployment enter DEPLOY_BACKEND_ONLY_KEEP_CLIENTS
+        type: string
+        default: ''
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: xass-server-route-diagnostics
+  group: xass-production
   cancel-in-progress: false
 
 jobs:
   inspect:
-    if: github.ref == 'refs/heads/main'
+    if: inputs.mode == 'inspect' || inputs.mode == ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -31,8 +50,10 @@ jobs:
           cd /home/red/serverredus
           printf 'deployed_revision=%s\n' "$(git rev-parse HEAD)"
           systemctl show serverredus-backend \
-            --property=MainPID --property=ExecStart --property=WorkingDirectory \
+            --property=MainPID --property=ExecStart --property=WorkingDirectory --property=User --property=Group \
             --no-pager
+          printf 'deployment_uid=%s\n' "$(id -u)"
+          .venv/bin/python -c 'import os,stat; s=os.stat(".env"); print("env_owner_uid=%s env_group_gid=%s env_mode=%s" % (s.st_uid,s.st_gid,oct(stat.S_IMODE(s.st_mode))))'
           backend_pid="$(systemctl show serverredus-backend --property=MainPID --value)"
           printf 'process_cwd=%s\n' "$(readlink "/proc/$backend_pid/cwd" 2>/dev/null || printf unavailable)"
           printf '%s\n' '--- nginx route directives ---'
@@ -56,4 +77,76 @@ jobs:
               "sets_vary": 'response.headers["Vary"] = "X-Api-Key"' in source,
           }, sort_keys=True))
           PY
+          REMOTE
+
+  deploy-backend-only:
+    if: >-
+      inputs.mode == 'deploy-backend-only' &&
+      github.ref == 'refs/heads/codex/xass-server-only-discord-20261030'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate explicit scope and successful checks for the immutable overlay
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          EXPECTED_BEFORE: ${{ inputs.expected_before }}
+          CONFIRM: ${{ inputs.confirm }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          target = os.environ['TARGET_SHA']
+          if (not re.fullmatch(r'[0-9a-f]{40}', target) or target != os.environ['WORKFLOW_SHA']
+              or os.environ['EXPECTED_BEFORE'] != '81601bb56190c564c1f25928f3c60c616ff9cdf4'
+              or os.environ['CONFIRM'] != 'DEPLOY_BACKEND_ONLY_KEEP_CLIENTS'):
+              raise SystemExit('Explicit scope, pinned workflow SHA or live revision confirmation is missing.')
+          repo = os.environ['REPOSITORY']
+          path = f'repos/{repo}/actions/workflows/checks.yml/runs?head_sha={target}&status=completed&per_page=100'
+          result = subprocess.run(['gh', 'api', path], capture_output=True, check=True, timeout=30)
+          runs = json.loads(result.stdout).get('workflow_runs', [])
+          matches = [r for r in runs if r.get('head_sha') == target
+                     and r.get('head_repository', {}).get('full_name') == repo
+                     and r.get('head_branch') == 'codex/xass-server-only-discord-20261030'
+                     and r.get('event') in {'push', 'workflow_dispatch'}]
+          latest = max(matches, key=lambda r: r['id'], default={})
+          if latest.get('conclusion') != 'success':
+              raise SystemExit('The latest completed contracts run for this exact overlay is not successful.')
+          verified_source = subprocess.run(['gh', 'api', f'repos/{repo}/actions/runs/41105958562'],
+                                           capture_output=True, check=True, timeout=30)
+          source_run = json.loads(verified_source.stdout)
+          if (source_run.get('head_sha') != '01f565f934cda8754b1ab70c8a67ac34edbb9e2f'
+              or source_run.get('status') != 'completed' or source_run.get('conclusion') != 'success'
+              or source_run.get('head_repository', {}).get('full_name') != repo
+              or source_run.get('path') != '.github/workflows/checks.yml'):
+              raise SystemExit('The exact backend source contracts run is not verified successful.')
+          print('Pinned overlay contracts verified; no release publication is part of this workflow.')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          persist-credentials: false
+      - name: Deploy only backend through pinned SSH with private backup and rollback
+        shell: bash
+        env:
+          SSH_HOST: 51.250.80.137
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          # Both substitutions are constrained hex/digits; all server configuration stays private.
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+-[0-9]+$ ]]
+          bash deploy/github_ssh.sh exec <<REMOTE
+          set -euo pipefail
+          cd /home/red/serverredus
+          git fetch --no-tags origin codex/xass-server-only-discord-20261030
+          test "\$(git rev-parse FETCH_HEAD)" = '$TARGET_SHA'
+          git cat-file -e '01f565f934cda8754b1ab70c8a67ac34edbb9e2f^{commit}' || git fetch --no-tags origin '01f565f934cda8754b1ab70c8a67ac34edbb9e2f'
+          git show '$TARGET_SHA:deploy/backend_only_deploy.py' | .venv/bin/python - --target '$TARGET_SHA' --run-id 'server-only-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT'
           REMOTE

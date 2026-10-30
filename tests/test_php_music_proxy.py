@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +30,7 @@ AUDIO = bytes(range(256)) * 1024
 TICKET = "fixture_ticket-Abc123.signed987"
 ETAG = '"fixture-audio-v1"'
 MODIFIED = "Mon, 07 Sep 2026 12:00:00 GMT"
+DISCORD_FIXTURE_KEY = Ed25519PrivateKey.generate()
 OWNER_COOKIE = "xass_pwa=fixture-owner-session; Path=/; Max-Age=86400; Secure; HttpOnly; SameSite=Lax"
 
 
@@ -52,6 +55,30 @@ class AudioBackend(BaseHTTPRequestHandler):
                                   "headers": {name.lower(): value for name, value in self.headers.items()},
                                   "body": request_body})
         parsed = urlsplit(self.path)
+        if parsed.path == "/api/discord/interactions":
+            try:
+                DISCORD_FIXTURE_KEY.public_key().verify(
+                    bytes.fromhex(self.headers.get("X-Signature-Ed25519", "")),
+                    self.headers.get("X-Signature-Timestamp", "").encode() + request_body)
+                code, value = 200, {"type": 1}
+            except (InvalidSignature, ValueError):
+                code, value = 401, {"detail": "Invalid Discord signature"}
+            body = json.dumps(value).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "backend_admin=not-for-discord; Path=/")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if re.fullmatch(r"/api/discord/artwork/1/[a-f0-9]{64}\.jpg", parsed.path):
+            body = b"\xff\xd8\xfffixture-public-artwork"
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path in {"/api/native/enrollment/verify", "/api/pwa/logout"}:
             body = json.dumps({"ok": True, "native": parsed.path.endswith("verify")}).encode()
             self.send_response(200)
@@ -202,6 +229,36 @@ class PhpMusicProxyTests(unittest.TestCase):
     def setUp(self):
         while not self.backend.requests.empty():
             self.backend.requests.get_nowait()
+
+    def test_discord_direct_fallback_preserves_signed_raw_body_and_real_status(self):
+        body = b'{ "type": 1, "text": "\\u0442" }'
+        timestamp = str(int(time.time()))
+        headers = {"Content-Type": "application/json", "X-Signature-Timestamp": timestamp,
+                   "X-Signature-Ed25519": DISCORD_FIXTURE_KEY.sign(timestamp.encode()+body).hex(),
+                   "Authorization": "Bearer must-not-forward", "Cookie": "xass_pwa=private"}
+        response = self.client.post("/api/discord/interactions", content=body, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"type": 1})
+        self.assertNotIn("set-cookie", response.headers)
+        request = self.backend.requests.get_nowait()
+        self.assertEqual(request["body"], body)
+        self.assertEqual(request["headers"]["x-signature-timestamp"], timestamp)
+        self.assertNotIn("authorization", request["headers"])
+        self.assertNotIn("cookie", request["headers"])
+        response = self.client.post("/api/discord/interactions", content=body+b" ", headers=headers)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "Invalid Discord signature"})
+
+    def test_discord_body_is_bounded_before_backend(self):
+        response = self.client.post("/api/discord/interactions", content=b"x"*65537)
+        self.assertEqual(response.status_code, 413)
+        self.assertTrue(self.backend.requests.empty())
+
+    def test_discord_current_artwork_passes_as_jpeg_not_json_or_installer(self):
+        response = self.client.get("/api/discord/artwork/1/"+"a"*64+".jpg")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+        self.assertEqual(response.content, b"\xff\xd8\xfffixture-public-artwork")
 
     def media_url(self, namespace="api", *, direct=False, ticket=TICKET):
         path = f"/{namespace}/music/tracks/1/stream?" + urlencode({"ticket": ticket})

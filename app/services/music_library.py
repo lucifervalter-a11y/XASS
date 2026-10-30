@@ -98,9 +98,13 @@ def track_json(track) -> dict:
     return payload
 
 
-def issue_ticket(settings, track_id: int, *, purpose="listen", binding="", ttl=3600) -> str:
+def issue_ticket(settings, track_id: int, *, purpose="listen", binding="", ttl=3600, variant="") -> str:
     payload = {"id": track_id, "p": purpose, "b": binding, "exp": int(time.time()) + ttl,
                "gen": _session_generation(settings), "nonce": secrets.token_hex(8)}
+    if variant:
+        if purpose != "agent" or variant not in {"mp3", "flac"}:
+            raise ValueError("Invalid media variant")
+        payload["variant"] = variant
     encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
     mac = hmac.new(_session_secret(settings), b"music-v1:" + encoded.encode(), hashlib.sha256).hexdigest()
     return encoded + "." + mac

@@ -10,6 +10,7 @@ $BACKEND = 'http://127.0.0.1:8000';
 $binaryMode = isset($_GET['_binary']) && (string)$_GET['_binary'] === '1';
 $mediaMode = $binaryMode && isset($_GET['_media']) && (string)$_GET['_media'] === '1';
 $passthroughMode = isset($_GET['_passthrough']) && (string)$_GET['_passthrough'] === '1';
+$discordMode = false;
 header('Cache-Control: private, no-store');
 if (!$binaryMode && !$passthroughMode) {
     header('Content-Type: application/json; charset=utf-8');
@@ -17,8 +18,8 @@ if (!$binaryMode && !$passthroughMode) {
 http_response_code(200);
 
 function proxy_error(int $status, string $detail): void {
-    global $binaryMode, $passthroughMode, $mediaMode;
-    if ($mediaMode) {
+    global $binaryMode, $passthroughMode, $mediaMode, $discordMode;
+    if ($mediaMode || $discordMode) {
         http_response_code($status);
     }
     if ($binaryMode || $passthroughMode) {
@@ -53,6 +54,13 @@ if (
     proxy_error(400, 'invalid proxy path');
 }
 $rawPath = preg_replace('#/+#', '/', $rawPath) ?? $rawPath;
+$discordMode = $rawPath === '/api/discord/interactions' ||
+    preg_match('#^/api/discord/artwork/[1-9][0-9]*/[a-f0-9]{64}\.jpg$#D', $rawPath) === 1;
+if ($discordMode) {
+    $binaryMode = false;
+    $mediaMode = false;
+    $passthroughMode = true;
+}
 
 if ($rawPath !== '/health' && strpos($rawPath, '/api/') !== 0 && strpos($rawPath, '/agent/') !== 0) {
     proxy_error(400, 'invalid proxy path');
@@ -68,7 +76,11 @@ $url    = $BACKEND . $rawPath . (isset($targetParts[1]) ? '?' . $targetParts[1] 
 
 $body = '';
 if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
-    $body = (string)file_get_contents('php://input');
+    $body = $discordMode ? (string)file_get_contents('php://input', false, null, 0, 65537)
+                        : (string)file_get_contents('php://input');
+    if ($discordMode && strlen($body) > 65536) {
+        proxy_error(413, 'Interaction is too large');
+    }
 }
 
 // Collect headers to forward.
@@ -93,6 +105,9 @@ $forwardHeaders[] = 'X-Forwarded-Proto: ' . $publicProto;
 if (function_exists('getallheaders')) {
     $allowed = ['content-type', 'x-telegram-init-data', 'x-xass-action-proof', 'x-xass-cipher',
                 'x-xass-inner-type', 'x-api-key', 'authorization', 'cookie'];
+    if ($discordMode) {
+        $allowed = ['content-type', 'x-signature-ed25519', 'x-signature-timestamp'];
+    }
     if ($mediaMode) {
         $allowed = array_merge($allowed, ['range', 'if-range']);
     }
@@ -115,6 +130,13 @@ $serverMap = [
     'HTTP_CONTENT_TYPE'         => 'Content-Type',
     'CONTENT_TYPE'              => 'Content-Type',
 ];
+if ($discordMode) {
+    $serverMap = [
+        'HTTP_X_SIGNATURE_ED25519' => 'X-Signature-Ed25519',
+        'HTTP_X_SIGNATURE_TIMESTAMP' => 'X-Signature-Timestamp',
+        'HTTP_CONTENT_TYPE' => 'Content-Type', 'CONTENT_TYPE' => 'Content-Type',
+    ];
+}
 if ($mediaMode) {
     $serverMap['HTTP_RANGE'] = 'Range';
     $serverMap['HTTP_IF_RANGE'] = 'If-Range';
@@ -138,7 +160,7 @@ $opts = [
         'method'        => $method,
         'header'        => implode("\r\n", $forwardHeaders),
         'content'       => $body,
-        'timeout'       => 90,
+        'timeout'       => $discordMode ? 1.0 : 90,
         'ignore_errors' => true,   // return body even on 4xx/5xx
         'follow_location' => 0,
     ],
@@ -214,7 +236,7 @@ if ($binaryMode) {
 $responseBody = @file_get_contents($url, false, $context);
 
 if ($responseBody === false) {
-    proxy_error(502, 'Backend unavailable: could not connect to ' . $url);
+    proxy_error(502, $discordMode ? 'Discord backend unavailable' : 'Backend unavailable: could not connect to ' . $url);
 }
 
 // PHP 8.4+ exposes the headers without the deprecated scoped variable.
@@ -243,7 +265,7 @@ if ($passthroughMode) {
     foreach ($responseHeaders as $headerLine) {
         if (stripos($headerLine, 'Content-Type:') === 0) {
             $contentType = trim(substr($headerLine, strlen('Content-Type:')));
-        } elseif (stripos($headerLine, 'Set-Cookie:') === 0) {
+        } elseif (!$discordMode && stripos($headerLine, 'Set-Cookie:') === 0) {
             header($headerLine, false);
         }
     }

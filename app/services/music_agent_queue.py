@@ -83,6 +83,18 @@ async def cancel_agent_queue(session, source_name: str) -> dict:
     if not item or item.device != "agent:" + source_name or not meta.queue_command_id:
         return {"cancelled": False, "restored_from_heartbeat": False}
     command = await session.get(AgentCommand, meta.queue_command_id)
+    if command and (command.payload or {}).get("direct_start"):
+        # An unacknowledged start may already be audible. Keep its fence until
+        # the explicit handoff has stopped it, or a fresh post-ACK report arrives.
+        # New direct play can atomically supersede it in reserve_direct_start.
+        if command.status != "pending" or command.delivered_at is not None:
+            return {"cancelled": False, "restored_from_heartbeat": False}
+        command.status = "cancelled"
+        command.completed_at = datetime.now(timezone.utc)
+        # Cancelled before delivery is known not to have started, but preserve
+        # the conservative loading lease until the previous PC sound is checked.
+        meta.queue_command_id = None
+        return {"cancelled": True, "restored_from_heartbeat": False}
     if (not command or command.source_name != source_name or (command.payload or {}).get("queue_managed") is not True
             or command.payload.get("queue_session_key") != item.session_key):
         return {"cancelled": False, "restored_from_heartbeat": False}
@@ -146,6 +158,19 @@ async def advance_agent_queue(session, settings, source, public_origin: str) -> 
     if credential is None:
         return {"status": "ignored"}
     command = await session.get(AgentCommand, meta.queue_command_id) if meta.queue_command_id else None
+    if command and (command.payload or {}).get("direct_start"):
+        from app.services.music_direct_start import direct_start_command, direct_start_confirmed
+        direct = await direct_start_command(session, item, meta)
+        if direct and not direct_start_confirmed(direct, source):
+            return {"status": "waiting", "command_id": direct.id}
+        if direct:
+            item.state = player["state"] if player.get("track_id") == item.track_id else "stopped"
+            item.position = max(0, _number(player.get("position_sec")))
+            item.updated_at = seen
+        meta.queue_command_id = None
+        meta.revision += 1
+        await session.commit()
+        return {"status": item.state, "command_id": command.id}
     if command is not None:
         payload = command.payload or {}
         if (payload.get("queue_managed") is not True or command.source_name != source.source_name

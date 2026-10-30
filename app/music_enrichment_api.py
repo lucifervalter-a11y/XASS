@@ -194,10 +194,10 @@ async def adopt_filename_names(session, track) -> None:
     artist, title = split
     if artist == track.artist and title == track.title:
         return
-    changed = await session.execute(update(MusicTrack).where(MusicTrack.id == track.id,
-        MusicTrack.deleted.is_(False), MusicTrack.title == track.title,
-        MusicTrack.artist == track.artist).values(title=title[:240], artist=artist[:240]))
-    if changed.rowcount != 1:
+    from app.services.music_covers import remember_catalog_names
+    changed = await remember_catalog_names(session, track.id, track.title, track.artist,
+                                           (artist[:240], title[:240]))
+    if not changed:
         return
     track.title, track.artist = title[:240], artist[:240]
     await session.commit()
@@ -210,8 +210,19 @@ async def enrich_saved_track(session, track_id, *, refresh=False):
     async with lock:
         track = await find_track(session, track_id)
         record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+        # A reviewed catalog-only batch protects names without disabling the
+        # existing cover/lyrics for unchanged audio. Explicit refresh remains an
+        # owner action; ordinary library/lyrics reads cannot silently undo tags.
+        if record and (record.result or {}).get("curation_tag_override") and not refresh:
+            return {"ok": True, "track": track_json(track), "enrichment": result_json(record)}
         if record is None or not record.dismissed:
             await adopt_filename_names(session, track)
+            # The row-locking adoption helper may have observed an owner batch
+            # committed after our initial read, including a same-value choice.
+            track = await find_track(session, track_id)
+            record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+            if record and (record.result or {}).get("curation_tag_override") and not refresh:
+                return {"ok": True, "track": track_json(track), "enrichment": result_json(record)}
         now = datetime.now(timezone.utc)
         confirmed_candidate, previous_result, previous_artwork = None, None, None
         if record:

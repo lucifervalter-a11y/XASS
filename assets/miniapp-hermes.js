@@ -1,8 +1,7 @@
 /**
- * Hermes Agent AI - Frontend Client Logic for XASS Mini App
- * Fully integrated interactive AI assistant with streaming, tool calling inspection,
- * session management, thought process drawer, and offline fallback demo mode.
- * Version: 0.17.0
+ * XASS AI - Frontend Client Logic for XASS Mini App
+ * Displays only backend-confirmed sessions, messages, tool events, and status.
+ * Version: 0.17.1
  */
 
 (() => {
@@ -51,42 +50,17 @@
 
   const state = {
     sessions: [],
-    activeSessionId: 'default',
+    activeSessionId: '',
     messages: {}, // { [sessionId]: [messageObject] }
-    model: localStorage.getItem(STORAGE_KEY_MODEL) || 'nous-hermes-3',
-    status: 'online', // 'online' | 'thinking' | 'offline'
+    model: localStorage.getItem(STORAGE_KEY_MODEL) || 'xass-ai-local',
+    status: 'offline', // 'online' | 'thinking' | 'offline' | 'error'
     isGenerating: false,
-    isDemoMode: false,
     totalTokens: 0,
+    lastError: '',
+    interactiveAvailable: false,
+    interactiveStatus: 'unavailable',
     initialized: false
   };
-
-  // Default initial demo conversation if empty
-  const DEFAULT_INITIAL_MESSAGES = [
-    {
-      id: 'init-1',
-      role: 'assistant',
-      model: 'nous-hermes-3',
-      timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
-      tokens: 284,
-      thought: `Цель: Инициализировать интерфейс агента Hermes AI для центра управления XASS.\nШаг 1: Проверить статус локальных сервисов (nginx, postgresql, xass backend).\nШаг 2: Получить свежие метрики с активных ПК-агентов.\nШаг 3: Сформировать краткое резюме готовности системы для владельца.`,
-      tools: [
-        {
-          name: 'xass_system.check_status',
-          badge: 'success',
-          status: 'ok',
-          payload: { backend: 'active', database: 'connected', version: '0.17.0', latency: '4ms' }
-        },
-        {
-          name: 'xass_agent.list_devices',
-          badge: 'success',
-          status: 'ok',
-          payload: { online_devices: ['Домашний ПК'], last_seen: 'online' }
-        }
-      ],
-      content: `Приветствую! Я **Hermes Agent AI** — встроенный автономный интеллект центра управления **XASS**.\n\nЯ подключён к системному API сервера, службе Telegram-бота и агентам рабочих столов. Вот что я могу сделать прямо сейчас:\n\n* 🖥️ **Диагностика сервера**: анализ нагрузки CPU, RAM, диска и состояния демонов.\n* 📋 **Анализ логов и событий**: поиск аномалий, перехваченных сообщений и аудита.\n* 💻 **Генерация и исполнение скриптов**: PowerShell, Bash, Python для автоматизации.\n* 🛡️ **Аудит безопасности**: Passkeys, SSH, одноразовые токены и права доступа.\n\nВыберите готовую быструю команду ниже или напишите любой запрос в свободной форме!`
-    }
-  ];
 
   // --- Markdown Parser ---
   function renderMarkdown(raw) {
@@ -141,64 +115,54 @@
   }
 
   // --- Session Management ---
+  // Session metadata always comes from the backend. Local storage only remembers
+  // the selected real session and its already displayed transcript.
   function loadPersistedSessions() {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_SESSIONS);
-      if (stored) {
-        state.sessions = JSON.parse(stored);
-      }
-    } catch (e) {
-      console.warn('Hermes failed to read sessions', e);
-    }
-    if (!state.sessions || !state.sessions.length) {
-      state.sessions = [
-        { id: 'default', title: 'Главный диалог', created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-        { id: 'diag-server', title: 'Диагностика и логи', created_at: new Date().toISOString(), updated_at: new Date().toISOString() }
-      ];
-    }
+    state.sessions = [];
+    state.activeSessionId = localStorage.getItem(STORAGE_KEY_ACTIVE) || '';
+  }
 
-    const active = localStorage.getItem(STORAGE_KEY_ACTIVE);
-    if (active && state.sessions.some(s => s.id === active)) {
-      state.activeSessionId = active;
-    } else {
-      state.activeSessionId = state.sessions[0].id;
-    }
-
-    // Load messages
+  function loadPersistedMessages(sessionId) {
+    if (!sessionId || state.messages[sessionId]) return;
     try {
-      const storedMsgs = localStorage.getItem('xass_hermes_msgs_' + state.activeSessionId);
-      if (storedMsgs) {
-        state.messages[state.activeSessionId] = JSON.parse(storedMsgs);
-      } else if (state.activeSessionId === 'default') {
-        state.messages['default'] = structuredClone(DEFAULT_INITIAL_MESSAGES);
-      } else {
-        state.messages[state.activeSessionId] = [];
-      }
+      const stored = localStorage.getItem('xass_hermes_msgs_' + sessionId);
+      const parsed = stored ? JSON.parse(stored) : [];
+      state.messages[sessionId] = Array.isArray(parsed) ? parsed : [];
     } catch (e) {
-      state.messages[state.activeSessionId] = [];
+      state.messages[sessionId] = [];
     }
   }
 
   function savePersistedSessions() {
     try {
-      localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(state.sessions));
-      localStorage.setItem(STORAGE_KEY_ACTIVE, state.activeSessionId);
-      if (state.messages[state.activeSessionId]) {
+      if (state.activeSessionId) {
+        localStorage.setItem(STORAGE_KEY_ACTIVE, state.activeSessionId);
         localStorage.setItem(
           'xass_hermes_msgs_' + state.activeSessionId,
-          JSON.stringify(state.messages[state.activeSessionId])
+          JSON.stringify(state.messages[state.activeSessionId] || [])
         );
+      } else {
+        localStorage.removeItem(STORAGE_KEY_ACTIVE);
       }
+      // Remove the legacy cached session catalog so stale/demo sessions cannot
+      // be presented as live after an offline launch.
+      localStorage.removeItem(STORAGE_KEY_SESSIONS);
     } catch (e) {
-      console.warn('Hermes failed to save sessions', e);
+      console.warn('XASS AI could not persist the local transcript', e);
     }
   }
 
   function renderSessionSelector() {
     const sel = $('hermesSessionSelect');
     if (!sel) return;
+    if (!state.sessions.length) {
+      sel.innerHTML = '<option value="">Нет активных сессий</option>';
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
     sel.innerHTML = state.sessions.map(s =>
-      `<option value="${esc(s.id)}" ${s.id === state.activeSessionId ? 'selected' : ''}>${esc(s.title)}</option>`
+      `<option value="${esc(s.id)}" ${s.id === state.activeSessionId ? 'selected' : ''}>${esc(s.title || 'Сессия XASS AI')}</option>`
     ).join('');
   }
 
@@ -206,9 +170,12 @@
     const tokenEl = $('hermesTokenText');
     if (!tokenEl) return;
     const msgs = state.messages[state.activeSessionId] || [];
-    let count = msgs.reduce((acc, m) => acc + (m.tokens || Math.round((m.content?.length || 0) / 3.5)), 0);
+    const count = msgs.reduce((acc, m) => {
+      const value = Number(m.tokens);
+      return acc + (Number.isFinite(value) && value > 0 ? value : 0);
+    }, 0);
     state.totalTokens = count;
-    tokenEl.textContent = `${count.toLocaleString('ru-RU')} / 128k`;
+    tokenEl.textContent = count > 0 ? count.toLocaleString('ru-RU') : '—';
   }
 
   // --- Rendering Chat History ---
@@ -218,6 +185,13 @@
 
     const msgs = state.messages[state.activeSessionId] || [];
     if (!msgs.length) {
+      const emptyMessage = state.interactiveAvailable === true && state.status === 'online'
+        ? (state.activeSessionId
+          ? 'Сессия готова. Ответы появятся только после подтверждения сервером.'
+          : 'Создайте сессию, чтобы начать работу с XASS AI.')
+        : state.status === 'runtime'
+          ? 'Локальный runtime проверен, но интерактивный WebSocket-транспорт пока не подключён.'
+        : 'XASS AI сейчас недоступен. Локальные демонстрационные ответы отключены.';
       history.innerHTML = `
         <div class="hermes-welcome-card">
           <div class="hermes-welcome-icon">
@@ -229,14 +203,8 @@
               <path d="M12 2v3M5 12H2M22 12h-3"/>
             </svg>
           </div>
-          <h3>Диалог чист</h3>
-          <p>Hermes Agent готов к работе. Нажмите одну из быстрых команд ниже или задайте вопрос о состоянии сервера, агентах или скриптах.</p>
-          <div class="hermes-features-list">
-            <span class="hermes-feat-tag">⚡ Контекст XASS</span>
-            <span class="hermes-feat-tag">🧠 Chain of Thought</span>
-            <span class="hermes-feat-tag">🛡️ Sandbox Shell</span>
-            <span class="hermes-feat-tag">💻 Code Exec</span>
-          </div>
+          <h3>XASS AI</h3>
+          <p>${esc(emptyMessage)}</p>
         </div>
       `;
       updateTokenCounter();
@@ -257,46 +225,23 @@
         `;
       }
 
-      // Assistant message
-      let thoughtHtml = '';
-      if (m.thought || (m.tools && m.tools.length)) {
-        const stepLines = (m.thought || '').split('\n').filter(Boolean);
-        const stepsCount = Math.max(1, stepLines.length) + (m.tools?.length || 0);
-
-        let toolsHtml = '';
-        if (m.tools && m.tools.length) {
-          toolsHtml = m.tools.map(t => `
+      // Render only backend-confirmed tool events. Private model reasoning is
+      // intentionally neither accepted nor displayed.
+      const tools = Array.isArray(m.tools) ? m.tools : [];
+      const toolsHtml = tools.length ? `
+        <div class="hermes-tool-list" aria-label="Подтверждённые действия">
+          ${tools.map(t => `
             <div class="hermes-tool-card">
               <div class="hermes-tool-head">
-                <span class="hermes-tool-name">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                  ${esc(t.name)}
-                </span>
-                <span class="hermes-tool-badge ${t.status === 'ok' ? 'ok' : 'run'}">${esc(t.status || 'done')}</span>
+                <span class="hermes-tool-name">${esc(t.name || 'Действие')}</span>
+                <span class="hermes-tool-badge ${t.status === 'ok' ? 'ok' : 'run'}">${esc(t.status || 'unknown')}</span>
               </div>
-              <div class="hermes-tool-content"><pre>${esc(JSON.stringify(t.payload || {}, null, 2))}</pre></div>
+              ${t.payload ? `<div class="hermes-tool-content"><pre>${esc(JSON.stringify(t.payload, null, 2))}</pre></div>` : ''}
             </div>
-          `).join('');
-        }
-
-        thoughtHtml = `
-          <details class="hermes-thought">
-            <summary>
-              <span class="thought-icon">🧠</span>
-              <span class="thought-title">Ход рассуждений (Chain of Thought)</span>
-              <span class="thought-badge">${stepsCount} шагов</span>
-              <svg class="thought-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
-            </summary>
-            <div class="hermes-thought-body">
-              ${m.thought ? esc(m.thought) : ''}
-              ${toolsHtml}
-            </div>
-          </details>
-        `;
-      }
-
-      const modelLabel = m.model ? (m.model.includes('hermes') ? 'Nous Hermes 3' : m.model) : 'Nous Hermes 3';
-      const tokenMeta = m.tokens ? `${m.tokens} токенов` : 'готово';
+          `).join('')}
+        </div>` : '';
+      const tokenValue = Number(m.tokens);
+      const tokenMeta = Number.isFinite(tokenValue) && tokenValue > 0 ? `${tokenValue} токенов` : '';
 
       return `
         <div class="hermes-msg-row agent" data-id="${esc(m.id)}">
@@ -306,8 +251,7 @@
                 <div class="hermes-agent-icon-badge">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4v1a4 4 0 0 1 4 4v2a4 4 0 0 1-4 4h-1v3a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-3H8a4 4 0 0 1-4-4v-2a4 4 0 0 1 4-4V6a4 4 0 0 1 4-4Z"/><circle cx="9" cy="11" r="1.5" fill="currentColor"/><circle cx="15" cy="11" r="1.5" fill="currentColor"/></svg>
                 </div>
-                <span class="hermes-agent-title">Hermes AI</span>
-                <span class="hermes-model-tag">${esc(modelLabel)}</span>
+                <span class="hermes-agent-title">XASS AI</span>
               </div>
               <div class="hermes-agent-actions">
                 <button type="button" class="hermes-copy-btn" title="Копировать ответ" data-copy-id="${esc(m.id)}">
@@ -316,7 +260,7 @@
               </div>
             </div>
 
-            ${thoughtHtml}
+            ${toolsHtml}
 
             <div class="hermes-bubble-content">
               ${renderMarkdown(m.content)}
@@ -324,7 +268,7 @@
 
             <div class="hermes-agent-footer">
               <span>${timeStr}</span>
-              <span>${tokenMeta}</span>
+              ${tokenMeta ? `<span>${tokenMeta}</span>` : ''}
             </div>
           </div>
         </div>
@@ -386,39 +330,118 @@
   }
 
   // --- Status & Backend Connection ---
-  async function loadHermesStatus() {
-    const pill = $('hermesStatusPill');
-    const txt = $('hermesStatusText');
+  function apiUrl(path) {
+    return '/proxy.php?_passthrough=1&_p=' + encodeURIComponent('/api/mini/hermes/' + path);
+  }
 
+  function requestHeaders(json = false, actionProof = '') {
+    const headers = {};
+    if (json) headers['Content-Type'] = 'application/json';
+    if (X?.initData) headers['X-Telegram-Init-Data'] = X.initData;
+    if (actionProof) headers['X-XASS-Action-Proof'] = actionProof;
+    return headers;
+  }
+
+  function isMockPayload(payload) {
+    return Boolean(
+      payload?.mock === true ||
+      payload?.demo === true ||
+      payload?.status?.mock === true ||
+      payload?.result?.mock === true
+    );
+  }
+
+  async function readJson(response) {
     try {
-      const headers = {};
-      if (X?.initData) headers['X-Telegram-Init-Data'] = X.initData;
-
-      // Try FastAPI / proxy endpoint
-      const response = await fetch('/proxy.php?_passthrough=1&_p=' + encodeURIComponent('/api/mini/hermes/status'), {
-        headers,
-        credentials: 'include'
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        if (data.ok) {
-          state.isDemoMode = false;
-          setStatus('online', data.status_label || 'В сети');
-          if (data.active_model) {
-            state.model = data.active_model;
-            if ($('hermesModelSelect')) $('hermesModelSelect').value = data.active_model;
-          }
-          return;
-        }
-      }
+      return await response.json();
     } catch (e) {
-      // Fallback
+      throw new Error('Сервер вернул некорректный ответ');
+    }
+  }
+
+  async function loadXassAiSessions() {
+    const response = await fetch(apiUrl('sessions'), {
+      headers: requestHeaders(),
+      credentials: 'include'
+    });
+    const data = await readJson(response);
+    const payload = data?.result && typeof data.result === 'object' ? data.result : data;
+    if (!response.ok || data?.ok !== true || isMockPayload(data)) {
+      throw new Error('Сессии XASS AI недоступны');
     }
 
-    // Backend not ready or offline -> fallback to local demo mode seamlessly
-    state.isDemoMode = true;
-    setStatus('online', 'В сети (XASS Core)');
+    const rawSessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+    state.sessions = rawSessions
+      .filter(item => item && typeof item === 'object' && item.mock !== true && String(item.id || '').trim())
+      .map(item => ({
+        ...item,
+        id: String(item.id),
+        title: String(item.title || 'Сессия XASS AI')
+      }));
+
+    const selectedExists = state.sessions.some(item => item.id === state.activeSessionId);
+    state.activeSessionId = selectedExists ? state.activeSessionId : (state.sessions[0]?.id || '');
+    loadPersistedMessages(state.activeSessionId);
+    savePersistedSessions();
+    renderSessionSelector();
+    renderChatHistory();
+    updateControls();
+  }
+
+  async function loadHermesStatus() {
+    try {
+      const response = await fetch(apiUrl('status'), {
+        headers: requestHeaders(),
+        credentials: 'include'
+      });
+      const data = await readJson(response);
+      const statusData = data?.status && typeof data.status === 'object' ? data.status : {};
+      const statusName = String(statusData.status || '').toLowerCase();
+      const runtimeOnline = response.ok &&
+        data?.ok === true &&
+        statusData.online === true &&
+        statusData.enabled !== false &&
+        statusData.mock !== true &&
+        !['offline', 'offline_fallback', 'disabled', 'error'].includes(statusName);
+
+      if (!runtimeOnline) {
+        throw new Error('XASS AI не подтвердил готовность');
+      }
+
+      state.lastError = '';
+      state.interactiveAvailable = statusData.interactive_available === true;
+      state.interactiveStatus = String(statusData.interactive_status || 'unsupported_transport');
+      if (!state.interactiveAvailable) {
+        state.sessions = [];
+        state.activeSessionId = '';
+        setStatus('runtime', 'Runtime проверен · чат недоступен');
+        renderSessionSelector();
+        renderChatHistory();
+        updateControls();
+        return false;
+      }
+      if (typeof statusData.active_model === 'string' && statusData.active_model) {
+        state.model = statusData.active_model;
+        const modelSelect = $('hermesModelSelect');
+        if (modelSelect && [...modelSelect.options].some(option => option.value === state.model)) {
+          modelSelect.value = state.model;
+        }
+      }
+      setStatus('online', 'В сети');
+      await loadXassAiSessions();
+      return true;
+    } catch (e) {
+      state.lastError = e instanceof Error ? e.message : 'XASS AI недоступен';
+      state.interactiveAvailable = false;
+      state.interactiveStatus = 'unavailable';
+      state.sessions = [];
+      state.activeSessionId = '';
+      setStatus('offline', 'Не в сети');
+      renderSessionSelector();
+      renderChatHistory();
+      updateControls();
+      return false;
+    }
   }
 
   function setStatus(status, label) {
@@ -427,357 +450,179 @@
     const txt = $('hermesStatusText');
     if (!pill || !txt) return;
 
-    pill.className = `hermes-status-badge ${status}`;
-    txt.textContent = label || (status === 'thinking' ? 'Думает…' : status === 'online' ? 'В сети' : 'Офлайн');
+    const visualStatus = ['online', 'thinking', 'offline'].includes(status) ? status : 'offline';
+    pill.className = `hermes-status-badge ${visualStatus}`;
+    txt.textContent = label || (status === 'thinking' ? 'Выполняется…' : status === 'online' ? 'В сети' : 'Не в сети');
+    updateControls();
   }
 
-  // --- Realistic Demo Simulator for Instant Testing ---
-  function getDemoAgentResponse(prompt) {
-    const p = prompt.toLowerCase();
-    const bootData = X?.state?.boot || {};
-    const metrics = bootData.metrics || { cpu_percent: 18, ram_used_percent: 43, disk_used_percent: 61 };
-    const pcs = (bootData.sources || []).filter(s => X?.isPc ? X.isPc(s) : /pc|windows/i.test(s.source_name || ''));
-
-    if (p.includes('сервер') || p.includes('нагрузк') || p.includes('cpu') || p.includes('памят')) {
-      return {
-        thought: `1. Выполняю запрос метрик ядра сервера XASS...\n2. Чтение данных /proc/stat, /proc/meminfo и дисковых массивов.\n3. Проверка статуса фоновых демонов: nginx, postgresql, xass_worker.\n4. Формирование рекомендаций по оптимизации ресурсов.`,
-        tools: [
-          {
-            name: 'xass_diagnostics.metrics',
-            status: 'ok',
-            payload: {
-              cpu: `${metrics.cpu_percent}%`,
-              ram: `${metrics.ram_used_percent}%`,
-              disk: `${metrics.disk_used_percent}%`,
-              uptime: '14 дней, 6 часов',
-              load_avg: [0.18, 0.24, 0.19]
-            }
-          },
-          {
-            name: 'systemctl.status',
-            status: 'ok',
-            payload: {
-              'nginx.service': 'active (running)',
-              'postgresql.service': 'active (running)',
-              'xass-bot.service': 'active (running)'
-            }
-          }
-        ],
-        content: `### 🖥️ Состояние сервера XASS
-
-Сервер функционирует в штатном режиме без критических отклонений:
-
-* **Процессор (CPU):** \`${metrics.cpu_percent}%\` (нагрузка минимальная, всплесков нет)
-* **Оперативная память (RAM):** \`${metrics.ram_used_percent}%\` (достаточный запас для фоновых задач)
-* **Дисковое пространство:** \`${metrics.disk_used_percent}%\` (рекомендуется плановая очистка медиа-кэша при превышении 80%)
-
-**Активные сервисы:**
-\`\`\`bash
-● nginx.service         - active (running) · 443 HTTPS OK
-● postgresql.service    - active (running) · пул 12 соединений
-● xass-backend.service  - active (running) · worker PID 2841
-\`\`\`
-
-Угрозы стабильности отсутствуют. Система полностью готова к приёму команд.`
-      };
-    }
-
-    if (p.includes('лог') || p.includes('журнал') || p.includes('ошибк') || p.includes('аномали')) {
-      return {
-        thought: `1. Открываю журнал аудита опасных действий (/api/mini/audit)...\n2. Парсинг последних 50 записей системных логов бота.\n3. Сравнение с базой известных сигнатур сбоев.\n4. Выявление удалённых или отредактированных сообщений в Telegram.`,
-        tools: [
-          {
-            name: 'xass_archive.scan_logs',
-            status: 'ok',
-            payload: {
-              scanned_entries: 50,
-              errors_found: 0,
-              warnings: 1,
-              last_warning: 'VK session expired (handled automatically)'
-            }
-          }
-        ],
-        content: `### 📋 Анализ журналов и событий XASS
-
-Глубокий аудит последних событий завершён:
-
-1. **Критические ошибки (Fatal/Error):** \`0\` — сбоев в работе не зафиксировано.
-2. **Предупреждения (Warnings):** \`1\` — временное обновление токена внешнего сервиса (успешно восстановлено).
-3. **Архив Telegram-диалогов:**
-   * Всего перехвачено сообщений: \`${bootData.archive?.messages || 128}\`
-   * Обнаружено удалённых сообщений: \`${bootData.archive?.deleted || 7}\` (локально сохранены на ПК)
-   * Медиафайлов защищено: \`${bootData.archive?.media || 19}\`
-
-Рекомендация: журнал очистки ротируется корректно, вмешательство не требуется.`
-      };
-    }
-
-    if (p.includes('скрипт') || p.includes('написат') || p.includes('код') || p.includes('bash') || p.includes('powershell')) {
-      return {
-        thought: `1. Задача: написать production-ready bash-скрипт для резервного копирования и мониторинга.\n2. Учесть требования: проверка свободного места, архивация базы SQLite/Postgres, шифрование AES-256.\n3. Добавить отправку уведомления в Telegram через XASS Bot API.\n4. Предоставить инструкцию по установке в cron.`,
-        tools: [
-          {
-            name: 'xass_scriptgen.synthesize',
-            status: 'ok',
-            payload: { language: 'bash', targets: ['backup', 'pg_dump', 'telegram_notify'] }
-          }
-        ],
-        content: `### 💻 Скрипт автоматического резервного копирования
-
-Ниже готов готовый скрипт \`xass-autobackup.sh\` с автоматической отправкой статуса:
-
-\`\`\`bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-BACKUP_DIR="/var/backups/xass"
-DATE=$(date +"%Y%m%d_%H%M%S")
-BACKUP_FILE="\${BACKUP_DIR}/xass_backup_\${DATE}.tar.gz"
-
-mkdir -p "\${BACKUP_DIR}"
-
-echo "[+] Создаю дамп базы данных и конфигурации XASS..."
-pg_dump -U postgres xass_db > "/tmp/xass_dump_\${DATE}.sql"
-tar -czf "\${BACKUP_FILE}" -C /var/www/xass config .env "/tmp/xass_dump_\${DATE}.sql"
-rm -f "/tmp/xass_dump_\${DATE}.sql"
-
-# Ротация: оставлять только последние 7 бэкапов
-find "\${BACKUP_DIR}" -name "xass_backup_*.tar.gz" -type f -mtime +7 -delete
-
-echo "[✓] Резервная копия сохранена: \${BACKUP_FILE}"
-\`\`\`
-
-**Установка в cron (каждую ночь в 03:00):**
-\`\`\`bash
-chmod +x /usr/local/bin/xass-autobackup.sh
-(crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/bin/xass-autobackup.sh >> /var/log/xass-backup.log 2>&1") | crontab -
-\`\`\``
-      };
-    }
-
-    if (p.includes('аудит') || p.includes('безопасн') || p.includes('passkey') || p.includes('ssh') || p.includes('порт')) {
-      return {
-        thought: `1. Запуск комплексной проверки периметра безопасности XASS.\n2. Проверка зарегистрированных Passkeys (FIDO2 / WebAuthn).\n3. Проверка открытых портов (ufw / iptables).\n4. Проверка одноразовых ссылок PWA для iOS.`,
-        tools: [
-          {
-            name: 'xass_security.audit_scan',
-            status: 'ok',
-            payload: {
-              https: true,
-              hsts: true,
-              passkeys_registered: bootData.passkeys?.length || 1,
-              pwa_pairing_mode: 'single-use-hmac-sha256',
-              open_ports: [80, 443]
-            }
-          }
-        ],
-        content: `### 🛡️ Отчёт аудита безопасности XASS
-
-Все ключевые уровни защиты проверены:
-
-| Уровень защиты | Статус | Детали |
-| :--- | :--- | :--- |
-| **HTTPS & TLS 1.3** | 🟢 Защищено | Сертификат валиден, HSTS активен |
-| **Passkey / Face ID** | 🟢 Активно | Зарегистрировано биометрических ключей: \`${Math.max(1, (bootData.passkeys || []).length)}\` |
-| **Одноразовые токены** | 🟢 Защищено | Ссылки PWA действуют 10 минут и сгорают после 1 входа |
-| **Сетевые порты** | 🟢 Оптимально | Открыты только 80/TCP и 443/TCP, SSH на нестандартном порту |
-| **Telegram Proofs** | 🟢 Защищено | Опасные команды ПК требуют биометрического подтверждения |
-
-Уязвимостей не выявлено. Контур защищён по стандартам zero-trust.`
-      };
-    }
-
-    if (p.includes('пк') || p.includes('устройств') || p.includes('агент') || p.includes('windows')) {
-      const pcCount = pcs.length;
-      return {
-        thought: `1. Опрос списка зарегистрированных Windows-агентов...\n2. Чтение статуса последних heartbeats и времени задержки.\n3. Проверка состояния локальных хранилищ архива переписки.`,
-        tools: [
-          {
-            name: 'xass_devices.poll',
-            status: 'ok',
-            payload: {
-              total_pc: pcCount || 1,
-              active_pc: (pcs.filter(x => x.is_online).length) || 1,
-              sample_device: pcs[0]?.source_name || 'Домашний ПК'
-            }
-          }
-        ],
-        content: `### 📱 Состояние подключённых устройств
-
-К системе XASS привязано **${Math.max(1, pcCount)}** агент(ов):
-
-* 💻 **${pcs[0]?.source_name || 'Домашний ПК'}:** В сети (v0.17.0) · Heartbeat получен только что.
-* 🔒 **Локальный архив сообщений:** Синхронизирован, свободное место на диске ПК достаточно.
-* ⚡ **Доступные действия:** Блокировка Win+L, отправка в сон, запуск сценариев и передача файлов.
-
-Все устройства откликаются без задержек.`
-      };
-    }
-
-    // Generic intelligent answer
-    return {
-      thought: `1. Пользовательский запрос: "${prompt}"\n2. Анализ намерения и сопоставление с возможностями центра XASS.\n3. Формирование структурированного развёрнутого ответа с практическими рекомендациями.`,
-      tools: [
-        {
-          name: 'hermes_core.process',
-          status: 'ok',
-          payload: { intent: 'general_assistance', model: state.model }
-        }
-      ],
-      content: `Я обработал ваш запрос: **«${prompt}»**.\n\nКак ассистент центра XASS, я могу применить эти данные для автоматизации процессов на сервере, взаимодействия с вашим ПК на Windows или синхронизации Telegram-медиа.\n\nЧто мы хотим сделать следующим шагом?\n\n1. Сформировать автоматический сценарий выполнения.\n2. Проверить системные требования и зависимости.\n3. Запустить команду напрямую на агенте.`
-    };
+  function updateControls() {
+    const sendBtn = $('hermesSendBtn');
+    const newSessionBtn = $('hermesNewSessionBtn');
+    const textarea = $('hermesPromptInput');
+    const ready = state.status === 'online' && state.interactiveAvailable === true;
+    if (sendBtn) sendBtn.disabled = !ready || !state.activeSessionId || state.isGenerating;
+    if (newSessionBtn) newSessionBtn.disabled = !ready || state.isGenerating;
+    if (textarea) textarea.disabled = !ready || !state.activeSessionId || state.isGenerating;
+    document.querySelectorAll('.hermes-action-chip').forEach(chip => {
+      chip.disabled = !ready || state.isGenerating;
+    });
   }
 
   // --- Sending Message ---
   async function sendHermesMessage(text) {
     text = (text || '').trim();
     if (!text || state.isGenerating) return;
+    if (state.status !== 'online' || state.interactiveAvailable !== true || !state.activeSessionId) {
+      toast('Чат XASS AI недоступен: подтверждённый интерактивный транспорт не подключён.');
+      return;
+    }
 
+    const sessionId = state.activeSessionId;
     state.isGenerating = true;
     haptic('medium');
 
-    const userMsgId = 'msg-' + Date.now();
     const userMsg = {
-      id: userMsgId,
+      id: 'msg-' + Date.now(),
       role: 'user',
       content: text,
       timestamp: new Date().toISOString()
     };
-
-    if (!state.messages[state.activeSessionId]) {
-      state.messages[state.activeSessionId] = [];
-    }
-    state.messages[state.activeSessionId].push(userMsg);
+    if (!state.messages[sessionId]) state.messages[sessionId] = [];
+    state.messages[sessionId].push(userMsg);
+    savePersistedSessions();
     renderChatHistory();
 
-    // Clear input
     const input = $('hermesPromptInput');
     if (input) {
       input.value = '';
       input.style.height = 'auto';
     }
 
-    // UI state: generating
-    setStatus('thinking', 'Думает…');
+    setStatus('thinking', 'Выполняется…');
     const typing = $('hermesTypingIndicator');
-    if (typing) typing.style.display = 'block';
-
     const sendBtn = $('hermesSendBtn');
+    if (typing) typing.style.display = 'block';
     if (sendBtn) {
-      sendBtn.disabled = true;
       const icon = sendBtn.querySelector('.send-icon');
       const spin = sendBtn.querySelector('.send-spin');
       if (icon) icon.style.display = 'none';
       if (spin) spin.style.display = 'block';
     }
-
+    updateControls();
     scrollChatToBottom();
 
-    // Try backend proxy chat endpoint
-    let assistantMsg = null;
-    let backendSuccess = false;
-
     try {
-      const headers = { 'Content-Type': 'application/json' };
-      if (X?.initData) headers['X-Telegram-Init-Data'] = X.initData;
-
-      const bodyPayload = {
-        session_id: state.activeSessionId,
-        prompt: text,
-        message: text,
-        model: state.model
-      };
-
-      const response = await fetch('/proxy.php?_passthrough=1&_p=' + encodeURIComponent('/api/mini/hermes/chat'), {
+      const binding = { session_id: sessionId, prompt: text, model: state.model || null };
+      const proof = typeof X?.passkeyAction === 'function'
+        ? await X.passkeyAction('xass-ai:prompt', binding)
+        : '';
+      const response = await fetch(apiUrl('chat'), {
         method: 'POST',
-        headers,
-        body: JSON.stringify(bodyPayload),
+        headers: requestHeaders(true, proof),
+        body: JSON.stringify({
+          session_id: sessionId,
+          prompt: text,
+          model: binding.model
+        }),
         credentials: 'include'
       });
+      const data = await readJson(response);
+      const payload = data?.result && typeof data.result === 'object' ? data.result : data;
+      const replyText = payload?.response || payload?.reply || payload?.text;
 
-      if (response.ok) {
-        const data = await response.json();
-        const replyText = data.response || data.reply || data.text;
-        if (data.ok && replyText) {
-          backendSuccess = true;
-          assistantMsg = {
-            id: 'resp-' + Date.now(),
-            role: 'assistant',
-            model: data.model || state.model,
-            content: replyText,
-            thought: data.thought || data.thinking || '',
-            tools: data.tool_calls || data.tools || [],
-            tokens: data.tokens_used || data.tokens || Math.round(replyText.length / 3.5),
-            timestamp: new Date().toISOString()
-          };
-        }
+      if (!response.ok || data?.ok !== true || isMockPayload(data) || typeof replyText !== 'string' || !replyText.trim()) {
+        throw new Error('Сервер не подтвердил ответ XASS AI');
       }
-    } catch (e) {
-      // Backend not yet available -> demo fallback
-    }
 
-    // If backend wasn't available or failed, use rich simulated demo
-    if (!backendSuccess) {
-      // Simulate realistic agent latency
-      await new Promise(resolve => setTimeout(resolve, 1100 + Math.random() * 600));
-
-      const demo = getDemoAgentResponse(text);
-      assistantMsg = {
+      const tokenCandidate = Number(payload.tokens_used ?? payload.tokens);
+      state.messages[sessionId].push({
         id: 'resp-' + Date.now(),
         role: 'assistant',
-        model: state.model,
-        content: demo.content,
-        thought: demo.thought,
-        tools: demo.tools,
-        tokens: Math.round(demo.content.length / 3.2),
+        content: replyText.trim(),
+        tools: Array.isArray(payload.tool_calls)
+          ? payload.tool_calls
+          : (Array.isArray(payload.tools) ? payload.tools : []),
+        tokens: Number.isFinite(tokenCandidate) && tokenCandidate > 0 ? tokenCandidate : undefined,
         timestamp: new Date().toISOString()
-      };
+      });
+      state.lastError = '';
+      setStatus('online', 'В сети');
+    } catch (e) {
+      state.lastError = e instanceof Error ? e.message : 'Не удалось получить ответ XASS AI';
+      state.interactiveAvailable = false;
+      state.interactiveStatus = 'request_failed';
+      state.messages[sessionId].push({
+        id: 'error-' + Date.now(),
+        role: 'error',
+        content: 'Не удалось получить ответ XASS AI. Проверьте подключение и повторите попытку.',
+        timestamp: new Date().toISOString()
+      });
+      setStatus('error', 'Ошибка подключения');
+    } finally {
+      if (typing) typing.style.display = 'none';
+      if (sendBtn) {
+        const icon = sendBtn.querySelector('.send-icon');
+        const spin = sendBtn.querySelector('.send-spin');
+        if (icon) icon.style.display = 'block';
+        if (spin) spin.style.display = 'none';
+      }
+      state.isGenerating = false;
+      savePersistedSessions();
+      renderChatHistory();
+      updateControls();
     }
-
-    if (typing) typing.style.display = 'none';
-    setStatus('online', 'В сети');
-
-    if (sendBtn) {
-      sendBtn.disabled = false;
-      const icon = sendBtn.querySelector('.send-icon');
-      const spin = sendBtn.querySelector('.send-spin');
-      if (icon) icon.style.display = 'block';
-      if (spin) spin.style.display = 'none';
-    }
-
-    state.messages[state.activeSessionId].push(assistantMsg);
-    savePersistedSessions();
-    renderChatHistory();
-    state.isGenerating = false;
   }
 
   // --- Session Controls ---
-  function createNewSession() {
-    const num = state.sessions.length + 1;
-    const newId = 'session-' + Date.now();
-    const newSession = {
-      id: newId,
-      title: 'Диалог ' + num,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
-    state.sessions.unshift(newSession);
-    state.activeSessionId = newId;
-    state.messages[newId] = [
-      {
-        id: 'greet-' + Date.now(),
-        role: 'assistant',
-        model: state.model,
-        content: `Новая сессия **${newSession.title}** начата. Задайте вопрос или используйте быстрые команды.`,
-        timestamp: new Date().toISOString()
-      }
-    ];
+  async function createNewSession() {
+    if (state.status !== 'online' || state.interactiveAvailable !== true || state.isGenerating) {
+      toast('Интерактивный транспорт XASS AI недоступен. Сессия не создана.');
+      return;
+    }
 
-    savePersistedSessions();
-    renderSessionSelector();
-    renderChatHistory();
-    toast('Создана новая сессия');
-    haptic('light');
+    state.isGenerating = true;
+    updateControls();
+    try {
+      const binding = { title: null };
+      const proof = typeof X?.passkeyAction === 'function'
+        ? await X.passkeyAction('xass-ai:session-create', binding)
+        : '';
+      const response = await fetch(apiUrl('sessions'), {
+        method: 'POST',
+        headers: requestHeaders(true, proof),
+        body: JSON.stringify({}),
+        credentials: 'include'
+      });
+      const data = await readJson(response);
+      const payload = data?.result && typeof data.result === 'object' ? data.result : data;
+      const session = payload?.session;
+      const sessionId = String(session?.id || '').trim();
+      if (!response.ok || data?.ok !== true || isMockPayload(data) || session?.mock === true || !sessionId) {
+        throw new Error('Сервер не подтвердил создание сессии XASS AI');
+      }
+
+      const confirmed = {
+        ...session,
+        id: sessionId,
+        title: String(session.title || 'Сессия XASS AI')
+      };
+      state.sessions = [confirmed, ...state.sessions.filter(item => item.id !== sessionId)];
+      state.activeSessionId = sessionId;
+      state.messages[sessionId] = [];
+      state.lastError = '';
+      savePersistedSessions();
+      renderSessionSelector();
+      renderChatHistory();
+      toast('Сессия XASS AI создана сервером');
+      haptic('light');
+    } catch (e) {
+      state.lastError = e instanceof Error ? e.message : 'Сессия XASS AI не создана';
+      toast(state.lastError);
+    } finally {
+      state.isGenerating = false;
+      updateControls();
+    }
   }
 
   function clearCurrentSession() {
@@ -785,15 +630,15 @@ chmod +x /usr/local/bin/xass-autobackup.sh
       state.messages[state.activeSessionId] = [];
       savePersistedSessions();
       renderChatHistory();
-      toast('История сессии очищена');
+      toast('Локальная копия истории скрыта');
       haptic('medium');
     };
 
     if (X?.ask) {
-      X.ask('Очистить сообщения текущей сессии Гермеса?', ok => {
+      X.ask('Скрыть локальную копию сообщений этой сессии XASS AI?', ok => {
         if (ok) doClear();
       });
-    } else if (confirm('Очистить сообщения текущей сессии Гермеса?')) {
+    } else if (confirm('Скрыть локальную копию сообщений этой сессии XASS AI?')) {
       doClear();
     }
   }
@@ -817,6 +662,7 @@ chmod +x /usr/local/bin/xass-autobackup.sh
     if (sessionSel) {
       sessionSel.onchange = () => {
         state.activeSessionId = sessionSel.value;
+        loadPersistedMessages(state.activeSessionId);
         savePersistedSessions();
         renderChatHistory();
         haptic('light');

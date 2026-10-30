@@ -31,6 +31,8 @@ from app.native_api import build_router as build_native_router, consume_native_p
 from app.native_dashboard_api import build_router as build_native_dashboard_router
 from app.music_storage_api import build_router as build_music_storage_router
 from app.hermes_api import build_router as build_hermes_router
+from app.discord_interactions import build_router as build_discord_router
+from app.music_curation_api import build_router as build_music_curation_router
 from app.schemas import (
     AgentPairClaimPayload,
     AgentPairClaimResponse,
@@ -199,7 +201,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.21.0"
+APP_VERSION = "0.21.1"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -1398,7 +1400,9 @@ app.include_router(build_music_router(settings, require_mini_owner, _public_orig
 app.include_router(build_native_router(settings, require_mini_owner))
 app.include_router(build_native_dashboard_router(settings, require_mini_owner))
 app.include_router(build_music_storage_router(settings, require_mini_owner, _require_pwa_action_proof))
-app.include_router(build_hermes_router(settings, require_mini_owner))
+app.include_router(build_hermes_router(settings, require_mini_owner, _require_pwa_action_proof))
+app.include_router(build_discord_router(settings, SessionLocal))
+app.include_router(build_music_curation_router(settings, require_mini_owner))
 
 
 @app.get("/api/pwa/config")
