@@ -167,6 +167,22 @@ print(json.dumps({'source_revision':_content_revision(root,_package_files(root))
                  'installers':digests,'hermes_url':s.hermes_url}))
 '''
 
+# This imports settings/URL parsing only. It never opens or connects to SQLite,
+# and neither the configured URL nor any secret is written to stdout/stderr here.
+STORAGE_CONFIG_CHECK = r'''
+import os
+from pathlib import Path
+from sqlalchemy.engine import make_url
+from app.config import Settings
+url = make_url(Settings().database_url)
+expected = Path.cwd() / 'data' / 'serverredus.db'
+valid = (url.get_backend_name() == 'sqlite' and bool(url.database)
+         and not url.host and not url.query and not url.username and not url.password)
+if not valid or Path(os.path.abspath(url.database)) != expected:
+    raise SystemExit(1)
+print('FIXED_SQLITE_CONFIRMED')
+'''
+
 
 class Deployment:
     def __init__(self, root: Path, target: str, run_id: str):
@@ -306,6 +322,106 @@ class Deployment:
             raise DeployError("Protection completed but public backend health needs review.")
         print("[OK] protect-config completed: public HEAD denied, backend healthy, config bytes and running services unchanged.", flush=True)
 
+    def protect_storage(self) -> None:
+        """Owner-only emergency containment; no sudo, DB reads, writes or restarts."""
+        self.phase("protect-storage: verify exact live revision, SQLite path and same owner/service UID")
+        if self.head() != BEFORE:
+            raise DeployError("Live revision differs from the inspected server; storage protection stopped.")
+        self.clean()
+        no_links(self.root / ".env")
+        self.environment_access()
+        if self.python("-c", STORAGE_CONFIG_CHECK, timeout=20).strip() != b"FIXED_SQLITE_CONFIRMED":
+            raise DeployError("Configured database is not the fixed approved SQLite file.")
+
+        def public_head(path: str) -> bytes:
+            result = self.command("curl", "--head", "--silent", "--show-error", "--connect-timeout", "5",
+                "--max-time", "10", "--output", "/dev/null", "--write-out", "%{http_code}\t%{content_type}",
+                LISTEN_URL + path, timeout=12).strip()
+            if len(result) > 256 or not re.match(rb"^[1-5][0-9]{2}\t", result):
+                raise DeployError("Public HEAD check did not return valid bounded metadata.")
+            return result
+
+        public_paths = ("/", "/miniapp.php", "/assets/miniapp-device-key.js")
+        public_before = {path: public_head(path) for path in public_paths}
+        plans = (("data/serverredus.db", 0o600, False, False),
+                 ("data/serverredus.db-wal", 0o600, True, False),
+                 ("data/serverredus.db-shm", 0o600, True, False),
+                 (".git", 0o700, False, True))
+        opened = []
+        absent = []
+        current_uid = os.geteuid()
+
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+
+        def validate_target(info, directory):
+            correct_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+            if not correct_type or info.st_uid != current_uid or (not directory and info.st_nlink != 1):
+                raise DeployError("Storage target is not an owned single regular file or approved directory.")
+
+        try:
+            # Open and validate EVERY target before changing ANY permissions.
+            for relative, mode, optional, directory in plans:
+                path = self.root / relative
+                no_links(path)
+                try:
+                    expected = path.lstat()
+                except FileNotFoundError:
+                    if optional:
+                        absent.append(path)
+                        continue
+                    raise DeployError("A required fixed storage target is missing.") from None
+                validate_target(expected, directory)
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                if directory:
+                    flags |= getattr(os, "O_DIRECTORY", 0)
+                descriptor = os.open(path, flags)
+                opened.append((path, descriptor, mode, directory, expected))
+                actual = os.fstat(descriptor)
+                validate_target(actual, directory)
+                if identity(actual) != identity(expected):
+                    raise DeployError("Storage target changed while opening; no permissions changed.")
+            for path, descriptor, _mode, directory, expected in opened:
+                no_links(path)
+                current = path.lstat()
+                validate_target(current, directory)
+                if identity(current) != identity(expected) or identity(os.fstat(descriptor)) != identity(expected):
+                    raise DeployError("Storage target changed before protection; no permissions changed.")
+            if any(path.exists() or path.is_symlink() for path in absent):
+                raise DeployError("SQLite sidecars changed during validation; inspect and retry.")
+            # Closing access is intentional. Never undo these modes on later failure.
+            for path, descriptor, mode, directory, expected in opened:
+                os.fchmod(descriptor, mode)
+            for path, descriptor, mode, directory, expected in opened:
+                actual = os.fstat(descriptor)
+                current = path.lstat()
+                validate_target(actual, directory)
+                if ((actual.st_dev, actual.st_ino, actual.st_uid, actual.st_gid) != identity(expected)[:4]
+                        or stat.S_IMODE(actual.st_mode) != mode or identity(current) != identity(actual)):
+                    raise DeployError("Storage changed during protection; hardened permissions retained, inspect manually.")
+            if any(path.exists() or path.is_symlink() for path in absent):
+                raise DeployError("A new SQLite sidecar needs inspection; existing hardened permissions retained.")
+        finally:
+            for _path, descriptor, _mode, _directory, _expected in opened:
+                os.close(descriptor)
+
+        self.phase("protect-storage: database/sidecars 0600, .git 0700; no bytes changed or services restarted")
+        private_paths = ["/" + path.relative_to(self.root).as_posix() for path, _, _, directory, _ in opened if not directory]
+        private_paths += ["/.git/config", "/.env"]
+        for path in private_paths:
+            if public_head(path).split(b"\t", 1)[0] not in {b"403", b"404"}:
+                print("[CRITICAL] Private HEAD denial not verified; keep restricted modes, nginx still requires administrator review.", flush=True)
+                raise DeployError("Storage exposure closure unverified; hardened permissions remain in place.")
+        for path, previous in public_before.items():
+            if public_head(path) != previous:
+                raise DeployError("Public route changed after protection; restricted storage permissions retained.")
+        self.health(public=False)
+        body = self.command("curl", "--fail", "--silent", "--show-error", "--connect-timeout", "5",
+            "--max-time", "10", LISTEN_URL + "/health", timeout=12)
+        if json.loads(body).get("status") != "ok":
+            raise DeployError("Storage is restricted but public backend health requires review.")
+        print("[OK] protect-storage completed: private HEAD denied, public routes unchanged, backend healthy; no DB/config bytes, keys or services changed.", flush=True)
+
     def health(self, *, public: bool) -> None:
         ready = False
         for _ in range(20):
@@ -415,7 +531,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--protect-config", action="store_true", help="Explicit permission-only protection; no code/key/service changes")
+    protection = parser.add_mutually_exclusive_group()
+    protection.add_argument("--protect-config", action="store_true", help="Explicit permission-only protection; no code/key/service changes")
+    protection.add_argument("--protect-storage", action="store_true", help="Owner-only fixed database/Git permission protection; no sudo or database reads")
     args = parser.parse_args()
     if Path.cwd().absolute() != ROOT:
         print("[FAILED] Run only from the explicitly approved server checkout.", flush=True)
@@ -432,6 +550,8 @@ def main() -> int:
             action = Deployment(ROOT, args.target, args.run_id)
             if args.protect_config:
                 action.protect_config()
+            elif args.protect_storage:
+                action.protect_storage()
             else:
                 action.execute()
         return 0

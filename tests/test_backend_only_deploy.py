@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -379,7 +380,9 @@ class TransportTests(unittest.TestCase):
         self.assertIn("default: inspect", workflow)
         self.assertIn("DEPLOY_BACKEND_ONLY_KEEP_CLIENTS", workflow)
         self.assertIn("HARDEN_PRIVATE_CONFIG", workflow)
-        self.assertIn("options: [inspect, protect-config, protect-web, deploy-backend-only]", workflow)
+        self.assertIn("options: [inspect, protect-config, protect-storage, protect-web, deploy-backend-only]", workflow)
+        self.assertIn("HARDEN_PRIVATE_STORAGE", workflow)
+        self.assertIn("--protect-storage", workflow)
         self.assertIn("HARDEN_PRIVATE_WEB_FILES", workflow)
         self.assertIn("deploy/nginx_private_guard.py' | sudo -n python3 - --run-id", workflow)
         self.assertIn("target != os.environ['WORKFLOW_SHA']", workflow)
@@ -390,6 +393,167 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("gh release", workflow)
         self.assertNotIn("deploy/update.sh", workflow)
+
+
+class StorageProtectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "server"
+        self.root.mkdir()
+        self.item = deploy.Deployment(self.root, "a" * 40, "storage-test")
+        self.item.head = Mock(return_value=deploy.BEFORE)
+        self.item.clean = Mock()
+        self.item.environment_access = Mock()
+        self.item.python = Mock(return_value=b"FIXED_SQLITE_CONFIRMED\n")
+        self.item.health = Mock()
+        self.item.restart = Mock()
+        self.private_status = b"403"
+        self.calls = []
+        self.metadata = {}
+        for index, relative in enumerate(("data/serverredus.db", "data/serverredus.db-wal", "data/serverredus.db-shm", ".git")):
+            self.metadata[self.root / relative] = dict(st_dev=1, st_ino=100 + index, st_uid=1000, st_gid=1000,
+                st_mode=0o40755 if relative == ".git" else 0o100664, st_nlink=2 if relative == ".git" else 1)
+        self.descriptors = {}
+        self.changed = []
+        self.closes = []
+        self.extra_validation = None
+
+    def command(self, *args, **kwargs):
+        self.calls.append(args)
+        self.assertEqual(args[0], "curl")
+        if "--head" not in args:
+            self.assertEqual(args[-1], deploy.LISTEN_URL + "/health")
+            return b'{"status":"ok"}'
+        path = args[-1].removeprefix(deploy.LISTEN_URL)
+        private = path in ("/.env", "/.git/config") or path.startswith("/data/")
+        return self.private_status + b"\ttext/html" if private else b"200\ttext/html"
+
+    def perform(self):
+        self.item.command = Mock(side_effect=self.command)
+        original_lstat = Path.lstat
+        def lstat(path, *args, **kwargs):
+            if path in self.metadata:
+                info = self.metadata[path]
+                if info is None:
+                    raise FileNotFoundError(2, "missing optional fixture")
+                return SimpleNamespace(**info)
+            return original_lstat(path, *args, **kwargs)
+        def open_target(path, flags):
+            self.assertIn(path, self.metadata)
+            self.assertFalse(flags & os.O_CREAT)
+            if hasattr(os, "O_NOFOLLOW"):
+                self.assertTrue(flags & os.O_NOFOLLOW)
+            if hasattr(os, "O_NONBLOCK"):
+                self.assertTrue(flags & os.O_NONBLOCK)
+            descriptor = 100 + len(self.descriptors)
+            self.descriptors[descriptor] = path
+            if self.extra_validation:
+                self.extra_validation(path)
+            return descriptor
+        def chmod(descriptor, mode):
+            self.changed.append((self.descriptors[descriptor], mode))
+            self.metadata[self.descriptors[descriptor]]["st_mode"] = (self.metadata[self.descriptors[descriptor]]["st_mode"] & ~0o7777) | mode
+        with patch.object(deploy.os, "geteuid", return_value=1000, create=True), \
+                patch.object(deploy, "no_links") as links, patch.object(Path, "lstat", lstat), \
+                patch.object(deploy.os, "open", side_effect=open_target), \
+                patch.object(deploy.os, "fstat", side_effect=lambda descriptor: SimpleNamespace(**self.metadata[self.descriptors[descriptor]])), \
+                patch.object(deploy.os, "fchmod", side_effect=chmod, create=True), \
+                patch.object(deploy.os, "close", side_effect=lambda descriptor: self.closes.append(descriptor)), \
+                patch.object(Path, "read_bytes", side_effect=AssertionError("NO storage/config bytes may be read")), \
+                patch.object(deploy.os, "read", side_effect=AssertionError("NO descriptor data may be read")), \
+                patch.object(deploy, "private_read", side_effect=AssertionError("NO private reads")), \
+                redirect_stdout(io.StringIO()) as stdout:
+            self.item.protect_storage()
+        return stdout.getvalue(), links
+
+    def test_fixed_owner_only_targets_no_reads_writes_restart_or_checkout(self):
+        output, links = self.perform()
+        self.assertIn("[OK]", output)
+        self.assertEqual(self.changed, [(path, 0o700 if path.name == ".git" else 0o600) for path in self.metadata])
+        self.assertEqual(len(self.closes), 4)
+        self.item.clean.assert_called_once_with()
+        self.item.environment_access.assert_called_once_with()
+        self.item.restart.assert_not_called()
+        self.item.python.assert_called_once_with("-c", deploy.STORAGE_CONFIG_CHECK, timeout=20)
+        for path in self.metadata:
+            self.assertIn(((path,),), [(call.args,) for call in links.call_args_list])
+        for args in self.calls:
+            if args[-1] != deploy.LISTEN_URL + "/health":
+                self.assertIn("--head", args)
+                self.assertIn("/dev/null", args)
+
+    def test_optional_sidecars_may_be_absent(self):
+        self.metadata[self.root / "data/serverredus.db-wal"] = None
+        self.metadata[self.root / "data/serverredus.db-shm"] = None
+        self.perform()
+        self.assertEqual(len(self.changed), 2)
+        self.assertFalse(any("-wal" in args[-1] or "-shm" in args[-1] for args in self.calls))
+
+    def test_foreign_owner_or_link_or_wrong_type_rejects_everything_before_chmod(self):
+        git_path = self.root / ".git"
+        initial = dict(self.metadata[git_path])
+        for change in ({"st_uid": 33}, {"st_mode": 0o120777}, {"st_mode": 0o100644}):
+            self.metadata[git_path] = {**initial, **change}
+            self.descriptors.clear()
+            with self.subTest(change=change), self.assertRaises(deploy.DeployError):
+                self.perform()
+            self.assertEqual(self.changed, [])
+
+    def test_database_hardlink_or_fifo_is_rejected(self):
+        path = self.root / "data/serverredus.db"
+        original = dict(self.metadata[path])
+        for change in ({"st_nlink": 2}, {"st_mode": 0o010600}):
+            self.metadata[path] = {**original, **change}
+            with self.subTest(change=change), self.assertRaises(deploy.DeployError):
+                self.perform()
+            self.assertEqual(self.changed, [])
+
+    def test_descriptor_identity_drift_is_rejected_before_any_chmod(self):
+        self.extra_validation = lambda path: self.metadata[path].update(st_ino=999)
+        with self.assertRaises(deploy.DeployError):
+            self.perform()
+        self.assertFalse(self.changed)
+        self.assertEqual(len(self.closes), 1)
+
+    def test_public_probe_failure_keeps_restricted_modes(self):
+        self.private_status = b"200"
+        with self.assertRaises(deploy.DeployError):
+            self.perform()
+        self.assertEqual(len(self.changed), 4)
+        self.assertEqual(self.metadata[self.root / ".git"]["st_mode"] & 0o777, 0o700)
+        self.assertEqual(self.metadata[self.root / "data/serverredus.db"]["st_mode"] & 0o777, 0o600)
+        self.item.restart.assert_not_called()
+
+    def test_wrong_revision_configured_database_or_service_owner_aborts_without_chmod(self):
+        self.item.head.return_value = "b" * 40
+        with self.assertRaises(deploy.DeployError):
+            self.perform()
+        self.item.head.return_value = deploy.BEFORE
+        self.item.python.return_value = b"OTHER_DATABASE"
+        with self.assertRaises(deploy.DeployError):
+            self.perform()
+        self.item.python.return_value = b"FIXED_SQLITE_CONFIRMED"
+        self.item.environment_access.side_effect = deploy.DeployError("different owner")
+        with self.assertRaises(deploy.DeployError):
+            self.perform()
+        self.assertFalse(self.changed)
+
+    def test_sqlite_config_check_accepts_only_exact_database_and_never_connects(self):
+        valid = "sqlite:///" + (self.root / "data/serverredus.db").as_posix()
+        settings = SimpleNamespace(database_url=valid)
+        fake_config = SimpleNamespace(Settings=lambda: settings)
+        with patch.dict(sys.modules, {"app.config": fake_config}), patch.object(Path, "cwd", return_value=self.root):
+            for url in (valid, valid + "?mode=ro", valid.replace("serverredus.db", "different.db"), "postgresql://example/database"):
+                settings.database_url = url
+                with self.subTest(url=url), redirect_stdout(io.StringIO()) as output:
+                    if url == valid:
+                        exec(deploy.STORAGE_CONFIG_CHECK, {})
+                        self.assertEqual(output.getvalue().strip(), "FIXED_SQLITE_CONFIRMED")
+                    else:
+                        with self.assertRaises(SystemExit):
+                            exec(deploy.STORAGE_CONFIG_CHECK, {})
+                        self.assertEqual(output.getvalue(), "")
 
 
 if __name__ == "__main__":

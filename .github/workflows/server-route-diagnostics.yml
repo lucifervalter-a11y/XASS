@@ -7,7 +7,7 @@ on:
       mode:
         description: Read-only diagnostics by default; deployment is an explicit separate action
         type: choice
-        options: [inspect, protect-config, protect-web, deploy-backend-only]
+        options: [inspect, protect-config, protect-storage, protect-web, deploy-backend-only]
         default: inspect
       target_sha:
         description: Full reviewed server-only overlay SHA (must equal this workflow revision)
@@ -18,7 +18,7 @@ on:
         type: string
         default: ''
       confirm:
-        description: DEPLOY_BACKEND_ONLY_KEEP_CLIENTS, HARDEN_PRIVATE_CONFIG or HARDEN_PRIVATE_WEB_FILES for the selected explicit action
+        description: DEPLOY_BACKEND_ONLY_KEEP_CLIENTS, HARDEN_PRIVATE_CONFIG, HARDEN_PRIVATE_STORAGE or HARDEN_PRIVATE_WEB_FILES for the selected explicit action
         type: string
         default: ''
 
@@ -112,7 +112,7 @@ jobs:
 
   deploy-backend-only:
     if: >-
-      (inputs.mode == 'deploy-backend-only' || inputs.mode == 'protect-config' || inputs.mode == 'protect-web') &&
+      (inputs.mode == 'deploy-backend-only' || inputs.mode == 'protect-config' || inputs.mode == 'protect-storage' || inputs.mode == 'protect-web') &&
       github.ref == 'refs/heads/codex/xass-server-only-discord-20261030'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -135,12 +135,13 @@ jobs:
           mode = os.environ['MODE']
           confirmation = {'deploy-backend-only': 'DEPLOY_BACKEND_ONLY_KEEP_CLIENTS',
                           'protect-config': 'HARDEN_PRIVATE_CONFIG',
+                          'protect-storage': 'HARDEN_PRIVATE_STORAGE',
                           'protect-web': 'HARDEN_PRIVATE_WEB_FILES'}.get(mode)
           if (not re.fullmatch(r'[0-9a-f]{40}', target) or target != os.environ['WORKFLOW_SHA']
               or os.environ['EXPECTED_BEFORE'] != '81601bb56190c564c1f25928f3c60c616ff9cdf4'
               or not confirmation or os.environ['CONFIRM'] != confirmation):
               raise SystemExit('Explicit scope, pinned workflow SHA or live revision confirmation is missing.')
-          if mode in {'protect-config', 'protect-web'}:
+          if mode in {'protect-config', 'protect-storage', 'protect-web'}:
               print('Explicit private-data protection authorized; no code deployment or backend restart.')
               raise SystemExit(0)
           repo = os.environ['REPOSITORY']
@@ -181,7 +182,7 @@ jobs:
           set -euo pipefail
           # Both substitutions are constrained hex/digits; all server configuration stays private.
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$MODE" == 'protect-config' || "$MODE" == 'protect-web' || "$MODE" == 'deploy-backend-only' ]]
+          [[ "$MODE" == 'protect-config' || "$MODE" == 'protect-storage' || "$MODE" == 'protect-web' || "$MODE" == 'deploy-backend-only' ]]
           [[ "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+-[0-9]+$ ]]
           bash deploy/github_ssh.sh exec <<REMOTE
           set -euo pipefail
@@ -193,6 +194,8 @@ jobs:
             test "\$(git rev-parse HEAD)" = '81601bb56190c564c1f25928f3c60c616ff9cdf4'
             test -z "\$(git status --porcelain --untracked-files=no)" || { echo 'Tracked server changes need review.'; exit 1; }
             git show '$TARGET_SHA:deploy/nginx_private_guard.py' | sudo -n python3 - --run-id 'protect-web-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT'
+          elif [[ '$MODE' == 'protect-storage' ]]; then
+            git show '$TARGET_SHA:deploy/backend_only_deploy.py' | .venv/bin/python - --target '$TARGET_SHA' --run-id 'protect-storage-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT' --protect-storage
           elif [[ '$MODE' == 'protect-config' ]]; then
             git show '$TARGET_SHA:deploy/backend_only_deploy.py' | .venv/bin/python - --target '$TARGET_SHA' --run-id 'protect-config-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT' --protect-config
           else
