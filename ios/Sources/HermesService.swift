@@ -114,45 +114,6 @@ public struct HermesMessage: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
-// MARK: - Live Activity & Dynamic Island Attributes
-
-#if canImport(ActivityKit)
-public struct HermesActivityAttributes: ActivityAttributes {
-    public struct ContentState: Codable, Hashable, Sendable {
-        public var queryPreview: String
-        public var statusPhase: String
-        public var progress: Double
-        public var isThinking: Bool
-        public var responseTokens: Int
-        public var stepDescription: String
-
-        public init(
-            queryPreview: String,
-            statusPhase: String,
-            progress: Double = 0.0,
-            isThinking: Bool = true,
-            responseTokens: Int = 0,
-            stepDescription: String = ""
-        ) {
-            self.queryPreview = queryPreview
-            self.statusPhase = statusPhase
-            self.progress = progress
-            self.isThinking = isThinking
-            self.responseTokens = responseTokens
-            self.stepDescription = stepDescription
-        }
-    }
-
-    public var sessionID: String
-    public var sessionTitle: String
-
-    public init(sessionID: String, sessionTitle: String) {
-        self.sessionID = sessionID
-        self.sessionTitle = sessionTitle
-    }
-}
-#endif
-
 // MARK: - Live Activity Manager
 
 @MainActor
@@ -254,9 +215,9 @@ public final class HermesService: ObservableObject {
     @Published public var currentReasoningStep: String = ""
     @Published public var errorMessage: String? = nil
 
-    public weak var api: OwnerService?
+    weak var api: OwnerService?
 
-    public init(api: OwnerService? = nil) {
+    init(api: OwnerService? = nil) {
         self.api = api
     }
 

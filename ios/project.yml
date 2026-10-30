@@ -17,7 +17,11 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+      - path: Shared
       - path: Resources
+    dependencies:
+      - target: XASSWidgets
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.xass.mobile
@@ -33,6 +37,7 @@ targets:
         NSSpeechRecognitionUsageDescription: "По вашему запросу расшифровать скачанную песню. По умолчанию распознавание локальное; распознавание Apple через интернет используется только если вы явно включите его."
         NSLocalNetworkUsageDescription: "Передать уже скачанный трек на ваш компьютер XASS в той же сети Wi-Fi. Другие устройства библиотеку не получают."
         UIBackgroundModes: [audio]
+        NSSupportsLiveActivities: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -45,6 +50,26 @@ targets:
     scheme:
       testTargets: [XASSTests, XASSUITests]
       gatherCoverageData: true
+  XASSWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widgets
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.xass.mobile.widgets
+        CODE_SIGN_STYLE: Automatic
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    info:
+      path: Generated/Widgets-Info.plist
+      properties:
+        CFBundleDisplayName: XASS
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
   XASSTests:
     type: bundle.unit-test
     platform: iOS

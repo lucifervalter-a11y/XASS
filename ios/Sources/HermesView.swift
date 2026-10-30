@@ -12,7 +12,7 @@ struct HermesQuickPrompt: Identifiable {
 public struct HermesView: View {
     @ObservedObject public var hermes: HermesService
     @ObservedObject public var themeManager = ThemeManager.shared
-    public weak var store: NativeStore?
+    weak var store: NativeStore?
 
     @State private var inputPrompt: String = ""
     @State private var showSessionSheet = false
@@ -21,7 +21,7 @@ public struct HermesView: View {
     @State private var isCreatingSession = false
     @FocusState private var isInputFocused: Bool
 
-    public init(hermes: HermesService, store: NativeStore? = nil) {
+    init(hermes: HermesService, store: NativeStore? = nil) {
         self.hermes = hermes
         self.store = store
     }

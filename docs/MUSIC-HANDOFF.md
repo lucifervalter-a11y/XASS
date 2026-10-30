@@ -32,6 +32,9 @@ rejected as protocol-2 targets before the source is paused. Legacy `loading`
 command results no longer count as successful playback. The new iOS client
 rejects a server which does not echo protocol 2. Update backend, agent and iOS
 together; do not advertise protocol-2 readiness on an old agent.
+The legacy session `force` field is still accepted for decoding but cannot
+override an audible foreign lease. Such requests receive `transfer_required`;
+only a confirmed quiet source or the handoff protocol permits ownership change.
 
 The Windows catalog play shortcut remains paired-agent authenticated. It records
 its active PC lease and refuses to start over another audible device; use the

@@ -3,39 +3,6 @@ import WidgetKit
 #if canImport(ActivityKit)
 import ActivityKit
 
-/// Attributes for Now Playing Live Activity & Dynamic Island.
-public struct NowPlayingAttributes: ActivityAttributes {
-    public struct ContentState: Codable, Hashable {
-        public var title: String
-        public var artist: String
-        public var duration: Double
-        public var position: Double
-        public var isPlaying: Bool
-        public var deviceName: String
-
-        public init(
-            title: String,
-            artist: String,
-            duration: Double,
-            position: Double,
-            isPlaying: Bool,
-            deviceName: String
-        ) {
-            self.title = title
-            self.artist = artist
-            self.duration = duration
-            self.position = position
-            self.isPlaying = isPlaying
-            self.deviceName = deviceName
-        }
-    }
-
-    public var trackID: String
-    public init(trackID: String) {
-        self.trackID = trackID
-    }
-}
-
 /// Dynamic Island & Lock Screen Widget presentation.
 public struct NowPlayingActivityWidgetView: View {
     let context: ActivityViewContext<NowPlayingAttributes>
@@ -187,6 +154,7 @@ public struct XASSHomeWidget: Widget {
     public var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: XASSWidgetProvider()) { entry in
             XASSHomeWidgetView(entry: entry)
+                .containerBackground(Color(red: 10 / 255, green: 14 / 255, blue: 20 / 255), for: .widget)
         }
         .configurationDisplayName("XASS Музыка")
         .description("Сейчас играет и статус сервера XASS")

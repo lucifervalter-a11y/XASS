@@ -997,7 +997,11 @@ def build_router(settings, require_owner, public_origin):
         if payload.action in {"play", "resume"} and payload.handoff_id is None:
             active = await session.get(MusicSession, 1)
             meta = await playback_meta(session)
-            if meta.transfer_id or (active and active.device != "agent:" + payload.source_name and active.state in {"playing", "loading"}):
+            pending = await session.get(MusicTransfer, meta.transfer_id) if meta.transfer_id else None
+            legacy_start = bool(payload.action == "play" and pending and pending.status == "starting"
+                and pending.target.get("protocol", 1) == 1 and active and active.device == "agent:" + payload.source_name
+                and active.track_id == payload.track_id)
+            if (meta.transfer_id and not legacy_start) or (active and active.device != "agent:" + payload.source_name and active.state in {"playing", "loading"}):
                 raise HTTPException(409, "Сначала подтвердите передачу через «Где слушать»")
         source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == payload.source_name))
         if source is None or source.source_type != "PC_AGENT" or not music_source_live(source):
@@ -1102,7 +1106,10 @@ def build_router(settings, require_owner, public_origin):
         if changed_player and item.state in {"playing", "loading"}:
             from app.music_playback import pc_source_released
             released = item.device.startswith("agent:") and await pc_source_released(session, item)
-            if not (payload.takeover and (payload.force or released)):
+            # Accept legacy `force` in the wire schema, but it is never proof
+            # that the old player stopped. Only its confirmed quiet state can
+            # release an audible lease without the handoff protocol.
+            if not (payload.takeover and released):
                 raise HTTPException(409, {"code": "transfer_required", "source_device": item.device,
                     "message": "Переключите устройство через «Где слушать», чтобы сохранить позицию и остановить старый плеер"})
             if item.device.startswith("agent:") and item.device != payload.device:
@@ -1151,7 +1158,7 @@ def build_router(settings, require_owner, public_origin):
                 await control(ControlBody(source_name=stop_pc, action="stop",
                     expires_at=int(time.time()) + 60), request, user, session)
             except HTTPException:
-                pass  # Offline PC: nothing is audible there that the server could stop.
+                pass  # Prior fresh quiet heartbeat already proved release; STOP is cleanup only.
         from app.services.music_broadcast import sync_music_profile
         await sync_music_profile(session, settings)
         return {"ok": True, "session": await current_session(session)}

@@ -142,6 +142,38 @@ class CurationTests(unittest.TestCase):
             self.service.undo(edit["id"], True)
         self.assertEqual(current, self.path.read_bytes())
 
+    def test_corrupt_stage_copy_cannot_replace_original_during_apply(self):
+        original = self.path.read_bytes(); proposal = self.proposal()
+        copy = shutil.copy2
+        def corrupted(source, destination, **kwargs):
+            result = copy(source, destination, **kwargs)
+            if Path(destination).name.startswith(".xass-curation-"):
+                with Path(destination).open("ab") as stream:
+                    stream.write(b"copy fault")
+            return result
+        with patch("music_curation.shutil.copy2", side_effect=corrupted):
+            with self.assertRaisesRegex(CurationError, "копия оригинала повреждена"):
+                self.service.apply(proposal["id"], True)
+        self.assertEqual(original, self.path.read_bytes())
+        self.assertEqual(self.service.history()["edits"], [])
+        self.assertEqual(list(self.music.glob(".xass-curation-*")), [])
+
+    def test_corrupt_stage_copy_cannot_replace_current_track_during_undo(self):
+        edit = self.service.apply(self.proposal()["id"], True)
+        current = self.path.read_bytes(); copy = shutil.copy2
+        def corrupted(source, destination, **kwargs):
+            result = copy(source, destination, **kwargs)
+            if Path(destination).name.startswith(".xass-curation-undo-"):
+                with Path(destination).open("ab") as stream:
+                    stream.write(b"copy fault")
+            return result
+        with patch("music_curation.shutil.copy2", side_effect=corrupted):
+            with self.assertRaisesRegex(CurationError, "копия оригинала повреждена"):
+                self.service.undo(edit["id"], True)
+        self.assertEqual(current, self.path.read_bytes())
+        self.assertEqual(self.service.history()["edits"][0]["state"], "applied")
+        self.assertEqual(list(self.music.glob(".xass-curation-*")), [])
+
     def test_duplicate_candidates_not_inferred_from_duration_or_variant(self):
         shutil.copy2(self.path, self.music / "byte-copy.wav")
         self.make_audio("different-encoding.wav", 8)

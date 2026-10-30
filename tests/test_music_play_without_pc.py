@@ -120,9 +120,9 @@ class PlayWithoutPCTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["session"]["device"], "agent:ПК")
         self.assertEqual(await self.commands(), [])
 
-    async def test_pc_queue_lease_does_not_block_phone_takeover(self):
-        # Root cause: after the PC auto-advanced a queue, a phone claim was
-        # rejected with agent_playback_authoritative even with force=true.
+    async def test_force_cannot_steal_disconnected_pc_queue_lease(self):
+        # Disconnection and a legacy force flag cannot prove a queued PC is
+        # silent; preserve its lease until an actual stop receipt arrives.
         track = await self.music_track()
         await self.pc_lease(track)
         async with self.sessions() as session:
@@ -135,11 +135,13 @@ class PlayWithoutPCTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
         await self.age_heartbeat("ПК", 30)
         response = await self.phone_claim(track, force=True)
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "transfer_required")
         async with self.sessions() as session:
-            self.assertIsNone((await session.get(MusicPlaybackState, 1)).queue_command_id)
+            self.assertIsNotNone((await session.get(MusicPlaybackState, 1)).queue_command_id)
             item = await session.get(MusicSession, 1)
-            self.assertEqual((item.device, item.session_key), ("local", self.phone_key))
+            self.assertEqual((item.device, item.session_key), ("agent:ПК", self.old_key))
+        self.assertEqual(len(await self.commands()), 1, "No unconfirmed replacement or STOP command")
 
     async def test_online_pc_still_requires_handoff_without_force(self):
         # PC remote must keep working when the PC IS online and playing.

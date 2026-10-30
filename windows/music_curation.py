@@ -669,10 +669,14 @@ class CurationService:
             os.close(fd); stage = Path(stage_name)
             try:
                 shutil.copy2(backup, stage)
+                if identity(stage) != before_hash:
+                    raise CurationError("Подготовленная копия оригинала повреждена. Правка отменена.")
                 write_tags(stage, json.loads(pending["changes"]))
                 after_hash = identity(stage)
                 with stage.open("r+b") as stream:
                     os.fsync(stream.fileno())
+                if identity(backup) != before_hash:
+                    raise CurationError("Оригинал в журнале изменился. Правка отменена.")
                 # Commit redo/undo evidence BEFORE the atomic rename. On killed
                 # processes recovery identifies the actual state from full hashes.
                 db.execute("INSERT INTO edits VALUES(?,?,?,?,?,?,?)", (edit, str(path), before_hash, after_hash, backup.name, "prepared", time.time())); db.commit()
@@ -706,6 +710,8 @@ class CurationService:
                 shutil.copy2(backup, stage)
                 with stage.open("r+b") as stream:
                     os.fsync(stream.fileno())
+                if identity(stage) != row["before_hash"]:
+                    raise CurationError("Подготовленная копия оригинала повреждена. Откат заблокирован.")
                 db.execute("UPDATE edits SET state='undo_prepared' WHERE id=?", (edit,)); db.commit()
                 if identity(path) != row["after_hash"]:
                     raise CurationError("Файл изменился во время отката. Ничего не заменено.")

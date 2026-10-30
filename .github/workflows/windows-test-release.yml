@@ -23,7 +23,10 @@ concurrency:
 
 jobs:
   regressions:
-    if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
+    if: >-
+      github.repository == 'lucifervalter-a11y/XASS' &&
+      (github.ref == 'refs/heads/test' ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/codex/')))
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -44,7 +47,7 @@ jobs:
       - name: Install headless desktop and PHP test support
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk
+          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk ffmpeg
       - name: Install complete pinned test dependencies
         run: python -m pip install -r requirements.txt -r pc_client/requirements.txt
       - name: Existing Python regression suite
@@ -61,7 +64,10 @@ jobs:
           php -l profile.php
 
   build:
-    if: github.repository == 'lucifervalter-a11y/XASS' && github.ref == 'refs/heads/test'
+    if: >-
+      github.repository == 'lucifervalter-a11y/XASS' &&
+      (github.ref == 'refs/heads/test' ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/codex/')))
     runs-on: windows-latest
     timeout-minutes: 50
     steps:

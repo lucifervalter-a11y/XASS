@@ -72,6 +72,9 @@ jobs:
           expected_version=$(python3 -c 'import pathlib,re; print(re.search(r"MARKETING_VERSION: \"([^\"]+)\"", pathlib.Path("project.yml").read_text()).group(1))')
           actual_version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' build/device/Build/Products/Release-iphoneos/XASS.app/Info.plist)
           test "$actual_version" = "$expected_version" || { echo "Packaged version does not match project.yml"; exit 1; }
+          widget_plist=build/device/Build/Products/Release-iphoneos/XASS.app/PlugIns/XASSWidgets.appex/Info.plist
+          test -f "$widget_plist" || { echo "Live Activity widget extension is missing"; exit 1; }
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$widget_plist")" = 'app.xass.mobile.widgets'
           mkdir -p build/package/Payload
           cp -R build/device/Build/Products/Release-iphoneos/XASS.app build/package/Payload/
           cd build/package

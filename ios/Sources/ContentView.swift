@@ -4,8 +4,8 @@ import AVKit
 /// Main application shell integrating all XASS native views, Hermes AI Agent, and multi-theme switcher.
 @MainActor
 public struct ContentView: View {
-    @ObservedObject public var app: AppState
-    @ObservedObject public var store: NativeStore
+    @ObservedObject var app: AppState
+    @ObservedObject var store: NativeStore
     @StateObject private var hermes: HermesService
     @ObservedObject private var themeManager = ThemeManager.shared
     @StateObject private var workspace: NativeWorkspaceStore
@@ -17,7 +17,7 @@ public struct ContentView: View {
     @State private var miniHeight: CGFloat = 64
     @State private var tabContentBottom: CGFloat?
 
-    public init(app: AppState, store: NativeStore) {
+    init(app: AppState, store: NativeStore) {
         self.app = app
         self.store = store
         _hermes = StateObject(wrappedValue: HermesService(api: store.api))
