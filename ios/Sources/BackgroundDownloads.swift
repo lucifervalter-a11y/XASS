@@ -46,11 +46,48 @@ struct BackgroundDownload: Codable, Identifiable {
     var expected: Int64 = 0
     var message: String? = nil
     var taskID: Int? = nil
+    var restartAttempts: Int = 0
+    var usedResumeData: Bool = false
+    var discardResumeData: Bool = false
+    var needsFreshTicket: Bool = false
+
+    private enum CodingKeys: String, CodingKey {
+        case id, origin, track, phase, received, expected, message, taskID
+        case restartAttempts, usedResumeData, discardResumeData, needsFreshTicket
+    }
 
     var progress: Double? {
         expected > 0 ? min(1, max(0, Double(received) / Double(expected))) : nil
     }
     var active: Bool { phase == .queued || phase == .downloading || phase == .committing }
+}
+
+extension BackgroundDownload {
+    // Stored defaults alone do not migrate synthesized Codable records. Old
+    // tasks are conservatively treated as not having used resume data.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        origin = try values.decode(String.self, forKey: .origin)
+        track = try values.decode(DownloadedTrack.self, forKey: .track)
+        phase = try values.decode(DownloadPhase.self, forKey: .phase)
+        received = try values.decode(Int64.self, forKey: .received)
+        expected = try values.decode(Int64.self, forKey: .expected)
+        message = try values.decodeIfPresent(String.self, forKey: .message)
+        taskID = try values.decodeIfPresent(Int.self, forKey: .taskID)
+        restartAttempts = try values.decodeIfPresent(Int.self, forKey: .restartAttempts) ?? 0
+        usedResumeData = try values.decodeIfPresent(Bool.self, forKey: .usedResumeData) ?? false
+        discardResumeData = try values.decodeIfPresent(Bool.self, forKey: .discardResumeData) ?? false
+        needsFreshTicket = try values.decodeIfPresent(Bool.self, forKey: .needsFreshTicket) ?? false
+    }
+}
+
+/// Injectable credential storage keeps recovery tests off the real Keychain.
+/// Production continues to use ThisDeviceOnly SecureStore entries.
+struct DownloadSecretAccess {
+    var load: (UUID) -> BackgroundDownloadSecret?
+    var save: (BackgroundDownloadSecret, UUID) throws -> Void
+    var remove: (UUID) -> Void
 }
 
 /// A cancellation callback belongs to one pause, not merely to a track ID.
@@ -106,6 +143,7 @@ final class DownloadLedger {
                       item.track.title.count <= 300, item.track.artist.count <= 300,
                       item.track.duration.isFinite, item.track.duration >= 0, item.track.duration <= 86400,
                       item.received >= 0, item.expected >= 0,
+                      (0...1).contains(item.restartAttempts),
                       item.received <= PrivateDownload.maxBytes, item.expected <= PrivateDownload.maxBytes,
                       ids.insert(item.id).inserted,
                       tracks.insert(origin.namespace + ":" + String(item.track.id)).inserted else { return false }
@@ -119,6 +157,12 @@ final class DownloadLedger {
         guard data.count <= 1024 * 1024 else { throw XASSErr.invalidCommand }
         try data.write(to: directory.appendingPathComponent("queue.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         entries = values
+    }
+    /// Fail closed in this process if storage itself is unavailable. A later
+    /// successful queue write persists this rejection with the other entries.
+    func rememberFailure(_ item: BackgroundDownload) {
+        guard item.phase == .failed, let index = entries.firstIndex(where: { $0.id == item.id }) else { return }
+        entries[index] = item
     }
     func stagedFile(_ item: BackgroundDownload) -> URL {
         let suffix = Self.extensions.contains(item.track.fileExtension ?? "") ? item.track.fileExtension! : "audio"
@@ -160,6 +204,8 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
     private var reconciling = false
     private var completionHandlers: [() -> Void] = []
     private var lastProgress = Date.distantPast
+    private var secretAccess: DownloadSecretAccess?
+    private var systemSchedulingEnabled = true
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.identifier)
         config.sessionSendsLaunchEvents = true; config.isDiscretionary = false
@@ -173,8 +219,13 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         super.init()
         ledger = try? DownloadLedger()
     }
+    init(ledger: DownloadLedger, origin: ServerOrigin, secrets: DownloadSecretAccess) {
+        self.ledger = ledger; self.allowedOrigin = origin.url.absoluteString; self.secretAccess = secrets
+        self.systemSchedulingEnabled = false
+        super.init()
+    }
     func start() {
-        guard !reconciled, !reconciling else { return }
+        guard systemSchedulingEnabled, !reconciled, !reconciling else { return }
         if ledger == nil { ledger = try? DownloadLedger() }
         // Protected storage can be unavailable before the first device unlock.
         // Do not destroy system-owned tasks just because that index is locked.
@@ -229,16 +280,18 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             ?? BackgroundDownload(id: UUID(), origin: origin.url.absoluteString, track: track)
         guard running[item.id] == nil else { return }
         let previous = item
-        let previousSecret = SecureStore.load(key(item.id))
+        let previousSecret = secret(item.id)
         item.track = track; item.phase = .queued; item.message = nil; item.taskID = nil
         item.received = 0; item.expected = 0
+        item.restartAttempts = 0; item.usedResumeData = false
+        item.discardResumeData = false; item.needsFreshTicket = false
         let secret = BackgroundDownloadSecret(url: url.absoluteString, issuedAt: Date(), resume: nil, expiresAt: expiresAt)
         guard secret.canResume() else { throw XASSErr.invalidMedia }
         try saveSecret(secret, id: item.id)
         var values = ledger.entries.filter { $0.id != item.id }; values.append(item)
         do { try ledger.save(values) } catch {
-            if let previousSecret { try? SecureStore.save(previousSecret, name: key(item.id)) }
-            else { SecureStore.remove(key(item.id)) }
+            if let previousSecret { try? saveSecret(previousSecret, id: item.id) }
+            else { removeSecret(item.id) }
             throw error
         }
         pauseEpochs.invalidate(item.id)
@@ -258,7 +311,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             guard update(item) else { return false }
             commit(item); return true
         }
-        guard !item.active else { return false }
+        guard !item.active, !item.needsFreshTicket else { return false }
         // URLSession has not supplied its opaque resume data yet. Record the
         // user's intent without launching a second download from byte zero.
         if pauseEpochs.requestResume(id) {
@@ -308,23 +361,30 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         if allowedOrigin == origin.url.absoluteString { allowedOrigin = nil }
         for item in entries(for: origin) {
             pause(item.id)
-            if forgetSecrets { pauseEpochs.invalidate(item.id); SecureStore.remove(key(item.id)) }
+            if forgetSecrets { pauseEpochs.invalidate(item.id); removeSecret(item.id) }
         }
     }
     func cancel(_ id: UUID) {
         guard let ledger, let item = ledger.entries.first(where: { $0.id == id }) else { return }
         do { try ledger.save(ledger.entries.filter { $0.id != id }) } catch { return }
         pauseEpochs.invalidate(id)
-        running.removeValue(forKey: id)?.cancel(); SecureStore.remove(key(id))
+        running.removeValue(forKey: id)?.cancel(); removeSecret(id)
         try? FileManager.default.removeItem(at: ledger.stagedFile(item)); schedule(); notify()
     }
     private func schedule() {
         guard reconciled, let ledger, let allowedOrigin else { return }
         for var item in ledger.entries where item.phase == .queued && item.origin == allowedOrigin {
             guard running.count < 2 else { break }
-            guard let origin = try? ServerOrigin(item.origin), let secret = secret(item.id), secret.canResume(),
+            guard !item.needsFreshTicket, let origin = try? ServerOrigin(item.origin), var secret = secret(item.id), secret.canResume(),
                   let url = try? origin.mediaURL(secret.url, trackID: item.track.id) else {
                 fail(item.id, "Для продолжения нужна новая ссылка. Нажмите «Повторить»."); continue
+            }
+            if item.discardResumeData {
+                // The ledger consumed the one-shot budget before this Keychain
+                // write. A crash between the two stores cannot reuse bad bytes.
+                secret.resume = nil
+                do { try saveSecret(secret, id: item.id) }
+                catch { fail(item.id, "Не удалось сбросить данные продолжения. Повторите загрузку."); continue }
             }
             let task: URLSessionDownloadTask
             if let resume = secret.resume { task = session.downloadTask(withResumeData: resume) }
@@ -335,6 +395,8 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
                 request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
                 task = session.downloadTask(with: request)
             }
+            item.usedResumeData = secret.resume != nil; item.discardResumeData = false
+            if !item.usedResumeData { item.received = 0; item.expected = 0 }
             item.phase = .downloading; item.taskID = task.taskIdentifier
             guard update(item) else { task.cancel(); continue }
             task.taskDescription = item.id.uuidString; running[item.id] = task; task.resume()
@@ -342,10 +404,18 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
     }
     private func key(_ id: UUID) -> String { "music-download-" + id.uuidString }
     private func secret(_ id: UUID) -> BackgroundDownloadSecret? {
+        if let secretAccess { return secretAccess.load(id) }
         guard let data = SecureStore.load(key(id)), data.count <= 3 * 1024 * 1024 else { return nil }
         return try? JSONDecoder().decode(BackgroundDownloadSecret.self, from: data)
     }
-    private func saveSecret(_ value: BackgroundDownloadSecret, id: UUID) throws { try SecureStore.save(JSONEncoder().encode(value), name: key(id)) }
+    private func saveSecret(_ value: BackgroundDownloadSecret, id: UUID) throws {
+        if let secretAccess { try secretAccess.save(value, id); return }
+        try SecureStore.save(JSONEncoder().encode(value), name: key(id))
+    }
+    private func removeSecret(_ id: UUID) {
+        if let secretAccess { secretAccess.remove(id); return }
+        SecureStore.remove(key(id))
+    }
     @discardableResult private func update(_ item: BackgroundDownload) -> Bool {
         guard let ledger, let index = ledger.entries.firstIndex(where: { $0.id == item.id }) else { return false }
         var values = ledger.entries; values[index] = item
@@ -354,7 +424,8 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
     private func notify() { NotificationCenter.default.post(name: Self.changed, object: nil) }
     private func fail(_ id: UUID, _ message: String) {
         guard var item = ledger?.entries.first(where: { $0.id == id }) else { return }
-        item.phase = .failed; item.message = message; update(item)
+        item.phase = .failed; item.message = message
+        if !update(item) { ledger?.rememberFailure(item); notify() }
     }
     private func item(_ task: URLSessionTask) -> BackgroundDownload? {
         guard let raw = task.taskDescription, let id = UUID(uuidString: raw),
@@ -376,6 +447,9 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
     }
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard var item = item(downloadTask), item.phase == .downloading, let ledger else { return }
+        if recoverFailure(id: item.id, taskID: downloadTask.taskIdentifier,
+                          statusCode: (downloadTask.response as? HTTPURLResponse)?.statusCode, error: nil,
+                          responseURL: downloadTask.response?.url) { return }
         guard let response = downloadTask.response as? HTTPURLResponse, [200, 206].contains(response.statusCode),
               let origin = try? ServerOrigin(item.origin), let url = response.url,
               (try? origin.mediaURL(url.absoluteString, trackID: item.track.id)) != nil,
@@ -421,7 +495,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             else { try FileManager.default.moveItem(at: temporary, to: target) }
             var values = library.tracks().filter { $0.id != item.track.id }; values.append(item.track); try library.save(values)
             try ledger.save(ledger.entries.filter { $0.id != item.id })
-            try? FileManager.default.removeItem(at: staged); SecureStore.remove(key(item.id)); notify()
+            try? FileManager.default.removeItem(at: staged); removeSecret(item.id); notify()
         } catch { fail(item.id, "Файл получен, но сохранение не завершено. Повторите загрузку.") }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -431,6 +505,11 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             schedule(); return
         }
         running.removeValue(forKey: item.id)
+        if recoverFailure(id: item.id, taskID: task.taskIdentifier,
+                          statusCode: (task.response as? HTTPURLResponse)?.statusCode, error: error as NSError?,
+                          responseURL: task.response?.url) {
+            schedule(); notify(); return
+        }
         if let error = error as NSError?, item.phase == .downloading {
             if var secret = secret(item.id) {
                 secret.resume = (error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data).flatMap { $0.count <= 2 * 1024 * 1024 ? $0 : nil }
@@ -439,6 +518,68 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             fail(item.id, "Загрузка прервана. Можно продолжить или повторить её.")
         }
         schedule(); notify()
+    }
+
+    /// Shared by both delegate callbacks. Current task identity fences late
+    /// callbacks after pause, cancel, logout, ticket refresh or replacement.
+    /// This never starts networking: scheduling remains with the delegate.
+    @discardableResult
+    func recoverFailure(id: UUID, taskID: Int, statusCode: Int?, error: NSError?, responseURL: URL? = nil) -> Bool {
+        guard var item = ledger?.entries.first(where: { $0.id == id }),
+              item.phase == .downloading, item.taskID == taskID else { return false }
+        if let responseURL {
+            guard let origin = try? ServerOrigin(item.origin),
+                  (try? origin.mediaURL(responseURL.absoluteString, trackID: item.track.id)) != nil else { return false }
+        }
+        if statusCode == 401 || statusCode == 403 {
+            item.needsFreshTicket = true; item.discardResumeData = true
+            item.phase = .failed; item.taskID = nil; item.usedResumeData = false
+            item.message = "Ссылка на загрузку отклонена сервером. Нажмите «Повторить» для получения новой."
+            // Even failed Keychain deletion cannot make resume() reuse a URL
+            // rejected by the server: the durable ledger is authoritative.
+            if !update(item) {
+                ledger?.rememberFailure(item)
+                if var rejected = secret(id) {
+                    rejected.resume = nil; rejected.expiresAt = .distantPast
+                    try? saveSecret(rejected, id: id)
+                }
+                notify()
+            }
+            pauseEpochs.invalidate(id); removeSecret(id)
+            return true
+        }
+        guard item.origin == allowedOrigin, item.usedResumeData, item.restartAttempts < 1,
+              !item.needsFreshTicket, let secret = secret(id), secret.canResume(),
+              let origin = try? ServerOrigin(item.origin),
+              (try? origin.mediaURL(secret.url, trackID: item.track.id)) != nil else { return false }
+        let resumeFailure: Bool
+        if statusCode == 416 {
+            resumeFailure = error == nil || (error?.domain == NSURLErrorDomain && error?.code == URLError.badServerResponse.rawValue)
+        } else if statusCode == nil || statusCode == 200 || statusCode == 206 {
+            // These are candidates only because THIS task used resume data.
+            // Network, cancellation, TLS, auth and disk-write errors are not.
+            let codes: Set<Int> = [URLError.cannotDecodeRawData.rawValue, URLError.cannotDecodeContentData.rawValue,
+                URLError.fileDoesNotExist.rawValue, URLError.downloadDecodingFailedMidStream.rawValue,
+                URLError.downloadDecodingFailedToComplete.rawValue]
+            // -1008 means resourceUnavailable, NOT cannotDecodeContentData.
+            // With no HTTP response on a resumed task it can indicate that
+            // the daemon cannot reopen resume state. Permit just one fresh GET.
+            let unavailableResume = statusCode == nil && error?.code == URLError.resourceUnavailable.rawValue
+                && error?.userInfo[NSUnderlyingErrorKey] == nil
+            resumeFailure = error?.domain == NSURLErrorDomain && (codes.contains(error?.code ?? 0) || unavailableResume)
+        } else { resumeFailure = false }
+        guard resumeFailure else { return false }
+        item.restartAttempts += 1; item.discardResumeData = true; item.usedResumeData = false
+        item.taskID = nil; item.phase = .queued; item.received = 0; item.expected = 0
+        item.message = "Загружаю заново…"
+        // Persist both the budget and the instruction to ignore old opaque
+        // bytes before touching Keychain or creating the replacement task.
+        guard update(item) else {
+            item.phase = .failed; item.message = "Не удалось сохранить состояние загрузки. Нажмите «Повторить»."
+            ledger?.rememberFailure(item); notify(); return true
+        }
+        pauseEpochs.invalidate(id)
+        return true
     }
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         let handlers = completionHandlers; completionHandlers.removeAll()
