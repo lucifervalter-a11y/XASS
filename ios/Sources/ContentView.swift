@@ -14,6 +14,7 @@ public struct ContentView: View {
     @State private var selectedTab: Int = 0
     @State private var showThemeSheet: Bool = false
     @State private var showQueue: Bool = false
+    @State private var showLyrics: Bool = false
     @State private var miniHeight: CGFloat = 64
     @State private var tabContentBottom: CGFloat?
 
@@ -65,11 +66,24 @@ public struct ContentView: View {
             .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $store.showPlayer) {
-            NowPlayingView(player: storePlayer)
+            NativePlayerOverlayHost(player: storePlayer, overlay: .nowPlaying,
+                showLyrics: $showLyrics, slots: playerSlots, tabContentBottom: nil,
+                setExpanded: { store.showPlayer = $0 })
         }
     }
 
     // MARK: - Tab Navigation
+
+    private var playerSlots: NowPlayingSlots {
+        var slots = NowPlayingSlots()
+        slots.volume = { [store] in AnyView(NativePlayerVolumeSection(store: store)) }
+        slots.lyrics = { [store] in
+            AnyView(Group { if let id = store.currentID { NativeLyricsContent(store: store, trackID: id) } })
+        }
+        slots.status = { [store] in AnyView(NativePlayerStatus(store: store)) }
+        slots.deviceLabel = store.playingDeviceName
+        return slots
+    }
 
     private var tabs: some View {
         TabView(selection: $selectedTab) {

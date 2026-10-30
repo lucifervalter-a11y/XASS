@@ -604,7 +604,7 @@ final class NativeStoreTests: XCTestCase {
         await store.refresh()
         store.selectedDevice = "agent:Studio"
         do { try await store.play(store.tracks[0]); XCTFail("A failed target must not start the phone automatically") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("остаётся на паузе")) }
+        catch { XCTAssertTrue(error.localizedDescription.contains("не подтверждена")) }
         XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" })
         XCTAssertFalse(audio.hasPlayableItem)
         XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
@@ -613,6 +613,87 @@ final class NativeStoreTests: XCTestCase {
         try await store.play(store.tracks[0])
         XCTAssertEqual(store.selectedDevice, "agent:Studio")
         XCTAssertFalse(audio.hasPlayableItem)
+    }
+
+    @MainActor func testFailureAfterStopRetainsExactPositionAndExplicitRetryDoesNotAutoPlay() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        api.session["session_key"] = store.sessionKey; api.session["client_id"] = store.clientID
+        api.players = [Self.studio(live: true)]
+        await store.refresh()
+        var stoppedPosition: Double?, retry = false
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/transfers", method == "POST" {
+                if retry {
+                    XCTAssertEqual(body?["device"] as? String, "agent:Studio")
+                    XCTAssertEqual(body?["output_id"] as? String, "headset")
+                    XCTAssertEqual(body?["position"] as? Double, stoppedPosition)
+                    return ["ok": true, "transfer_id": "retry-failed", "protocol": 2, "revision": 3,
+                            "status": "failed", "phase": "failed", "error_code": "target_unavailable"]
+                }
+                return ["ok": true, "transfer_id": "stopped-failed", "protocol": 2, "revision": 2,
+                        "status": "waiting", "phase": "waiting"]
+            }
+            if path == "/api/mini/music/transfers/stopped-failed/ack" {
+                stoppedPosition = body?["position"] as? Double
+                return ["ok": true]
+            }
+            if path == "/api/mini/music/transfers/stopped-failed", method == "GET" {
+                return ["ok": true, "status": "failed", "phase": "failed", "error_code": "target_timeout",
+                        "detail": "ПК не подтвердил запуск"]
+            }
+            return nil
+        }
+        do { try await store.pickRoute(device: "agent:Studio", output: "headset"); XCTFail("Unconfirmed target cannot succeed") }
+        catch {}
+        let failure = try XCTUnwrap(store.transferFailure)
+        XCTAssertEqual(failure.target, "agent:Studio"); XCTAssertEqual(failure.outputID, "headset")
+        XCTAssertEqual(failure.trackID, 1); XCTAssertEqual(failure.sourceState, .pausedOnPhone)
+        XCTAssertNotNil(stoppedPosition); XCTAssertEqual(failure.exactStoppedPosition, stoppedPosition)
+        XCTAssertEqual(failure.position, stoppedPosition)
+        XCTAssertTrue(failure.message.contains("iPhone на паузе")); XCTAssertTrue(store.showRoutePicker)
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
+        retry = true
+        do { try await store.retryFailedTransfer(); XCTFail("Retry must report failure, not start locally") } catch {}
+        XCTAssertEqual(api.requests.filter { $0.0 == "/api/mini/music/transfers" && $0.1 == "POST" }.count, 2)
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(api.requests.contains { $0.2?["force"] as? Bool == true })
+    }
+
+    @MainActor func testResumeAfterFailedTransferRequiresServerLeaseOrStopReceipt() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        await store.refresh()
+        api.handler = { path, method, body in
+            if path.hasSuffix("/ticket") { return ["ok": true, "path": "/api/music/tracks/1/stream?ticket=fixture"] }
+            if path == "/api/mini/music/session", method == "POST" {
+                XCTAssertNil(body?["force"])
+                throw OwnerAPIError(status: 409, message: "Stop receipt required", detail: ["code": "transfer_required"])
+            }
+            if path == "/api/mini/music/transfers", method == "POST" {
+                return ["ok": true, "transfer_id": "source-offline", "protocol": 2, "revision": 5,
+                        "status": "failed", "phase": "failed", "error_code": "source_timeout"]
+            }
+            return nil
+        }
+        do { try await store.transfer(to: "agent:Studio", trackID: 1, startPosition: 37); XCTFail("Expected failure") } catch {}
+        XCTAssertNotNil(store.transferFailure); XCTAssertFalse(audio.hasPlayableItem)
+        do { try await store.resumeAfterTransferFailure(); XCTFail("Uncertain source must block phone playback") } catch {}
+        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" && $0.2?["device"] as? String == "local" })
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session/recover" }, "Recovery requires a separate owner confirmation")
+    }
+
+    func testTransferFailureWordingDoesNotClaimPauseAfterPrepareFailure() {
+        let playing = NativeTransferFailure(target: "agent:Studio", outputID: "default", trackID: 1,
+            position: 15, exactStoppedPosition: nil, sourceState: .playingOnPhone)
+        XCTAssertTrue(playing.message.contains("продолжает играть"))
+        XCTAssertFalse(playing.message.contains("на паузе"))
+        let uncertain = NativeTransferFailure(target: "agent:Studio", outputID: "default", trackID: 1,
+            position: 15, exactStoppedPosition: nil, sourceState: .unknown)
+        XCTAssertTrue(uncertain.message.contains("неизвестно"))
+        XCTAssertFalse(uncertain.message.contains("на паузе"))
     }
 
     @MainActor func testPCOfflineMidTrackDoesNotStartAnotherOutput() async throws {

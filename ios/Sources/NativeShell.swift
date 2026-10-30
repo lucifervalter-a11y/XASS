@@ -521,6 +521,13 @@ struct NativeTransferWait: View {
     var body: some View {
         NavigationStack {
             List {
+                if store.transferFailure != nil || store.error != nil {
+                    Section {
+                        NativeMessage(store: store)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                    }.accessibilityIdentifier("routeTransferFailure")
+                }
                 if let status = store.transferStatus {
                     Section {
                         VStack(alignment: .leading, spacing: 10) {

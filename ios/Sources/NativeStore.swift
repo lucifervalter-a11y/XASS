@@ -2,6 +2,26 @@ import Foundation
 import Combine
 import UIKit
 
+struct NativeTransferFailure: Equatable {
+    enum SourceState: Equatable { case pausedOnPhone, playingOnPhone, confirmedStopped, unknown }
+    let target: String
+    let outputID: String
+    let trackID: Int
+    let position: Double
+    let exactStoppedPosition: Double?
+    let sourceState: SourceState
+    var targetName: String { target.hasPrefix("agent:") ? String(target.dropFirst(6)) : "iPhone" }
+    var message: String {
+        let prefix = "Передача на \(targetName) не подтверждена. "
+        switch sourceState {
+        case .pausedOnPhone: return prefix + "iPhone на паузе; состояние другого устройства неизвестно. Выберите, где продолжить."
+        case .playingOnPhone: return prefix + "Музыка продолжает играть на iPhone."
+        case .confirmedStopped: return prefix + "Остановка прежнего плеера подтверждена, запуск нового — нет. Автоматического возврата не будет."
+        case .unknown: return prefix + "Состояние прежнего плеера неизвестно. Другой звук автоматически не запускается."
+        }
+    }
+}
+
 /// Playback ticks stay off NativeStore. A half-second position update must not
 /// invalidate the library list or reset its scroll offset.
 @MainActor final class NativePlaybackClock: ObservableObject {
@@ -76,6 +96,7 @@ import UIKit
     @Published private(set) var libraryLoadingMore = false
     @Published private(set) var transferStatus: String?
     @Published private(set) var transferProgress: Double = 0
+    @Published private(set) var transferFailure: NativeTransferFailure?
     private var libraryRequest = UUID()
     private var libraryPageRequest = UUID()
     private var knownTracks: [Int: LibraryTrack] = [:]
@@ -360,11 +381,9 @@ import UIKit
             do {
                 // Keep the source route until its player has been paused and acknowledged.
                 if device.hasPrefix("agent:"), let id = currentID {
-                    // An offline PC always falls back to this iPhone. A failed
-                    // handoff to a live PC is reported, unless the iPhone was
-                    // audible: then it keeps playing here (never silence).
-                    let audibleHere = selectedDevice == "local" && ownsSession && playing
-                    try await transferToPC(device, trackID: id, startPosition: position, output: output, fallbackOnHandoffFailure: audibleHere)
+                    // Preparation leaves the source alone; once it has stopped,
+                    // failure requires an explicit, confirmed retry.
+                    try await transferToPC(device, trackID: id, startPosition: position, output: output)
                     // Offline PC: the iPhone kept playing, the route stays "iPhone".
                     if selectedDevice == device { userPickedRoute = true }
                 } else {
@@ -431,7 +450,7 @@ import UIKit
     func disconnect() {
         cancelMusicImport()
         generation = UUID(); libraryRequest = UUID(); loading = false; foreground(false); ownsSession = false; pendingReport = nil; suppressReports = true
-        reportTask?.cancel(); reportTask = nil; audio.disconnect(); imageCache.removeAllObjects()
+        reportTask?.cancel(); reportTask = nil; audio.disconnect(); imageCache.removeAllObjects(); transferFailure = nil
         (api as? OwnerAPI)?.invalidate()
     }
     private var sessionRefreshFailure: String?
@@ -666,6 +685,7 @@ import UIKit
         notice = "Кэш обложек очищен. Скачанная музыка не затронута."
     }
     func playOffline(_ track: DownloadedTrack) {
+        transferFailure = nil
         var seen = Set<Int>()
         baseQueue = (audio.downloads + audio.cachedTracks.map(\.track)).filter { seen.insert($0.id).inserted }.map(LibraryTrack.init)
         queue = shuffle ? baseQueue.shuffled() : baseQueue
@@ -688,7 +708,7 @@ import UIKit
     }
 
     /// Check the chosen PC promptly; a failed handoff requires an explicit retry.
-    private func transferToPC(_ device: String, trackID: Int, startPosition: Double?, output: String? = nil, fallbackOnHandoffFailure: Bool = true) async throws {
+    private func transferToPC(_ device: String, trackID: Int, startPosition: Double?, output: String? = nil) async throws {
         let resumeAt = startPosition ?? currentPlaybackPosition(trackID)
         guard pcIsLive(device), await pcReachable(device) else {
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return
@@ -701,9 +721,9 @@ import UIKit
             pcConnecting = nil
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt, notice: Self.playingHereNotice)
         }
-        catch where fallbackOnHandoffFailure && Self.isPCFailure(error) {
+        catch where Self.isPCFailure(error) {
             pcConnecting = nil
-            throw OwnerAPIError(status: 409, message: "Передача на ПК не подтверждена. iPhone остаётся на паузе. Повторите передачу или явно выберите iPhone.")
+            throw OwnerAPIError(status: 409, message: transferFailure?.message ?? "ПК не подтвердил передачу. Автоматический запуск на iPhone отключён.")
         }
     }
 
@@ -848,6 +868,7 @@ import UIKit
         canonicalSessionKey = sessionKey; canonicalClientID = clientID; canonicalDevice = "local"; ownsSession = true; position = startPosition
         audio.handle(try NativeAudioCommand(["action": "play", "trackId": track.id, "title": track.title, "artist": track.artist,
             "url": url, "position": startPosition, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: track.id), "repeat": repeatMode]))
+        transferFailure = nil
         showPlayer = true
     }
     func playAll(_ rows: [LibraryTrack], shuffled: Bool) async throws {
@@ -857,6 +878,7 @@ import UIKit
     }
     func transfer(to device: String, trackID: Int? = nil, startPosition: Double? = nil, output: String? = nil) async throws {
         guard !busy else { return }; busy = true
+        transferFailure = nil; error = nil; notice = nil
         let diagnosticTarget: NativeDiagnosticTarget = device == "local" ? .localPlayer : .pcPlayer
         NativeDiagnostics.shared.record(operation: .musicTransfer, step: .started, target: diagnosticTarget)
         defer { busy = false; transferStatus = nil; transferProgress = 0; activeTransferID = nil; activeTransferKind = nil }
@@ -866,8 +888,21 @@ import UIKit
         let chosenID = trackID ?? currentID
         guard let chosenID = chosenID else { selectedDevice = device; outputID = output ?? "default"; return }
         let ownedSource = selectedDevice == "local" && (ownsSession || (canonicalDevice == "local" && canonicalSessionKey == sessionKey))
+        let chosenOutput = output ?? (device == selectedDevice ? outputID : "default")
+        let requestedPosition = startPosition ?? currentPlaybackPosition(chosenID)
+        var stoppedHere: Double?, stoppedElsewhere: Double?, transferCompleted = false
+        defer {
+            if !transferCompleted, !transferCancelled, generation == nextGeneration {
+                let source: NativeTransferFailure.SourceState = stoppedHere != nil ? .pausedOnPhone
+                    : stoppedElsewhere != nil ? .confirmedStopped
+                    : ownedSource && audio.state == "playing" ? .playingOnPhone : .unknown
+                let exact = stoppedHere ?? stoppedElsewhere
+                transferFailure = NativeTransferFailure(target: device, outputID: chosenOutput, trackID: chosenID,
+                    position: exact ?? requestedPosition, exactStoppedPosition: exact, sourceState: source)
+            }
+        }
         var body: [String: Any] = ["protocol": 2, "session_key": sessionKey, "client_id": clientID, "device": device,
-            "output_id": output ?? (device == selectedDevice ? outputID : "default"), "track_id": chosenID, "volume": device == "local" ? 100 : Int(volume), "autoplay": true,
+            "output_id": chosenOutput, "track_id": chosenID, "volume": device == "local" ? 100 : Int(volume), "autoplay": true,
             "queue": Array(queue.prefix(2000)).map(\.id), "repeat_mode": repeatMode]
         if let start = startPosition { body["position"] = start }
         if device.hasPrefix("agent:") {
@@ -915,6 +950,10 @@ import UIKit
         var sourceStopped = false
         var targetStarted = false
         while response["status"] as? String != "ready" {
+            if response["phase"] as? String == "starting", let session = response["session"] as? [String: Any],
+               let exact = session["position"] as? NSNumber, exact.doubleValue.isFinite, exact.doubleValue >= 0 {
+                stoppedElsewhere = exact.doubleValue
+            }
             if transferCancelled || generation != nextGeneration {
                 let id = activeTransferID ?? transferID
                 if !id.isEmpty {
@@ -941,6 +980,7 @@ import UIKit
                 if response["phase"] as? String == "waiting", ownedSource, !sourceStopped {
                     suppressReports = true; audio.pause(); suppressReports = false
                     let stoppedPosition = audio.exactPosition()
+                    stoppedHere = stoppedPosition
                     ownsSession = false; pendingReport = nil; sourceStopped = true
                     _ = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/ack",
                         method: "POST", body: ["session_key": sessionKey, "position": stoppedPosition, "revision": attemptRevision])
@@ -1026,7 +1066,29 @@ import UIKit
         }
         // Close route picker only after handoff actually finished.
         NativeDiagnostics.shared.record(operation: .musicTransfer, step: .completed, target: diagnosticTarget)
+        transferCompleted = true; transferFailure = nil
         showRoutePicker = false
+    }
+    func dismissTransferFailure() { transferFailure = nil }
+    func retryFailedTransfer() async throws {
+        guard let failure = transferFailure, !busy else { return }
+        // Explicit retry always re-enters the confirmed protocol. Never use the
+        // reachability fallback, direct resume, or a force ownership claim.
+        try await transfer(to: failure.target, trackID: failure.trackID,
+                           startPosition: failure.position, output: failure.outputID)
+    }
+    func resumeAfterTransferFailure() async throws {
+        guard let failure = transferFailure, !busy else { return }
+        if failure.sourceState == .playingOnPhone && ownsSession && audio.state == "playing" {
+            transferFailure = nil; error = nil; showRoutePicker = false; return
+        }
+        guard let track = knownTracks[failure.trackID] ?? tracks.first(where: { $0.id == failure.trackID }) else {
+            throw OwnerAPIError(status: 404, message: "Трек недоступен")
+        }
+        // playLocal first obtains a server lease. A foreign audible/uncertain
+        // lease requires a handoff; offline is never permission to force it.
+        try await playLocal(track, startPosition: failure.position)
+        transferFailure = nil; error = nil; showRoutePicker = false
     }
     private static func transferDiagnosticError(_ code: String?) -> NativeDiagnosticError {
         switch code {
@@ -1071,8 +1133,8 @@ import UIKit
         if selectedDevice == "local" {
             if ownsSession || offlinePlayback { playing ? audio.pause() : audio.resume() }
             else if canonicalDevice.hasPrefix("agent:") && !transferPending {
-                // The last output was a PC that is gone now: play here at once,
-                // no handoff (an offline PC can never acknowledge it).
+                // Request a local lease. An uncertain PC lease still requires
+                // confirmed handoff; disconnection does not prove silence.
                 try await playOnPhoneAfterPCLoss(trackID: id, position: pcResumePosition(id))
             }
             else { try await transfer(to: "local") }

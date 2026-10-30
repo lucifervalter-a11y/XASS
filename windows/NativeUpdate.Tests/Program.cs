@@ -56,7 +56,7 @@ try
     {
         foreach (var channel in new[] { NativeReleaseChannel.Stable, NativeReleaseChannel.Test })
         {
-            using var fixture = new Fixture(Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N")), generous, fastIdle, channel);
+            using var fixture = new Fixture(Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N")), generous, generous, channel);
             var other = channel == NativeReleaseChannel.Stable ? NativeReleaseChannel.Test : NativeReleaseChannel.Stable;
             object Release(NativeReleaseChannel c) => new
             {
@@ -235,20 +235,26 @@ try
     });
     await Run("size and digest failures clean partial files and preserve prior verified bytes", async () =>
     {
-        using var fixture = Create();
+        // Integrity is not a timing test. Disk/antivirus scheduling on shared CI
+        // must not race a 150 ms idle deadline and hide the checksum failure.
+        using var fixture = Create(idle: generous);
         string target = Path.Combine(fixture.Folder, $"XASS-Native-Test-{revision}.exe");
         File.WriteAllText(target, "previous verified fixture");
         foreach (byte[] invalid in new[] { installer[..^1], installer.Concat(new byte[] { 1 }).ToArray(), new byte[installer.Length] })
         {
-            fixture.Handler.Enqueue(invalid);
+            // Deliberately outlive the fast timeout used by deadline tests: this
+            // fixture must still exercise size/digest rejection, not cancellation.
+            var body = new SyntheticBody(invalid, delay: fastIdle + TimeSpan.FromMilliseconds(50));
+            fixture.Handler.Enqueue(body);
             await Fails<InvalidOperationException>(() => fixture.Client.DownloadAsync(update, new ProgressRecorder(), default));
+            Assert(body.Disposed && !body.CancellationObserved, "Integrity validation was preempted by timeout");
             NoPartial(fixture);
             Assert(File.ReadAllText(target) == "previous verified fixture", "Failed download replaced the prior installer");
         }
     });
     await Run("redirects keep the HTTPS host and credential restrictions", async () =>
     {
-        using var fixture = Create();
+        using var fixture = Create(idle: generous);
         foreach (string destination in new[] { "https://example.org/file", "http://github.com/file", "https://user:secret@github.com/file", "https://github.com:444/file" })
         {
             fixture.Handler.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Redirect)
@@ -266,7 +272,7 @@ try
     });
     await Run("HTTP failure disposes response and permits retry", async () =>
     {
-        using var fixture = Create();
+        using var fixture = Create(idle: generous);
         var body = new SyntheticBody(Array.Empty<byte>());
         fixture.Handler.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StreamContent(body) }));
         await Fails<HttpRequestException>(() => fixture.Client.CheckAsync("", default));

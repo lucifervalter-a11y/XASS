@@ -38,19 +38,23 @@ import UniformTypeIdentifiers
     @State private var showDiagnostics = false
     @State private var confirmRecovery = false
     var body: some View {
-        if let text = store.error ?? store.notice ?? (store.canRecoverPlayback ? "Прежний плеер давно не отвечает. Если музыка на нём остановлена, можно сбросить зависшую сессию." : nil) {
+        if let text = store.transferFailure?.message ?? store.error ?? store.notice ?? (store.canRecoverPlayback ? "Прежний плеер давно не отвечает. Если музыка на нём остановлена, можно сбросить зависшую сессию." : nil) {
           VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: store.error == nil ? "checkmark.circle" : "exclamationmark.circle").foregroundStyle(store.error == nil ? Color.green : Color.orange)
+                Image(systemName: store.error == nil && store.transferFailure == nil ? "checkmark.circle" : "exclamationmark.circle").foregroundStyle(store.error == nil && store.transferFailure == nil ? Color.green : Color.orange)
                 Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
-                Button { store.error = nil; store.notice = nil } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }.accessibilityLabel("Скрыть сообщение")
+                Button { store.error = nil; store.notice = nil; store.dismissTransferFailure() } label: { Image(systemName: "xmark").frame(width: 24, height: 24) }.accessibilityLabel("Скрыть сообщение")
             }
-            if store.error != nil {
+            if store.transferFailure != nil, let detail = store.error, detail != text {
+                Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if store.transferFailure != nil { NativeTransferFailureActions(store: store) }
+            if store.error != nil || store.transferFailure != nil {
                 Button { showDiagnostics = true } label: { Label("Отправить диагностику", systemImage: "square.and.arrow.up") }
                     .font(.subheadline).buttonStyle(.borderless).accessibilityIdentifier("musicErrorDiagnostics")
             }
-            if store.canRecoverPlayback {
+            if store.canRecoverPlayback && store.transferFailure == nil {
                 Button("Сбросить зависший плеер") { confirmRecovery = true }
                     .font(.subheadline).buttonStyle(.borderless).disabled(store.busy).accessibilityIdentifier("recoverStaleMusic")
             }
@@ -67,6 +71,36 @@ import UniformTypeIdentifiers
                     Button("Отмена", role: .cancel) {}
                 } message: {
                     Text("Закройте старый плеер или остановите музыку на нём. Сервер не может выключить звук на устройстве без связи. После сброса старый плеер потеряет управление сессией.")
+                }
+        }
+    }
+}
+
+@MainActor struct NativeTransferFailureActions: View {
+    @ObservedObject var store: NativeStore
+    @State private var confirmStopped = false
+    var body: some View {
+        if let failure = store.transferFailure {
+            VStack(alignment: .leading, spacing: 10) {
+                Button("Возобновить на iPhone") {
+                    if store.canRecoverPlayback { confirmStopped = true }
+                    else { store.run { try await store.resumeAfterTransferFailure() } }
+                }.accessibilityIdentifier("handoffResumePhone")
+                Button(failure.target.hasPrefix("agent:") ? "Повторить передачу на ПК" : "Повторить передачу на iPhone") {
+                    store.run { try await store.retryFailedTransfer() }
+                }.accessibilityIdentifier("handoffRetryTarget")
+                if failure.sourceState == .unknown || failure.sourceState == .pausedOnPhone {
+                    Text("Если другое устройство не отвечает, сначала остановите звук на нём. Приложение не будет считать потерю сети подтверждением остановки.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.buttonStyle(.borderless).disabled(store.busy)
+                .confirmationDialog("Звук на прежнем устройстве точно остановлен?", isPresented: $confirmStopped, titleVisibility: .visible) {
+                    Button("Да, остановлен — восстановить и слушать на iPhone") {
+                        store.run { try await store.recoverStalePlayback(); try await store.resumeAfterTransferFailure() }
+                    }
+                    Button("Отмена", role: .cancel) {}
+                } message: {
+                    Text("Сервер не может остановить плеер без связи. Подтверждайте только после ручной остановки. Восстановление сверит прежнюю сессию и её версию.")
                 }
         }
     }
@@ -153,6 +187,7 @@ import UniformTypeIdentifiers
             busy: store.busy,
             error: store.error,
             notice: store.notice,
+            transferFailure: store.transferFailure,
             canRecoverPlayback: store.canRecoverPlayback,
             libraryHasMore: store.libraryHasMore,
             libraryLoadingMore: store.libraryLoadingMore,
@@ -175,6 +210,7 @@ private struct NativeLibrarySnapshot: Equatable {
     var busy: Bool
     var error: String?
     var notice: String?
+    var transferFailure: NativeTransferFailure?
     var canRecoverPlayback: Bool
     var libraryHasMore: Bool
     var libraryLoadingMore: Bool
@@ -204,7 +240,7 @@ private struct NativeLibraryBrowser: View, Equatable {
             if !snapshot.authorized {
                 NativeLoginPrompt(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
-            if snapshot.error != nil || snapshot.notice != nil || snapshot.canRecoverPlayback { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
+            if snapshot.error != nil || snapshot.notice != nil || snapshot.transferFailure != nil || snapshot.canRecoverPlayback { NativeMessage(store: store).listRowBackground(Color.clear).listRowSeparator(.hidden) }
             HStack(spacing: 12) {
                 // Multiple NavigationLinks in one List row activate together on iOS.
                 // A single destination binding gives each explicit button one route.
