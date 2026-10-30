@@ -32,7 +32,13 @@ public sealed partial class MainWindow
     private ComboBox fileRoot = new();
     private CheckBox autoUpdates = new(), transcription = new();
     private Button pairButton = new(), saveSettings = new(), installUpdate = new();
-    private readonly NativeUpdateClient nativeUpdates = new();
+    private readonly NativeReleaseChannel installedNativeChannel = NativeReleaseChannel.Installed();
+    private readonly NativeUpdateSelection nativeUpdateSelection = new(NativeUpdatePreferences.LoadChannel(NativeReleaseChannel.Installed()));
+    private readonly ComboBox nativeUpdateChannel = new() { Header = "Получать обновления", MinWidth = 220 };
+    private readonly TextBlock nativeInstalledStatus = DLabel(""), nativeSelectedStatus = DLabel("");
+    private readonly TextBlock nativeAgentUpdateStatus = DLabel("");
+    private Button checkNativeUpdate = new();
+    private bool nativeChannelChoiceInProgress;
     private NativeUpdate? availableNativeUpdate;
     private readonly NativeUpdateCoordinator updateCoordinator = new();
     private readonly CheckBox nativeAutomatic = new() { Content = "Автоматически обновлять XASS после закрытия окна в трей" };
@@ -59,7 +65,14 @@ public sealed partial class MainWindow
             try { await action(); }
             catch (OperationCanceledException) { }
             catch (Exception e) { DesktopError(e); }
-            finally { if (!closed) button.IsEnabled = true; }
+            finally
+            {
+                if (!closed)
+                {
+                    button.IsEnabled = true;
+                    if (ReferenceEquals(button, installUpdate) || ReferenceEquals(button, checkNativeUpdate)) RefreshNativeUpdateControls();
+                }
+            }
         };
         return button;
     }
@@ -554,7 +567,7 @@ public sealed partial class MainWindow
             && !await DesktopConfirmAsync("Включить расшифровку песен?", "Агент сможет скачать среду Demucs + Whisper и модели с официальных источников. Это использует интернет, диск и ресурсы ПК.", "Включить")) return;
         bool automatic = nativeAutomatic.IsChecked == true;
         if (automatic && !NativeUpdatePreferences.Load() && !await DesktopConfirmAsync("Включить нативное автообновление?",
-            "После закрытия окна в трей XASS сможет проверять обновления своего канала раз в 30 минут. Если музыка не играет и архив не переносится, приложение и агент будут перезапущены для установки. Перед установкой создаётся проверенная резервная копия; при неудачном запуске будет выполнен откат. Микрофоны не включатся автоматически.", "Включить")) return;
+            "После закрытия окна в трей XASS сможет проверять выбранный канал («Релиз / Бета» на странице обновлений) раз в 30 минут. Если музыка не играет и архив не переносится, приложение и агент будут перезапущены для установки. Более старая версия не устанавливается. Перед установкой создаётся проверенная резервная копия; при неудачном запуске будет выполнен откат. Микрофоны не включатся автоматически.", "Включить")) return;
         await client.RequestAsync(new { action = "desktop_save_settings", settings = new { owner_name = ownerName.Text.Trim(), interval_sec = seconds,
             auto_update = autoUpdates.IsChecked == true, transcription_enabled = transcription.IsChecked == true, archive_folder = archiveFolder.Text.Trim(), archive_max_gb = gb, archive_retention_days = days } }, lifetime.Token);
         NativeUpdatePreferences.Save(automatic);
@@ -565,17 +578,73 @@ public sealed partial class MainWindow
     {
         var page = AddDesktopPage("updates", "Обновления", Symbol.Download);
         installUpdate = DButton("Скачать и установить", InstallNativeUpdateAsync); installUpdate.IsEnabled = false;
-        page.Children.Add(updateStatus); page.Children.Add(DActions(DButton("Проверить обновления", CheckNativeUpdateAsync), installUpdate,
+        checkNativeUpdate = DButton("Проверить обновления", CheckNativeUpdateAsync);
+        nativeUpdateChannel.Items.Add(new ComboBoxItem { Content = "Релиз", Tag = NativeReleaseChannel.Stable.Distribution });
+        nativeUpdateChannel.Items.Add(new ComboBoxItem { Content = "Бета", Tag = NativeReleaseChannel.Test.Distribution });
+        nativeUpdateChannel.SelectedIndex = nativeUpdateSelection.Selected.Prerelease ? 1 : 0;
+        nativeUpdateChannel.SelectionChanged += async (_, _) => await ChangeNativeUpdateChannelAsync();
+        page.Children.Add(nativeInstalledStatus); page.Children.Add(nativeUpdateChannel); page.Children.Add(nativeSelectedStatus);
+        page.Children.Add(updateStatus); page.Children.Add(DActions(checkNativeUpdate, installUpdate,
             DButton("Перезапустить агент", RestartDesktopAgentAsync), DButton("Отменить подготовку", () => { nativeUpdateCancellation?.Cancel(); return Task.CompletedTask; })));
         page.Children.Add(updateProgress);
-        page.Children.Add(DLabel("Принимаются только нативные выпуски официального репозитория XASS для установленного канала. Перед установкой создаётся проверенная копия программы. Если новая версия не пройдёт проверку запуска, XASS восстановит предыдущую. Данные и настройки сохраняются."));
+        page.Children.Add(DLabel("Релиз — проверенные выпуски. Бета — предварительные версии. Выбор сохраняется отдельно от установленного пакета и применяется к ручным и автоматическим проверкам. Возврат на релиз не откатывает версию: если релиз старее, XASS дождётся подходящего выпуска. Во время проверки, загрузки и установки менять канал нельзя."));
+        page.Children.Add(DLabel("Принимаются только нативные пакеты официального репозитория XASS. SHA-256 и резервная копия проверяются перед установкой; при неудачном запуске выполняется откат. Выбор канала не изменяет старый Python-клиент и его автообновления."));
+        page.Children.Add(new Expander { Header = "Служебный агент и история установки", Content = nativeAgentUpdateStatus, HorizontalAlignment = HorizontalAlignment.Stretch });
+        RefreshNativeUpdateControls();
+    }
+    private void RefreshNativeUpdateControls()
+    {
+        bool idle = !closed && !nativeUpdateSelection.IsBusy && !nativeUpdateRunning && !nativeChannelChoiceInProgress;
+        nativeUpdateChannel.IsEnabled = idle && NativeRuntimeMode.AllowUpdates;
+        checkNativeUpdate.IsEnabled = idle && NativeRuntimeMode.AllowUpdates;
+        installUpdate.IsEnabled = idle && NativeRuntimeMode.AllowUpdates && availableNativeUpdate is { } available
+            && available.Distribution == nativeUpdateSelection.Selected.Distribution;
+        nativeInstalledStatus.Text = $"Установлено: XASS {InstalledNativeVersion()} · {installedNativeChannel.DisplayName}\nРевизия: {InstalledNativeRevision()}";
+        nativeSelectedStatus.Text = $"Выбран канал: {nativeUpdateSelection.Selected.DisplayName}. "
+            + (nativeUpdateSelection.Selected == installedNativeChannel ? "Канал установленного пакета совпадает." : "Установленный пакет пока не изменён; канал пакета сменится после успешной установки.");
+    }
+    private async Task ChangeNativeUpdateChannelAsync()
+    {
+        if (nativeChannelChoiceInProgress || nativeUpdateChannel.SelectedItem is not ComboBoxItem item) return;
+        var selected = NativeReleaseChannel.FromDistribution(item.Tag as string);
+        if (selected == nativeUpdateSelection.Selected) return;
+        nativeChannelChoiceInProgress = true;
+        bool changed = false;
+        var operation = nativeUpdateSelection.TryBegin();
+        try
+        {
+            RefreshNativeUpdateControls();
+            if (operation is null || !NativeRuntimeMode.AllowUpdates) return;
+            if (!await DesktopConfirmAsync($"Перейти на канал «{selected.DisplayName}»?",
+                selected.Prerelease
+                    ? "Будут проверяться предварительные версии XASS. В них возможны ошибки. Если нативное автообновление включено, оно тоже будет использовать Бету. Установленный пакет не изменится до загрузки и успешной установки."
+                    : "Будут проверяться только релизы. Если опубликованный релиз старее установленной Беты, XASS сохранит текущую версию и дождётся нового релиза. Автоматического отката не будет.", "Выбрать канал")) return;
+            operation.Dispose();
+            changed = nativeUpdateSelection.TrySelect(selected, NativeUpdatePreferences.SaveChannel);
+            if (changed) { availableNativeUpdate = null; updateStatus.Text = "Канал сохранён. Проверка выбранного канала…"; }
+        }
+        catch (Exception error) { DesktopError(error); }
+        finally
+        {
+            operation?.Dispose();
+            nativeUpdateChannel.SelectedIndex = nativeUpdateSelection.Selected.Prerelease ? 1 : 0;
+            nativeChannelChoiceInProgress = false;
+            RefreshNativeUpdateControls();
+        }
+        if (changed)
+        {
+            try { await CheckNativeUpdateAsync(); }
+            catch (OperationCanceledException) { }
+            catch (Exception error) { DesktopError(error); }
+        }
     }
     private async Task LoadDesktopUpdatesAsync()
     {
         var result = await DesktopRequestAsync("desktop_updates");
         string nativeResult = "Ещё нет";
         try { nativeResult = await File.ReadAllTextAsync(Path.Combine(NativeUpdateCoordinator.UpdatesRoot, "last-result.json")); } catch (IOException) { }
-        updateStatus.Text = $"Версия: {DValue(result, "version")}\nРевизия: {DValue(result, "revision")}\nКанал: {DValue(result, "distribution")}\nСохранённое автообновление: {DValue(result, "auto_update")}\nПоследний результат: {DValue(result, "result")}\nСостояние: {DValue(result, "state")}\nНативное обновление: {nativeResult}";
+        nativeAgentUpdateStatus.Text = $"Служебный агент: {DValue(result, "version")} · {DValue(result, "distribution")}\nАвтообновление агента: {DValue(result, "auto_update")}\nПоследний результат агента: {DValue(result, "result")}\nСостояние: {DValue(result, "state")}\nНативное обновление: {nativeResult}";
+        RefreshNativeUpdateControls();
     }
     private string InstalledNativeRevision()
     {
@@ -583,26 +652,51 @@ public sealed partial class MainWindow
         { try { using var doc = JsonDocument.Parse(File.ReadAllText(file)); string value = DValue(doc.RootElement, "revision"); if (!string.IsNullOrEmpty(value)) return value; } catch { } }
         return "";
     }
+    private static string InstalledNativeVersion()
+    {
+        try { using var info = JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "build-info.json"))); return DValue(info.RootElement, "version"); }
+        catch { return "не определена"; }
+    }
+    private string NativeUpdateResultText(NativeUpdateCheck result, NativeReleaseChannel channel) => result.Availability switch
+    {
+        NativeUpdateAvailability.NoRelease => $"В канале «{channel.DisplayName}» не найден опубликованный совместимый пакет. Установленная версия сохранена; это не подтверждение её актуальности.",
+        NativeUpdateAvailability.Current => $"Установлен опубликованный пакет канала «{channel.DisplayName}».",
+        NativeUpdateAvailability.OlderVersion => $"В канале «{channel.DisplayName}» доступна {result.Update!.Version}, но установлена более новая {InstalledNativeVersion()}. Откат заблокирован; ждём следующий выпуск выбранного канала.",
+        NativeUpdateAvailability.UnknownVersion => "Не удалось безопасно сравнить версии. Установка заблокирована; установленный пакет не изменён.",
+        _ => $"Доступна XASS {result.Update!.Version} · {channel.DisplayName}\n{result.Update.Revision}\n{result.Update.Size / 1048576.0:F1} МБ"
+    };
     private async Task CheckNativeUpdateAsync()
     {
+        using var operation = nativeUpdateSelection.TryBegin();
+        if (operation is null || nativeChannelChoiceInProgress || !NativeRuntimeMode.AllowUpdates) return;
         availableNativeUpdate = null; installUpdate.IsEnabled = false;
-        updateStatus.Text = "Проверка официальных выпусков XASS…";
+        RefreshNativeUpdateControls();
+        updateStatus.Text = $"Проверка официальных выпусков XASS · {operation.Channel.DisplayName}…";
         try
         {
-            availableNativeUpdate = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);
-            installUpdate.IsEnabled = availableNativeUpdate is not null;
-            updateStatus.Text = availableNativeUpdate is null ? "Новых совместимых обновлений не найдено." : $"Доступна {availableNativeUpdate.Version}\n{availableNativeUpdate.Revision}\n{availableNativeUpdate.Size / 1048576.0:F1} МБ";
+            using var nativeUpdates = new NativeUpdateClient(operation.Channel);
+            var result = await nativeUpdates.CheckForInstallationAsync(InstalledNativeRevision(), InstalledNativeVersion(), installedNativeChannel, lifetime.Token);
+            availableNativeUpdate = result.Availability == NativeUpdateAvailability.Available ? result.Update : null;
+            updateStatus.Text = NativeUpdateResultText(result, operation.Channel);
             SelectDesktopPage("updates");
         }
         catch (OperationCanceledException) { updateStatus.Text = "Проверка обновления отменена. Можно повторить."; throw; }
         catch (TimeoutException) { updateStatus.Text = "Сервер обновлений не ответил вовремя. Нажмите «Проверить» для повторной попытки."; throw; }
         catch { updateStatus.Text = "Не удалось проверить обновление. Проверьте сеть и повторите."; throw; }
+        finally { operation.Dispose(); RefreshNativeUpdateControls(); }
     }
     private async Task InstallNativeUpdateAsync()
     {
-        var update = availableNativeUpdate; if (update is null || nativeUpdateRunning) return;
-        if (!await DesktopConfirmAsync("Установить обновление?", $"XASS {update.Version}, ревизия {update.Revision}\nЗагрузка: {update.Size / 1048576.0:F1} МБ. После проверки SHA-256 и резервного копирования XASS, агент и микрофоны завершатся. Если проверка новой версии не пройдёт, предыдущая версия будет восстановлена. Данные сохраняются.", "Скачать и установить")) return;
-        await ApplyNativeUpdateAsync(update, automatic: false);
+        var update = availableNativeUpdate; if (update is null || nativeUpdateRunning || nativeChannelChoiceInProgress) return;
+        using var operation = nativeUpdateSelection.TryBegin(); if (operation is null) return;
+        try
+        {
+            RefreshNativeUpdateControls();
+            NativeUpdateVersionPolicy.RequireInstallable(update, operation.Channel, InstalledNativeRevision(), InstalledNativeVersion(), installedNativeChannel.Distribution);
+            if (!await DesktopConfirmAsync("Установить обновление?", $"XASS {update.Version} · {operation.Channel.DisplayName}, ревизия {update.Revision}\nЗагрузка: {update.Size / 1048576.0:F1} МБ. После проверки SHA-256 и резервного копирования XASS, агент и микрофоны завершатся. Если проверка новой версии не пройдёт, предыдущая версия будет восстановлена. Данные сохраняются.", "Скачать и установить")) return;
+            await ApplyNativeUpdateAsync(update, automatic: false, operation.Channel);
+        }
+        finally { operation.Dispose(); RefreshNativeUpdateControls(); }
     }
     private bool AutomaticNativeGuardsAllow(CancellationToken token) => NativeAutomaticUpdatePolicy.AllowsShutdown(new(
         Closed: closed, Quitting: desktopQuitting, Pairing: desktopPairing, Enabled: NativeUpdatePreferences.Load(),
@@ -629,11 +723,12 @@ public sealed partial class MainWindow
         if (rejected is not null) NativeUpdatePreferences.RememberRejected(rejected);
         return NativeUpdatePreferences.IsRejected(update.Sha256);
     }
-    private async Task ApplyNativeUpdateAsync(NativeUpdate update, bool automatic)
+    private async Task ApplyNativeUpdateAsync(NativeUpdate update, bool automatic, NativeReleaseChannel capturedChannel)
     {
         if (!NativeRuntimeMode.AllowUpdates)
             throw new InvalidOperationException("Updates are disabled in isolated test mode.");
         if (nativeUpdateRunning) return;
+        NativeUpdateVersionPolicy.RequireInstallable(update, capturedChannel, InstalledNativeRevision(), InstalledNativeVersion(), installedNativeChannel.Distribution);
         if (!NativeAutomaticUpdatePolicy.MayAttemptRelease(update.Sha256, automatic, NativeUpdatePreferences.IsRejected))
         { updateStatus.Text = "Этот пакет ранее не прошёл проверку. Автоповтор отключён; доступен явный повтор установки или новый выпуск."; return; }
         nativeUpdateRunning = true; nativeUpdateCommitAuthorized = false;
@@ -642,6 +737,8 @@ public sealed partial class MainWindow
         PreparedNativeUpdate? prepared = null;
         try
         {
+            using var nativeUpdates = new NativeUpdateClient(capturedChannel);
+            RefreshNativeUpdateControls();
             updateProgress.Value = 0; updateProgress.Visibility = Visibility.Visible;
             updateStatus.Text = "Загрузка проверяемого установщика…";
             string installer = await nativeUpdates.DownloadAsync(update, new System.Progress<double>(p => updateProgress.Value = p), cancel.Token);
@@ -691,17 +788,23 @@ public sealed partial class MainWindow
     }
     private async Task CheckAutomaticNativeUpdateAsync()
     {
-        if (nativeUpdateRunning || !AutomaticNativeGuardsAllow(lifetime.Token)) return;
+        if (nativeUpdateRunning || nativeChannelChoiceInProgress || !NativeRuntimeMode.AllowUpdates || !AutomaticNativeGuardsAllow(lifetime.Token)) return;
+        using var operation = nativeUpdateSelection.TryBegin(); if (operation is null) return;
         try
         {
+            RefreshNativeUpdateControls();
             if (!await FreshAutomaticNativeGuardsAllowAsync(lifetime.Token)) return;
-            NativeUpdate? update = await nativeUpdates.CheckAsync(InstalledNativeRevision(), lifetime.Token);
-            if (update is null || await IsAutomaticNativeUpdateRejectedAsync(update, lifetime.Token)) return;
-            await ApplyNativeUpdateAsync(update, automatic: true);
+            using var nativeUpdates = new NativeUpdateClient(operation.Channel);
+            var result = await nativeUpdates.CheckForInstallationAsync(InstalledNativeRevision(), InstalledNativeVersion(), installedNativeChannel, lifetime.Token);
+            updateStatus.Text = NativeUpdateResultText(result, operation.Channel);
+            NativeUpdate? update = result.Update;
+            if (result.Availability != NativeUpdateAvailability.Available || update is null || await IsAutomaticNativeUpdateRejectedAsync(update, lifetime.Token)) return;
+            await ApplyNativeUpdateAsync(update, automatic: true, operation.Channel);
         }
         catch (OperationCanceledException) { if (!closed) updateStatus.Text = "Автоматическая проверка отменена."; }
         catch (TimeoutException) { if (!closed) updateStatus.Text = "Автоматическая проверка не дождалась сети. Можно проверить обновление вручную или дождаться следующей попытки."; }
         catch { if (!closed) updateStatus.Text = "Автообновление отложено. Проверьте состояние или повторите проверку вручную."; }
+        finally { operation.Dispose(); RefreshNativeUpdateControls(); }
     }
 
     public void AcceptDesktopActivation(string[] arguments)

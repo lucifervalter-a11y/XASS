@@ -63,19 +63,100 @@ class NativeUpdaterTests(unittest.TestCase):
             command = args[0]
             write_json(self.job / ("health-" + command[-1] + ".json"),
                        {"ready": True, "nonce": command[-1], "pid": 99,
-                        "revision": json.loads((self.install / "native-install.json").read_text())["revision"]})
+                        "revision": json.loads((self.install / "native-install.json").read_text(encoding='utf-8'))["revision"]})
             return Mock(pid=99, poll=Mock(return_value=None))
         updater.popen = launch
         updater.verify_installed(NEW)
         updater.stop_install_processes = Mock()
         updater.restore()
-        self.assertEqual(json.loads((self.install / "native-install.json").read_text())["distribution"], "native-test")
+        self.assertEqual(json.loads((self.install / "native-install.json").read_text(encoding='utf-8'))["distribution"], "native-test")
         updater.verify_installed(OLD)
 
     def test_stable_installation_rejects_test_channel_before_backup(self):
         self.make_install(OLD, "native")
         with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
         self.assertFalse((self.job / "backup").exists())
+
+    def channel_request(self, distribution="native-test", allow=True):
+        self.request.update(schema=2, release_distribution=distribution, allow_channel_change=allow)
+        write_json(self.job / "request.json", self.request)
+
+    def test_explicit_stable_to_beta_selection_is_supported(self):
+        self.make_install(OLD, "native")
+        self.channel_request()
+        updater = NativeUpdater(self.job / "request.json")
+        self.assertEqual(updater.release_distribution, "native-test")
+        self.assertEqual(updater.previous["distribution"], "native")
+
+    def test_same_revision_channel_change_verifies_target_not_rollback_identity(self):
+        self.make_install(NEW, "native")
+        self.channel_request()
+        updater = NativeUpdater(self.job / "request.json", run=self.updater.run)
+        updater.popen = Mock()
+        # The unchanged SHA alone must not make the old-channel install pass.
+        with self.assertRaises(ValueError):
+            updater.verify_installed(NEW, distribution="native-test")
+        updater.popen.assert_not_called()
+        self.make_install(NEW, "native-test")
+        def launch(*args, **kwargs):
+            command = args[0]
+            write_json(self.job / ("health-" + command[-1] + ".json"),
+                       {"ready": True, "nonce": command[-1], "pid": 99, "revision": NEW})
+            return Mock(pid=99, poll=Mock(return_value=None))
+        updater.popen = launch
+        updater.verify_installed(NEW, distribution="native-test")
+        # Rollback at the same SHA still verifies the original stable channel.
+        with self.assertRaises(ValueError): updater.verify_installed(NEW)
+
+    def test_channel_request_rejects_unconfirmed_transition(self):
+        self.make_install(OLD, "native")
+        self.channel_request(allow=False)
+        with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+        self.assertFalse((self.job / "backup").exists())
+
+    def test_channel_request_rejects_package_from_other_channel(self):
+        self.channel_request(distribution="native")
+        with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+
+    def test_same_channel_does_not_require_channel_change_consent(self):
+        self.channel_request(allow=False)
+        self.assertEqual(NativeUpdater(self.job / "request.json").release_distribution, "native-test")
+
+    def test_channel_consent_must_be_boolean(self):
+        for invalid in (1, "true", None):
+            with self.subTest(invalid=invalid):
+                self.channel_request(allow=invalid)
+                with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+
+    def test_manual_and_automatic_channel_downgrades_are_rejected(self):
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                self.request.update(version="0.9.9", automatic=automatic)
+                self.channel_request()
+                with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+        self.assertFalse((self.job / "backup").exists())
+
+    def test_unknown_version_cannot_bypass_downgrade_guard(self):
+        for version in (None, True, "nightly", "1.0.0-beta", "1.0", "999999.0.0"):
+            with self.subTest(version=version):
+                self.request["version"] = version
+                self.channel_request()
+                with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+
+    def test_numeric_version_comparison_is_not_lexicographic(self):
+        self.request["version"] = "10.0.0"
+        self.channel_request()
+        NativeUpdater(self.job / "request.json")
+
+    def test_v2_request_requires_complete_explicit_fields(self):
+        self.request["schema"] = 2
+        write_json(self.job / "request.json", self.request)
+        with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+
+    def test_boolean_schema_is_not_schema_one(self):
+        self.request["schema"] = True
+        write_json(self.job / "request.json", self.request)
+        with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
 
     def test_stable_migration_rejects_wrong_installed_channel_before_launch(self):
         updater = self.stable_request()
@@ -117,7 +198,7 @@ class NativeUpdaterTests(unittest.TestCase):
         self.assertEqual((self.install / "Xass.Native.exe").read_bytes(), original)
         self.assertEqual(before, {p.name: digest(p) for p in protected.iterdir()})
         verify_tree(self.job / "backup", self.updater.inventory)
-        self.assertEqual(json.loads((self.job / "state.json").read_text())["phase"], "failed")
+        self.assertEqual(json.loads((self.job / "state.json").read_text(encoding='utf-8'))["phase"], "failed")
 
     def test_cancel_after_parent_exits_never_stops_or_replaces_runtime(self):
         self.updater.wait_for_parent = Mock(side_effect=lambda: (self.job / "cancel").touch())
@@ -146,7 +227,7 @@ class NativeUpdaterTests(unittest.TestCase):
         with patch("native_updater.copy_tree_verified", side_effect=OSError("disk full")):
             code = self.updater.execute()
         self.assertEqual(code,1); self.updater.run.assert_not_called(); self.assertFalse(self.updater.applied)
-        state = json.loads((self.job / "state.json").read_text())
+        state = json.loads((self.job / "state.json").read_text(encoding='utf-8'))
         self.assertEqual(state["phase"], "failed")
         self.assertNotIn("rejected_sha256", state)
         self.assertEqual(state["sha256"], self.request["sha256"])
@@ -167,15 +248,15 @@ class NativeUpdaterTests(unittest.TestCase):
         self.updater.restore()
         self.assertEqual((self.install / "Xass.Native.exe").read_bytes(), original)
         quarantines=list(self.install.parent.glob("XASS-Native-Test.failed-*")); self.assertEqual(len(quarantines),1)
-        self.assertEqual((quarantines[0] / "Xass.Native.exe").read_text(), "bad-update")
+        self.assertEqual((quarantines[0] / "Xass.Native.exe").read_text(encoding='utf-8'), "bad-update")
         self.updater.verify_installed.assert_called_once_with(OLD)
     def test_failed_installer_is_rolled_back(self):
         self.updater.wait_for_parent=Mock(); self.updater.stop_install_processes=Mock(); self.updater.verify_installed=Mock()
         self.updater.run.return_value=SimpleNamespace(returncode=1)
         self.assertEqual(self.updater.execute(),3)
-        state=json.loads((self.job / "state.json").read_text()); self.assertEqual(state["phase"],"rolled-back");self.assertTrue(state["rollback_ok"])
+        state=json.loads((self.job / "state.json").read_text(encoding='utf-8')); self.assertEqual(state["phase"],"rolled-back");self.assertTrue(state["rollback_ok"])
         self.assertEqual(state["rejected_sha256"], self.request["sha256"])
-        self.assertEqual(json.loads((self.updates / "last-result.json").read_text())["rejected_sha256"], self.request["sha256"])
+        self.assertEqual(json.loads((self.updates / "last-result.json").read_text(encoding='utf-8'))["rejected_sha256"], self.request["sha256"])
     def test_default_installer_uses_process_tree_supervisor(self):
         updater = NativeUpdater(self.job / "request.json")
         self.assertIs(updater.installer_run, run_installer)
@@ -203,7 +284,7 @@ class NativeUpdaterTests(unittest.TestCase):
         self.updater.restore.assert_not_called(); self.updater.verify_installed.assert_not_called()
         self.updater.popen.assert_not_called(); self.updater.restore_uninstall_registration.assert_not_called()
         self.updater.stop_install_processes.assert_called_once()
-        state = json.loads((self.job / "state.json").read_text())
+        state = json.loads((self.job / "state.json").read_text(encoding='utf-8'))
         self.assertEqual(state["phase"], "rollback-failed")
         self.assertTrue(state["rollback_blocked"])
         self.assertFalse(state["installer_shutdown_confirmed"])
@@ -231,7 +312,7 @@ class NativeUpdaterTests(unittest.TestCase):
         self.updater.wait_for_parent=Mock(); self.updater.stop_install_processes=Mock()
         self.updater.verify_installed=Mock(side_effect=RuntimeError("unhealthy"))
         self.assertEqual(self.updater.execute(),4); self.assertTrue((self.job / "backup").is_dir())
-        self.assertEqual(json.loads((self.job / "state.json").read_text())["phase"],"rollback-failed")
+        self.assertEqual(json.loads((self.job / "state.json").read_text(encoding='utf-8'))["phase"],"rollback-failed")
     def test_payload_integrity_failure_prevents_launch(self):
         (self.install / "Xass.Native.exe").write_text("altered")
         self.updater.popen=Mock()
@@ -267,18 +348,18 @@ if __name__=="__main__":unittest.main()
 class NativeUpdaterUiContracts(unittest.TestCase):
     def test_auto_update_requires_separate_explicit_opt_in(self):
         root=Path(__file__).resolve().parents[1]/"Xass.Native"
-        preferences=(root/"Services/NativeUpdatePreferences.cs").read_text()
+        preferences=(root/"Services/NativeUpdatePreferences.cs").read_text(encoding='utf-8')
         self.assertIn("automatic_enabled",preferences);self.assertIn("return false",preferences)
-        window=(root/"MainWindow.Desktop.cs").read_text()
+        window=(root/"MainWindow.Desktop.cs").read_text(encoding='utf-8')
         self.assertIn("Включить нативное автообновление?",window)
         self.assertIn("AppWindow.IsVisible",window)
-        policy=(root/"Services/NativeAutomaticUpdatePolicy.cs").read_text()
+        policy=(root/"Services/NativeAutomaticUpdatePolicy.cs").read_text(encoding='utf-8')
         self.assertIn('"playing" or "paused" or "loading"',policy)
     def test_ui_health_is_backend_acknowledged_before_file_write(self):
         root=Path(__file__).resolve().parents[1]/"Xass.Native"
-        window=(root/"MainWindow.Desktop.cs").read_text()
+        window=(root/"MainWindow.Desktop.cs").read_text(encoding='utf-8')
         section=window[window.index('arguments.Contains("--native-update-health"'):]
         self.assertLess(section.index('action = "host_status"'),section.index("WriteHealthAcknowledgmentAsync"))
-        coordinator=(root/"Services/NativeUpdateCoordinator.cs").read_text()
+        coordinator=(root/"Services/NativeUpdateCoordinator.cs").read_text(encoding='utf-8')
         self.assertIn("CancellationTokenSource.CreateLinkedTokenSource",coordinator)
         self.assertIn('Path.Combine(job, "cancel")',coordinator)

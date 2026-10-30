@@ -85,7 +85,7 @@ class RealInstallerRollback(unittest.TestCase):
                     def read_uninstall_registration(self): return {}
                     def restore_uninstall_registration(self): pass
                     def wait_for_parent(self): pass
-                    def verify_installed(self, revision):
+                    def verify_installed(self, revision, *, distribution=None):
                         if revision != OLD: raise AssertionError("Incomplete update reached health check")
                         verify_tree(self.install, inventory)
                         self.rollback_verified = True

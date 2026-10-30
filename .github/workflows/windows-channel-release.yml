@@ -1,0 +1,313 @@
+name: Validate Windows release and beta installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: Three-component version expected in both verified installers
+        required: true
+        default: '0.21.4'
+        type: string
+
+# Artifacts only: no GitHub Releases writes, production secrets, server deploy,
+# legacy installer publication, or installation on the owner's workstation.
+permissions:
+  contents: read
+
+concurrency:
+  group: xass-native-channels-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_VERSION: ${{ inputs.expected_version }}
+  PYTHONUTF8: '1'
+
+jobs:
+  regressions:
+    if: github.repository == 'lucifervalter-a11y/XASS' && startsWith(github.ref, 'refs/heads/codex/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pc_client/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install complete regression support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk ffmpeg libchromaprint-tools
+          python -m pip install -r requirements.txt -r pc_client/requirements.txt
+      - name: All Python modules in isolated processes without exclusions
+        env:
+          XASS_TEST_PHP: /usr/bin/php
+          PYTHONPATH: .
+        run: >-
+          xvfb-run -a python -u -X utf8 -B scripts/run_tests_isolated.py
+          --tests-dir tests --repo-root . --module-timeout 240 --suite-timeout 1500
+          --report artifacts/channel-regressions.json
+      - name: Browser and PHP contracts
+        run: |
+          node --test tests/*.cjs tests/*.js
+          php -l proxy.php
+          php -l index.php
+          php -l miniapp.php
+          php -l profile.php
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xass-channel-regressions-${{ github.run_id }}
+          path: artifacts/channel-regressions.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+  build:
+    needs: regressions
+    runs-on: windows-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distribution: native
+            installer: XASS-Native-Setup.exe
+            metadata: XASS-Native-Setup.json
+            manifest: native-update.json
+          - distribution: native-test
+            installer: XASS-Native-Test-Setup.exe
+            metadata: XASS-Native-Test-Setup.json
+            manifest: native-test-update.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            pc_client/requirements.txt
+            pc_client/voice-requirements.txt
+            pc_client/build-requirements.txt
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Verify immutable source and requested version
+        shell: python
+        run: |
+          import json, os, re, subprocess
+          from pathlib import Path
+          version = os.environ['EXPECTED_VERSION']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), 'Invalid expected version'
+          assert json.loads(Path('pc_client/version.json').read_text())['version'] == version
+          assert subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip() == os.environ['GITHUB_SHA']
+          assert not subprocess.check_output(['git','status','--porcelain'], text=True).strip()
+      - name: Install build tools and voice lifecycle dependencies
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed.' }
+          python -m pip install psutil==7.0.0
+          if ($LASTEXITCODE -ne 0) { throw 'Process dependency installation failed.' }
+          dotnet run --project windows/VoiceLifecycle.Tests/VoiceLifecycle.Tests.csproj -c Release -- (Get-Command python).Source
+          if ($LASTEXITCODE -ne 0) { throw 'Voice lifecycle tests failed.' }
+      - name: Build complete channel payload and execute native tests
+        shell: pwsh
+        run: ./windows/build_installer.ps1 -Revision '${{ github.sha }}' -Distribution '${{ matrix.distribution }}' -OutputDirectory 'artifacts/windows-${{ matrix.distribution }}'
+      - name: Real fresh install, same-channel upgrade, injected rollback and uninstall
+        shell: pwsh
+        run: ./windows/test_installer.ps1 -Installer 'artifacts/windows-${{ matrix.distribution }}/${{ matrix.installer }}' -PayloadManifest 'artifacts/windows-${{ matrix.distribution }}/payload-manifest.json'
+      - name: Verify complete delivery set and immutable identity
+        shell: python
+        env:
+          CHANNEL: ${{ matrix.distribution }}
+          INSTALLER: ${{ matrix.installer }}
+          METADATA: ${{ matrix.metadata }}
+          MANIFEST: ${{ matrix.manifest }}
+        run: |
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          root = Path('artifacts') / ('windows-' + os.environ['CHANNEL'])
+          names = {os.environ['INSTALLER'], os.environ['INSTALLER'] + '.sha256',
+                   os.environ['METADATA'], os.environ['MANIFEST'], 'payload-manifest.json'}
+          assert {p.name for p in root.iterdir()} == names, 'Unexpected delivery set'
+          installer = root / os.environ['INSTALLER']
+          with installer.open('rb') as source:
+              digest = hashlib.file_digest(source, 'sha256').hexdigest()
+          assert (root / (installer.name + '.sha256')).read_text().strip() == f'{digest}  {installer.name}'
+          for name in (os.environ['METADATA'], os.environ['MANIFEST'], 'payload-manifest.json'):
+              data = json.loads((root / name).read_text())
+              assert data['revision'] == os.environ['GITHUB_SHA'], 'Wrong artifact commit'
+              if name != 'payload-manifest.json':
+                  assert data['version'] == os.environ['EXPECTED_VERSION']
+                  assert data['distribution'] == os.environ['CHANNEL']
+                  assert data['sha256'] == digest
+                  assert data.get('size', data.get('bytes')) == installer.stat().st_size
+          manifest = json.loads((root / os.environ['MANIFEST']).read_text())
+          assert manifest['filename'] == installer.name
+          smoke = json.loads(Path('artifacts/windows-native-smoke.json').read_text())
+          assert smoke['revision'] == os.environ['GITHUB_SHA'] and smoke['same_version'] is True
+          assert smoke['from_distribution'] == smoke['to_distribution'] == os.environ['CHANNEL']
+          assert smoke['injected_failure_and_actual_rollback'] == 'passed'
+          assert smoke['verified_install_and_native_readiness'] == 'passed'
+          shutil.copyfile('artifacts/windows-native-smoke.json', root / 'windows-native-smoke.json')
+      # These are CI candidates needed by the real cross-channel tests, not
+      # releasable installers. Only the final delivery job establishes the gate.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-channel-candidate-${{ matrix.distribution }}-${{ github.run_id }}
+          path: artifacts/windows-${{ matrix.distribution }}/*
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  migrate:
+    needs: [regressions, build]
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: native
+            previous: native-test
+            installer: XASS-Native-Setup.exe
+            previous_installer: XASS-Native-Test-Setup.exe
+            manifest: native-update.json
+          - target: native-test
+            previous: native
+            installer: XASS-Native-Test-Setup.exe
+            previous_installer: XASS-Native-Setup.exe
+            manifest: native-test-update.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - run: python -m pip install psutil==7.0.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-candidate-${{ matrix.target }}-${{ github.run_id }}
+          path: artifacts/target
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-candidate-${{ matrix.previous }}-${{ github.run_id }}
+          path: artifacts/previous
+      - name: Real same-SHA cross-channel migration and rollback on ephemeral runner
+        shell: pwsh
+        run: >-
+          ./windows/test_installer.ps1
+          -Installer 'artifacts/target/${{ matrix.installer }}'
+          -PayloadManifest artifacts/target/payload-manifest.json
+          -PreviousInstaller 'artifacts/previous/${{ matrix.previous_installer }}'
+          -TargetMetadata 'artifacts/target/${{ matrix.manifest }}'
+      - name: Verify migration direction and recovery evidence
+        shell: python
+        env:
+          TARGET: ${{ matrix.target }}
+          PREVIOUS: ${{ matrix.previous }}
+        run: |
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path('artifacts/windows-native-migration-smoke.json').read_text())
+          assert result['revision'] == os.environ['GITHUB_SHA'] and result['same_version'] is True
+          assert result['from_distribution'] == os.environ['PREVIOUS']
+          assert result['to_distribution'] == os.environ['TARGET']
+          assert result['injected_failure_and_actual_rollback'] == 'passed'
+          assert result['verified_install_and_native_readiness'] == 'passed'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-channel-migration-${{ matrix.target }}-${{ github.run_id }}
+          path: artifacts/windows-native-migration-smoke.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  delivery:
+    needs: [regressions, build, migrate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-candidate-native-${{ github.run_id }}
+          path: delivery/native
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-candidate-native-test-${{ github.run_id }}
+          path: delivery/native-test
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-regressions-${{ github.run_id }}
+          path: delivery/verification
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-migration-native-${{ github.run_id }}
+          path: delivery/verification/to-native
+      - uses: actions/download-artifact@v4
+        with:
+          name: xass-channel-migration-native-test-${{ github.run_id }}
+          path: delivery/verification/to-native-test
+      - name: Final all-checks delivery gate (no release publication)
+        shell: python
+        run: |
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('delivery')
+          regression = json.loads((root / 'verification/channel-regressions.json').read_text())
+          assert regression['success'] is True and regression['complete'] is True
+          assert regression['discovered_modules'] == len(regression['modules']) > 0
+          assert all(item['outcome'] == 'PASS' for item in regression['modules'])
+          channels = {}
+          for channel in ('native', 'native-test'):
+              folder = root / channel
+              manifest = json.loads((folder / (channel + '-update.json')).read_text())
+              assert manifest['revision'] == os.environ['GITHUB_SHA']
+              assert manifest['version'] == os.environ['EXPECTED_VERSION']
+              assert manifest['distribution'] == channel
+              executable = folder / manifest['filename']
+              with executable.open('rb') as source:
+                  assert hashlib.file_digest(source, 'sha256').hexdigest() == manifest['sha256']
+              assert executable.stat().st_size == manifest['size']
+              migration = json.loads((root / ('verification/to-' + channel) / 'windows-native-migration-smoke.json').read_text())
+              assert migration['revision'] == os.environ['GITHUB_SHA'] and migration['to_distribution'] == channel
+              assert migration['from_distribution'] == ('native-test' if channel == 'native' else 'native')
+              assert migration['injected_failure_and_actual_rollback'] == 'passed'
+              assert migration['verified_install_and_native_readiness'] == 'passed'
+              channels[channel] = manifest
+          report = {'schema': 1, 'revision': os.environ['GITHUB_SHA'], 'version': os.environ['EXPECTED_VERSION'],
+                    'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                    'channels': channels, 'python_totals': regression['totals'],
+                    'all_modules_executed': True, 'cross_channel_rollback': 'both-directions-passed',
+                    'publication_performed': False, 'physical_device_audio_acceptance': False}
+          (root / 'verification/verified-checks.json').write_text(json.dumps(report, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('Both native release/beta installers passed full isolated Python, browser/PHP, native build, '
+                            'same-channel and both cross-channel real installer/rollback checks.\n\n'
+                            'Final delivery artifact only: no GitHub Release, server or legacy channel was changed.\n\n'
+                            'Unsigned installers; existing local Whisper model required. Physical audio/microphone and '
+                            'interactive WinUI acceptance are not established by CI.\n')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xass-native-channel-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: delivery/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

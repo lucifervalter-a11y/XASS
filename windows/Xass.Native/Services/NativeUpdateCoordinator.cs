@@ -14,10 +14,9 @@ public sealed class NativeUpdateCoordinator
         string marker = Path.Combine(install, "native-install.json"), runtime = Path.Combine(install, "runtime");
         if (!File.Exists(marker) || !File.Exists(Path.Combine(runtime, "XASS.NativeHelper.exe")))
             throw new InvalidOperationException("Автоматическое обновление поддерживается после установки полного нативного пакета.");
+        bool changeChannel;
         using (var document = JsonDocument.Parse(await File.ReadAllTextAsync(marker, token)))
-            if (document.RootElement.GetProperty("distribution").GetString() is not ("native-test" or "native")
-                || document.RootElement.GetProperty("app_id").GetString() != "B4D7E8B9-9C58-4C36-A432-D114393006D8")
-                throw new InvalidOperationException("Неизвестная установка XASS. Обновление остановлено.");
+            changeChannel = ValidateInstallation(update, document.RootElement);
         string job = Path.Combine(UpdatesRoot, "job-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(job);
         PendingJob = new PreparedNativeUpdate(job);
@@ -35,9 +34,10 @@ public sealed class NativeUpdateCoordinator
         string request = Path.Combine(job, "request.json");
         using var self = Process.GetCurrentProcess();
         double created = new DateTimeOffset(self.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0;
-        await File.WriteAllTextAsync(request, JsonSerializer.Serialize(new { schema = 1, job_id = Path.GetFileName(job), install_root = install,
+        await File.WriteAllTextAsync(request, JsonSerializer.Serialize(new { schema = 2, job_id = Path.GetFileName(job), install_root = install,
             installer, sha256 = update.Sha256, size = update.Size, version = update.Version, revision = update.Revision,
-            parent_pid = Environment.ProcessId, parent_created = created, automatic }), token);
+            parent_pid = Environment.ProcessId, parent_created = created, automatic,
+            release_distribution = update.Distribution, allow_channel_change = changeChannel }), token);
         var start = new ProcessStartInfo(Path.Combine(helperRoot, "XASS.NativeHelper.exe")) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = job };
         start.ArgumentList.Add("--role"); start.ArgumentList.Add("native-updater");
         start.ArgumentList.Add("--request"); start.ArgumentList.Add(request);
@@ -71,6 +71,16 @@ public sealed class NativeUpdateCoordinator
             await CancelPreparedAsync(new PreparedNativeUpdate(job));
             throw;
         }
+    }
+    internal static bool ValidateInstallation(NativeUpdate update, JsonElement installed)
+    {
+        string? distribution = installed.GetProperty("distribution").GetString();
+        if (distribution is not ("native-test" or "native")
+            || installed.GetProperty("app_id").GetString() != "B4D7E8B9-9C58-4C36-A432-D114393006D8")
+            throw new InvalidOperationException("Неизвестная установка XASS. Обновление остановлено.");
+        NativeUpdateVersionPolicy.RequireInstallable(update, NativeReleaseChannel.FromDistribution(update.Distribution),
+            installed.GetProperty("revision").GetString() ?? "", installed.GetProperty("version").GetString() ?? "", distribution);
+        return distribution != update.Distribution;
     }
     public Task CancelPendingAsync() => CancelPendingAsync(UpdatesRoot);
     internal Task CancelPendingAsync(string updatesRoot) => PendingJob is { } pending

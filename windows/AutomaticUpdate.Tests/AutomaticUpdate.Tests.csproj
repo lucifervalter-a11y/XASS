@@ -4,6 +4,8 @@
     <Compile Include="../Xass.Native/Services/NativeAutomaticUpdatePolicy.cs" Link="NativeAutomaticUpdatePolicy.cs" />
     <Compile Include="../Xass.Native/Services/NativeUpdatePreferences.cs" Link="NativeUpdatePreferences.cs" />
     <Compile Include="../Xass.Native/Services/NativeUpdateCoordinator.cs" Link="NativeUpdateCoordinator.cs" />
+    <Compile Include="../Xass.Native/Services/NativeUpdateClient.cs" Link="NativeUpdateClient.cs" />
+    <Compile Include="../Xass.Native/Services/NativeUpdateSelection.cs" Link="NativeUpdateSelection.cs" />
     <Compile Include="../Xass.Native/Services/NativeRuntimeMode.cs" Link="NativeRuntimeMode.cs" />
   </ItemGroup>
 </Project>

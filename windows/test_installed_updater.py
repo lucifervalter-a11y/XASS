@@ -15,7 +15,7 @@ from native_updater import APP_ID, NativeUpdater, digest, write_json
 
 class ForcedPostInstallHealthFailure(NativeUpdater):
     """Injection belongs to this CI driver, never the shipped updater role."""
-    def verify_installed(self, revision):
+    def verify_installed(self, revision, *, distribution=None):
         checks = getattr(self, '_smoke_health_checks', 0) + 1
         self._smoke_health_checks = checks
         if checks == 1:
@@ -24,7 +24,7 @@ class ForcedPostInstallHealthFailure(NativeUpdater):
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
                 winreg.SetValueEx(key, 'DisplayName', 0, winreg.REG_SZ, 'XASS Native CI injected health failure')
             raise RuntimeError('CI-injected post-install health failure')
-        super().verify_installed(revision)
+        super().verify_installed(revision, distribution=distribution)
 
 
 def main():
@@ -64,9 +64,11 @@ def main():
         ):
             job = updates / ('job-' + uuid.uuid4().hex)
             job.mkdir()
-            request = {'schema': 1, 'job_id': job.name, 'install_root': str(installed), 'installer': str(installer),
+            request = {'schema': 2, 'job_id': job.name, 'install_root': str(installed), 'installer': str(installer),
                        'sha256': digest(installer), 'size': installer.stat().st_size, 'version': target['version'],
-                       'revision': revision, 'parent_pid': os.getpid(), 'parent_created': 1.0, 'automatic': False}
+                       'revision': revision, 'parent_pid': os.getpid(), 'parent_created': 1.0, 'automatic': False,
+                       'release_distribution': target['distribution'],
+                       'allow_channel_change': identity['distribution'] != target['distribution']}
             write_json(job / 'request.json', request)
             updater = kind(job / 'request.json')
             # The test driver replaces the parent UI. Real readiness is still

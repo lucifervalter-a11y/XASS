@@ -4,11 +4,12 @@ using System.Text.RegularExpressions;
 
 namespace Xass.Native.Services;
 
-public sealed record NativeUpdate(string Version, string Revision, string Tag, Uri Download, long Size, string Sha256);
+public sealed record NativeUpdate(string Version, string Revision, string Tag, Uri Download, long Size, string Sha256, string Distribution = "native-test");
 public sealed record NativeReleaseChannel(string Distribution, string TagPrefix, string InstallerName, string ManifestName, string DownloadPrefix, bool Prerelease)
 {
     public static NativeReleaseChannel Test { get; } = new("native-test", "native-test-", "XASS-Native-Test-Setup.exe", "native-test-update.json", "XASS-Native-Test-", true);
     public static NativeReleaseChannel Stable { get; } = new("native", "native-stable-", "XASS-Native-Setup.exe", "native-update.json", "XASS-Native-", false);
+    public string DisplayName => Prerelease ? "Бета" : "Релиз";
     public static NativeReleaseChannel FromDistribution(string? value) => value switch
     {
         "native-test" => Test, "native" => Stable,
@@ -22,7 +23,7 @@ public sealed record NativeReleaseChannel(string Distribution, string TagPrefix,
         return FromDistribution(info.RootElement.GetProperty("distribution").GetString());
     }
 }
-public sealed class NativeUpdateClient
+public sealed class NativeUpdateClient : IDisposable
 {
     private const string Repo = "lucifervalter-a11y/XASS";
     private readonly NativeReleaseChannel channel;
@@ -32,10 +33,11 @@ public sealed class NativeUpdateClient
     private readonly TimeSpan checkTimeout, downloadTimeout, idleTimeout;
     private readonly string updatesFolder;
 
-    public NativeUpdateClient() : this(
+    public NativeUpdateClient() : this(NativeReleaseChannel.Installed()) { }
+    public NativeUpdateClient(NativeReleaseChannel selectedChannel) : this(
         new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan },
         TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(15), TimeSpan.FromSeconds(30),
-        NativeRuntimeMode.UpdatesRoot, NativeReleaseChannel.Installed()) { }
+        NativeRuntimeMode.UpdatesRoot, selectedChannel) { }
 
     // The transport and deadlines can be replaced by deterministic, offline tests.
     // Production keeps the same strict HTTPS/repository/redirect checks below.
@@ -43,7 +45,7 @@ public sealed class NativeUpdateClient
         TimeSpan idleTimeout, string updatesFolder, NativeReleaseChannel? releaseChannel = null)
     {
         this.http = http;
-        channel = releaseChannel ?? NativeReleaseChannel.Test;
+        channel = NativeReleaseChannel.FromDistribution((releaseChannel ?? NativeReleaseChannel.Test).Distribution);
         this.checkTimeout = checkTimeout;
         this.downloadTimeout = downloadTimeout;
         this.idleTimeout = idleTimeout;
@@ -125,6 +127,13 @@ public sealed class NativeUpdateClient
             throw TimedOut(deadline, error);
         }
     }
+    public async Task<NativeUpdateCheck> CheckForInstallationAsync(string installedRevision, string installedVersion, NativeReleaseChannel installedChannel, CancellationToken token)
+    {
+        // Fetch the selected channel's actual release, including an already-installed
+        // revision, so "no release published" never becomes "you are up to date".
+        var latest = await CheckAsync("", token).ConfigureAwait(false);
+        return NativeUpdateVersionPolicy.Evaluate(latest, installedRevision, installedVersion, installedChannel.Distribution);
+    }
     private async Task<NativeUpdate?> CheckCoreAsync(string installedRevision, TransferDeadline deadline)
     {
         using var releases = await JsonAsync(new Uri($"https://api.github.com/repos/{Repo}/releases?per_page=30"), 2 * 1024 * 1024, deadline).ConfigureAwait(false);
@@ -143,7 +152,7 @@ public sealed class NativeUpdateClient
             using var manifest = await JsonAsync(manifestUri, 65536, deadline).ConfigureAwait(false);
             var m = manifest.RootElement;
             if (m.GetProperty("distribution").GetString() != channel.Distribution || m.GetProperty("filename").GetString() != channel.InstallerName)
-                throw new InvalidOperationException("Этот пакет не предназначен для канала установленного приложения.");
+                throw new InvalidOperationException("Этот пакет не предназначен для выбранного канала обновлений.");
             string version = m.GetProperty("version").GetString() ?? "", revision = m.GetProperty("revision").GetString() ?? "";
             string sha = m.GetProperty("sha256").GetString() ?? "";
             long size = m.GetProperty("size").GetInt64();
@@ -153,13 +162,18 @@ public sealed class NativeUpdateClient
                 || size < 1024 || size > 8L * 1024 * 1024 * 1024 || installerAsset.GetProperty("size").GetInt64() != size)
                 throw new InvalidOperationException("Манифест не прошёл проверку размера, версии или контрольной суммы.");
             if (string.Equals(installedRevision, revision, StringComparison.OrdinalIgnoreCase)) return null;
-            return new NativeUpdate(version, revision, tag, uri, size, sha.ToLowerInvariant());
+            return new NativeUpdate(version, revision, tag, uri, size, sha.ToLowerInvariant(), channel.Distribution);
         }
         return null;
     }
     public async Task<string> DownloadAsync(NativeUpdate update, IProgress<double> progress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        if (update.Distribution != channel.Distribution || !update.Tag.StartsWith(channel.TagPrefix, StringComparison.Ordinal)
+            || update.Download.AbsoluteUri != $"https://github.com/{Repo}/releases/download/{Uri.EscapeDataString(update.Tag)}/{channel.InstallerName}"
+            || !Regex.IsMatch(update.Revision, "^[a-fA-F0-9]{40}$") || !Regex.IsMatch(update.Sha256, "^[a-fA-F0-9]{64}$")
+            || update.Size < 1024 || update.Size > 8L * 1024 * 1024 * 1024)
+            throw new InvalidOperationException("Пакет не соответствует выбранному каналу или проверенному выпуску.");
         using var deadline = new TransferDeadline(token, downloadTimeout, idleTimeout);
         Directory.CreateDirectory(updatesFolder);
         string final = Path.Combine(updatesFolder, $"{channel.DownloadPrefix}{update.Revision}.exe"), temporary = final + ".download";
@@ -197,4 +211,5 @@ public sealed class NativeUpdateClient
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
+    public void Dispose() => http.Dispose();
 }

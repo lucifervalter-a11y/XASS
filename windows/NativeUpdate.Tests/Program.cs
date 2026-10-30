@@ -52,6 +52,39 @@ static void TotalTimeout(TimeoutException error) => Assert(error.Message.Contain
 
 try
 {
+    await Run("selected channel has honest no-release, same-build and downgrade outcomes", async () =>
+    {
+        using var fixture = new Fixture(Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N")), generous, generous, NativeReleaseChannel.Test);
+        fixture.Handler.Enqueue(JsonSerializer.SerializeToUtf8Bytes(Array.Empty<object>()));
+        var none = await fixture.Client.CheckForInstallationAsync(revision, "1.2.3", NativeReleaseChannel.Test, default);
+        Assert(none.Availability == NativeUpdateAvailability.NoRelease && none.Update is null, "Unpublished channel claimed current");
+        foreach (var scenario in new[] {
+            (Revision: revision, Version: "1.2.3", Channel: NativeReleaseChannel.Test, Expected: NativeUpdateAvailability.Current),
+            (Revision: revision, Version: "1.2.3", Channel: NativeReleaseChannel.Stable, Expected: NativeUpdateAvailability.Available),
+            (Revision: "", Version: "1.2.4", Channel: NativeReleaseChannel.Stable, Expected: NativeUpdateAvailability.OlderVersion),
+            (Revision: "", Version: "1.2.3.0", Channel: NativeReleaseChannel.Test, Expected: NativeUpdateAvailability.UnknownVersion),
+            (Revision: "", Version: "1.2.2", Channel: NativeReleaseChannel.Test, Expected: NativeUpdateAvailability.Available),
+            (Revision: "", Version: "", Channel: NativeReleaseChannel.Test, Expected: NativeUpdateAvailability.UnknownVersion),
+            (Revision: "", Version: "1.2.3-preview", Channel: NativeReleaseChannel.Test, Expected: NativeUpdateAvailability.UnknownVersion) })
+        {
+            fixture.Handler.Enqueue(releases); fixture.Handler.Enqueue(manifest);
+            var result = await fixture.Client.CheckForInstallationAsync(scenario.Revision, scenario.Version, scenario.Channel, default);
+            Assert(result.Availability == scenario.Expected && result.Update?.Distribution == "native-test", "Incorrect availability: " + scenario);
+        }
+    });
+    await Run("download cannot cross channel or accept a forged repository asset", async () =>
+    {
+        using var fixture = Create(idle: generous);
+        foreach (var invalid in new[] {
+            update with { Distribution = "native" },
+            update with { Tag = "native-stable-fixture" },
+            update with { Download = new Uri("https://github.com/other/repo/releases/download/" + tag + "/" + filename) },
+            update with { Revision = "../outside" },
+            update with { Sha256 = "" }, update with { Size = 1 } })
+            await Fails<InvalidOperationException>(() => fixture.Client.DownloadAsync(invalid, new ProgressRecorder(), default));
+        Assert(fixture.Handler.Requests.Count == 0, "Invalid captured channel/asset reached network");
+        NoPartial(fixture); NoInstaller(fixture);
+    });
     await Run("stable and test clients select only their own release channel", async () =>
     {
         foreach (var channel in new[] { NativeReleaseChannel.Stable, NativeReleaseChannel.Test })

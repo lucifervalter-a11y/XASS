@@ -7,7 +7,7 @@ public sealed class NativeUpdatePreferencesStore
 {
     private readonly string path;
     private readonly object gate = new();
-    private sealed record State(bool Enabled, List<string> Rejected);
+    private sealed record State(bool Enabled, List<string> Rejected, string? SelectedDistribution = null);
     public NativeUpdatePreferencesStore(string path) => this.path = path;
     private State Read()
     {
@@ -28,7 +28,13 @@ public sealed class NativeUpdatePreferencesStore
                 if (!rejected.Contains(value)) rejected.Add(value);
             }
         }
-        return new(enabled, rejected);
+        string? selected = null;
+        if (data.RootElement.TryGetProperty("selected_distribution", out var channel))
+        {
+            if (channel.ValueKind != JsonValueKind.String) throw new InvalidDataException("Некорректный канал обновлений.");
+            selected = NativeReleaseChannel.FromDistribution(channel.GetString()).Distribution;
+        }
+        return new(enabled, rejected, selected);
     }
     private void Write(State state)
     {
@@ -36,7 +42,9 @@ public sealed class NativeUpdatePreferencesStore
         string temporary = path + ".tmp";
         using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
         {
-            JsonSerializer.Serialize(stream, new { schema = 1, automatic_enabled = state.Enabled, rejected_sha256 = state.Rejected });
+            var value = new Dictionary<string, object> { ["schema"] = 1, ["automatic_enabled"] = state.Enabled, ["rejected_sha256"] = state.Rejected };
+            if (state.SelectedDistribution is not null) value["selected_distribution"] = state.SelectedDistribution;
+            JsonSerializer.Serialize(stream, value);
             stream.Flush(flushToDisk: true);
         }
         File.Move(temporary, path, true);
@@ -45,6 +53,16 @@ public sealed class NativeUpdatePreferencesStore
     { lock (gate) { try { return Read().Enabled; } catch { return false; } } }
     public void Save(bool enabled)
     { lock (gate) { State state = Read(); Write(state with { Enabled = enabled }); } }
+    public NativeReleaseChannel LoadChannel(NativeReleaseChannel installed)
+    {
+        lock (gate)
+        {
+            try { return NativeReleaseChannel.FromDistribution(Read().SelectedDistribution ?? installed.Distribution); }
+            catch { return installed; }
+        }
+    }
+    public void SaveChannel(NativeReleaseChannel channel)
+    { lock (gate) { State state = Read(); Write(state with { SelectedDistribution = NativeReleaseChannel.FromDistribution(channel.Distribution).Distribution }); } }
     public void RememberRejected(string sha256)
     {
         if (!NativeAutomaticUpdatePolicy.ValidSha256(sha256)) throw new InvalidDataException("Неверная контрольная сумма обновления.");
@@ -69,6 +87,8 @@ public static class NativeUpdatePreferences
     private static readonly NativeUpdatePreferencesStore Store = new(NativeRuntimeMode.UpdatePreferencesFile);
     public static bool Load() => Store.Load();
     public static void Save(bool enabled) => Store.Save(enabled);
+    public static NativeReleaseChannel LoadChannel(NativeReleaseChannel installed) => Store.LoadChannel(installed);
+    public static void SaveChannel(NativeReleaseChannel channel) => Store.SaveChannel(channel);
     public static void RememberRejected(string sha256) => Store.RememberRejected(sha256);
     public static bool IsRejected(string sha256) => Store.IsRejected(sha256);
 }

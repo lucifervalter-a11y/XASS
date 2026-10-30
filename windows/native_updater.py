@@ -23,7 +23,16 @@ from installer_process import InstallerProcessError, run_installer
 
 APP_ID = "B4D7E8B9-9C58-4C36-A432-D114393006D8"
 REQUEST_KEYS = {"schema", "job_id", "install_root", "installer", "sha256", "size", "version", "revision", "parent_pid", "parent_created", "automatic"}
+CHANNEL_REQUEST_KEYS = REQUEST_KEYS | {"release_distribution", "allow_channel_change"}
 ACTIVE = {"preparing", "backing-up", "ready", "installing", "health-check", "rolling-back", "rollback-health"}
+
+
+def numeric_version(value) -> tuple[int, int, int]:
+    # Installer versions are deliberately numeric; unknown/prerelease syntax
+    # cannot accidentally turn a channel change into an implicit downgrade.
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", value):
+        raise ValueError("Unknown installer version")
+    return tuple(int(part) for part in value.split("."))
 
 
 def object_file(path: Path, maximum: int = 1024 * 1024) -> dict:
@@ -91,7 +100,9 @@ class NativeUpdater:
         if self.job.parent.resolve() != root.resolve() or not re.fullmatch(r"job-[a-f0-9]{32}", self.job.name):
             raise ValueError("Untrusted update job location")
         self.request = object_file(self.request_path, 16384)
-        if set(self.request) != REQUEST_KEYS or self.request["schema"] != 1:
+        schema = self.request.get("schema")
+        expected_keys = {1: REQUEST_KEYS, 2: CHANNEL_REQUEST_KEYS}.get(schema) if type(schema) is int else None
+        if expected_keys is None or set(self.request) != expected_keys:
             raise ValueError("Unknown update request schema")
         r = self.request
         if r["job_id"] != self.job.name or type(r["automatic"]) is not bool or type(r["parent_pid"]) is not int or r["parent_pid"] <= 0:
@@ -121,7 +132,15 @@ class NativeUpdater:
         self.release_distribution = expected_names[self.installer.name]
         if self.previous.get("app_id") != APP_ID or self.previous.get("distribution") not in {"native-test", "native"}:
             raise ValueError("Not a native installation")
-        if self.previous.get("distribution") == "native" and self.release_distribution != "native":
+        if schema == 2:
+            if (r["release_distribution"] != self.release_distribution
+                    or type(r["allow_channel_change"]) is not bool):
+                raise ValueError("Update channel does not match the selected release")
+            if self.previous["distribution"] != self.release_distribution and not r["allow_channel_change"]:
+                raise ValueError("Changing the release channel requires explicit selection")
+            if numeric_version(r["version"]) < numeric_version(self.previous.get("version")):
+                raise ValueError("The selected channel has an older version; wait for a newer release")
+        elif self.previous.get("distribution") == "native" and self.release_distribution != "native":
             raise ValueError("A stable installation cannot move to the test channel")
         if not re.fullmatch(r"[a-fA-F0-9]{40}", str(self.previous.get("revision") or "")):
             raise ValueError("Installed revision is unknown")
@@ -246,9 +265,11 @@ class NativeUpdater:
         self.installer_shutdown_confirmed = True
         if result.returncode != 0: raise RuntimeError("Installer failed")
 
-    def verify_installed(self, revision: str):
+    def verify_installed(self, revision: str, *, distribution: str | None = None):
         marker = object_file(self.install / "native-install.json", 16384)
-        expected_distribution = self.previous["distribution"] if revision == self.previous["revision"] else self.release_distribution
+        expected_distribution = distribution or (self.previous["distribution"] if revision == self.previous["revision"] else self.release_distribution)
+        if expected_distribution not in {"native", "native-test"}:
+            raise ValueError("Unknown installed release channel")
         if marker.get("app_id") != APP_ID or marker.get("distribution") != expected_distribution or marker.get("revision") != revision:
             raise ValueError("Installed identity/revision mismatch")
         payload = object_file(self.install / "payload-manifest.json", 16 * 1024 * 1024)
@@ -304,7 +325,9 @@ class NativeUpdater:
         try:
             self.prepare(); self.wait_for_parent(); self.install_release()
             self.state("health-check", "Проверка нативного приложения, среды и агента")
-            self.verify_installed(self.request["revision"])
+            # Stable and beta may be built from the same commit. Revision alone
+            # cannot distinguish the target install from its rollback identity.
+            self.verify_installed(self.request["revision"], distribution=self.release_distribution)
             self.state("completed", "Нативное обновление установлено и проверено", ok=True)
             return 0
         except InterruptedError:
