@@ -604,7 +604,11 @@ final class NativeStoreTests: XCTestCase {
         await store.refresh()
         store.selectedDevice = "agent:Studio"
         do { try await store.play(store.tracks[0]); XCTFail("A failed target must not start the phone automatically") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("не подтверждена")) }
+        catch let failure as OwnerAPIError {
+            XCTAssertEqual(failure.status, 409)
+            XCTAssertEqual(failure.message, "ПК недоступен для музыки. Проверьте подключение и версию агента")
+        }
+        XCTAssertTrue(store.transferFailure?.message.contains("не подтверждена") == true)
         XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" })
         XCTAssertFalse(audio.hasPlayableItem)
         XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
@@ -613,6 +617,7 @@ final class NativeStoreTests: XCTestCase {
         try await store.play(store.tracks[0])
         XCTAssertEqual(store.selectedDevice, "agent:Studio")
         XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertNil(store.transferFailure)
     }
 
     @MainActor func testFailureAfterStopRetainsExactPositionAndExplicitRetryDoesNotAutoPlay() async throws {
