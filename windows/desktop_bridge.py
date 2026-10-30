@@ -34,7 +34,7 @@ SCHEMAS = {
     "desktop_clipboard": set(), "desktop_screenshot": set(), "desktop_lock": {"confirmed"},
     "desktop_curation_start": {"folder"}, "desktop_curation_inspect": {"id"},
     "desktop_curation_candidates": {"id"}, "desktop_curation_propose": {"id", "changes", "artwork_path", "digest"},
-    "desktop_curation_transcribe": {"id", "model_path"},
+    "desktop_curation_transcribe": {"id", "model_path"}, "desktop_curation_fingerprint": {"id"},
     "desktop_curation_duplicates": set(), "desktop_curation_history": set(),
     "desktop_curation_apply": {"id", "confirmed"}, "desktop_curation_undo": {"id", "confirmed"},
 }

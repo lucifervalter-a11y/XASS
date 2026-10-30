@@ -1,7 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-enum XASSStyle {
+@MainActor enum XASSStyle {
     static var background: Color { ThemeManager.shared.currentTheme.backgroundColor }
     static var surface: Color { ThemeManager.shared.currentTheme.cardColor }
     static var accent: Color { ThemeManager.shared.currentTheme.accentColor }

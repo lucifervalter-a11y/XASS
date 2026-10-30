@@ -135,7 +135,7 @@ def _read_tags(path):
     if not math.isfinite(duration) or not 0 <= duration <= 86400:
         duration = 0
     return {"title": title[:480], "artist": artist[:480], "album": album[:480], "lyrics": lyrics[:MAX_TEXT],
-            "artwork": art, "cover_preview": preview, "duration": round(duration, 3), "variants": variants(title or path.stem), "filename": path.stem}
+            "artwork": art, "cover_preview": preview, "duration": round(duration, 3), "variants": variants(title + " " + path.stem), "filename": path.stem}
 
 
 def write_tags(path, changes):
@@ -277,17 +277,17 @@ def search_terms(tags):
     parts = re.split(r"\s+[-–—]\s+", title)
     if len(parts) == 2 and not artist:
         artist, title = parts
-    return {**tags, "title": title, "artist": artist, "variants": variants(title)}
+    return {**tags, "title": title, "artist": artist, "variants": sorted(set(tags.get("variants", [])) | set(variants(title)))}
 
 
-def acoustic_recordings(path):
-    """Optional explicit local fpcalc + owner's provider key. Never install either."""
-    executable, key = os.environ.get("XASS_FPCALC", ""), os.environ.get("XASS_ACOUSTID_KEY", "")
-    if not executable or not key:
-        return [], "Акустическое распознавание не настроено: нет локального fpcalc или ключа AcoustID. Доступен поиск по тегам."
+def local_fingerprint(path):
+    """The explicitly installed fpcalc works locally, without a provider key."""
+    executable = os.environ.get("XASS_FPCALC", "")
+    if not executable:
+        return None
     binary = safe(Path(executable))
-    if not binary.is_file() or len(key) > 128:
-        return [], "Акустическое распознавание недоступно: проверьте установленный fpcalc и настройку AcoustID."
+    if not binary.is_file():
+        raise CurationError("Локальный fpcalc не найден. Проверьте настройку XASS_FPCALC.")
     result = subprocess.run([str(binary), "-json", "-length", "120", str(path)], capture_output=True, timeout=45,
                             creationflags=0x08000000 if os.name == "nt" else 0)
     if result.returncode != 0 or len(result.stdout) > 65536:
@@ -297,6 +297,18 @@ def acoustic_recordings(path):
     value = fingerprint.get("fingerprint")
     if type(duration) not in (int, float) or not math.isfinite(duration) or not 0 < duration <= 86400 or not isinstance(value, str) or not 1 < len(value) < 60000:
         raise CurationError("Некорректный акустический отпечаток.")
+    return {"duration": duration, "fingerprint": value}
+
+
+def acoustic_recordings(path, fingerprint=None):
+    """Optional owner's provider key. No implicit executable or key install."""
+    key = os.environ.get("XASS_ACOUSTID_KEY", "")
+    if not key or len(key) > 128:
+        return [], "AcoustID не настроен: нет ключа. Локальное сравнение отпечатков не требует ключа; доступен поиск по тегам."
+    fingerprint = fingerprint or local_fingerprint(path)
+    if fingerprint is None:
+        return [], "Акустическое распознавание не настроено: нет локального fpcalc. Доступен поиск по тегам."
+    duration, value = fingerprint["duration"], fingerprint["fingerprint"]
     import httpx
     with httpx.Client(timeout=8, follow_redirects=False, trust_env=False) as client:
         deadline = time.monotonic() + 12
@@ -432,6 +444,7 @@ class CurationService:
             db.executescript("""CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY, path TEXT NOT NULL, digest TEXT, info TEXT);
                 CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, track TEXT NOT NULL, digest TEXT NOT NULL, changes TEXT NOT NULL, evidence TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS edits(id TEXT PRIMARY KEY, path TEXT NOT NULL, before_hash TEXT NOT NULL, after_hash TEXT NOT NULL, backup TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS fingerprints(track TEXT PRIMARY KEY, digest TEXT NOT NULL, fingerprint TEXT NOT NULL, duration REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS scan(id INTEGER PRIMARY KEY CHECK(id=1), folder TEXT NOT NULL);""")
             try:
                 yield db
@@ -465,7 +478,7 @@ class CurationService:
             if truncated or visited > 20000:
                 truncated = True; break
         with self.database() as db:
-            db.execute("DELETE FROM proposals"); db.execute("DELETE FROM tracks")
+            db.execute("DELETE FROM proposals"); db.execute("DELETE FROM fingerprints"); db.execute("DELETE FROM tracks")
             db.execute("INSERT OR REPLACE INTO scan VALUES(1, ?)", (str(folder),))
             rows = [{"id": uuid.uuid4().hex, "name": str(path.relative_to(folder))} for path in paths]
             db.executemany("INSERT INTO tracks(id,path) VALUES(?,?)", [(row["id"], str(path)) for row, path in zip(rows, paths)])
@@ -513,7 +526,10 @@ class CurationService:
         acoustic, acoustic_notice = [], "Акустический отпечаток не проверялся."
         if self.provider is lookup:
             try:
-                acoustic, acoustic_notice = acoustic_recordings(path)
+                fingerprint = local_fingerprint(path)
+                if fingerprint:
+                    self._save_fingerprint(key, row["digest"], fingerprint)
+                acoustic, acoustic_notice = acoustic_recordings(path, fingerprint) if fingerprint else ([], "Локальный fpcalc не настроен. Доступен поиск по тегам.")
             except Exception:
                 acoustic_notice = "AcoustID недоступен. Результаты поиска по тегам требуют проверки."
             result = self.provider(before, acoustic)
@@ -533,6 +549,26 @@ class CurationService:
                 if str(error) != "Новых изменений нет.":
                     raise
         return {"status": result["status"], "proposals": views, "notices": [acoustic_notice, *result.get("warnings", [])]}
+
+    def _save_fingerprint(self, key, digest, fingerprint):
+        with self.database() as db:
+            current, path = self._track(db, key)
+            if current["digest"] != digest or identity(path) != digest:
+                raise CurationError("Файл изменился во время сравнения звука. Повторите проверку.")
+            # Only a local comparison key is persisted, never the provider key.
+            value = hashlib.sha256(("chromaprint:120:" + fingerprint["fingerprint"]).encode()).hexdigest()
+            db.execute("INSERT OR REPLACE INTO fingerprints VALUES(?,?,?,?)", (key, digest, value, fingerprint["duration"])); db.commit()
+
+    def fingerprint(self, key):
+        with self.database() as db:
+            row, path = self._track(db, key)
+            if not row["digest"] or identity(path) != row["digest"]:
+                raise CurationError("Файл изменился. Сначала повторите проверку.")
+        fingerprint = local_fingerprint(path)
+        if fingerprint is None:
+            return {"available": False, "notice": "Локальный fpcalc не настроен. Укажите XASS_FPCALC; ничего не скачивалось и в сеть не отправлялось."}
+        self._save_fingerprint(key, row["digest"], fingerprint)
+        return {"available": True, "notice": "Первые 120 секунд сравниваются локально. Совпадение — только кандидат для прослушивания, не разрешение на удаление."}
 
     def propose(self, key, changes, *, evidence=None, artwork_path="", artwork_data="", expected_digest=None):
         if not isinstance(changes, dict) or set(changes) - {"title", "artist", "album", "lyrics"}:
@@ -607,19 +643,33 @@ class CurationService:
     def duplicates(self):
         with self.database() as db:
             rows = list(db.execute("SELECT * FROM tracks WHERE info IS NOT NULL"))
-        exact, possible = {}, {}
+            fingerprints = {row["track"]: row for row in db.execute("SELECT * FROM fingerprints")}
+        exact, possible, acoustic = {}, {}, {}
         for row in rows:
             info = json.loads(row["info"])
             value = {"id": row["id"], "name": Path(row["path"]).name, "duration": info["duration"], "variants": info["variants"]}
             exact.setdefault(row["digest"], []).append(value)
             if info["title"] and info["artist"]:
                 possible.setdefault((norm(info["title"]), norm(info["artist"]), tuple(info["variants"])), []).append(value)
+            fingerprint = fingerprints.get(row["id"])
+            if fingerprint is not None and fingerprint["digest"] == row["digest"]:
+                acoustic.setdefault((fingerprint["fingerprint"], tuple(info["variants"])), []).append({**value, "duration": fingerprint["duration"]})
         exact_sets = {tuple(sorted(x["id"] for x in group)) for group in exact.values() if len(group) > 1}
         result = [{"kind": "exact_bytes", "reason": "Файлы совпадают побайтово (SHA-256). Ничего не удалено.", "tracks": group}
                   for group in exact.values() if len(group) > 1]
         for group in possible.values():
             if len(group) > 1 and tuple(sorted(x["id"] for x in group)) not in exact_sets:
                 result.append({"kind": "candidate", "reason": "Совпали названия и версии. Звук не сравнивался; разница длительности не доказывает дубликат или другую запись.", "tracks": group})
+        for matches in acoustic.values():
+            # Cluster conservatively: no group spans more than one second.
+            group = []
+            for value in sorted(matches, key=lambda item: item["duration"]) + [None]:
+                if group and (value is None or value["duration"] - group[0]["duration"] > 1):
+                    if len(group) > 1 and tuple(sorted(x["id"] for x in group)) not in exact_sets:
+                        result.append({"kind": "fingerprint_candidate", "reason": "Совпали локальные отпечатки первых 120 с и длительность (±1 с). Это не побайтовая копия: прослушайте обе версии. Файлы не удаляются.", "tracks": group})
+                    group = []
+                if value is not None:
+                    group.append(value)
         return {"groups": result[:200], "truncated": len(result) > 200}
 
     def _recover(self, db):
@@ -731,6 +781,8 @@ class CurationService:
                 return self.candidates(request.get("id"))
             if action == "desktop_curation_transcribe":
                 return self.transcribe(request.get("id"), request.get("model_path"))
+            if action == "desktop_curation_fingerprint":
+                return self.fingerprint(request.get("id"))
             if action == "desktop_curation_propose":
                 digest = plain(request.get("digest"), 64)
                 if not re.fullmatch(r"[0-9a-f]{64}", digest):

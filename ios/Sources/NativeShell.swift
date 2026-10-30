@@ -146,16 +146,17 @@ enum NativeShellSheet: Hashable, Identifiable {
             content(NativeWeatherView(store: store, workspace: workspace), tag: 4).tabItem { Label("Погода", systemImage: "cloud.sun") }.tag(4).accessibilityIdentifier("tab-weather")
         }.tint(XASSStyle.accent)
     }
+    private var resolvedSheet: NativeShellSheet? {
+        NativeShellSheet.resolve(enrollment: store.showEnrollment, route: store.showRoutePicker,
+                                 actionsTrackID: playerActions?.id, queue: showQueue,
+                                 fixtureDevice: fixtureDevice, fixtureStorage: fixtureStorage,
+                                 fixtureAlbums: fixtureAlbums, fixtureMusicImport: fixtureMusicImport, lyricsToolsTrackID: lyricsToolsTrackID)
+    }
     private var presentedSheet: Binding<NativeShellSheet?> {
-        Binding(get: {
-            NativeShellSheet.resolve(enrollment: store.showEnrollment, route: store.showRoutePicker,
-                                     actionsTrackID: playerActions?.id, queue: showQueue,
-                                     fixtureDevice: fixtureDevice, fixtureStorage: fixtureStorage,
-                                     fixtureAlbums: fixtureAlbums, fixtureMusicImport: fixtureMusicImport, lyricsToolsTrackID: lyricsToolsTrackID)
-        }, set: { value in
+        Binding(get: { resolvedSheet }, set: { value in
             guard value == nil else { return }
             // Clear only what was actually on screen; lower-priority flags stay.
-            switch presentedSheet.wrappedValue {
+            switch resolvedSheet {
             case .enrollment: store.showEnrollment = false
             case .route: store.showRoutePicker = false
             case .actions: playerActions = nil

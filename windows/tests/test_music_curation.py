@@ -259,6 +259,78 @@ class CurationTests(unittest.TestCase):
         self.service.undo(edit["id"], True)
         self.assertEqual(self.path.read_bytes(), original)
 
+    def test_local_fingerprint_without_provider_key_is_persisted_as_review_only(self):
+        second = self.make_audio("renamed.wav", title="Different title", artist="Different artist")
+        originals = {path: path.read_bytes() for path in (self.path, second)}
+        rows = self.scan()
+        with patch.dict(os.environ, {"XASS_ACOUSTID_KEY": ""}), patch("music_curation.local_fingerprint", return_value={"duration": 2, "fingerprint": "synthetic-private-fingerprint"}), patch("music_curation._json_get") as network:
+            for row in rows:
+                self.assertTrue(self.service.fingerprint(row["id"])["available"])
+        network.assert_not_called()
+        again = CurationService(self.data)
+        group = next(g for g in again.duplicates()["groups"] if g["kind"] == "fingerprint_candidate")
+        self.assertIn("не побайтовая копия", group["reason"])
+        self.assertEqual(len(group["tracks"]), 2)
+        with again.database() as db:
+            stored = db.execute("SELECT fingerprint FROM fingerprints").fetchone()[0]
+            self.assertNotEqual(stored, "synthetic-private-fingerprint")
+            self.assertEqual(len(stored), 64)
+        self.assertEqual(originals, {path: path.read_bytes() for path in originals})
+
+    def test_matching_fingerprint_keeps_variants_and_large_duration_differences_separate(self):
+        self.make_audio("Live.wav", title="Song (Live)")
+        self.make_audio("Extended.wav", title="Another title", seconds=8)
+        rows = self.scan()
+        for row in rows:
+            with patch("music_curation.local_fingerprint", return_value={"duration": row["tags"]["duration"], "fingerprint": "same-fingerprint"}):
+                self.service.fingerprint(row["id"])
+        self.assertFalse(any(g["kind"] == "fingerprint_candidate" for g in self.service.duplicates()["groups"]))
+
+    def test_filename_variant_is_protected_even_when_title_tag_omits_it(self):
+        self.make_audio("Artist - Song (Live).wav", title="Song")
+        rows = self.scan()
+        live = next(row for row in rows if "Live" in row["name"])
+        self.assertEqual(search_terms(live["tags"])["variants"], ["live"])
+        self.assertFalse(any(group["kind"] == "candidate" for group in self.service.duplicates()["groups"]))
+
+    def test_fingerprint_cannot_be_attached_after_file_changes_during_analysis(self):
+        row = self.scan()[0]
+        def delayed(path):
+            write_tags(path, {"title": "Changed externally"}); self.service.inspect(row["id"])
+            return {"duration": 2, "fingerprint": "stale-fingerprint"}
+        with patch("music_curation.local_fingerprint", side_effect=delayed):
+            with self.assertRaisesRegex(CurationError, "изменился во время"):
+                self.service.fingerprint(row["id"])
+        with self.service.database() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM fingerprints").fetchone()[0], 0)
+
+    def test_fingerprint_invalidated_after_reviewed_tag_write(self):
+        self.make_audio("other.wav", title="Different title")
+        rows = self.scan()
+        with patch("music_curation.local_fingerprint", return_value={"duration": 2, "fingerprint": "same-fingerprint"}):
+            for row in rows: self.service.fingerprint(row["id"])
+        proposal = self.service.propose(rows[0]["id"], {"album": "New album"})
+        self.service.apply(proposal["id"], True); self.service.inspect(rows[0]["id"])
+        self.assertFalse(any(g["kind"] == "fingerprint_candidate" for g in self.service.duplicates()["groups"]))
+
+    def test_multi_undo_newest_first_restores_chain_but_preserves_conflicting_track(self):
+        other = self.make_audio("Other.wav", title="Other")
+        original = self.path.read_bytes(); rows = self.scan()
+        track = next(row for row in rows if row["name"] == self.path.name)
+        other_track = next(row for row in rows if row["name"] == other.name)
+        self.service.apply(self.service.propose(track["id"], {"title": "First"})["id"], True)
+        self.service.inspect(track["id"])
+        self.service.apply(self.service.propose(track["id"], {"title": "Second"})["id"], True)
+        self.service.apply(self.service.propose(other_track["id"], {"title": "Third"})["id"], True)
+        write_tags(other, {"album": "External changes"}); external = other.read_bytes()
+        restored, conflicts = 0, 0
+        for edit in self.service.history()["edits"]:
+            try: self.service.undo(edit["id"], True); restored += 1
+            except CurationError: conflicts += 1
+        self.assertEqual((restored, conflicts), (2, 1))
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(other.read_bytes(), external)
+
 
 class ProviderTests(unittest.TestCase):
     def tags(self, **values):
@@ -306,7 +378,18 @@ class ProviderTests(unittest.TestCase):
         from music_curation import acoustic_recordings
         with patch.dict(os.environ, {"XASS_FPCALC": "", "XASS_ACOUSTID_KEY": ""}), patch("music_curation.subprocess.run") as run:
             rows, notice = acoustic_recordings(Path("missing.wav"))
-        self.assertEqual(rows, []); self.assertIn("не настроено", notice); run.assert_not_called()
+        self.assertEqual(rows, []); self.assertIn("нет ключа", notice); run.assert_not_called()
+
+    def test_local_fpcalc_needs_no_provider_key(self):
+        from music_curation import local_fingerprint
+        with tempfile.TemporaryDirectory() as folder:
+            binary = Path(folder) / "fpcalc.exe"; binary.write_bytes(b"fixture-not-executable")
+            response = SimpleNamespace(returncode=0, stdout=b'{"duration":120,"fingerprint":"fixture-fingerprint"}')
+            with patch.dict(os.environ, {"XASS_ACOUSTID_KEY": "", "XASS_FPCALC": str(binary)}), patch("music_curation.subprocess.run", return_value=response) as run:
+                result = local_fingerprint(Path(folder) / "fixture.wav")
+        self.assertEqual(result["duration"], 120)
+        self.assertIn("-length", run.call_args.args[0])
+        self.assertNotIn("shell", run.call_args.kwargs)
 
 
 if __name__ == "__main__":

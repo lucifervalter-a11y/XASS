@@ -30,7 +30,7 @@ public sealed partial class MainWindow
     private readonly Image curationOldCover = new() { Width = 120, Height = 120, Stretch = Stretch.UniformToFill };
     private readonly Image curationNewCover = new() { Width = 120, Height = 120, Stretch = Stretch.UniformToFill };
     private readonly TextBox curationOriginalLyrics = new() { Header = "Исходный текст", IsReadOnly = true, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MaxHeight = 180 };
-    private readonly ListView curationHistory = new() { DisplayMemberPath = "Display", MaxHeight = 220 };
+    private readonly ListView curationHistory = new() { DisplayMemberPath = "Display", MaxHeight = 260, SelectionMode = ListViewSelectionMode.Multiple };
     private readonly ProgressBar curationProgress = new() { Minimum = 0, Maximum = 1, Visibility = Visibility.Collapsed };
     private CancellationTokenSource? curationOperation;
     private string curationSelected = "", curationCoverPath = "", curationProposal = "", curationDigest = "";
@@ -60,6 +60,7 @@ public sealed partial class MainWindow
             });
         };
         page.Children.Add(curationList);
+        page.Children.Add(DActions(DButton("Сравнить звук локально", FingerprintCurationAsync)));
         page.Children.Add(curationDuplicates);
         page.Children.Add(DLabel("Проверка выбранного трека", 20));
         page.Children.Add(DActions(DButton("Найти в открытом каталоге", () => SearchCurationAsync(all: false)),
@@ -84,9 +85,9 @@ public sealed partial class MainWindow
         page.Children.Add(DActions(DButton("Посмотреть изменения", PreviewCurationAsync), DButton("Применить просмотренную правку", ApplyCurationAsync)));
         page.Children.Add(curationReview);
         page.Children.Add(DLabel("Журнал оригиналов", 20));
-        page.Children.Add(DLabel("Откат восстанавливает исходный файл целиком. Если после правки его изменило другое приложение, автоматический откат блокируется. Дубликаты только показываются — файлы не удаляются."));
+        page.Children.Add(DLabel("Выберите одну или несколько правок (например, все треки альбома). Откат идёт от новых к старым, по одному файлу. Конфликты пропускаются, а успешные восстановления сохраняются даже при отмене. Дубликаты только показываются — файлы не удаляются."));
         page.Children.Add(curationHistory);
-        page.Children.Add(DActions(DButton("Обновить журнал", LoadCurationHistoryAsync), DButton("Откатить выбранную правку", UndoCurationAsync)));
+        page.Children.Add(DActions(DButton("Обновить журнал", LoadCurationHistoryAsync), DButton("Откатить выбранные правки", UndoCurationAsync)));
         Closed += (_, _) => curationOperation?.Cancel();
     }
 
@@ -102,7 +103,7 @@ public sealed partial class MainWindow
         if (curationOperation is not null) { curationStatus.Text = "Дождитесь завершения текущего действия или нажмите «Остановить»."; return; }
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         curationOperation = cancel;
-        curationList.IsEnabled = curationSuggestions.IsEnabled = false;
+        curationList.IsEnabled = curationSuggestions.IsEnabled = curationHistory.IsEnabled = false;
         foreach (var editor in new[] { curationTitle, curationArtist, curationAlbum, curationLyrics }) editor.IsEnabled = false;
         curationProgress.Visibility = Visibility.Visible;
         try { await action(cancel.Token); }
@@ -111,7 +112,7 @@ public sealed partial class MainWindow
         finally
         {
             curationOperation = null; curationProgress.Visibility = Visibility.Collapsed;
-            curationList.IsEnabled = curationSuggestions.IsEnabled = true;
+            curationList.IsEnabled = curationSuggestions.IsEnabled = curationHistory.IsEnabled = true;
             foreach (var editor in new[] { curationTitle, curationArtist, curationAlbum, curationLyrics }) editor.IsEnabled = true;
         }
     }
@@ -146,11 +147,43 @@ public sealed partial class MainWindow
                 catch (InvalidOperationException error) { failures++; curationRows.Add(new(id, name, error.Message)); }
                 curationProgress.Value = curationRows.Count;
             }
-            var groups = await CurationRequestAsync(new { action = "desktop_curation_duplicates", version = 1 }, token);
-            curationDuplicates.Text = string.Join("\n\n", groups.GetProperty("groups").EnumerateArray().Select(g =>
-                $"{DValue(g, "reason")}\n{string.Join(" / ", g.GetProperty("tracks").EnumerateArray().Select(t => DValue(t, "name")))}"));
+            await RefreshCurationDuplicatesAsync(token);
             curationStatus.Text = $"Проверено: {tracks.Length - failures}; не удалось прочитать: {failures}. Ничего не изменено."
                 + (start.GetProperty("truncated").GetBoolean() ? " Достигнут предел: выберите меньшую папку для оставшихся файлов." : "");
+        });
+    }
+
+    private async Task RefreshCurationDuplicatesAsync(CancellationToken token)
+    {
+        var groups = await CurationRequestAsync(new { action = "desktop_curation_duplicates", version = 1 }, token);
+        curationDuplicates.Text = string.Join("\n\n", groups.GetProperty("groups").EnumerateArray().Select(g =>
+            $"{DValue(g, "reason")}\n{string.Join(" / ", g.GetProperty("tracks").EnumerateArray().Select(t => DValue(t, "name")))}"));
+        if (groups.GetProperty("truncated").GetBoolean()) curationDuplicates.Text += "\nПоказаны первые 200 групп.";
+    }
+
+    private async Task FingerprintCurationAsync()
+    {
+        var ids = curationRows.Select(row => row.Id).ToArray();
+        if (ids.Length == 0) { curationStatus.Text = "Сначала проверьте папку с музыкой."; return; }
+        await CurationRunAsync(async token =>
+        {
+            curationProgress.Maximum = ids.Length; curationProgress.Value = 0;
+            int completed = 0, failed = 0;
+            foreach (string id in ids)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    var result = await CurationRequestAsync(new { action = "desktop_curation_fingerprint", version = 1, id }, token);
+                    if (!result.GetProperty("available").GetBoolean()) { curationStatus.Text = DValue(result, "notice"); return; }
+                    completed++;
+                }
+                catch (InvalidOperationException) { failed++; }
+                curationProgress.Value++;
+                curationStatus.Text = $"Сравнение звука на ПК: {curationProgress.Value} из {ids.Length}; ошибок: {failed}. Можно остановить.";
+            }
+            await RefreshCurationDuplicatesAsync(token);
+            curationStatus.Text = $"Получено отпечатков: {completed}; ошибок: {failed}. Совпадения — только кандидаты: прослушайте их. Файлы не менялись, звук не отправлялся в сеть.";
         });
     }
 
@@ -184,6 +217,7 @@ public sealed partial class MainWindow
                 curationStatus.Text = $"Поиск: {curationProgress.Value} из {ids.Length}. Варианты: {found}; ошибки: {failed}.";
             }
             curationStatus.Text += " Ничего не записано. Выберите трек и вариант для просмотра.";
+            await RefreshCurationDuplicatesAsync(token);
         });
     }
 
@@ -308,12 +342,28 @@ public sealed partial class MainWindow
 
     private async Task UndoCurationAsync()
     {
-        if (curationHistory.SelectedItem is not CurationRow edit) return;
-        if (!await DesktopConfirmAsync("Восстановить оригинал?", edit.Name + "\nВернуть точное содержимое файла до этой правки?", "Восстановить")) return;
+        var selected = curationHistory.SelectedItems.OfType<CurationRow>().Select(row => row.Id).ToHashSet();
+        // Items arrive in newest-first journal order, independent of click order.
+        var edits = curationHistory.Items.OfType<CurationRow>().Where(row => selected.Contains(row.Id)).ToArray();
+        if (edits.Length == 0) { curationStatus.Text = "Выберите правки в журнале оригиналов."; return; }
+        if (!await DesktopConfirmAsync("Восстановить оригиналы?", $"Выбрано правок: {edits.Length}. Вернуть точное содержимое файлов до этих правок? Обработка идёт от новых к старым; конфликтные файлы не заменяются, остальные могут быть восстановлены.\n\n" + string.Join("\n", edits.Select(edit => edit.Name)), "Восстановить")) return;
         await CurationRunAsync(async token =>
         {
-            await CurationRequestAsync(new { action = "desktop_curation_undo", version = 1, id = edit.Id, confirmed = true }, token);
-            curationStatus.Text = "Оригинал восстановлен. Повторите проверку папки для обновления списка.";
+            curationProgress.Maximum = edits.Length; curationProgress.Value = 0;
+            int restored = 0; var failures = new List<string>();
+            foreach (var edit in edits)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    await CurationRequestAsync(new { action = "desktop_curation_undo", version = 1, id = edit.Id, confirmed = true }, token);
+                    restored++;
+                }
+                catch (InvalidOperationException error) { failures.Add(edit.Name + ": " + error.Message); }
+                curationProgress.Value++;
+                curationStatus.Text = $"Восстановлено: {restored} из {edits.Length}; пропущено: {failures.Count}.";
+            }
+            curationStatus.Text += " Повторите проверку папки для обновления списка.\n" + string.Join("\n", failures.Take(12));
         });
         await LoadCurationHistoryAsync();
     }
