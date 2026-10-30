@@ -2,7 +2,7 @@ import XCTest
 @testable import XASS
 
 /// Exercises the same durable recovery handler used by URLSession delegates.
-/// No network task, background daemon, or real Keychain entry is needed.
+/// No external request, background daemon, or real Keychain entry is needed.
 final class DownloadRecoveryTests: XCTestCase {
     private final class SecretFixture {
         var values: [UUID: BackgroundDownloadSecret] = [:]
@@ -102,6 +102,71 @@ final class DownloadRecoveryTests: XCTestCase {
         // A durable discard marker, not a successful Keychain mutation, fences
         // the old opaque bytes until scheduling safely clears the secret.
         XCTAssertEqual(secrets.values[item.id]?.resume, Data([7, 9, 2, 1]))
+    }
+
+    @MainActor func testFoundationRejectsInvalidOpaqueResumeDataThroughRealDelegate() async throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        var item = job()
+        let secrets = SecretFixture(); secrets.values[item.id] = secret(for: item)
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil; configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        let session = URLSession(configuration: configuration, delegate: manager, delegateQueue: .main)
+        defer { session.invalidateAndCancel() }
+        // This malformed blob contains no URL or request. Foundation rejects
+        // it locally; the injected manager cannot schedule a replacement GET.
+        let task = session.downloadTask(withResumeData: Data("invalid-xass-resume-fixture".utf8))
+        item.taskID = task.taskIdentifier; task.taskDescription = item.id.uuidString
+        try ledger.save([item])
+        let settled = expectation(description: "Real URLSession delegate settles rejected resume data")
+        var observed = false
+        let observer = NotificationCenter.default.addObserver(forName: BackgroundDownloads.changed,
+            object: nil, queue: .main) { _ in
+                guard !observed, let phase = ledger.entries.first(where: { $0.id == item.id })?.phase,
+                      phase != .downloading else { return }
+                observed = true; settled.fulfill()
+            }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        task.resume()
+        await fulfillment(of: [settled], timeout: 5)
+
+        let recovered = try XCTUnwrap(ledger.entries.first)
+        let diagnostic = task.error.map { String(describing: $0) } ?? "Foundation returned no transport error"
+        XCTAssertEqual(recovered.phase, .queued, diagnostic)
+        XCTAssertEqual(recovered.restartAttempts, 1, diagnostic)
+        XCTAssertTrue(recovered.discardResumeData, diagnostic)
+        XCTAssertFalse(recovered.usedResumeData)
+        XCTAssertNil(recovered.taskID)
+        XCTAssertEqual(recovered.received, 0)
+        XCTAssertEqual(recovered.expected, 0)
+    }
+
+    @MainActor func testFallbackLedgerWriteFailureDoesNotScheduleOrLoseRetryBudgetInMemory() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        let item = job(), other = job(2, taskID: 22), secrets = SecretFixture()
+        secrets.values[item.id] = secret(for: item); try ledger.save([item, other])
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+        let queue = ledger.directory.appendingPathComponent("queue.json")
+        try FileManager.default.removeItem(at: queue)
+        try FileManager.default.createDirectory(at: queue, withIntermediateDirectories: false)
+
+        XCTAssertTrue(manager.recoverFailure(id: item.id, taskID: 21, statusCode: nil, error: invalidResume))
+
+        let failed = try XCTUnwrap(ledger.entries.first { $0.id == item.id })
+        XCTAssertEqual(failed.phase, .failed)
+        XCTAssertEqual(failed.restartAttempts, 1)
+        XCTAssertTrue(failed.discardResumeData)
+        XCTAssertFalse(failed.usedResumeData)
+        XCTAssertNil(failed.taskID)
+        XCTAssertFalse(manager.resume(item.id), "An unwritable journal must not start another transfer")
+        XCTAssertFalse(manager.recoverFailure(id: item.id, taskID: 21, statusCode: 416, error: nil))
+        XCTAssertEqual(try encoded(ledger.entries.filter { $0.id == other.id }), try encoded([other]))
+        XCTAssertEqual(secrets.saves, 0)
+        XCTAssertTrue(secrets.removals.isEmpty)
     }
 
     @MainActor func testOneFailedFileLeavesOtherFortyNineJobsExactlyUntouched() throws {
