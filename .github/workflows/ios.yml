@@ -43,6 +43,8 @@ jobs:
           echo "XASS_SIMULATOR_ID=$simulator_id" >> "$GITHUB_ENV"
           mkdir -p build
           # One short test bundle exercises the system audio session; extra simulator clones add no value.
+          # Fail this focused real-Foundation regression before the slower UI suite.
+          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -only-testing:XASSTests/DownloadRecoveryTests -derivedDataPath build/simulator -resultBundlePath build/RecoveryTests.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/recovery-tests.log
           xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/simulator-tests.log
       - name: Capture real native screens (isolated simulator data, no account or audio)
         working-directory: ios
@@ -86,8 +88,13 @@ jobs:
         if: always()
         working-directory: ios
         run: |
+          if [ -d build/RecoveryTests.xcresult ]; then
+            xcrun xcresulttool get test-results summary --path build/RecoveryTests.xcresult > build/recovery-summary.json || true
+            xcrun xcresulttool export diagnostics --path build/RecoveryTests.xcresult --output-path build/recovery-diagnostics || true
+          fi
           if [ -d build/Tests.xcresult ]; then
             xcrun xcresulttool export attachments --path build/Tests.xcresult --output-path build/test-attachments
+            xcrun xcresulttool get test-results summary --path build/Tests.xcresult > build/test-summary.json || true
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -113,6 +120,11 @@ jobs:
           name: XASS-iOS-simulator-test-results
           path: |
             ios/build/Tests.xcresult
+            ios/build/RecoveryTests.xcresult
+            ios/build/recovery-tests.log
+            ios/build/recovery-summary.json
+            ios/build/recovery-diagnostics
+            ios/build/test-summary.json
             ios/build/simulator-tests.log
             ios/build/device-build.log
           if-no-files-found: ignore

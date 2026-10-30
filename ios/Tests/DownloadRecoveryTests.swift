@@ -104,7 +104,7 @@ final class DownloadRecoveryTests: XCTestCase {
         XCTAssertEqual(secrets.values[item.id]?.resume, Data([7, 9, 2, 1]))
     }
 
-    @MainActor func testFoundationRejectsInvalidOpaqueResumeDataThroughRealDelegate() async throws {
+    @MainActor func testFoundationRejectsInvalidOpaqueResumeDataThroughRealDelegate() throws {
         let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
         let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
         var item = job()
@@ -131,7 +131,9 @@ final class DownloadRecoveryTests: XCTestCase {
         defer { NotificationCenter.default.removeObserver(observer) }
 
         task.resume()
-        await fulfillment(of: [settled], timeout: 5)
+        // The delegate runs on the main queue. XCTest's synchronous waiter
+        // pumps that run loop without introducing an async test stack frame.
+        waitForExpectations(timeout: 5)
 
         let recovered = try XCTUnwrap(ledger.entries.first)
         let diagnostic = task.error.map { String(describing: $0) } ?? "Foundation returned no transport error"
