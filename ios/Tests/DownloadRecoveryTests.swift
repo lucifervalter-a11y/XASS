@@ -739,6 +739,55 @@ final class DownloadRecoveryTests: XCTestCase {
         XCTAssertEqual(ledger.entries.first?.restartAttempts, 1)
     }
 
+    @MainActor func testUnsupportedURLRecoveryRequiresMissingResumedRequestAndExactUnderlyingError() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        let secrets = SecretFixture()
+        let unsupported = NSError(domain: NSURLErrorDomain, code: NSURLErrorUnsupportedURL)
+        let matchingCFNetwork = NSError(domain: "kCFErrorDomainCFNetwork", code: NSURLErrorUnsupportedURL)
+        let matching = NSError(domain: NSURLErrorDomain, code: NSURLErrorUnsupportedURL,
+                               userInfo: [NSUnderlyingErrorKey: matchingCFNetwork])
+        let tls = NSError(domain: NSURLErrorDomain, code: NSURLErrorUnsupportedURL,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSURLErrorDomain, code: NSURLErrorSecureConnectionFailed)])
+        let otherDomain = NSError(domain: NSURLErrorDomain, code: NSURLErrorUnsupportedURL,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: NSURLErrorUnsupportedURL)])
+        let otherCode = NSError(domain: NSURLErrorDomain, code: NSURLErrorUnsupportedURL,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: "kCFErrorDomainCFNetwork", code: NSURLErrorNetworkConnectionLost)])
+        let wrongOuterDomain = NSError(domain: "kCFErrorDomainCFNetwork", code: NSURLErrorUnsupportedURL)
+        let cases: [(resumed: Bool, missingRequest: Bool, status: Int?, error: NSError, accepted: Bool)] = [
+            (true, true, nil, unsupported, true),
+            (true, true, nil, matching, true),
+            (false, true, nil, matching, false),
+            (true, false, nil, matching, false),
+            (true, true, 200, matching, false),
+            (true, true, nil, tls, false),
+            (true, true, nil, otherDomain, false),
+            (true, true, nil, otherCode, false),
+            (true, true, nil, wrongOuterDomain, false)
+        ]
+        for (index, fixture) in cases.enumerated() {
+            let item = job(resumed: fixture.resumed)
+            secrets.values[item.id] = secret(for: item); try ledger.save([item])
+            let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+            let before = try encoded(ledger.entries)
+
+            XCTAssertEqual(manager.recoverFailure(id: item.id, taskID: 21, statusCode: fixture.status,
+                error: fixture.error, missingResumeRequest: fixture.missingRequest), fixture.accepted, "Case \(index)")
+
+            if fixture.accepted {
+                let recovered = try XCTUnwrap(ledger.entries.first)
+                XCTAssertEqual(recovered.phase, .queued)
+                XCTAssertEqual(recovered.restartAttempts, 1)
+                XCTAssertTrue(recovered.discardResumeData)
+                XCTAssertFalse(recovered.usedResumeData)
+                XCTAssertNil(recovered.taskID)
+            } else {
+                XCTAssertEqual(try encoded(ledger.entries), before, "Case \(index) must remain untouched")
+            }
+        }
+        XCTAssertEqual(secrets.saves, 0); XCTAssertTrue(secrets.removals.isEmpty)
+    }
+
     @MainActor func testRecognizedResumeDecodingFailuresGetAtMostOneFreshAttempt() throws {
         let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
         let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")

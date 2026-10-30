@@ -530,7 +530,8 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
         running.removeValue(forKey: item.id)
         if recoverFailure(id: item.id, taskID: task.taskIdentifier,
                           statusCode: (task.response as? HTTPURLResponse)?.statusCode, error: error as NSError?,
-                          responseURL: task.response?.url) {
+                          responseURL: task.response?.url,
+                          missingResumeRequest: task.originalRequest?.url == nil && task.currentRequest?.url == nil) {
             schedule(); notify(); return
         }
         if let error = error as NSError?, item.phase == .downloading {
@@ -547,7 +548,8 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
     /// callbacks after pause, cancel, logout, ticket refresh or replacement.
     /// This never starts networking: scheduling remains with the delegate.
     @discardableResult
-    func recoverFailure(id: UUID, taskID: Int, statusCode: Int?, error: NSError?, responseURL: URL? = nil) -> Bool {
+    func recoverFailure(id: UUID, taskID: Int, statusCode: Int?, error: NSError?, responseURL: URL? = nil,
+                        missingResumeRequest: Bool = false) -> Bool {
         guard var item = ledger?.entries.first(where: { $0.id == id }),
               item.phase == .downloading, item.taskID == taskID else { return false }
         if let responseURL {
@@ -589,7 +591,17 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             // the daemon cannot reopen resume state. Permit just one fresh GET.
             let unavailableResume = statusCode == nil && error?.code == URLError.resourceUnavailable.rawValue
                 && error?.userInfo[NSUnderlyingErrorKey] == nil
-            resumeFailure = error?.domain == NSURLErrorDomain && (codes.contains(error?.code ?? 0) || unavailableResume)
+            // A malformed dictionary can produce a task with no request at all.
+            // Darwin reports unsupportedURL, including a matching CFNetwork
+            // cause. This is not permission to retry an arbitrary bad URL: the
+            // original HTTPS ticket was separately validated above.
+            let underlying = error?.userInfo[NSUnderlyingErrorKey] as? NSError
+            let unsupportedResume = missingResumeRequest && statusCode == nil
+                && error?.code == URLError.unsupportedURL.rawValue
+                && (underlying == nil || (underlying?.domain == "kCFErrorDomainCFNetwork"
+                    && underlying?.code == URLError.unsupportedURL.rawValue))
+            resumeFailure = error?.domain == NSURLErrorDomain
+                && (codes.contains(error?.code ?? 0) || unavailableResume || unsupportedResume)
         } else { resumeFailure = false }
         guard resumeFailure else { return false }
         return queueFreshAttempt(item)
