@@ -7,7 +7,7 @@ on:
       mode:
         description: Read-only diagnostics by default; deployment is an explicit separate action
         type: choice
-        options: [inspect, protect-config, protect-storage, protect-web, deploy-backend-only]
+        options: [inspect, startup-diagnostics, protect-config, protect-storage, protect-web, deploy-backend-only]
         default: inspect
       target_sha:
         description: Full reviewed server-only overlay SHA (must equal this workflow revision)
@@ -31,6 +31,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  startup-diagnostics:
+    if: inputs.mode == 'startup-diagnostics'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read only bounded startup categories without raw journal or private settings
+        shell: bash
+        env:
+          SSH_HOST: 51.250.80.137
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | bash deploy/github_ssh.sh exec
+          from pathlib import Path
+          source = Path('deploy/backend_startup_diagnostics.py').read_text(encoding='utf-8')
+          delimiter = 'XASS_READONLY_DIAGNOSTICS_20261030'
+          if delimiter in source:
+              raise SystemExit('Unexpected diagnostic delimiter')
+          print("set -euo pipefail\ncd /home/red/serverredus\n.venv/bin/python - <<'" + delimiter + "'")
+          print(source)
+          print(delimiter)
+          PY
+
   inspect:
     if: inputs.mode == 'inspect' || inputs.mode == ''
     runs-on: ubuntu-latest
