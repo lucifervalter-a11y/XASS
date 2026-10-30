@@ -20,6 +20,81 @@ def journal(message, **values):
 
 
 class SanitizationTests(unittest.TestCase):
+    def test_event_offsets_distinguish_deploy_and_rollback_startup(self):
+        raw = journal("INFO: Application startup complete.",
+                      __REALTIME_TIMESTAMP=str(diag.START_US + 12_345_678), _PID="100")
+        raw += journal("INFO: Application startup complete.",
+                       __REALTIME_TIMESTAMP=str(diag.START_US + 98_765_432), _PID="200")
+        events = diag.parse_journal(raw, set())["events"]
+        self.assertEqual(events, [
+            {"kind": "STARTUP_COMPLETE", "offset_ms": 12_345, "pid": 100},
+            {"kind": "STARTUP_COMPLETE", "offset_ms": 98_765, "pid": 200},
+        ])
+
+    def test_timestamp_rejection_never_exports_arbitrary_values(self):
+        invalid = (None, True, diag.START_US, "SECRET_TIMESTAMP", "1" * 10000,
+                   str(diag.START_US - 1), str(diag.END_US + 1), " " + str(diag.START_US),
+                   str(diag.START_US) + "\n", [str(diag.START_US)])
+        for value in invalid:
+            with self.subTest(value=type(value)):
+                result = diag.parse_journal(journal("Application startup complete.", __REALTIME_TIMESTAMP=value), set())
+                self.assertEqual(result["events"], [])
+                self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_pid_rejection_does_not_drop_valid_event(self):
+        for value in ("SECRET_PID", "-10", "2147483648", 123, True, "1\n"):
+            result = diag.parse_journal(journal("Application startup complete.",
+                                               __REALTIME_TIMESTAMP=str(diag.START_US), _PID=value), set())
+            self.assertEqual(result["events"], [{"kind": "STARTUP_COMPLETE", "offset_ms": 0}])
+
+    def test_only_fixed_http_routes_and_status_without_address_or_parameters(self):
+        raw = journal('INFO:  127.0.0.1:50123 - "GET /health HTTP/1.1" 200 OK',
+                      __REALTIME_TIMESTAMP=str(diag.START_US + 1000))
+        raw += journal('INFO:  PRIVATE_ADDRESS_SENTINEL - "POST /api/discord/interactions HTTP/1.1" 401 Unauthorized',
+                       __REALTIME_TIMESTAMP=str(diag.START_US + 2000))
+        result = diag.parse_journal(raw, set())
+        self.assertEqual(result["events"], [
+            {"kind": "HTTP_ACCESS", "offset_ms": 1, "method": "GET", "route": "/health", "status": 200},
+            {"kind": "HTTP_ACCESS", "offset_ms": 2, "method": "POST", "route": "/api/discord/interactions", "status": 401},
+        ])
+        self.assertNotIn("127.0.0.1", json.dumps(result))
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_http_wrong_routes_params_methods_and_status_rejected(self):
+        for request in ('GET /health?token=SECRET HTTP/1.1" 200 OK',
+                        'GET /api/private/SECRET HTTP/1.1" 200 OK',
+                        'POST /health HTTP/1.1" 200 OK',
+                        'GET /api/discord/interactions HTTP/1.1" 200 OK',
+                        'GET /health HTTP/1.1" 999 SECRET',
+                        'GET /health HTTP/1.1" 200 OK token=SECRET'):
+            result = diag.parse_journal(journal('INFO: 127.0.0.1:123 - "' + request,
+                                               __REALTIME_TIMESTAMP=str(diag.START_US)), set())
+            self.assertEqual(result["events"], [])
+            self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_event_count_bounded_preserves_last_rollback(self):
+        raw = b"".join(journal("Application startup complete.", __REALTIME_TIMESTAMP=str(diag.START_US + i * 1000))
+                       for i in range(60))
+        result = diag.parse_journal(raw, set())
+        self.assertEqual(len(result["events"]), 40)
+        self.assertEqual([event["offset_ms"] for event in result["events"]], list(range(20)) + list(range(40, 60)))
+        self.assertIn("EVENT_LIMIT_REACHED", result["reasons"])
+
+    def test_service_stop_events_export_only_enum_and_timing(self):
+        raw = journal("Stopping PRIVATE_DESCRIPTION_SENTINEL...\nStopped PRIVATE_DESCRIPTION_SENTINEL.",
+                      __REALTIME_TIMESTAMP=str(diag.END_US), UNIT=diag.SERVICE, _SYSTEMD_UNIT="init.scope")
+        result = diag.parse_journal(raw, set())
+        self.assertEqual([event["kind"] for event in result["events"]], ["SERVICE_STOPPING", "SERVICE_STOPPED"])
+        self.assertEqual(result["events"][0]["offset_ms"], 110000)
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_systemd_durations_are_numeric_bounded_and_sanitized(self):
+        for value, expected in (("1min 30s", 90000), ("90s", 90000), ("500ms", 500),
+                                ("1.5s", 1500), ("1000us", 1), ("1d", 86400000)):
+            self.assertEqual(diag.timeout_milliseconds(value), expected)
+        for value in ("infinity", "SECRET_SENTINEL", "99d", "90s\nSECRET", "-1s", "nanms", "1s  SECRET", None, True):
+            self.assertEqual(diag.timeout_milliseconds(value), "TIMEOUT_UNAVAILABLE")
+
     def test_exception_text_and_unrelated_private_fields_never_exported(self):
         secret = "PRIVATE_TOKEN_SENTINEL=abcdefghijklmnopqrstuvwxyz"
         raw = journal("ValueError: " + secret, DATABASE_URL=secret)
@@ -90,12 +165,13 @@ class SanitizationTests(unittest.TestCase):
 
     def test_collect_suppresses_permission_error_and_bad_service_values(self):
         responses = [("OK", b"a" * 40), ("OK", b"app/main.py\n"), ("OK", b"app/music_curation_api.py\n"),
-                     ("OK", b"ActiveState=active\nSubState=TOKEN_SENTINEL\nToken=SECRET\n"),
+                     ("OK", b"ActiveState=active\nSubState=TOKEN_SENTINEL\nToken=SECRET\nTimeoutStartUSec=1min 30s\nTimeoutStopUSec=SECRET_SENTINEL\n"),
                      ("COMMAND_FAILED", b"Permission denied SECRET_SENTINEL")]
         with patch.object(diag, "bounded_command", side_effect=responses) as command, patch.object(diag, "dependency_versions", return_value={}):
             result = diag.collect()
         self.assertEqual(result["journal_status"], "JOURNAL_PERMISSION_DENIED")
         self.assertEqual(result["service"], {"ActiveState": "active"})
+        self.assertEqual(result["service_timeouts_ms"], {"start": 90000, "stop": "TIMEOUT_UNAVAILABLE"})
         self.assertNotIn("SENTINEL", json.dumps(result))
         self.assertRegex(result["python"], r"^[0-9]+\.[0-9]+\.[0-9]+$")
         self.assertEqual(command.call_args_list[2].args[0], ["git", "ls-tree", "-r", "--name-only", diag.FAILED_OVERLAY, "--", "app"])
