@@ -29,7 +29,7 @@ except ModuleNotFoundError:
 
 MUSIC_COMMANDS = frozenset({
     "music_outputs", "music_play", "music_pause", "music_resume", "music_stop",
-    "music_seek", "music_volume", "music_status",
+    "music_seek", "music_volume", "music_status", "music_prepare", "music_start_prepared",
 })
 SUPPORTED_FORMATS = ("mp3", "wav", "flac", "ogg")
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
@@ -639,6 +639,9 @@ class MusicPlayer:
         self._reveal = 0
         self._reveal_listener = None
         self._ownership = None
+        self._handoff_id = ""
+        self._handoff_revision = -1
+        self._prepared_expires = 0.0
 
     def set_ownership(self, ownership) -> None:
         """Optional native-local/cast lock gate; never required by legacy callers."""
@@ -682,6 +685,10 @@ class MusicPlayer:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            if self._state == "prepared" and time.time() >= self._prepared_expires:
+                self._discard_track()
+                self._state = "stopped"
+                self._handoff_id = ""
             if self._state == "playing":
                 if self._progress["error"]:
                     self._error = self._progress["error"]
@@ -701,7 +708,11 @@ class MusicPlayer:
                     "title": self._title, "artist": self._artist, "error": self._error,
                     "downloaded_bytes": self._downloaded_bytes, "total_bytes": self._total_bytes,
                     "media_transport": self._media_transport,
-                    "supported_formats": list(SUPPORTED_FORMATS)}
+                    "supported_formats": list(SUPPORTED_FORMATS),
+                    "supported_codecs": ["mp3", "pcm_s16le", "pcm_s24le", "pcm_f32le", "flac", "vorbis"],
+                    "handoff_protocol": 2, "handoff_id": self._handoff_id,
+                    "handoff_revision": self._handoff_revision,
+                    "audio_started": self._state == "playing" and self._progress.get("rendered_frames", 0) > 0}
 
     def presentation(self) -> dict[str, Any]:
         """Cover and embedded lyrics for this window only. Heartbeats stay on snapshot()."""
@@ -787,6 +798,7 @@ class MusicPlayer:
                 if gain != 1.0:
                     samples = array("h", (int(sample * gain) for sample in samples))
                 progress["position"] += len(samples) / (2 * SAMPLE_RATE)
+                progress["rendered_frames"] = progress.get("rendered_frames", 0) + len(samples) // 2
                 requested = yield samples
         except GeneratorExit:
             pass
@@ -877,7 +889,30 @@ class MusicPlayer:
                     return {**self.snapshot(), "outputs": rows, "default_output_id": "default"}
                 if command == "music_status":
                     return self.snapshot()
-                if command == "music_play":
+                if command == "music_prepare" and self._state == "playing":
+                    raise MusicError("На целевом ПК уже играет музыка. Сначала остановите её")
+                handoff_id = payload.get("handoff_id")
+                if handoff_id is not None:
+                    revision = payload.get("handoff_revision")
+                    if (not isinstance(handoff_id, str) or re.fullmatch(r"[a-f0-9]{32}", handoff_id) is None
+                            or isinstance(revision, bool) or not isinstance(revision, int) or revision < 0
+                            or revision < self._handoff_revision
+                            or (revision == self._handoff_revision and handoff_id != self._handoff_id)):
+                        raise MusicError("Подтверждение относится к старому переключению")
+                    if command == "music_prepare" and handoff_id == self._handoff_id:
+                        return self.snapshot()
+                    if command == "music_start_prepared":
+                        if (handoff_id != self._handoff_id or self._state not in {"prepared", "playing"}
+                                or self._track_id != payload.get("track_id")):
+                            raise MusicError("Подготовка трека истекла. Повторите переключение")
+                        if self._state == "playing":
+                            return self.snapshot()
+                    self._handoff_id, self._handoff_revision = handoff_id, revision
+                elif command in {"music_prepare", "music_start_prepared"}:
+                    raise MusicError("Отсутствует подтверждение переключения")
+                elif command in {"music_play", "music_stop"}:
+                    self._handoff_id = ""
+                if command in {"music_play", "music_prepare"}:
                     server_url = str(config.get("server_url") or "")
                     media_path = payload.get("media_path")
                     # The server may have a public HTTPS origin while an older
@@ -903,7 +938,8 @@ class MusicPlayer:
                     _, ids = self._engine().outputs()
                     if output_id not in ids:
                         raise MusicError("Аудиовыход не найден. Обновите список устройств")
-                    self._claim_ownership()
+                    if command == "music_play":
+                        self._claim_ownership()
                     self._discard_track()
                     self._generation += 1
                     self._track_id, self._output_id, self._volume = track_id, output_id, volume
@@ -913,13 +949,17 @@ class MusicPlayer:
                     self._media_transport = "lan_check" if lan_url else "server"
                     self._progress = {"position": position, "ended": False, "error": ""}
                     self._pending = (self._generation, url, dict(config), position, lan_url, expected_sha256,
-                                     server_lyrics, artwork_url)
+                                     server_lyrics, artwork_url, command == "music_prepare")
+                    self._prepared_expires = float(payload.get("expires_at", time.time() + 120))
                     self._reveal += 1
                     reveal = True
                     if self._worker is None:
                         self._worker = threading.Thread(target=self._download_loop, name="xass-music", daemon=True)
                         self._worker.start()
                     self._condition.notify()
+                elif command == "music_start_prepared":
+                    position = _number(payload.get("position_sec", 0), "Позиция", 0, self._duration)
+                    self._start_at(position)
                 elif command == "music_stop":
                     self._generation += 1
                     self._pending = None
@@ -1105,6 +1145,7 @@ class MusicPlayer:
                 expected_sha256 = pending[5] if len(pending) > 5 else None
                 server_lyrics = pending[6] if len(pending) > 6 else ""
                 artwork_url = pending[7] if len(pending) > 7 else None
+                prepare_only = pending[8] if len(pending) > 8 else False
             path = None
             try:
                 path = self._download(generation, url, config, lan_url, expected_sha256)
@@ -1126,7 +1167,24 @@ class MusicPlayer:
                     self._lyrics = server_lyrics or notes["lyrics"]
                     self._artwork = notes["artwork"]
                     path = None
-                    self._start_at(position)
+                    if prepare_only:
+                        if time.time() >= self._prepared_expires:
+                            raise MusicError("Подготовка трека истекла. Повторите переключение")
+                        # Open the actual output and decode a bounded PCM block,
+                        # but never submit it to WASAPI before START_PREPARED.
+                        engine = self._engine()
+                        _, ids = engine.outputs()
+                        if self._output_id not in ids:
+                            raise MusicError("Выбранный аудиовыход отключён")
+                        probe = engine.stream(self._path, position)
+                        try:
+                            probe.send(1024)
+                        finally:
+                            probe.close()
+                        self._device = engine.device(ids[self._output_id])
+                        self._state = "prepared"
+                    else:
+                        self._start_at(position)
                 if artwork_url:
                     artwork = self._fetch_artwork(generation, artwork_url, config)
                     if artwork:

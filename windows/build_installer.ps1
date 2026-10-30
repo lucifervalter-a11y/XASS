@@ -9,6 +9,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if ($Revision -notmatch '^([0-9a-f]{40}|local-build)$') { throw 'Use a full commit SHA or local-build.' }
+if ($Revision -ne 'local-build') {
+    $CheckedOutRevision = & git -C $RepoRoot rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or $CheckedOutRevision.Trim() -ne $Revision) {
+        throw 'Release revision must match the checked-out commit. Use local-build for development snapshots.'
+    }
+    $SourceChanges = & git -C $RepoRoot status --porcelain --untracked-files=normal
+    if ($LASTEXITCODE -ne 0 -or $SourceChanges) {
+        throw 'Release build requires a clean source checkout; commit reviewed changes first or use local-build.'
+    }
+}
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $RepoRoot 'artifacts\windows-installer' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $Version = [string](Get-Content (Join-Path $RepoRoot 'pc_client\version.json') -Raw | ConvertFrom-Json).version
@@ -76,10 +86,10 @@ $FreezeArguments = @(
     '--add-data', "$(Join-Path $RepoRoot 'pc_client\assets\xass.ico');assets",
     '--add-data', "$(Join-Path $RepoRoot 'pc_client\assets\xass-icon.png');assets"
 )
-foreach ($Module in @('bridge', 'desktop_bridge', 'desktop_music_service', 'background_agent', 'native_updater', 'installer_process', 'assistant_bridge', 'background_voice_bridge', 'background_voice', 'native_music_ownership', 'native_agent_identity', 'voice_capture', 'voice_assistant', 'client_agent')) {
+foreach ($Module in @('bridge', 'desktop_bridge', 'desktop_music_service', 'music_curation', 'background_agent', 'native_updater', 'installer_process', 'assistant_bridge', 'background_voice_bridge', 'background_voice', 'native_music_ownership', 'native_agent_identity', 'voice_capture', 'voice_assistant', 'client_agent')) {
     $FreezeArguments += @('--hidden-import', $Module)
 }
-foreach ($Module in @('cryptography', 'miniaudio', 'faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'numpy')) {
+foreach ($Module in @('cryptography', 'miniaudio', 'mutagen', 'faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'numpy')) {
     $FreezeArguments += @('--collect-all', $Module)
 }
 $FreezeArguments += (Join-Path $PSScriptRoot 'native_host.py')
@@ -117,8 +127,10 @@ foreach ($Package in @('microsoft.netcore.app.runtime.win-x64', 'microsoft.windo
 $Payload = Join-Path $BuildRoot 'payload'
 & $Python -I -B (Join-Path $PSScriptRoot 'stage_native_package.py') --native $Native --companion $Companion --destination $Payload --licenses $Licenses --revision $Revision
 if ($LASTEXITCODE -ne 0) { throw 'Native payload verification failed.' }
+& $Python -I -X utf8 -B (Join-Path $PSScriptRoot 'test_frozen_runtime.py') --installed $Payload
+if ($LASTEXITCODE -ne 0) { throw 'Staged companion roles or audio codec parsing failed.' }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-& $IsccPath "/DXassVersion=$Version" "/DXassDistribution=$Distribution" "/DSourceDir=$Payload" "/DOutputDir=$OutputDirectory" (Join-Path $PSScriptRoot 'packaging\XASS-Native.iss')
+& $IsccPath '/Q' "/DXassVersion=$Version" "/DXassDistribution=$Distribution" "/DSourceDir=$Payload" "/DOutputDir=$OutputDirectory" (Join-Path $PSScriptRoot 'packaging\XASS-Native.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
 $InstallerName = if ($Distribution -eq 'native') { 'XASS-Native-Setup.exe' } else { 'XASS-Native-Test-Setup.exe' }
 $ManifestName = if ($Distribution -eq 'native') { 'native-update.json' } else { 'native-test-update.json' }

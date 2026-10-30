@@ -22,7 +22,7 @@ ROLES = {
     "background-agent": "background_agent",
     "native-updater": "native_updater",
 }
-HEALTH_IMPORTS = ("httpx", "psutil", "cryptography", "miniaudio", "numpy", "faster_whisper")
+HEALTH_IMPORTS = ("httpx", "psutil", "cryptography", "miniaudio", "mutagen", "numpy", "faster_whisper")
 
 
 def local_model_environment() -> None:

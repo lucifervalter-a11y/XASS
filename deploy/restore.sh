@@ -24,7 +24,7 @@ python3 "$SCRIPT_DIR/portable_migrate.py" restore "$ARCHIVE" --target "$TARGET"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y python3-venv python3-pip git nginx php-fpm curl ca-certificates certbot python3-certbot-nginx
+apt-get install -y python3-venv python3-pip git nginx php-fpm curl ca-certificates certbot python3-certbot-nginx ffmpeg
 python3 -m venv "$TARGET/.venv"
 "$TARGET/.venv/bin/python" -m pip install --disable-pip-version-check -r "$TARGET/requirements.txt"
 

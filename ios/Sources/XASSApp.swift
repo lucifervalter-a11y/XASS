@@ -2,6 +2,7 @@ import SwiftUI
 import AVKit
 
 @main @MainActor struct XASSApp: App {
+    @UIApplicationDelegateAdaptor(XASSDownloadAppDelegate.self) private var downloadDelegate
     @StateObject private var app = AppState()
     @Environment(\.scenePhase) private var scenePhase
     var body: some Scene {
@@ -104,7 +105,27 @@ struct BrandMark: View {
                 if audio.downloads.isEmpty {
                     ContentUnavailableView("Музыка без интернета", systemImage: "arrow.down.circle", description: Text("Сохраните треки из библиотеки XASS. Они останутся только в этом приложении, отдельно от файлов сервера."))
                 }
-                if !audio.downloadIDs.isEmpty { Label("Сохраняю треки: \(audio.downloadIDs.count)…", systemImage: "arrow.down").foregroundStyle(.secondary) }
+                if !audio.downloadQueue.isEmpty {
+                    Section("Очередь загрузок") {
+                        ForEach(audio.downloadQueue) { job in
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(job.track.title).lineLimit(2)
+                                if job.phase == .downloading {
+                                    if let progress = job.progress { ProgressView(value: progress) }
+                                    else { ProgressView() }
+                                }
+                                Text(job.message ?? (job.phase == .paused ? "На паузе" : job.phase == .queued ? "В очереди" : job.phase == .committing ? "Сохранение…" : "Загрузка…"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                                HStack {
+                                    if job.active { Button("Пауза") { audio.pauseDownload(job.id) }.disabled(job.phase == .committing) }
+                                    else { Button(job.phase == .paused ? "Продолжить" : "Повторить") { audio.retryDownload(job) } }
+                                    Spacer()
+                                    Button("Отменить", role: .destructive) { audio.cancelDownload(job.id) }
+                                }.buttonStyle(.borderless)
+                            }.padding(.vertical, 4)
+                        }
+                    }
+                }
                 ForEach(audio.downloads) { track in
                     HStack {
                         Button { audio.playOffline(track) } label: {

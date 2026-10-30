@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import wave
 
 
 def exercise(helper: Path, source: Path, data: Path, role: str, requests: list[dict]) -> list[dict]:
@@ -35,6 +36,22 @@ def main() -> None:
         bridge = exercise(helper, source, data, 'agent-bridge', [{'action': 'desktop_status', 'version': 1}])
         if len(bridge) != 1 or bridge[0].get('ok') is not True:
             raise RuntimeError('Installed native desktop bridge failed')
+        # mutagen discovers codec parsers dynamically. Exercise an actual file
+        # through the frozen bridge so missing frozen parsers cannot pass merely
+        # because importing the top-level mutagen package succeeds.
+        library = data / 'synthetic-library'; library.mkdir()
+        with wave.open(str(library / 'untagged.wav'), 'wb') as audio:
+            audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(8000)
+            audio.writeframes(b'\x00\x00' * 800)
+        scan = exercise(helper, source, data, 'agent-bridge',
+                        [{'action': 'desktop_curation_start', 'version': 1, 'folder': str(library)}])
+        tracks = scan[0].get('result', {}).get('tracks', [])
+        if scan[0].get('ok') is not True or len(tracks) != 1:
+            raise RuntimeError('Installed local-library scan failed')
+        inspected = exercise(helper, source, data, 'agent-bridge',
+                             [{'action': 'desktop_curation_inspect', 'version': 1, 'id': tracks[0]['id']}])
+        if inspected[0].get('ok') is not True or not inspected[0].get('result', {}).get('tags'):
+            raise RuntimeError('Installed audio-tag parser is missing or failed')
         assistant = exercise(helper, source, data, 'assistant',
                              [{'operation': 'plan', 'settings': {}, 'text': 'открой ютуб'}])
         if not any(row.get('type') == 'result' and row.get('result', {}).get('state') == 'ready' for row in assistant):
@@ -49,7 +66,7 @@ def main() -> None:
             raise RuntimeError('Installed background host protocol failed')
         if (data / 'config.json').exists():
             raise RuntimeError('Read-only installed smoke unexpectedly created pairing configuration')
-    print('Installed roles passed: desktop bridge, text planning, idle music and unpaired background host. No microphone, model, player or network action requested.')
+    print('Installed roles passed: desktop bridge, local-library codec parsing, text planning, idle music and unpaired background host. No microphone, model, player or network action requested.')
 
 
 if __name__ == '__main__':

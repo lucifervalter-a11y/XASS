@@ -153,7 +153,7 @@ install_system_packages() {
   case "$pm" in
     apt)
       run_root apt-get update
-      run_root apt-get install -y python3 python3-venv python3-pip curl tzdata
+      run_root apt-get install -y python3 python3-venv python3-pip curl tzdata ffmpeg
       ;;
     dnf)
       run_root dnf install -y python3 python3-pip python3-virtualenv curl tzdata
@@ -162,7 +162,7 @@ install_system_packages() {
       run_root yum install -y python3 python3-pip python3-virtualenv curl tzdata
       ;;
     pacman)
-      run_root pacman -Sy --noconfirm python python-pip curl tzdata
+      run_root pacman -Sy --noconfirm python python-pip curl tzdata ffmpeg
       ;;
     *)
       print_warn "Unsupported package manager. Install Python 3.11+, venv and curl manually."

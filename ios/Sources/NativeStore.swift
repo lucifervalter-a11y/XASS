@@ -158,6 +158,12 @@ import UIKit
                 do { done(.success(try await self.ticket(id))) } catch { done(.failure(error)) }
             }
         }
+        audio.requestDownloadTicket = { [weak self] id, done in
+            Task { @MainActor in
+                guard let self else { done(.failure(OwnerAPIError.signedOut)); return }
+                do { done(.success(try await self.ticket(id, purpose: "download"))) } catch { done(.failure(error)) }
+            }
+        }
     }
     private static func persistedID(_ prefix: String, origin: ServerOrigin) -> String {
         let name = prefix + origin.namespace
@@ -386,7 +392,7 @@ import UIKit
         suppressReports = true; audio.pause(); suppressReports = false
         let position = audio.exactPosition()
         ownsSession = false
-        _ = try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/ack", method: "POST", body: ["session_key": sessionKey, "position": position])
+        _ = try? await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/ack", method: "POST", body: ["session_key": sessionKey, "position": position, "revision": session["active_transfer_revision"] as? Int ?? 0])
     }
 
     func cancelTransfer() {
@@ -469,13 +475,11 @@ import UIKit
         // /session reconciles queue-command ACKs with heartbeat freshness.
         // /players supplies discovery/capabilities only: its raw heartbeat can
         // still describe the previous track during server-owned auto-advance.
-        // PC switched off mid-track: continue on this iPhone from the current
-        // position instead of leaving silence. A paused PC is not resumed.
+        // A missing heartbeat can be a VPN partition while buffered PC audio
+        // continues. Report uncertainty; never start another output blindly.
         if let pc = pcBefore, pcWasAudible, let id = trackBefore, !busy, !ownsSession, !offlinePlayback, !transferPending,
            canonicalDevice == pc, currentID == id, playbackState == "unavailable" || !pcIsLive(pc) {
-            do { try await playOnPhoneAfterPCLoss(trackID: id, position: pcResumePosition(id)) }
-            catch is CancellationError {}
-            catch { handle(error) }
+            notice = "Связь с ПК потеряна. Звук на другом устройстве не подтверждён. Выберите устройство вручную."
         }
     }
     private func applySession(_ value: [String: Any]) {
@@ -490,7 +494,7 @@ import UIKit
         else { publishIfChanged(\.selectedDevice, "local") }
         let state = value["state"] as? String ?? "stopped"
         publishIfChanged(\.playbackState, state)
-        // An offline PC is not an error: playback simply happens on the iPhone.
+        // Keep disconnected PC state visible without claiming it is silent.
         let rawDetail = value["detail"] as? String
         let detail = state == "unavailable" && canonicalDevice.hasPrefix("agent:") && rawDetail == Self.pcOfflineServerDetail ? nil : rawDetail
         if let detail = detail { publishIfChanged(\.error, detail) }
@@ -676,8 +680,7 @@ import UIKit
         }
     }
 
-    /// Play on a chosen PC, or on this iPhone when that PC is gone. The PC is
-    /// checked within `pcResponseDeadline`; a failed handoff never ends in silence.
+    /// Check the chosen PC promptly; a failed handoff requires an explicit retry.
     private func transferToPC(_ device: String, trackID: Int, startPosition: Double?, output: String? = nil, fallbackOnHandoffFailure: Bool = true) async throws {
         let resumeAt = startPosition ?? currentPlaybackPosition(trackID)
         guard pcIsLive(device), await pcReachable(device) else {
@@ -693,11 +696,11 @@ import UIKit
         }
         catch where fallbackOnHandoffFailure && Self.isPCFailure(error) {
             pcConnecting = nil
-            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
+            throw OwnerAPIError(status: 409, message: "Передача на ПК не подтверждена. iPhone остаётся на паузе. Повторите передачу или явно выберите iPhone.")
         }
     }
 
-    /// Resume the current PC; if it does not confirm in time, play here.
+    /// Resume the current PC without starting a second output on an ambiguous timeout.
     private func resumeOnPC(_ device: String, trackID: Int) async throws {
         let resumeAt = pcResumePosition(trackID)
         guard await pcReachable(device) else { try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt); return }
@@ -718,12 +721,10 @@ import UIKit
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt, notice: Self.playingHereNotice)
         } catch where Self.isPCFailure(error) {
             pcConnecting = nil; transferStatus = nil; transferProgress = 0
-            try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt)
+            throw OwnerAPIError(status: 409, message: "ПК не подтвердил запуск. Автоматическое воспроизведение на iPhone отключено до подтверждения остановки ПК.")
         }
     }
 
-    /// The iPhone is the default output: a gone PC falls back here silently,
-    /// with a toast instead of an error.
     /// «Играть на iPhone» while a PC has not confirmed play/resume yet.
     func playHereInsteadOfPC() {
         guard pcConnecting != nil, !pcWaitAbandoned else { return }
@@ -824,19 +825,10 @@ import UIKit
         suppressReports = true; pendingReport = nil
         do { response = try await writeSession(claim, explicit: true) }
         catch let failure as OwnerAPIError where failure.status == 409 && failure.detail?["code"] as? String == "transfer_required" {
-            // Choosing a song on this iPhone is an explicit "play here". Take
-            // the lease directly (the server stops the PC / the other phone
-            // pauses on its next poll) instead of waiting for a handoff that a
-            // silent or offline PC can never acknowledge.
             NativeDiagnostics.shared.record(operation: .musicSession, step: .requested, target: .localPlayer, error: .conflict)
-            var forced = claim; forced["force"] = true
-            do { response = try await writeSession(forced, explicit: true) }
-            catch let again as OwnerAPIError where again.status == 409 && again.detail?["code"] as? String == "transfer_required" {
-                // Server without `force` support: fall back to the handoff.
-                suppressReports = false; busy = false
-                try await transfer(to: "local", trackID: track.id, startPosition: startPosition)
-                return
-            } catch { suppressReports = false; throw error }
+            suppressReports = false; busy = false
+            try await transfer(to: "local", trackID: track.id, startPosition: startPosition)
+            return
         } catch { suppressReports = false; throw error }
         suppressReports = false
         if Task.isCancelled || generation != nextGeneration || transferCancelled {
@@ -866,21 +858,11 @@ import UIKit
         if offlinePlayback { suppressReports = true; audio.pause(); suppressReports = false }
         let chosenID = trackID ?? currentID
         guard let chosenID = chosenID else { selectedDevice = device; outputID = output ?? "default"; return }
-        if device != "local", tracks.first(where: { $0.id == chosenID })?.pcSupported == false {
-            throw OwnerAPIError(status: 415, message: "Этот формат доступен на iPhone. Для ПК загрузите MP3 или WAV.")
-        }
         let ownedSource = selectedDevice == "local" && (ownsSession || (canonicalDevice == "local" && canonicalSessionKey == sessionKey))
-        let actualPosition = ownedSource && audio.hasPlayableItem ? audio.exactPosition() : position
-        if ownedSource {
-            suppressReports = true; audio.pause(); suppressReports = false
-            _ = try await writeSession(snapshot(state: "paused", position: actualPosition), explicit: true)
-            ownsSession = false; pendingReport = nil
-        }
-        var body: [String: Any] = ["session_key": sessionKey, "client_id": clientID, "device": device,
+        var body: [String: Any] = ["protocol": 2, "session_key": sessionKey, "client_id": clientID, "device": device,
             "output_id": output ?? (device == selectedDevice ? outputID : "default"), "track_id": chosenID, "volume": device == "local" ? 100 : Int(volume), "autoplay": true,
             "queue": Array(queue.prefix(2000)).map(\.id), "repeat_mode": repeatMode]
         if let start = startPosition { body["position"] = start }
-        else if ownedSource { body["position"] = actualPosition }
         if device.hasPrefix("agent:") {
             lanOffer?.stop()
             lanOffer = nil
@@ -908,6 +890,11 @@ import UIKit
         }
         let started = try await api.request("/api/mini/music/transfers", method: "POST", body: body)
         guard let transferID = started["transfer_id"] as? String else { throw OwnerAPIError.invalidResponse }
+        guard started["protocol"] as? Int == 2, let attemptRevision = started["revision"] as? Int else {
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
+            throw OwnerAPIError(status: 409, message: "Обновите сервер XASS для безопасной передачи звука")
+        }
+        defer { audio.cancelPreparedHandoff(attempt: transferID) }
         activeTransferID = transferID
         NativeDiagnostics.shared.record(operation: .musicTransfer, step: .acknowledged, target: diagnosticTarget)
         if Task.isCancelled || transferCancelled || generation != nextGeneration {
@@ -915,9 +902,11 @@ import UIKit
             throw CancellationError()
         }
         transferStatus = device.hasPrefix("agent:") ? Self.pcConnectingText : "Подключаю устройство…"; transferProgress = 0.08
-        let deadline = Date().addingTimeInterval(30)
+        let deadline = Date().addingTimeInterval(180)
         let startedAt = Date()
         var response = started
+        var sourceStopped = false
+        var targetStarted = false
         while response["status"] as? String != "ready" {
             if transferCancelled || generation != nextGeneration {
                 let id = activeTransferID ?? transferID
@@ -933,12 +922,47 @@ import UIKit
                     error: Self.transferDiagnosticError(response["error_code"] as? String))
                 throw OwnerAPIError(status: 409, message: response["detail"] as? String ?? "Источник не подтвердил остановку. Переключение отменено.")
             }
+            do {
+                if response["phase"] as? String == "preparing", device == "local" {
+                    guard let track = tracks.first(where: { $0.id == chosenID }) ?? knownTracks[chosenID] else { throw OwnerAPIError.invalidResponse }
+                    let url = audio.analysisFile(chosenID) == nil ? try await ticket(chosenID) : ""
+                    try await audio.prepareHandoff(try NativeAudioCommand(["action": "play", "trackId": chosenID,
+                        "title": track.title, "artist": track.artist, "url": url]), attempt: transferID)
+                    response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/target-ack",
+                        method: "POST", body: ["session_key": sessionKey, "revision": attemptRevision, "state": "prepared"])
+                }
+                if response["phase"] as? String == "waiting", ownedSource, !sourceStopped {
+                    suppressReports = true; audio.pause(); suppressReports = false
+                    let stoppedPosition = audio.exactPosition()
+                    ownsSession = false; pendingReport = nil; sourceStopped = true
+                    _ = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/ack",
+                        method: "POST", body: ["session_key": sessionKey, "position": stoppedPosition, "revision": attemptRevision])
+                }
+                if response["phase"] as? String == "starting", device == "local", !targetStarted {
+                    guard let session = response["session"] as? [String: Any],
+                          session["session_key"] as? String == sessionKey,
+                          session["device"] as? String == "local", session["track_id"] as? Int == chosenID,
+                          let track = tracks.first(where: { $0.id == chosenID }) ?? knownTracks[chosenID] else { throw OwnerAPIError.invalidResponse }
+                    applySession(session); selectedDevice = "local"
+                    try await audio.startPreparedHandoff(try NativeAudioCommand(["action": "play", "trackId": chosenID,
+                        "title": track.title, "artist": track.artist, "position": NativeValue.number(session["position"]),
+                        "session": snapshot(), "queue": NativeValue.queue(queue, currentID: chosenID), "repeat": repeatMode]), attempt: transferID)
+                    targetStarted = true
+                    response = try await api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(transferID) + "/target-ack",
+                        method: "POST", body: ["session_key": sessionKey, "revision": attemptRevision, "state": "playing"])
+                    continue
+                }
+            } catch {
+                if targetStarted || device == "local" { suppressReports = true; audio.pause(); suppressReports = false }
+                await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
+                throw error
+            }
             guard Date() < deadline else {
                 NativeDiagnostics.shared.record(operation: .musicTransfer, step: .failed, target: diagnosticTarget, error: .timeout)
                 let id = activeTransferID ?? transferID
                 await cancelServerOperation("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/cancel")
                 activeTransferID = nil
-                throw OwnerAPIError(status: 408, message: "Устройство не подтвердило переключение. Второй плеер не запущен.")
+                throw OwnerAPIError(status: 408, message: "Передача не подтверждена. Состояние другого устройства неизвестно; iPhone не возобновляет звук автоматически.")
             }
             let elapsed = Date().timeIntervalSince(startedAt)
             transferProgress = min(0.92, 0.08 + elapsed / 30)
@@ -979,34 +1003,15 @@ import UIKit
             await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
             throw OwnerAPIError(status: 409, message: error ?? "Подтверждение другого плеера")
         }
+        if device == "local", !targetStarted {
+            await cancelServerOperation(cancellationPath(transferID, kind: .handoff))
+            ownsSession = false; playbackState = "paused"
+            throw OwnerAPIError.invalidResponse
+        }
         offlinePlayback = false; applySession(session); currentID = chosenID; error = nil
         if selectedDevice == "local" {
-            guard let track = currentTrack else {
-                activeTransferID = nil
-                playbackState = "error"
-                throw OwnerAPIError.invalidResponse
-            }
-            let url: String
-            do {
-                if audio.downloads.contains(where: { $0.id == chosenID }) || audio.cachedTracks.contains(where: { $0.id == chosenID }) { url = "" }
-                else { url = try await ticket(chosenID) }
-            } catch {
-                playbackState = "error"
-                _ = try? await writeSession(snapshot(state: "error"), explicit: true)
-                activeTransferID = nil
-                throw error
-            }
-            guard generation == nextGeneration, !transferCancelled else {
-                // Cancel between ready → ticket → play: do not leave UI "playing" without AVPlayer.
-                activeTransferID = nil
-                ownsSession = false
-                playbackState = "paused"
-                suppressReports = true; audio.pause(); suppressReports = false
-                throw CancellationError()
-            }
+            guard targetStarted else { throw OwnerAPIError.invalidResponse }
             ownsSession = true
-            audio.handle(try NativeAudioCommand(["action": "play", "trackId": chosenID, "title": track.title, "artist": track.artist,
-                "url": url, "position": position, "session": snapshot(), "queue": NativeValue.queue(queue, currentID: chosenID), "repeat": repeatMode]))
             activeTransferID = nil
         } else {
             ownsSession = false
@@ -1166,7 +1171,7 @@ import UIKit
                         self.generation = UUID(); self.ownsSession = false; self.pendingReport = nil; self.suppressReports = true
                         self.audio.pause(); let position = self.audio.exactPosition(); self.suppressReports = false
                         if failure.detail?["code"] as? String == "transfer_requested", let id = failure.detail?["transfer_id"] as? String {
-                            do { _ = try await self.api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/ack", method: "POST", body: ["session_key": self.sessionKey, "position": position]) }
+                            do { _ = try await self.api.request("/api/mini/music/transfers/" + OwnerAPI.pathComponent(id) + "/ack", method: "POST", body: ["session_key": self.sessionKey, "position": position, "revision": failure.detail?["revision"] as? Int ?? 0]) }
                             catch { self.handle(error) }
                         }
                     } else if (error as? OwnerAPIError)?.status == 401 {

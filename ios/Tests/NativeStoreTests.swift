@@ -5,6 +5,7 @@ import Combine
 @MainActor private final class NativeOwnerFixture: OwnerService {
     let origin = try! ServerOrigin("https://native-store-fixture.invalid")
     var requests: [(String, String, [String: Any]?)] = []
+    var players: [[String: Any]] = []
     var session: [String: Any] = ["track_id": 1, "device": "local", "client_id": "other-phone", "session_key": String(repeating: "b", count: 32), "state": "paused", "position": 37, "share_site": false]
     var handler: ((String, String, [String: Any]?) async throws -> [String: Any]?)?
     func request(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
@@ -13,7 +14,7 @@ import Combine
         if path == "/api/mini/bootstrap" { return ["ok": true, "sources": []] }
         if path.contains("library") { return ["ok": true, "tracks": [["id": 1, "title": "Silent fixture", "duration": 100]], "playlists": []] }
         if path == "/api/mini/music/session" { return ["ok": true, "session": session] }
-        if path.contains("players") { return ["ok": true, "players": []] }
+        if path.contains("players") { return ["ok": true, "players": players] }
         throw OwnerAPIError(status: 400, message: "Unexpected fixture request: " + path)
     }
 }
@@ -82,24 +83,41 @@ final class NativeStoreTests: XCTestCase {
         store.disconnect()
     }
 
-    @MainActor func testReopenedOwnPhoneConfirmsPauseBeforeAgentTransfer() async throws {
+    @MainActor func testReopenedOwnPhoneWaitsForPreparedTargetBeforeAcknowledgingStop() async throws {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
         api.session["session_key"] = store.sessionKey; api.session["client_id"] = store.clientID; api.session["state"] = "playing"
+        var prepared = false, stopped = false
         api.handler = { path, method, body in
             if path == "/api/mini/music/transfers", method == "POST" {
-                XCTAssertEqual(body?["position"] as? Double, 37)
-                return ["ok": true, "transfer_id": "test-transfer", "status": "ready", "session": ["track_id": 1, "device": "agent:Студия", "position": 37, "state": "playing", "session_key": store.sessionKey, "client_id": store.clientID]]
+                XCTAssertEqual(body?["protocol"] as? Int, 2)
+                XCTAssertNil(body?["position"], "The exact stopped position is reported only after target preparation")
+                return ["ok": true, "transfer_id": "test-transfer", "protocol": 2, "revision": 7, "status": "waiting", "phase": "preparing"]
+            }
+            if path == "/api/mini/music/transfers/test-transfer", method == "GET" {
+                if !prepared {
+                    prepared = true
+                    return ["ok": true, "protocol": 2, "revision": 7, "status": "waiting", "phase": "waiting"]
+                }
+                XCTAssertTrue(stopped, "The new device may play only after the old device acknowledges stop")
+                return ["ok": true, "protocol": 2, "revision": 7, "status": "ready", "phase": "ready", "session": ["track_id": 1, "device": "agent:Студия", "position": 0, "state": "playing", "session_key": store.sessionKey, "client_id": store.clientID]]
+            }
+            if path == "/api/mini/music/transfers/test-transfer/ack", method == "POST" {
+                XCTAssertTrue(prepared)
+                XCTAssertEqual(body?["revision"] as? Int, 7)
+                XCTAssertEqual(body?["session_key"] as? String, store.sessionKey)
+                XCTAssertEqual(body?["position"] as? Double, audio.exactPosition())
+                stopped = true
+                return ["ok": true]
             }
             return nil
         }
         await store.refresh(); try await store.transfer(to: "agent:Студия")
         let writes = api.requests.filter { $0.1 == "POST" }
-        XCTAssertEqual(writes.map { $0.0 }, ["/api/mini/music/session", "/api/mini/music/transfers"])
-        XCTAssertEqual(writes.first?.2?["state"] as? String, "paused")
+        XCTAssertEqual(writes.map { $0.0 }, ["/api/mini/music/transfers", "/api/mini/music/transfers/test-transfer/ack"])
         XCTAssertEqual(store.selectedDevice, "agent:Студия")
         XCTAssertFalse(audio.hasPlayableItem)
         XCTAssertFalse(audio.canResumePlayback())
-        store.disconnect()
     }
 
     @MainActor func testFailedSharingDoesNotClaimPublishedAndRapidToggleIsBounded() async {
@@ -182,12 +200,13 @@ final class NativeStoreTests: XCTestCase {
     }
     @MainActor func testShuffleTransferUsesOneCanonicalOrderAndQueuePatchIsPartial() async throws {
         let api = NativeOwnerFixture(), store = NativeStore(api: api, audio: AudioController())
+        api.players = [["source_name": "Студия", "live": true, "available": true]]
         await store.refresh()
         let tracks = (1...8).compactMap { LibraryTrack(["id": $0, "title": "Track \($0)"]) }
         store.tracks = tracks; store.selectedDevice = "agent:Студия"
         api.handler = { path, method, body in
             if path == "/api/mini/music/transfers", method == "POST" {
-                return ["ok": true, "transfer_id": "shuffle-transfer", "status": "ready", "session": ["track_id": body!["track_id"]!, "device": "agent:Студия", "session_key": store.sessionKey, "client_id": store.clientID, "queue": body!["queue"]!, "repeat_mode": "off"]]
+                return ["ok": true, "transfer_id": "shuffle-transfer", "protocol": 2, "revision": 1, "status": "ready", "phase": "ready", "session": ["track_id": body!["track_id"]!, "device": "agent:Студия", "session_key": store.sessionKey, "client_id": store.clientID, "queue": body!["queue"]!, "repeat_mode": "off"]]
             }
             return nil
         }
@@ -224,31 +243,37 @@ final class NativeStoreTests: XCTestCase {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         defer { store.disconnect() }
         api.session["session_key"] = store.sessionKey; api.session["client_id"] = store.clientID
+        api.players = [Self.studio(live: true)]
         await store.refresh()
         api.handler = { path, method, body in
-            if path == "/api/mini/music/session", method == "POST" {
+            if path == "/api/mini/music/transfers/route-picker/ack", method == "POST" {
                 XCTAssertEqual(store.selectedDevice, "local")
-                XCTAssertEqual(body?["device"] as? String, "local")
-                XCTAssertEqual(body?["state"] as? String, "paused")
+                XCTAssertEqual(body?["revision"] as? Int, 2)
+                XCTAssertEqual(body?["session_key"] as? String, store.sessionKey)
+                return ["ok": true]
             }
             if path == "/api/mini/music/transfers", method == "POST" {
-                return ["ok": true, "transfer_id": "route-picker", "status": "ready", "session": ["track_id": 1, "device": "agent:Studio", "session_key": store.sessionKey, "state": "playing"]]
+                return ["ok": true, "transfer_id": "route-picker", "protocol": 2, "revision": 2, "status": "waiting", "phase": "waiting"]
+            }
+            if path == "/api/mini/music/transfers/route-picker", method == "GET" {
+                return ["ok": true, "protocol": 2, "revision": 2, "status": "ready", "phase": "ready", "session": ["track_id": 1, "device": "agent:Studio", "session_key": store.sessionKey, "state": "playing"]]
             }
             return nil
         }
         try await store.pickRoute(device: "agent:Studio")
-        XCTAssertEqual(api.requests.filter { $0.1 == "POST" }.map { $0.0 }, ["/api/mini/music/session", "/api/mini/music/transfers"])
+        XCTAssertEqual(api.requests.filter { $0.1 == "POST" }.map { $0.0 }, ["/api/mini/music/transfers", "/api/mini/music/transfers/route-picker/ack"])
         XCTAssertEqual(store.selectedDevice, "agent:Studio")
         XCTAssertFalse(store.showRoutePicker)
     }
     @MainActor func testCancelWhileInitialTransferReturnsReadyStillCancelsServer() async throws {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         defer { store.disconnect() }
+        api.players = [Self.studio(live: true)]
         await store.refresh()
         api.handler = { path, _, _ in
             if path == "/api/mini/music/transfers" {
                 store.cancelTransfer()
-                return ["ok": true, "transfer_id": "cancel-ready", "status": "ready", "session": ["track_id": 1, "device": "agent:Studio", "state": "playing"]]
+                return ["ok": true, "transfer_id": "cancel-ready", "protocol": 2, "revision": 3, "status": "ready", "phase": "ready", "session": ["track_id": 1, "device": "agent:Studio", "state": "playing"]]
             }
             if path.hasSuffix("/cancel") { return ["ok": true, "status": "failed"] }
             return nil
@@ -286,8 +311,8 @@ final class NativeStoreTests: XCTestCase {
                 var session: [String: Any] = ["session_key": body!["session_key"]!, "device": body!["device"]!,
                     "track_id": body!["track_id"]!, "state": "playing", "position": 81]
                 session[field] = value
-                ready = ["ok": true, "transfer_id": id, "status": "ready", "session": session]
-                return afterWaiting ? ["ok": true, "transfer_id": id, "status": "waiting"] : ready
+                ready = ["ok": true, "transfer_id": id, "protocol": 2, "revision": 4, "status": "ready", "phase": "ready", "session": session]
+                return afterWaiting ? ["ok": true, "transfer_id": id, "protocol": 2, "revision": 4, "status": "waiting", "phase": "waiting"] : ready
             }
             if requestPath == path, method == "GET" { return ready }
             if requestPath == path + "/cancel", method == "POST" {
@@ -420,7 +445,7 @@ final class NativeStoreTests: XCTestCase {
             }
             if path == "/api/mini/music/transfers" {
                 store.cancelTransfer()
-                return ["ok": true, "transfer_id": "from-pc", "status": "ready"]
+                return ["ok": true, "transfer_id": "from-pc", "protocol": 2, "revision": 8, "status": "ready", "phase": "ready"]
             }
             if path.hasSuffix("/cancel") { return ["ok": true] }
             return nil
@@ -428,28 +453,41 @@ final class NativeStoreTests: XCTestCase {
         do { try await store.play(store.tracks[0]); XCTFail("Fixture cancels the handoff") }
         catch is CancellationError {} catch { XCTFail("Unexpected failure: \(error)") }
         let claims = api.requests.filter { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
-        XCTAssertEqual(claims.count, 2, "A local pick first retries as an explicit forced claim")
-        XCTAssertEqual(claims.last?.2?["force"] as? Bool, true)
-        XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" }, "Servers without force support still use the handoff")
+        XCTAssertEqual(claims.count, 1, "A contested output must use the safe handoff, never a forced claim")
+        XCTAssertNil(claims.first?.2?["force"])
+        XCTAssertEqual(api.requests.first { $0.0 == "/api/mini/music/transfers" }?.2?["protocol"] as? Int, 2)
         XCTAssertFalse(audio.hasPlayableItem)
     }
 
-    @MainActor func testPhonePickOverStalePCLeaseTakesOverWithoutWaitingForHandoff() async throws {
+    @MainActor func testPhonePickOverStalePCLeaseStaysPausedUntilExplicitSafeRetry() async throws {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         defer { store.disconnect() }
         api.session["device"] = "agent:Studio"; api.session["state"] = "loading"
         await store.refresh()
+        var sourceConfirmedStopped = false
         api.handler = { path, method, body in
             if path.hasSuffix("/ticket") { return ["ok": true, "path": "/api/music/tracks/1/stream?ticket=fixture"] }
             if path == "/api/mini/music/session", method == "POST" {
-                guard body?["force"] as? Bool == true else {
+                XCTAssertNil(body?["force"], "A lost heartbeat is not proof that the old device is silent")
+                guard sourceConfirmedStopped else {
                     throw OwnerAPIError(status: 409, message: "Handoff required", detail: ["code": "transfer_required"])
                 }
                 return ["ok": true, "session": ["track_id": 1, "device": "local", "state": "loading", "session_key": store.sessionKey, "client_id": store.clientID]]
             }
-            if path.hasPrefix("/api/mini/music/transfers") { XCTFail("A forced local claim must not wait for the PC"); return ["ok": true] }
+            if path == "/api/mini/music/transfers" {
+                return ["ok": true, "transfer_id": "stale-pc", "protocol": 2, "revision": 9, "status": "failed", "phase": "failed",
+                    "error_code": "source_timeout", "detail": "Источник не подтвердил остановку. Звук на паузе."]
+            }
             return nil
         }
+        do { try await store.play(store.tracks[0]); XCTFail("Unknown source state must not be bypassed") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("не подтвердил остановку")) }
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(audio.canResumePlayback())
+        XCTAssertFalse(store.busy)
+        XCTAssertEqual(api.requests.filter { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }.count, 1)
+        // Once the server knows the source stopped, a new user action can reserve the phone.
+        sourceConfirmedStopped = true
         try await store.play(store.tracks[0])
         XCTAssertTrue(audio.hasPlayableItem)
         XCTAssertEqual(store.selectedDevice, "local")
@@ -477,7 +515,7 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/control" })
     }
 
-    // MARK: P0 — the iPhone plays by itself when no PC is online.
+    // MARK: Offline discovery may select the phone, but an ambiguous handoff never starts a second output.
 
     private static func studio(live: Bool, state: String = "playing", position: Double = 40) -> [String: Any] {
         ["source_name": "Studio", "online": true, "live": live, "available": live,
@@ -549,26 +587,35 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
     }
 
-    @MainActor func testFailedPCHandoffFallsBackToIPhone() async throws {
+    @MainActor func testFailedPCHandoffStaysPausedAndAllowsExplicitRetry() async throws {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         defer { store.disconnect() }
         Self.phoneHandler(api, store) { [Self.studio(live: true)] }
         let base = api.handler
+        var retry = false
         api.handler = { path, method, body in
-            if path == "/api/mini/music/transfers" { throw OwnerAPIError(status: 409, message: "ПК недоступен для музыки. Проверьте подключение и версию агента") }
+            if path == "/api/mini/music/transfers" {
+                if !retry { throw OwnerAPIError(status: 409, message: "ПК недоступен для музыки. Проверьте подключение и версию агента") }
+                return ["ok": true, "transfer_id": "retry-pc", "protocol": 2, "revision": 10, "status": "ready", "phase": "ready",
+                    "session": ["track_id": 1, "device": "agent:Studio", "session_key": store.sessionKey, "state": "playing"]]
+            }
             return try await base?(path, method, body)
         }
         await store.refresh()
         store.selectedDevice = "agent:Studio"
-        try await store.play(store.tracks[0])
+        do { try await store.play(store.tracks[0]); XCTFail("A failed target must not start the phone automatically") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("остаётся на паузе")) }
         XCTAssertTrue(api.requests.contains { $0.0 == "/api/mini/music/transfers" })
-        XCTAssertTrue(audio.hasPlayableItem)
-        XCTAssertEqual(store.selectedDevice, "local")
-        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
-        XCTAssertNil(store.error)
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
+        XCTAssertFalse(store.busy)
+        retry = true
+        try await store.play(store.tracks[0])
+        XCTAssertEqual(store.selectedDevice, "agent:Studio")
+        XCTAssertFalse(audio.hasPlayableItem)
     }
 
-    @MainActor func testPCOfflineMidTrackContinuesOnIPhoneFromCurrentPosition() async throws {
+    @MainActor func testPCOfflineMidTrackDoesNotStartAnotherOutput() async throws {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         defer { store.disconnect() }
         var live = true
@@ -581,14 +628,11 @@ final class NativeStoreTests: XCTestCase {
         live = false
         api.session["state"] = "unavailable"; api.session["position"] = 0; api.session["detail"] = "Компьютер не в сети"
         try await store.refreshSession()
-        let claim = api.requests.last { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
-        let resumed = claim?.2?["position"] as? Double ?? -1
-        XCTAssertGreaterThanOrEqual(resumed, 40, "Continue from where the PC was, not from 0")
-        XCTAssertLessThan(resumed, 75)
-        XCTAssertEqual(claim?.2?["device"] as? String, "local")
-        XCTAssertTrue(audio.hasPlayableItem)
-        XCTAssertEqual(store.notice, NativeStore.pcOfflineNotice)
-        XCTAssertNil(store.error)
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(audio.canResumePlayback())
+        XCTAssertEqual(store.playbackState, "unavailable")
+        XCTAssertTrue(store.notice?.contains("не подтверждён") == true)
     }
 
     @MainActor func testPausedPCGoingOfflineDoesNotStartAudio() async throws {
@@ -640,7 +684,7 @@ final class NativeStoreTests: XCTestCase {
         for _ in 0..<80 where !condition() { try? await Task.sleep(nanoseconds: 50_000_000) }
     }
 
-    @MainActor func testWaitingForPCResumeOffersPlayOnIPhoneFromCurrentPosition() async throws {
+    @MainActor func testWaitingForPCResumeCannotBypassUnconfirmedStopWithPlayHere() async throws {
         let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
         defer { store.disconnect() }
         api.session["device"] = "agent:Studio"; api.session["state"] = "paused"; api.session["position"] = 40
@@ -653,6 +697,14 @@ final class NativeStoreTests: XCTestCase {
                 return ["ok": true, "command_id": 7, "status": "pending"]
             }
             if path == "/api/mini/music/control/7" { return ["ok": true, "status": "pending"] }
+            if path == "/api/mini/music/session", method == "POST" {
+                XCTAssertNil(body?["force"])
+                throw OwnerAPIError(status: 409, message: "Handoff required", detail: ["code": "transfer_required"])
+            }
+            if path == "/api/mini/music/transfers" {
+                return ["ok": true, "transfer_id": "resume-unknown", "protocol": 2, "revision": 13, "status": "failed", "phase": "failed",
+                    "error_code": "source_timeout", "detail": "Источник не подтвердил остановку. Звук на паузе."]
+            }
             return try await base?(path, method, body)
         }
         await store.refresh()
@@ -664,15 +716,16 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertFalse(audio.hasPlayableItem)
         let tapped = Date()
         store.playHereInsteadOfPC()
-        try await resume.value
+        do { try await resume.value; XCTFail("A pending pause must not authorize another audible output") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("не подтвердил остановку")) }
         XCTAssertLessThan(Date().timeIntervalSince(tapped), 2)
-        XCTAssertTrue(audio.hasPlayableItem, "«Играть на iPhone» switches immediately")
+        XCTAssertFalse(audio.hasPlayableItem)
         let claim = api.requests.last { $0.0 == "/api/mini/music/session" && $0.1 == "POST" }
         XCTAssertEqual(claim?.2?["position"] as? Double, 40, "From the current position")
         XCTAssertEqual(store.selectedDevice, "local")
         XCTAssertNil(store.pcConnecting)
         XCTAssertNil(store.transferStatus)
-        XCTAssertEqual(store.notice, NativeStore.playingHereNotice)
+        XCTAssertNotEqual(store.notice, NativeStore.playingHereNotice)
         await waitUntil { pcActions.contains("pause") }
         XCTAssertEqual(pcActions, ["resume", "pause"], "A late PC resume is paused again")
     }
@@ -683,8 +736,8 @@ final class NativeStoreTests: XCTestCase {
         Self.phoneHandler(api, store) { [Self.studio(live: true, state: "stopped")] }
         let base = api.handler
         api.handler = { path, method, body in
-            if path == "/api/mini/music/transfers" { return ["ok": true, "transfer_id": "to-pc", "status": "waiting"] }
-            if path == "/api/mini/music/transfers/to-pc" { return ["ok": true, "transfer_id": "to-pc", "status": "waiting"] }
+            if path == "/api/mini/music/transfers" { return ["ok": true, "transfer_id": "to-pc", "protocol": 2, "revision": 11, "status": "waiting", "phase": "preparing"] }
+            if path == "/api/mini/music/transfers/to-pc" { return ["ok": true, "transfer_id": "to-pc", "protocol": 2, "revision": 11, "status": "waiting", "phase": "preparing"] }
             if path == "/api/mini/music/transfers/to-pc/cancel" { return ["ok": true, "transfer_id": "to-pc", "status": "failed"] }
             return try await base?(path, method, body)
         }
@@ -700,6 +753,57 @@ final class NativeStoreTests: XCTestCase {
         XCTAssertEqual(store.selectedDevice, "local")
         XCTAssertNil(store.pcConnecting)
         XCTAssertEqual(store.notice, NativeStore.playingHereNotice)
+    }
+
+    @MainActor func testTargetTimeoutAfterSourceStopDoesNotResumePhone() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        api.session["session_key"] = store.sessionKey; api.session["client_id"] = store.clientID; api.session["state"] = "playing"
+        await store.refresh()
+        var stopped = false
+        api.handler = { path, method, body in
+            if path == "/api/mini/music/transfers" {
+                return ["ok": true, "transfer_id": "timeout-after-stop", "protocol": 2, "revision": 14, "status": "waiting", "phase": "waiting"]
+            }
+            if path.hasSuffix("/ack"), method == "POST" {
+                XCTAssertEqual(body?["revision"] as? Int, 14)
+                stopped = true
+                return ["ok": true]
+            }
+            if path == "/api/mini/music/transfers/timeout-after-stop", method == "GET" {
+                XCTAssertTrue(stopped)
+                return ["ok": true, "protocol": 2, "revision": 14, "status": "failed", "phase": "failed", "error_code": "target_timeout",
+                    "detail": "Передача на ПК не подтверждена. Звук на паузе."]
+            }
+            return nil
+        }
+        do { try await store.transfer(to: "agent:Studio"); XCTFail("Unconfirmed target must remain a failure") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Звук на паузе")) }
+        XCTAssertTrue(stopped)
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(audio.canResumePlayback())
+        XCTAssertFalse(api.requests.contains { $0.0 == "/api/mini/music/session" && $0.1 == "POST" })
+        XCTAssertFalse(store.busy)
+    }
+
+    @MainActor func testPhoneCannotAcceptReadyReceiptWithoutPreparingAndStartingItsPlayer() async throws {
+        let api = NativeOwnerFixture(), audio = AudioController(), store = NativeStore(api: api, audio: audio)
+        defer { store.disconnect() }
+        await store.refresh()
+        api.handler = { path, _, _ in
+            if path == "/api/mini/music/transfers" {
+                return ["ok": true, "transfer_id": "premature-ready", "protocol": 2, "revision": 15, "status": "ready", "phase": "ready",
+                    "session": ["track_id": 1, "device": "local", "session_key": store.sessionKey, "state": "playing"]]
+            }
+            if path.hasSuffix("/cancel") { return ["ok": true] }
+            return nil
+        }
+        do { try await store.pickRoute(device: "local"); XCTFail("A server receipt cannot replace local player acknowledgements") }
+        catch { XCTAssertTrue(error is OwnerAPIError) }
+        XCTAssertFalse(audio.hasPlayableItem)
+        XCTAssertFalse(audio.canResumePlayback())
+        XCTAssertFalse(store.busy)
+        XCTAssertTrue(store.showRoutePicker)
     }
 
     @MainActor func testFavoriteUpdatesHiddenCurrentTrackAndDeletePrunesPlaylists() async throws {
@@ -731,7 +835,7 @@ final class NativeStoreTests: XCTestCase {
         api.handler = { path, _, _ in
             if path == "/api/mini/music/transfers" {
                 await withCheckedContinuation { done in returnReceipt = done; posted.fulfill() }
-                return ["ok": true, "transfer_id": "task-cancelled", "status": "ready"]
+                return ["ok": true, "transfer_id": "task-cancelled", "protocol": 2, "revision": 12, "status": "ready", "phase": "ready"]
             }
             if path.hasSuffix("/cancel") {
                 try Task.checkCancellation()

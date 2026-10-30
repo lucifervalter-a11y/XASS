@@ -70,9 +70,10 @@ On an ephemeral Windows GitHub runner only:
 ```
 
 This checks fresh installation, same-version reinstall/upgrade, every installed
-file hash, installed runtime import health, uninstall and preservation of unique
-nonsecret data markers. It never launches the GUI. Interactive acceptance remains
-mandatory, including upgrades from an older published native build.
+file hash, installed runtime import health, native startup and readiness, actual
+post-install failure rollback, uninstall and preservation of unique nonsecret
+data markers. Interactive acceptance remains mandatory, including upgrades from
+an older published native build.
 
 ## Dependencies and limits
 
@@ -101,11 +102,32 @@ mandatory, including upgrades from an older published native build.
 
 ## Verification status for this implementation
 
-Linux/cloud source tests passed. WinUI compilation, the portable C# test program,
-PyInstaller freezing, Inno compilation and Windows install/runtime/UI acceptance
-cannot run here because no Windows SDK, dotnet, PowerShell or Inno is installed.
-The combined build must include the voice, desktop and music workers' modules
-listed by `native-payload.json` before invoking the installer script.
+The isolated interruption regression can also run on a Windows workstation:
+
+```powershell
+python -m unittest discover -s windows/tests -p test_real_installer_rollback.py -v
+```
+
+It compiles a dedicated Inno fixture with no uninstall registration, shortcuts or
+production application ID. After replacing the first of two payload files, the
+fixture waits; the production Job Object supervisor terminates the complete
+installer tree and the production updater restores its verified backup. The test
+checks exact original payload bytes, preserved synthetic config/E2E/archive files,
+retained failed payload for diagnosis, and the rejected release checksum used by
+the automatic retry policy. All paths are inside a fresh temporary folder. This
+checks interrupted installation and recovery, not interactive audio/UI quality.
+The portable AutomaticUpdate tests separately verify persisted bad-release
+blocking; the full installed-app smoke still belongs on an ephemeral runner.
+
+Local Windows verification on 2026-10-30 passed WinUI self-contained publishing
+with .NET 8.0.427, 307 Python source checks, portable C# service suites, the real
+Inno mid-install interruption/rollback fixture, PyInstaller companion health,
+and staged role smoke including dynamically discovered WAV tag parsing. These
+checks use isolated data and do not upgrade the workstation's existing XASS
+registration. The full install/uninstall registration smoke remains restricted
+to an ephemeral runner. A local development package is marked `local-build`;
+release builds require a clean checkout and the exact checked-out commit SHA.
+The combined build must include all modules listed by `native-payload.json`.
 
 Manual Windows appearance checks: restart persistence, corrupt-file recovery,
 read-only settings folder, repeated Apply/Reset, close during save, live Windows

@@ -118,6 +118,7 @@ struct NativePlaybackQueue {
     @Published private(set) var playbackGain: Double = 100
     @Published private(set) var downloads: [DownloadedTrack] = []
     @Published private(set) var downloadIDs: Set<Int> = []
+    @Published private(set) var downloadQueue: [BackgroundDownload] = []
     @Published var error: String?
     @Published var showRoutes = false
     @Published private(set) var cachedTracks: [CachedAudio] = []
@@ -131,12 +132,14 @@ struct NativePlaybackQueue {
     var emit: (([String: Any]) -> Void)?
     var reportSession: (([String: Any]) -> Void)?
     var requestTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
+    var requestDownloadTicket: ((Int, @escaping (Result<String, Error>) -> Void) -> Void)?
     var canResumePlayback: () -> Bool = { true }
     private let player: AVPlayer
     private var loader: SecureMediaLoader?
     private var origin: ServerOrigin?
     private var library: OfflineLibrary?
-    private var jobs: [Int: PrivateDownload] = [:]
+    private var downloadObserver: NSObjectProtocol?
+    private var pendingPinIDs: Set<Int> = []
     private var timeObserver: Any?
     private var itemObserver: NSKeyValueObservation?
     private var playerObserver: NSKeyValueObservation?
@@ -159,9 +162,14 @@ struct NativePlaybackQueue {
     private var nowPlayingArtwork: MPMediaItemArtwork?
     private var nowPlayingArtworkImage: UIImage?
     private var nowPlayingArtworkTrackID = 0
+    private var preparedHandoff: (id: String, item: AVPlayerItem, loader: SecureMediaLoader?, player: AVPlayer)?
+    private var handoffPrerolled = false
 
     init(player: AVPlayer = AVPlayer()) {
         self.player = player
+        downloadObserver = NotificationCenter.default.addObserver(forName: BackgroundDownloads.changed, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refreshDownloads() }
+        }
         player.volume = 1
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
             Task { @MainActor in self?.updateTime() }
@@ -268,10 +276,13 @@ struct NativePlaybackQueue {
 
     func configure(_ origin: ServerOrigin) {
         if self.origin == origin { return }
-        stop(); jobs.values.forEach { $0.cancel() }; jobs.removeAll(); downloadIDs.removeAll()
+        stop()
+        if let previous = self.origin { BackgroundDownloads.shared.suspend(origin: previous, forgetSecrets: false) }
+        pendingPinIDs.removeAll(); downloadIDs.removeAll(); downloadQueue = []
         resetCache()
         self.origin = origin; library = try? OfflineLibrary(origin: origin)
         downloads = library?.tracks() ?? []; sessionSnapshot = nil
+        BackgroundDownloads.shared.activate(origin); refreshDownloads()
         let token = cacheGeneration
         Task { [weak self] in
             do {
@@ -282,7 +293,9 @@ struct NativePlaybackQueue {
         }
     }
     func disconnect() {
-        stop(); jobs.values.forEach { $0.cancel() }; jobs.removeAll(); downloadIDs.removeAll()
+        stop()
+        if let origin { BackgroundDownloads.shared.suspend(origin: origin, forgetSecrets: true) }
+        pendingPinIDs.removeAll(); downloadIDs.removeAll(); downloadQueue = []
         resetCache()
         origin = nil; library = nil; downloads = []; sessionSnapshot = nil
     }
@@ -315,11 +328,13 @@ struct NativePlaybackQueue {
         try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
         try AVAudioSession.sharedInstance().setActive(true)
     }
-    private func play(_ command: NativeAudioCommand, preservingGain: Bool = false) throws {
+    private func play(_ command: NativeAudioCommand, preservingGain: Bool = false,
+                      preparedItem: AVPlayerItem? = nil, preparedLoader: SecureMediaLoader? = nil) throws {
         guard let origin = origin else { throw XASSErr.invalidOrigin }
         let item: AVPlayerItem
         let nextLoader: SecureMediaLoader?
-        if let library = library, let track = downloads.first(where: { $0.id == command.trackID }), FileManager.default.fileExists(atPath: library.file(for: track).path) {
+        if let preparedItem { item = preparedItem; nextLoader = preparedLoader }
+        else if let library = library, let track = downloads.first(where: { $0.id == command.trackID }), FileManager.default.fileExists(atPath: library.file(for: track).path) {
             item = AVPlayerItem(url: library.file(for: track)); nextLoader = nil
         } else if let cache = automaticCache, let entry = cachedTracks.first(where: { $0.id == command.trackID }) {
             item = AVPlayerItem(url: cache.file(entry.id, suffix: entry.track.fileExtension ?? "audio")); nextLoader = nil
@@ -350,6 +365,74 @@ struct NativePlaybackQueue {
         if command.position > 0 { player.seek(to: CMTime(seconds: command.position, preferredTimescale: 600)) }
         player.play(); publish(forceReport: true)
     }
+    /// Preroll an independent silent player; the current source keeps playing
+    /// until the server explicitly requests its STOP receipt.
+    func prepareHandoff(_ command: NativeAudioCommand, attempt: String) async throws {
+        cancelPreparedHandoff()
+        guard let origin else { throw XASSErr.invalidOrigin }
+        let item: AVPlayerItem
+        let mediaLoader: SecureMediaLoader?
+        if let file = analysisFile(command.trackID) {
+            item = AVPlayerItem(url: file); mediaLoader = nil
+        } else {
+            let url = try origin.mediaURL(command.rawURL, trackID: command.trackID)
+            let created = SecureMediaLoader(origin: origin, trackID: command.trackID, url: url)
+            item = AVPlayerItem(asset: created.asset()); mediaLoader = created
+        }
+        let silent = AVPlayer(playerItem: item)
+        preparedHandoff = (attempt, item, mediaLoader, silent)
+        handoffPrerolled = false
+        let deadline = Date().addingTimeInterval(25)
+        do {
+            while silent.status != .readyToPlay || item.status != .readyToPlay {
+                try Task.checkCancellation()
+                guard preparedHandoff?.id == attempt, Date() < deadline, item.status != .failed, silent.status != .failed else {
+                    throw OwnerAPIError(status: 415, message: "Не удалось подготовить трек на iPhone")
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            silent.preroll(atRate: 1) { [weak self] completed in
+                Task { @MainActor in
+                    guard self?.preparedHandoff?.id == attempt else { return }
+                    self?.handoffPrerolled = completed
+                }
+            }
+            while !handoffPrerolled {
+                try Task.checkCancellation()
+                guard preparedHandoff?.id == attempt, Date() < deadline, item.status != .failed else {
+                    throw OwnerAPIError(status: 408, message: "iPhone не подтвердил подготовку аудиобуфера")
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        } catch { cancelPreparedHandoff(attempt: attempt); throw error }
+    }
+    func cancelPreparedHandoff(attempt: String? = nil) {
+        guard attempt == nil || preparedHandoff?.id == attempt else { return }
+        preparedHandoff?.player.cancelPendingPrerolls()
+        preparedHandoff?.player.replaceCurrentItem(with: nil)
+        preparedHandoff?.loader?.invalidate()
+        preparedHandoff = nil; handoffPrerolled = false
+    }
+    func startPreparedHandoff(_ command: NativeAudioCommand, attempt: String) async throws {
+        guard let prepared = preparedHandoff, prepared.id == attempt, handoffPrerolled else {
+            throw OwnerAPIError(status: 409, message: "Подготовка устарела. Повторите передачу")
+        }
+        prepared.player.replaceCurrentItem(with: nil)
+        preparedHandoff = nil; handoffPrerolled = false
+        if let snapshot = command.session { setSession(snapshot) }
+        queue = command.queue
+        try play(command, preparedItem: prepared.item, preparedLoader: prepared.loader)
+        let deadline = Date().addingTimeInterval(12)
+        do {
+            while player.timeControlStatus != .playing {
+                try Task.checkCancellation()
+                guard trackID == command.trackID, state != "error", Date() < deadline else {
+                    throw OwnerAPIError(status: 408, message: "iPhone не подтвердил запуск звука")
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        } catch { pause(); throw error }
+    }
     func playOffline(_ track: DownloadedTrack) {
         stop()
         sessionSnapshot = nil
@@ -370,6 +453,7 @@ struct NativePlaybackQueue {
         catch { self.error = "Не удалось включить аудио. Проверьте устройство вывода."; state = "error"; publish() }
     }
     func stop() {
+        cancelPreparedHandoff()
         transition = UUID(); awaitingTrack = false
         player.pause(); player.replaceCurrentItem(with: nil); itemObserver = nil; loader?.invalidate(); loader = nil
         state = "stopped"; position = 0; nowPlayingArtwork = nil; nowPlayingArtworkImage = nil; nowPlayingArtworkTrackID = 0
@@ -507,20 +591,20 @@ struct NativePlaybackQueue {
     }
     private func download(_ command: NativeAudioCommand) throws {
         guard let origin = origin, let library = library else { throw XASSErr.invalidOrigin }
-        guard jobs[command.trackID] == nil, !downloadIDs.contains(command.trackID) else { return }
+        guard !downloadIDs.contains(command.trackID) else { return }
         if let cache = automaticCache, let entry = cachedTracks.first(where: { $0.id == command.trackID }) {
-            downloadIDs.insert(command.trackID)
+            pendingPinIDs.insert(command.trackID); refreshDownloads()
             let account = accountGeneration
             Task { [weak self] in
                 do {
                     let copied = try await cache.copyToPinned(entry, to: library)
                     guard let self = self, self.origin == origin, self.accountGeneration == account else { return }
                     var values = library.tracks().filter { $0.id != copied.id }; values.append(copied); try library.save(values)
-                    self.downloadIDs.remove(command.trackID); self.downloads = values
+                    self.pendingPinIDs.remove(command.trackID); self.refreshDownloads()
                     self.emit?(["action": "download", "trackId": command.trackID, "downloaded": true])
                 } catch {
                     guard let self = self, self.accountGeneration == account else { return }
-                    self.downloadIDs.remove(command.trackID); self.error = "Не удалось сохранить трек из кэша."
+                    self.pendingPinIDs.remove(command.trackID); self.refreshDownloads(); self.error = "Не удалось сохранить трек из кэша."
                 }
             }
             return
@@ -529,21 +613,32 @@ struct NativePlaybackQueue {
         let url = try origin.mediaURL(command.rawURL, trackID: command.trackID)
         let free = try? library.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
         if let free = free, free < PrivateDownload.maxBytes + 32 * 1024 * 1024 { throw URLError(.cannotWriteToFile) }
-        let job = PrivateDownload(origin: origin, trackID: command.trackID, destination: library.file(command.trackID))
-        jobs[command.trackID] = job; downloadIDs.insert(command.trackID)
+        let track = DownloadedTrack(id: command.trackID, title: command.title, artist: command.artist,
+            duration: self.trackID == command.trackID ? self.duration : 0)
+        try BackgroundDownloads.shared.enqueue(origin: origin, track: track, url: url)
+        refreshDownloads()
+    }
+    private func refreshDownloads() {
+        guard let origin else { return }
+        downloadQueue = BackgroundDownloads.shared.entries(for: origin)
+        downloadIDs = Set(downloadQueue.filter(\.active).map { $0.track.id }).union(pendingPinIDs)
+        downloads = library?.tracks() ?? []
+        emit?(["action": "downloads", "downloads": downloads.map(\.bridge)])
+    }
+    func pauseDownload(_ id: UUID) { BackgroundDownloads.shared.pause(id); refreshDownloads() }
+    func cancelDownload(_ id: UUID) { BackgroundDownloads.shared.cancel(id); refreshDownloads() }
+    func retryDownload(_ item: BackgroundDownload) {
+        guard let origin, item.origin == origin.url.absoluteString else { return }
+        if BackgroundDownloads.shared.resume(item.id) { refreshDownloads(); return }
+        guard let requestDownloadTicket else { error = "Для новой ссылки подключитесь к серверу."; return }
         let account = accountGeneration
-        job.start(url: url) { [weak self] result in
-            Task { @MainActor in
-                guard let self = self, self.origin == origin, self.accountGeneration == account else { return }
-                self.jobs.removeValue(forKey: command.trackID); self.downloadIDs.remove(command.trackID)
-                do {
-                    let file = try result.get()
-                    var tracks = library.tracks().filter { $0.id != command.trackID }
-                    tracks.append(DownloadedTrack(id: command.trackID, title: command.title, artist: command.artist, duration: self.trackID == command.trackID ? self.duration : 0, fileExtension: file.pathExtension))
-                    try library.save(tracks); self.downloads = tracks
-                    self.emit?(["action": "download", "trackId": command.trackID, "downloaded": true])
-                } catch { self.error = "Загрузка не завершена. Проверьте сеть и свободное место, затем повторите."; self.emit?(["action": "download", "trackId": command.trackID, "downloaded": false, "error": self.error!]) }
-            }
+        requestDownloadTicket(item.track.id) { [weak self] result in
+            guard let self, self.origin == origin, self.accountGeneration == account else { return }
+            do {
+                let url = try origin.mediaURL(result.get(), trackID: item.track.id)
+                try BackgroundDownloads.shared.enqueue(origin: origin, track: item.track, url: url)
+                self.refreshDownloads()
+            } catch { self.error = "Не удалось продолжить загрузку. Проверьте связь с сервером." }
         }
     }
     func removeDownload(_ track: DownloadedTrack) {
@@ -579,7 +674,7 @@ struct NativePlaybackQueue {
                 guard let self = self, self.cacheGeneration == token else { return }
                 self.applyCache(await cache.snapshot())
                 guard needed, await cache.hasSpaceForDownload(), self.cacheGeneration == token,
-                      !self.downloads.contains(where: { $0.id == id }), self.jobs[id] == nil,
+                      !self.downloads.contains(where: { $0.id == id }), !self.downloadIDs.contains(id),
                       self.cacheDownloadID == nil, let request = self.requestTicket, let origin = self.origin else { return }
                 self.cacheDownloadID = id
                 request(id) { [weak self] result in

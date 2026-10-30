@@ -64,13 +64,19 @@ final class OwnerAPITests: XCTestCase {
                 var result: [String: Any] = ["ok": true]
                 if path == "/api/mini/bootstrap" { result["sources"] = [] }
                 else if path.contains("/music/library") { result["tracks"] = [["id": 1, "title": "Fixture", "duration": 99]]; result["playlists"] = [] }
-                else if path == "/api/mini/music/players" { result["players"] = [] }
+                else if path == "/api/mini/music/players" {
+                    result["players"] = [["source_name": "Fixture", "live": true, "available": true]]
+                }
                 else if path == "/api/mini/music/session" {
                     result["session"] = ["track_id": 1, "device": "local", "state": "paused", "position": 12, "session_key": String(repeating: "z", count: 32)]
                 } else if path == "/api/mini/music/transfers" {
                     result = ["ok": !oldServer || !fail, "transfer_id": transferID, "status": fail ? "failed" : "ready",
                         "detail": fail ? "ПК не подтвердил запуск музыки" : "", "error_code": "target_start_failed",
                         "session": ["track_id": 1, "device": "agent:Fixture", "session_key": ownerSessionKey, "state": "playing", "position": 12]]
+                    if !oldServer || !fail {
+                        result["protocol"] = 2; result["revision"] = fail ? 1 : 2
+                        result["phase"] = fail ? "failed" : "ready"
+                    }
                 }
                 let data = try! JSONSerialization.data(withJSONObject: result)
                 let envelope = try! JSONSerialization.data(withJSONObject: ["_s": 200, "_b": String(decoding: data, as: UTF8.self)])
@@ -84,7 +90,7 @@ final class OwnerAPITests: XCTestCase {
             defer { store.disconnect(); api.invalidate() }
             await store.refresh()
             do { try await store.pickRoute(device: "agent:Fixture"); XCTFail("Failed target must not become ready") }
-            catch { XCTAssertEqual(error.localizedDescription, "ПК не подтвердил запуск музыки") }
+            catch { XCTAssertEqual(error.localizedDescription, oldServer ? "Обновите сервер XASS для безопасной передачи звука" : "ПК не подтвердил запуск музыки") }
             XCTAssertFalse(store.busy)
             XCTAssertEqual(store.selectedDevice, "local")
             XCTAssertTrue(store.showRoutePicker)

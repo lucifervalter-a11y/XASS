@@ -11,7 +11,7 @@ domain="${1:-}"
 [[ -f "$root/.migration-pending" ]] || { echo 'No staged migration found'; exit 1; }
 [[ ! -e /etc/systemd/system/serverredus-backend.service && ! -e /etc/nginx/sites-available/xass-migrated ]] || { echo 'Existing server configuration found; refusing to overwrite it'; exit 1; }
 apt-get update
-apt-get install -y nginx php-fpm python3-venv git sudo
+apt-get install -y nginx php-fpm python3-venv git sudo ffmpeg
 id xass >/dev/null 2>&1 || useradd --system --home-dir "$root" --shell /usr/sbin/nologin xass
 python3 -m venv "$root/.venv"
 "$root/.venv/bin/python" -m pip install -r "$root/requirements.txt"

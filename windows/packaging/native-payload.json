@@ -45,6 +45,7 @@
     "desktop_bridge.py",
     "background_agent.py",
     "desktop_music_service.py",
+    "music_curation.py",
     "native_updater.py",
     "installer_process.py"
   ],

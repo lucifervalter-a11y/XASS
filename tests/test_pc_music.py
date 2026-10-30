@@ -166,6 +166,31 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertIs(self.audio.selected[-1], self.audio.ids["stable-two"])
         self.assertEqual(self.requests[0].headers["X-Api-Key"], CONFIG["api_key"])
 
+    def test_prepare_is_silent_and_start_is_attempt_fenced(self):
+        attempt = {"handoff_id": "a" * 32, "handoff_revision": 8, "expires_at": time.time() + 30}
+        self.command("music_prepare", track_id=7, url=URL, **attempt)
+        ready = self.wait_state("prepared")
+        self.assertEqual(ready["handoff_protocol"], 2)
+        self.assertFalse(any(device.running for device in self.audio.devices))
+        with self.assertRaises(mp.MusicError):
+            self.command("music_start_prepared", track_id=7, handoff_id="b" * 32, handoff_revision=7)
+        started = self.command("music_start_prepared", track_id=7, position_sec=19.5, **attempt)
+        self.assertEqual(started["state"], "playing")
+        count = len(self.audio.devices)
+        self.command("music_start_prepared", track_id=7, position_sec=19.5, **attempt)
+        self.assertEqual(len(self.audio.devices), count)
+        self.command("music_stop", **attempt)
+        with self.assertRaises(mp.MusicError):
+            self.command("music_start_prepared", track_id=7, **attempt)
+
+    def test_preparation_expiry_never_autoplays(self):
+        self.command("music_prepare", track_id=7, url=URL,
+            handoff_id="a" * 32, handoff_revision=1, expires_at=time.time() + 30)
+        self.wait_state("prepared")
+        self.player._prepared_expires = time.time() - 1
+        self.assertEqual(self.player.snapshot()["state"], "stopped")
+        self.assertFalse(any(device.running for device in self.audio.devices))
+
     def test_server_relative_media_route_uses_paired_legacy_origin_not_public_url(self):
         legacy = {**CONFIG, "server_url": "http://private.example:8000/base"}
         path = "/agent/music/tracks/7/stream?ticket=test-ticket"

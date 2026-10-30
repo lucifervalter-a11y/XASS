@@ -316,14 +316,14 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancelled.json()["status"], "ready")
         self.assertEqual(cancelled.json()["session"]["state"], "playing")
 
-    async def test_cancel_ready_pc_target_stops_pending_audio_download(self):
+    async def test_cancel_loading_pc_target_stops_pending_audio_download(self):
         track = await self.music_track()
         await self.agent("PC")
         response = await self.transfer(track, device="agent:PC")
         command = (await self.commands())[0]
         await self.complete(command.id, state="loading")
         transfer_id = response.json()["transfer_id"]
-        self.assertEqual((await self.poll(transfer_id))["status"], "ready")
+        self.assertEqual((await self.poll(transfer_id))["status"], "waiting")
         cancelled = await self.request("POST", f"/api/mini/music/transfers/{transfer_id}/cancel")
         self.assertEqual(cancelled.json()["status"], "failed")
         self.assertEqual([item.command for item in await self.commands()], ["music_play", "music_stop"])
@@ -395,7 +395,7 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack.status_code, 200, ack.text)
         self.assertEqual((await self.poll(transfer_id))["session"]["position"], 600)
 
-    async def test_offline_target_is_rejected_but_offline_source_no_longer_blocks_the_phone(self):
+    async def test_offline_target_is_rejected_and_offline_source_is_not_assumed_silent(self):
         track = await self.music_track()
         await self.agent("Offline", track_id=track, state="playing", online=False)
         target = await self.transfer(track, device="agent:Offline")
@@ -403,12 +403,11 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         await self.playing(track, device="agent:Offline")
         state = (await self.request("GET", "/api/mini/music/session")).json()["session"]
         self.assertEqual(state["state"], "unavailable")
-        # An offline PC cannot ACK a pause. The phone used to get HTTP 409
-        # forever ("Предыдущий ПК не в сети") and could never play again.
+        # Loss of a heartbeat may be a VPN partition while the PC keeps playing.
         response = await self.transfer()
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["status"], "ready")
-        self.assertEqual(response.json()["session"]["device"], "local")
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertEqual(response.json()["session"]["device"], "agent:Offline")
         self.assertEqual(await self.commands(), [])
 
     async def claim(self, track, **extra):
@@ -432,7 +431,7 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
         commands = await self.commands()
         self.assertEqual([c.command for c in commands], ["music_stop"])
 
-    async def test_phone_claim_over_offline_pc_plays(self):
+    async def test_phone_claim_over_offline_pc_requires_confirmed_handoff(self):
         track = await self.music_track()
         await self.agent("PC", track_id=track, state="playing")
         await self.playing(track, device="agent:PC", state="playing")
@@ -441,8 +440,8 @@ class MusicTransferTests(unittest.IsolatedAsyncioTestCase):
             source.last_seen_at = datetime.now(timezone.utc) - timedelta(minutes=5)
             await session.commit()
         response = await self.claim(track)
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["session"]["session_key"], self.new_key)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "transfer_required")
 
     async def test_phone_claim_over_audible_pc_requires_handoff_unless_forced(self):
         track = await self.music_track()

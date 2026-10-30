@@ -32,6 +32,11 @@ SCHEMAS = {
     "desktop_archive_probe": {"path"}, "desktop_diagnostics": set(),
     "desktop_updates": set(), "desktop_check_update": set(), "desktop_transcription": set(),
     "desktop_clipboard": set(), "desktop_screenshot": set(), "desktop_lock": {"confirmed"},
+    "desktop_curation_start": {"folder"}, "desktop_curation_inspect": {"id"},
+    "desktop_curation_candidates": {"id"}, "desktop_curation_propose": {"id", "changes", "artwork_path", "digest"},
+    "desktop_curation_transcribe": {"id", "model_path"},
+    "desktop_curation_duplicates": set(), "desktop_curation_history": set(),
+    "desktop_curation_apply": {"id", "confirmed"}, "desktop_curation_undo": {"id", "confirmed"},
 }
 SETTINGS = {"owner_name", "interval_sec", "auto_update", "transcription_enabled",
             "archive_folder", "archive_max_gb", "archive_retention_days"}
@@ -205,6 +210,9 @@ class DesktopService:
             raise ValueError("Unsupported desktop schema")
         if type(request.get("version", VERSION)) is not int or request.get("version", VERSION) != VERSION:
             raise ValueError("Unsupported protocol version")
+        if action.startswith("desktop_curation_"):
+            from music_curation import CurationService
+            return CurationService(self.data).request(action, request)
         if action == "desktop_settings":
             return self.settings()
         if action == "desktop_save_settings":

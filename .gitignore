@@ -25,3 +25,6 @@ pc_client/dist/
 pc_client/packaging/*.generated.*
 dist-release/
 /artifacts/
+/.tools/
+windows/**/bin/
+windows/**/obj/

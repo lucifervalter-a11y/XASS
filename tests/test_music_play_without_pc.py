@@ -102,25 +102,22 @@ class PlayWithoutPCTests(unittest.IsolatedAsyncioTestCase):
         response = await self.transfer(track, device="agent:ПК")
         self.assertEqual(response.status_code, 409, response.text)
 
-    async def test_phone_takeover_from_stale_playing_pc_needs_no_force(self):
+    async def test_phone_takeover_from_stale_playing_pc_requires_stop_receipt(self):
         track = await self.music_track()
         await self.pc_lease(track)
         await self.age_heartbeat("ПК", 30)
         response = await self.phone_claim(track)
-        self.assertEqual(response.status_code, 200, response.text)
-        session = response.json()["session"]
-        self.assertEqual(session["device"], "local")
-        self.assertEqual(session["session_key"], self.phone_key)
-        self.assertEqual(session["state"], "loading")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "transfer_required")
 
-    async def test_transfer_to_phone_from_dead_pc_is_ready_at_once(self):
+    async def test_transfer_to_phone_from_disconnected_pc_does_not_guess_silence(self):
         track = await self.music_track()
         await self.pc_lease(track)
         await self.age_heartbeat("ПК", 30)
         response = await self.transfer(track, position=40)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["status"], "ready")
-        self.assertEqual(response.json()["session"]["device"], "local")
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertEqual(response.json()["session"]["device"], "agent:ПК")
         self.assertEqual(await self.commands(), [])
 
     async def test_pc_queue_lease_does_not_block_phone_takeover(self):
