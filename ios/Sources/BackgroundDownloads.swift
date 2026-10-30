@@ -413,7 +413,12 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             item.usedResumeData = secret.resume != nil; item.discardResumeData = false
             if !item.usedResumeData { item.received = 0; item.expected = 0 }
             item.phase = .downloading; item.taskID = task.taskIdentifier
-            guard update(item) else { task.cancel(); continue }
+            guard update(item) else {
+                // Terminal in-memory state must precede cancellation: its
+                // completion callback schedules the queue again.
+                fail(item.id, "Не удалось сохранить состояние загрузки. Нажмите «Повторить».")
+                task.cancel(); continue
+            }
             task.taskDescription = item.id.uuidString; running[item.id] = task; task.resume()
         }
     }
