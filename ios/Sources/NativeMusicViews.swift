@@ -420,6 +420,7 @@ private struct NativeLibraryBrowser: View, Equatable {
                     Button("Убрать из библиотеки", role: .destructive) { confirmDelete = true }
                     NativeMessage(store: store)
                 }
+                .accessibilityIdentifier("nativeTrackActionsList")
             }
             .background(XASSStyle.background)
             .disabled(acting).navigationTitle(track.title).navigationBarTitleDisplayMode(.inline).toolbar { Button("Готово") { dismiss() }.disabled(acting) }

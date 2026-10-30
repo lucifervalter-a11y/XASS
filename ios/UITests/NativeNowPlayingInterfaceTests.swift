@@ -134,9 +134,19 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
         XCTAssertTrue(app.buttons["lyricsToolsDone"].waitForExistence(timeout: 3))
         app.buttons["lyricsToolsDone"].tap()
         app.buttons["nativePlayerMore"].tap()
-        XCTAssertTrue(app.buttons["nativeTrackInformation"].waitForExistence(timeout: 3))
+        let actions = app.collectionViews["nativeTrackActionsList"]
+        XCTAssertTrue(actions.waitForExistence(timeout: 3))
         XCTAssertFalse(app.buttons["nativeTrackPCTranscription"].exists)
-        app.buttons["nativeTrackInformation"].tap()
+        let informationEntry = app.buttons["nativeTrackInformation"]
+        // A medium sheet materializes this row below the bottom edge. Its
+        // existence does not mean tap() can reach it; scroll the sheet's List,
+        // not the lyrics view behind it, until the complete row is visible.
+        for _ in 0..<5 {
+            if fullyVisible(informationEntry, in: actions, app: app) { break }
+            actions.swipeUp()
+        }
+        XCTAssertTrue(fullyVisible(informationEntry, in: actions, app: app), "Information row is reachable inside the actions sheet")
+        informationEntry.tap()
         let informationBar = app.navigationBars["Информация о песне"]
         XCTAssertTrue(informationBar.waitForExistence(timeout: 3))
         let information = app.collectionViews["nativeEnrichment"]
@@ -167,6 +177,12 @@ final class NativeNowPlayingInterfaceTests: XCTestCase {
     @MainActor private func waitForDisappearance(_ element: XCUIElement) {
         let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: element)
         XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 5), .completed)
+    }
+
+    @MainActor private func fullyVisible(_ element: XCUIElement, in container: XCUIElement, app: XCUIApplication) -> Bool {
+        guard element.exists, element.isHittable, element.frame.height > 0 else { return false }
+        let viewport = container.frame.intersection(app.frame).insetBy(dx: 0, dy: 24)
+        return viewport.contains(element.frame)
     }
 
     @MainActor private func capture(_ app: XCUIApplication, _ name: String) {

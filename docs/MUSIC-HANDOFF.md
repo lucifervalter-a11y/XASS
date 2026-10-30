@@ -42,6 +42,15 @@ device picker to perform a confirmed handoff. The offline local-file Windows
 player remains independent of the server; its local/cast audio lock prevents
 two XASS engines from owning the same PC output.
 
+Legacy direct `play`/`resume` and the Windows catalog shortcut atomically commit
+the queued command and a `loading` lease. A concurrent phone claim or another
+PC start cannot pass between them. The lease is fenced against old controller
+reports and quiet/ended heartbeats until the command is acknowledged and a
+newer actual player report arrives. Timeout alone never releases that fence.
+Resume requires the PC's buffered track to match the canonical session. Modern
+capability-advertising PCs use the same codec preparation pipeline for direct
+play; older agents retain an explicit unsupported-M4A error.
+
 ## Codec preparation and deployment
 
 Install `ffmpeg` **and** `ffprobe` on the backend PATH. Debian/Ubuntu installers
@@ -75,3 +84,6 @@ silent preparation, attempt fencing and expiry with a fake audio backend.
 executables are installed (Linux CI installs them). iOS device audio routing,
 lock-screen background behavior and physical speaker latency still require
 device validation; API tests cannot establish those properties.
+`test_music_direct_start` also holds an uncommitted command insertion while a
+phone claim and heartbeat race it, and injects insert/commit failures to verify
+that neither the lease nor superseded commands survive a rolled-back write.

@@ -94,11 +94,15 @@ final class OwnerAPITests: XCTestCase {
             XCTAssertFalse(store.busy)
             XCTAssertEqual(store.selectedDevice, "local")
             XCTAssertTrue(store.showRoutePicker)
+            XCTAssertEqual(store.transferFailure?.sourceState, .unknown)
+            XCTAssertTrue(store.transferFailure?.message.contains("Другой звук автоматически не запускается") == true)
+            XCTAssertFalse(store.audio.hasPlayableItem)
             fail = false
             try await store.pickRoute(device: "agent:Fixture")
             XCTAssertEqual(store.selectedDevice, "agent:Fixture")
             XCTAssertFalse(store.busy)
             XCTAssertFalse(store.showRoutePicker)
+            XCTAssertNil(store.transferFailure)
         }
     }
 

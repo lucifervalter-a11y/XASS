@@ -721,9 +721,12 @@ struct NativeTransferFailure: Equatable {
             pcConnecting = nil
             try await playOnPhoneAfterPCLoss(trackID: trackID, position: resumeAt, notice: Self.playingHereNotice)
         }
-        catch where Self.isPCFailure(error) {
+        catch {
             pcConnecting = nil
-            throw OwnerAPIError(status: 409, message: transferFailure?.message ?? "ПК не подтвердил передачу. Автоматический запуск на iPhone отключён.")
+            // The separate transferFailure banner describes the safe playback
+            // state. Preserve the actual cause (including protocol upgrade,
+            // permissions and transport errors) for its detail and diagnostics.
+            throw error
         }
     }
 

@@ -133,7 +133,8 @@ import SwiftUI
                     NavigationLink { NativeDiagnosticLogView() } label: { Label("Журнал приложения", systemImage: "doc.text.magnifyingglass") }.accessibilityIdentifier("nativeToolsAppDiagnostics")
                     NavigationLink { NativeSettingsView(app: app, store: store) } label: { Label("Настройки приложения", systemImage: "gearshape") }.accessibilityIdentifier("nativeToolsSettings")
                 }
-            }.navigationTitle("Инструменты").scrollContentBackground(.hidden).background(XASSStyle.background)
+            }.accessibilityIdentifier("nativeToolsList")
+                .navigationTitle("Инструменты").scrollContentBackground(.hidden).background(XASSStyle.background)
         }
     }
 }

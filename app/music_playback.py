@@ -125,6 +125,10 @@ async def pc_source_released(session, item, *, now=None) -> bool:
     source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == item.device[6:]))
     if not music_source_live(source, now=now):
         return False  # Network loss cannot prove that buffered audio is silent.
+    from app.services.music_direct_start import direct_start_command, direct_start_confirmed
+    command = await direct_start_command(session, item)
+    if command and not direct_start_confirmed(command, source):
+        return False
     return pc_heartbeat_proves_silence(item, source, now=now)
 
 
@@ -149,6 +153,10 @@ async def current_session(session):
     timestamp = aware(item.updated_at)
     now = datetime.now(timezone.utc)
     queue_command = await session.get(AgentCommand, meta.queue_command_id) if meta and meta.queue_command_id else None
+    if queue_command and (queue_command.payload or {}).get("direct_start") and (
+            queue_command.payload.get("queue_session_key") != item.session_key
+            or queue_command.source_name != item.device.removeprefix("agent:")):
+        queue_command = None
     queue_pending = bool(queue_command and (queue_command.status in {"awaiting_media", "pending", "delivered", "failed"} or
         (queue_command.status == "completed" and not (queue_command.payload or {}).get("queue_seen_playing") and item.state == "loading")))
     if queue_command and queue_command.status in {"awaiting_media", "failed"}:
@@ -156,6 +164,9 @@ async def current_session(session):
     if item.device.startswith("agent:"):
         source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == item.device[6:]))
         if music_source_live(source, now=now):
+            if queue_command and (queue_command.payload or {}).get("direct_start"):
+                from app.services.music_direct_start import direct_start_confirmed
+                queue_pending = not direct_start_confirmed(queue_command, source)
             player = (source.last_payload or {}).get("music_player") or {}
             # A paused heartbeat from before a new play command cannot prove
             # silence if the command was delivered and its ACK was lost.
