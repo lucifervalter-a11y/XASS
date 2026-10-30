@@ -35,7 +35,7 @@ jobs:
         run: brew install xcodegen
       - name: Generate Xcode project
         run: bash ios/prepare.sh
-      - name: Simulator regression tests
+      - name: Focused download recovery regression
         working-directory: ios
         run: |
           set -euo pipefail
@@ -45,7 +45,11 @@ jobs:
           # One short test bundle exercises the system audio session; extra simulator clones add no value.
           # Fail this focused real-Foundation regression before the slower UI suite.
           xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -only-testing:XASSTests/DownloadRecoveryTests -derivedDataPath build/simulator -resultBundlePath build/RecoveryTests.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/recovery-tests.log
-          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$simulator_id" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/simulator-tests.log
+      - name: Simulator regression tests
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild test -project XASS.xcodeproj -scheme XASS -destination "platform=iOS Simulator,id=$XASS_SIMULATOR_ID" -parallel-testing-enabled NO -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/simulator-tests.log
       - name: Capture real native screens (isolated simulator data, no account or audio)
         working-directory: ios
         run: |

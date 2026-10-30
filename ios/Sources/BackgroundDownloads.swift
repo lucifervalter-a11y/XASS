@@ -320,7 +320,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             return true
         }
         guard let secret = secret(id), secret.canResume() else { return false }
-        item.phase = .queued; item.message = nil
+        item.phase = .queued; item.message = nil; item.taskID = nil; item.usedResumeData = false
         guard update(item) else { return false }
         pauseEpochs.invalidate(id); schedule(); return true
     }
@@ -386,21 +386,39 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
                 do { try saveSecret(secret, id: item.id) }
                 catch { fail(item.id, "Не удалось сбросить данные продолжения. Повторите загрузку."); continue }
             }
-            let task: URLSessionDownloadTask
-            if let resume = secret.resume { task = session.downloadTask(withResumeData: resume) }
-            else {
+            var pendingTask: URLSessionDownloadTask?
+            if let resume = secret.resume {
+                pendingTask = Self.makeResumedTask(session: session, data: resume)
+                if pendingTask == nil {
+                    // Malformed opaque data can throw an Objective-C exception
+                    // before a task exists, so no delegate callback can help.
+                    guard recoverRejectedResumeCreation(id: item.id) else {
+                        fail(item.id, "Данные продолжения отклонены. Повторите загрузку."); continue
+                    }
+                    guard let recovered = ledger.entries.first(where: { $0.id == item.id }),
+                          recovered.phase == .queued else { continue }
+                    item = recovered; secret.resume = nil
+                    do { try saveSecret(secret, id: item.id) }
+                    catch { fail(item.id, "Не удалось сбросить данные продолжения. Повторите загрузку."); continue }
+                }
+            }
+            if pendingTask == nil {
                 var request = URLRequest(url: url)
                 // No owner cookies, Authorization, API key or custom credential
                 // headers are sent to the background networking daemon.
                 request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-                task = session.downloadTask(with: request)
+                pendingTask = session.downloadTask(with: request)
             }
+            guard let task = pendingTask else { continue }
             item.usedResumeData = secret.resume != nil; item.discardResumeData = false
             if !item.usedResumeData { item.received = 0; item.expected = 0 }
             item.phase = .downloading; item.taskID = task.taskIdentifier
             guard update(item) else { task.cancel(); continue }
             task.taskDescription = item.id.uuidString; running[item.id] = task; task.resume()
         }
+    }
+    static func makeResumedTask(session: URLSession, data: Data) -> URLSessionDownloadTask? {
+        XASSDownloadTaskWithResumeData(session, data)
     }
     private func key(_ id: UUID) -> String { "music-download-" + id.uuidString }
     private func secret(_ id: UUID) -> BackgroundDownloadSecret? {
@@ -569,6 +587,30 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             resumeFailure = error?.domain == NSURLErrorDomain && (codes.contains(error?.code ?? 0) || unavailableResume)
         } else { resumeFailure = false }
         guard resumeFailure else { return false }
+        return queueFreshAttempt(item)
+    }
+    /// There is no task ID or delegate event when Foundation rejects task
+    /// construction itself. Only a queued job holding resume bytes qualifies.
+    @discardableResult
+    func recoverRejectedResumeCreation(id: UUID) -> Bool {
+        guard var item = ledger?.entries.first(where: { $0.id == id }),
+              item.phase == .queued, item.taskID == nil, item.origin == allowedOrigin,
+              !item.needsFreshTicket,
+              let secret = secret(id), secret.resume != nil, secret.canResume(),
+              let origin = try? ServerOrigin(item.origin),
+              (try? origin.mediaURL(secret.url, trackID: item.track.id)) != nil else { return false }
+        guard item.restartAttempts < 1 else {
+            // No second automatic attempt. A later explicit Retry may start
+            // fresh, but must never pass the known-rejected blob back again.
+            item.discardResumeData = true; item.usedResumeData = false; item.phase = .failed
+            item.message = "Данные продолжения отклонены. Нажмите «Повторить» для загрузки заново."
+            if !update(item) { ledger?.rememberFailure(item); notify() }
+            return true
+        }
+        return queueFreshAttempt(item)
+    }
+    private func queueFreshAttempt(_ original: BackgroundDownload) -> Bool {
+        var item = original
         item.restartAttempts += 1; item.discardResumeData = true; item.usedResumeData = false
         item.taskID = nil; item.phase = .queued; item.received = 0; item.expected = 0
         item.message = "Загружаю заново…"
@@ -578,7 +620,7 @@ final class BackgroundDownloads: NSObject, URLSessionDownloadDelegate {
             item.phase = .failed; item.message = "Не удалось сохранить состояние загрузки. Нажмите «Повторить»."
             ledger?.rememberFailure(item); notify(); return true
         }
-        pauseEpochs.invalidate(id)
+        pauseEpochs.invalidate(item.id)
         return true
     }
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

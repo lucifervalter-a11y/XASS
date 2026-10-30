@@ -104,39 +104,48 @@ final class DownloadRecoveryTests: XCTestCase {
         XCTAssertEqual(secrets.values[item.id]?.resume, Data([7, 9, 2, 1]))
     }
 
-    @MainActor func testFoundationRejectsInvalidOpaqueResumeDataThroughRealDelegate() throws {
+    @MainActor private func assertNativeResumeRejection(_ bytes: Data) throws {
         let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
         let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
         var item = job()
-        let secrets = SecretFixture(); secrets.values[item.id] = secret(for: item)
+        item.phase = .queued; item.taskID = nil; item.usedResumeData = false
+        let secrets = SecretFixture()
+        var stored = secret(for: item); stored.resume = bytes; secrets.values[item.id] = stored
+        try ledger.save([item])
         let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil; configuration.httpCookieStorage = nil
         configuration.urlCredentialStorage = nil
         let session = URLSession(configuration: configuration, delegate: manager, delegateQueue: .main)
         defer { session.invalidateAndCancel() }
-        // This malformed blob contains no URL or request. Foundation rejects
-        // it locally; the injected manager cannot schedule a replacement GET.
-        let task = session.downloadTask(withResumeData: Data("invalid-xass-resume-fixture".utf8))
-        item.taskID = task.taskIdentifier; task.taskDescription = item.id.uuidString
-        try ledger.save([item])
-        let settled = expectation(description: "Real URLSession delegate settles rejected resume data")
-        var observed = false
-        let observer = NotificationCenter.default.addObserver(forName: BackgroundDownloads.changed,
-            object: nil, queue: .main) { _ in
-                guard !observed, let phase = ledger.entries.first(where: { $0.id == item.id })?.phase,
-                      phase != .downloading else { return }
-                observed = true; settled.fulfill()
-            }
-        defer { NotificationCenter.default.removeObserver(observer) }
-
-        task.resume()
-        // The delegate runs on the main queue. XCTest's synchronous waiter
-        // pumps that run loop without introducing an async test stack frame.
-        waitForExpectations(timeout: 5)
+        // Neither fixture contains a URL/request. Foundation can reject it
+        // synchronously with an Objective-C exception OR return a task which
+        // reports a local error through the real delegate. Both paths must use
+        // the same durable budget; the injected manager cannot create a GET.
+        var diagnostic = "Foundation rejected resume data during guarded task creation"
+        if let task = BackgroundDownloads.makeResumedTask(session: session, data: bytes) {
+            item.phase = .downloading; item.usedResumeData = true
+            item.taskID = task.taskIdentifier; task.taskDescription = item.id.uuidString
+            try ledger.save([item])
+            let settled = expectation(description: "Real URLSession delegate settles rejected resume data")
+            var observed = false
+            let observer = NotificationCenter.default.addObserver(forName: BackgroundDownloads.changed,
+                object: nil, queue: .main) { _ in
+                    guard !observed, let phase = ledger.entries.first(where: { $0.id == item.id })?.phase,
+                          phase != .downloading else { return }
+                    observed = true; settled.fulfill()
+                }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            task.resume()
+            // The delegate runs on the main queue. XCTest's synchronous waiter
+            // pumps the run loop without introducing an async test stack frame.
+            waitForExpectations(timeout: 5)
+            diagnostic = task.error.map { String(describing: $0) } ?? "Foundation returned no transport error"
+        } else {
+            XCTAssertTrue(manager.recoverRejectedResumeCreation(id: item.id))
+        }
 
         let recovered = try XCTUnwrap(ledger.entries.first)
-        let diagnostic = task.error.map { String(describing: $0) } ?? "Foundation returned no transport error"
         XCTAssertEqual(recovered.phase, .queued, diagnostic)
         XCTAssertEqual(recovered.restartAttempts, 1, diagnostic)
         XCTAssertTrue(recovered.discardResumeData, diagnostic)
@@ -144,6 +153,170 @@ final class DownloadRecoveryTests: XCTestCase {
         XCTAssertNil(recovered.taskID)
         XCTAssertEqual(recovered.received, 0)
         XCTAssertEqual(recovered.expected, 0)
+        XCTAssertEqual(secrets.values[item.id]?.resume, bytes, "Opaque bytes are never parsed or rewritten by recovery")
+    }
+
+    @MainActor func testFoundationRejectsInvalidOpaqueResumeDataThroughRealDelegate() throws {
+        // Foundation accepts this as an OpenStep plist string and has thrown
+        // objectForKey: before task creation; the production guard must catch it.
+        try assertNativeResumeRejection(Data("invalid-xass-resume-fixture".utf8))
+    }
+
+    @MainActor func testFoundationRejectsEmptyBinaryResumeDictionaryThroughGuardOrDelegate() throws {
+        let bytes = try PropertyListSerialization.data(fromPropertyList: [String: String](),
+                                                       format: .binary, options: 0)
+        try assertNativeResumeRejection(bytes)
+    }
+
+    @MainActor func testRejectedCreationPreservesOtherFortyNineJobsAndDurableBudget() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        var jobs = (1...50).map { job($0, taskID: 20 + $0) }
+        jobs[0].phase = .queued; jobs[0].taskID = nil; jobs[0].usedResumeData = false
+        for index in 1..<jobs.count {
+            jobs[index].phase = index.isMultiple(of: 2) ? .paused : .downloading
+            jobs[index].received = Int64(index * 10); jobs[index].expected = 1024
+            jobs[index].message = "Original \(index)"
+        }
+        let before = try encoded(Array(jobs.dropFirst())), secrets = SecretFixture()
+        for item in jobs { secrets.values[item.id] = secret(for: item) }
+        try ledger.save(jobs)
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+
+        XCTAssertTrue(manager.recoverRejectedResumeCreation(id: jobs[0].id))
+
+        let restored = try DownloadLedger(root: directory)
+        let recovered = try XCTUnwrap(restored.entries.first)
+        XCTAssertEqual(recovered.phase, .queued)
+        XCTAssertEqual(recovered.restartAttempts, 1)
+        XCTAssertTrue(recovered.discardResumeData)
+        XCTAssertFalse(recovered.usedResumeData)
+        XCTAssertNil(recovered.taskID)
+        XCTAssertEqual(recovered.received, 0); XCTAssertEqual(recovered.expected, 0)
+        XCTAssertEqual(try encoded(Array(restored.entries.dropFirst())), before)
+        XCTAssertEqual(restored.entries.count, 50)
+        XCTAssertEqual(secrets.values.count, 50)
+        XCTAssertEqual(secrets.saves, 0); XCTAssertTrue(secrets.removals.isEmpty)
+        let relaunched = BackgroundDownloads(ledger: restored, origin: origin, secrets: secrets.access)
+        XCTAssertTrue(relaunched.recoverRejectedResumeCreation(id: recovered.id), "A second creation rejection is handled without another automatic attempt")
+        XCTAssertEqual(restored.entries.first?.restartAttempts, 1)
+        XCTAssertEqual(restored.entries.first?.phase, .failed)
+        XCTAssertTrue(restored.entries.first?.discardResumeData == true)
+        XCTAssertFalse(relaunched.recoverRejectedResumeCreation(id: recovered.id), "Failed phase fences duplicate callbacks")
+        XCTAssertEqual(try encoded(Array(restored.entries.dropFirst())), before)
+    }
+
+    @MainActor func testManualResumeClearsRetiredTaskBeforeGuardedCreationRecovery() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        var item = job(); item.phase = .failed
+        let secrets = SecretFixture(); secrets.values[item.id] = secret(for: item)
+        try ledger.save([item])
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+
+        XCTAssertTrue(manager.resume(item.id))
+
+        let queued = try XCTUnwrap(ledger.entries.first)
+        XCTAssertEqual(queued.phase, .queued)
+        XCTAssertNil(queued.taskID, "The completed task must not block creation-level recovery")
+        XCTAssertFalse(queued.usedResumeData)
+        XCTAssertTrue(manager.recoverRejectedResumeCreation(id: item.id))
+        XCTAssertEqual(ledger.entries.first?.restartAttempts, 1)
+        XCTAssertEqual(ledger.entries.first?.phase, .queued)
+        XCTAssertTrue(ledger.entries.first?.discardResumeData == true)
+    }
+
+    @MainActor func testRejectedCreationWithExhaustedBudgetWaitsForExplicitFreshRetry() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        var item = job(); item.phase = .queued; item.taskID = nil; item.restartAttempts = 1
+        let secrets = SecretFixture(); secrets.values[item.id] = secret(for: item)
+        try ledger.save([item])
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+
+        XCTAssertTrue(manager.recoverRejectedResumeCreation(id: item.id))
+
+        let failed = try XCTUnwrap(ledger.entries.first)
+        XCTAssertEqual(failed.phase, .failed)
+        XCTAssertEqual(failed.restartAttempts, 1)
+        XCTAssertTrue(failed.discardResumeData)
+        XCTAssertFalse(failed.usedResumeData)
+        XCTAssertNil(failed.taskID)
+        XCTAssertTrue(failed.message?.contains("Повторить") == true)
+        XCTAssertEqual(try DownloadLedger(root: directory).entries.first?.phase, .failed)
+        XCTAssertFalse(manager.recoverRejectedResumeCreation(id: item.id))
+        XCTAssertTrue(manager.resume(item.id), "Only an explicit retry may queue the next clean GET")
+        XCTAssertEqual(ledger.entries.first?.phase, .queued)
+        XCTAssertEqual(ledger.entries.first?.restartAttempts, 1)
+        XCTAssertTrue(ledger.entries.first?.discardResumeData == true)
+        XCTAssertEqual(secrets.saves, 0); XCTAssertTrue(secrets.removals.isEmpty)
+    }
+
+    @MainActor func testRejectedCreationRequiresQueuedCurrentJobAndValidResumeSecret() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        let secrets = SecretFixture()
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+        for phase in [DownloadPhase.downloading, .paused, .failed, .committing] {
+            var item = job(); item.phase = phase
+            secrets.values[item.id] = secret(for: item); try ledger.save([item])
+            let before = try encoded(ledger.entries)
+            XCTAssertFalse(manager.recoverRejectedResumeCreation(id: item.id))
+            XCTAssertEqual(try encoded(ledger.entries), before)
+        }
+        var item = job(); item.phase = .queued; item.taskID = nil; item.usedResumeData = false
+        var noResume = secret(for: item); noResume.resume = nil
+        let crossOrigin = BackgroundDownloadSecret(
+            url: "https://other.invalid/api/music/tracks/1/stream?ticket=fixture",
+            issuedAt: Date(), resume: Data([1]), expiresAt: Date().addingTimeInterval(300))
+        for invalid in [nil, noResume, secret(for: item, expired: true), crossOrigin] as [BackgroundDownloadSecret?] {
+            secrets.values[item.id] = invalid; try ledger.save([item])
+            let before = try encoded(ledger.entries)
+            XCTAssertFalse(manager.recoverRejectedResumeCreation(id: item.id))
+            XCTAssertEqual(try encoded(ledger.entries), before)
+        }
+        secrets.values[item.id] = secret(for: item)
+        item.needsFreshTicket = true; try ledger.save([item])
+        let before = try encoded(ledger.entries)
+        XCTAssertFalse(manager.recoverRejectedResumeCreation(id: item.id))
+        XCTAssertEqual(try encoded(ledger.entries), before)
+        XCTAssertFalse(manager.recoverRejectedResumeCreation(id: UUID()))
+        item.needsFreshTicket = false; try ledger.save([item])
+        let otherOrigin = try ServerOrigin("https://other.invalid")
+        let switched = BackgroundDownloads(ledger: ledger, origin: otherOrigin, secrets: secrets.access)
+        XCTAssertFalse(switched.recoverRejectedResumeCreation(id: item.id))
+        XCTAssertEqual(ledger.entries.first?.restartAttempts, 0)
+        item.taskID = 21; try ledger.save([item])
+        let staleTask = try encoded(ledger.entries)
+        XCTAssertFalse(manager.recoverRejectedResumeCreation(id: item.id), "Creation rejection cannot retire an existing task")
+        XCTAssertEqual(try encoded(ledger.entries), staleTask)
+        XCTAssertEqual(secrets.saves, 0); XCTAssertTrue(secrets.removals.isEmpty)
+    }
+
+    @MainActor func testRejectedCreationLedgerFailureKeepsConsumedBudgetWithoutStartingTask() throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let ledger = try DownloadLedger(root: directory), origin = try ServerOrigin("https://download.invalid")
+        var item = job(); item.phase = .queued; item.taskID = nil; item.usedResumeData = false
+        let other = job(2, taskID: 22), secrets = SecretFixture()
+        secrets.values[item.id] = secret(for: item); secrets.values[other.id] = secret(for: other)
+        try ledger.save([item, other])
+        let manager = BackgroundDownloads(ledger: ledger, origin: origin, secrets: secrets.access)
+        let queue = ledger.directory.appendingPathComponent("queue.json")
+        try FileManager.default.removeItem(at: queue)
+        try FileManager.default.createDirectory(at: queue, withIntermediateDirectories: false)
+
+        XCTAssertTrue(manager.recoverRejectedResumeCreation(id: item.id))
+
+        let failed = try XCTUnwrap(ledger.entries.first { $0.id == item.id })
+        XCTAssertEqual(failed.phase, .failed)
+        XCTAssertEqual(failed.restartAttempts, 1)
+        XCTAssertTrue(failed.discardResumeData)
+        XCTAssertFalse(failed.usedResumeData)
+        XCTAssertNil(failed.taskID)
+        XCTAssertFalse(manager.recoverRejectedResumeCreation(id: item.id))
+        XCTAssertFalse(manager.resume(item.id))
+        XCTAssertEqual(try encoded(ledger.entries.filter { $0.id == other.id }), try encoded([other]))
+        XCTAssertEqual(secrets.saves, 0); XCTAssertTrue(secrets.removals.isEmpty)
     }
 
     @MainActor func testFallbackLedgerWriteFailureDoesNotScheduleOrLoseRetryBudgetInMemory() throws {

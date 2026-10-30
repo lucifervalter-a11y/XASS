@@ -25,6 +25,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.xass.mobile
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/XASS-Bridging-Header.h
+        GCC_ENABLE_OBJC_EXCEPTIONS: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
     info:
