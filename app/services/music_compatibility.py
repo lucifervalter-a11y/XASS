@@ -26,7 +26,7 @@ MAX_CACHE_BYTES = 1024 * 1024 * 1024
 MAX_SECONDS = 120
 INPUT_FORMATS = "mp3,wav,flac,ogg,mov"
 OUTPUTS = {"flac": ("audio/flac", ["-c:a", "flac", "-compression_level", "3"]),
-           "mp3": ("audio/mpeg", ["-c:a", "libmp3lame", "-b:a", "256k", "-ac", "2", "-ar", "48000"])}
+           "mp3": ("audio/mpeg", ["-c:a", "libmp3lame", "-b:a", "320k", "-ac", "2", "-ar", "48000"])}
 _job = threading.BoundedSemaphore(1)
 
 
@@ -125,7 +125,11 @@ def prepare(root: Path, track, supported: list[str], *, forced_codec=""):
     temporary = None
     try:
         directory = _cache_root(root)
-        target = directory / f"{digest}.{output}"
+        # The profile participates in the cache key: increasing MP3 quality
+        # must not silently reuse an older 256k file from the same original.
+        profile = json.dumps(OUTPUTS[output][1], separators=(",", ":"))
+        cache_key = hashlib.sha256((digest + ":" + profile).encode("ascii")).hexdigest()
+        target = directory / f"{cache_key}.{output}"
         if target.is_symlink():
             raise HTTPException(503, "Кэш совместимого аудио недоступен")
         if not target.is_file():

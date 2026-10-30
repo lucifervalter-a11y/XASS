@@ -56,6 +56,17 @@ class CompatibilityTests(unittest.TestCase):
         finally:
             compat._job.release()
 
+    def test_timed_out_conversion_removes_partial_output_and_releases_slot(self):
+        with patch.object(compat, "probe_codec", return_value=("aac", 5)), \
+                patch.object(compat.shutil, "which", return_value="fixture-ffmpeg"), \
+                patch.object(compat.subprocess, "run", side_effect=subprocess.TimeoutExpired("ffmpeg", compat.MAX_SECONDS)):
+            with self.assertRaises(HTTPException) as error:
+                compat.prepare(self.root, self.track, ["flac"])
+        self.assertEqual(error.exception.status_code, 415)
+        self.assertEqual(list((self.root / "compatible-audio").iterdir()), [])
+        self.assertTrue(compat._job.acquire(blocking=False))
+        compat._job.release()
+
     def test_variant_is_signed_and_credential_bound(self):
         settings = SimpleNamespace(bot_token="test", setup_api_key="fixture", pwa_session_generation_path=str(self.root / "generation"))
         token = issue_ticket(settings, 2, purpose="agent", binding="a" * 64, variant="flac")
@@ -106,12 +117,21 @@ class CompatibilityTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
     def test_real_mp3_only_receiver_gets_complete_fallback(self):
         before = self.file.read_bytes()
+        directory = self.root / "compatible-audio"
+        directory.mkdir()
+        old_cache = directory / (self.track.sha256 + ".mp3")
+        old_cache.write_bytes(b"legacy 256k profile must not be reused")
         prepared = compat.prepare(self.root, self.track, ["mp3"])
         codec, duration = compat.probe_codec(prepared["path"])
         self.assertEqual(codec, "mp3")
         self.assertLess(abs(duration - 5), .5)
         self.assertEqual(prepared["mime"], "audio/mpeg")
         self.assertEqual(self.file.read_bytes(), before)
+        self.assertNotEqual(prepared["path"], old_cache)
+        result = subprocess.run([shutil.which("ffprobe"), "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1",
+            str(prepared["path"])], check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(int(result.stdout.strip()), 320000)
 
 
 if __name__ == "__main__":

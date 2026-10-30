@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     owner_user_id: int = 0
     authorized_user_ids: Annotated[list[int], NoDecode] = []
     admin_user_ids: Annotated[list[int], NoDecode] = []
+    # Discord application verification key (not the bot token).
+    discord_public_key: str = ""
+    discord_listen_url: str = ""
 
     database_url: str = "sqlite+aiosqlite:///./data/serverredus.db"
     media_root: str = "./data/media"

@@ -47,7 +47,7 @@ jobs:
       - name: Install headless desktop and PHP test support
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk ffmpeg
+          sudo apt-get install --no-install-recommends -y php-cli xvfb xauth python3-tk ffmpeg libchromaprint-tools
       - name: Install complete pinned test dependencies
         run: python -m pip install -r requirements.txt -r pc_client/requirements.txt
       - name: Existing Python regression suite

@@ -31,6 +31,9 @@
     "Xass.Native.deps.json",
     "Xass.Native.runtimeconfig.json",
     "Xass.Native.pri",
+    "app.manifest",
+    "assets/xass.ico",
+    "assets/xass-icon.png",
     "coreclr.dll",
     "hostfxr.dll",
     "hostpolicy.dll",
@@ -52,6 +55,8 @@
   "required_companion_files": [
     "XASS.NativeHelper.exe",
     "_internal/python312.dll",
-    "_internal/build-info.json"
+    "_internal/build-info.json",
+    "_internal/assets/xass.ico",
+    "_internal/assets/xass-icon.png"
   ]
 }

@@ -1,10 +1,12 @@
 """Rollback failure injection uses synthetic folders and mocked installers only."""
 from __future__ import annotations
+from contextlib import closing
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -86,6 +88,45 @@ class NativeUpdaterTests(unittest.TestCase):
         self.installer.write_bytes(b"tampered")
         with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
         self.assertFalse((self.job / "backup").exists())
+    def test_same_size_installer_corruption_is_rejected_by_sha_not_size(self):
+        original = (self.install / "Xass.Native.exe").read_bytes()
+        self.installer.write_bytes(b"Y" * self.request["size"])
+        with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")
+        self.assertFalse((self.job / "backup").exists())
+        self.assertEqual((self.install / "Xass.Native.exe").read_bytes(), original)
+
+    def test_package_changed_after_backup_never_stops_or_replaces_runtime(self):
+        original = (self.install / "Xass.Native.exe").read_bytes()
+        protected = self.local / "XASS"
+        protected.mkdir()
+        (protected / "config.json").write_bytes(b'{"synthetic":true}')
+        (protected / ".e2e-key").write_bytes(b"synthetic-pairing-key")
+        with closing(sqlite3.connect(protected / "archive.sqlite3")) as connection, connection:
+            connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+            connection.execute("INSERT INTO messages VALUES (1, 'synthetic archive record')")
+        before = {p.name: digest(p) for p in protected.iterdir()}
+        self.updater.wait_for_parent = Mock(side_effect=lambda: self.installer.write_bytes(b"Y" * self.request["size"]))
+        self.updater.stop_install_processes = Mock()
+        self.updater.installer_run = Mock()
+        self.updater.verify_installed = Mock()
+        self.assertEqual(self.updater.execute(), 1)
+        self.updater.stop_install_processes.assert_not_called()
+        self.updater.installer_run.assert_not_called()
+        self.updater.verify_installed.assert_not_called()
+        self.assertFalse(self.updater.applied)
+        self.assertEqual((self.install / "Xass.Native.exe").read_bytes(), original)
+        self.assertEqual(before, {p.name: digest(p) for p in protected.iterdir()})
+        verify_tree(self.job / "backup", self.updater.inventory)
+        self.assertEqual(json.loads((self.job / "state.json").read_text())["phase"], "failed")
+
+    def test_cancel_after_parent_exits_never_stops_or_replaces_runtime(self):
+        self.updater.wait_for_parent = Mock(side_effect=lambda: (self.job / "cancel").touch())
+        self.updater.stop_install_processes = Mock()
+        self.updater.installer_run = Mock()
+        self.assertEqual(self.updater.execute(), 2)
+        self.updater.stop_install_processes.assert_not_called()
+        self.updater.installer_run.assert_not_called()
+        self.assertFalse(self.updater.applied)
     def test_rejects_unknown_schema_fields(self):
         self.request["shell"] = "untrusted"; write_json(self.job / "request.json", self.request)
         with self.assertRaises(ValueError): NativeUpdater(self.job / "request.json")

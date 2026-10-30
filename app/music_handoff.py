@@ -6,8 +6,9 @@ from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from app.models import AgentCommand, HeartbeatSource
-from app.music_models import MusicSession
+from app.music_models import MusicSession, MusicTrack
 from app.music_playback_models import MusicTransfer
+from app.services.agent_commands import _idempotency_digest
 
 
 def reliable(transfer):
@@ -23,6 +24,54 @@ def receipt(details, transfer, states):
     return (isinstance(details, dict) and details.get("state") in states
             and details.get("handoff_id") == transfer.id
             and details.get("handoff_revision") == target.get("attempt_revision"))
+
+
+def current_player_receipt(source, command, transfer, states):
+    """A cached pre-command or disconnected heartbeat cannot certify readiness."""
+    if (not source or source.is_online is not True or not command
+            or not source.last_seen_at or not command.created_at):
+        return False
+    seen = source.last_seen_at
+    created = command.created_at
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - seen).total_seconds()
+    details = (source.last_payload or {}).get("music_player")
+    return (0 <= age <= 15 and seen >= created and receipt(details, transfer, states)
+            and details.get("track_id") == transfer.target["track_id"])
+
+
+async def recover_command_ids(session, transfer):
+    """Recover the enqueue/transfer-commit crash window before timeout or cancel.
+
+    A missing row reference is not evidence that START was never delivered.
+    Reuse the same durable key as enqueue_agent_command, without sending any
+    new command or probing an unavailable real device during failure cleanup.
+    """
+    if not reliable(transfer):
+        return
+    target = transfer.target or {}
+    revision = target.get("attempt_revision")
+    for action, device, existing in (
+        ("prepare", target.get("device", ""), target.get("prepare_command_id")),
+        ("pause", transfer.source_device, transfer.stop_command_id),
+        ("start_prepared", target.get("device", ""), transfer.start_command_id),
+    ):
+        if existing or not device.startswith("agent:"):
+            continue
+        digest = _idempotency_digest(device[6:], "music_" + action,
+            f"handoff:{transfer.id}:{revision}:{action}")
+        command = await session.scalar(select(AgentCommand).where(AgentCommand.idempotency_key == digest))
+        if command is None:
+            continue
+        if action == "prepare":
+            changed(transfer, prepare_command_id=command.id)
+        elif action == "pause":
+            transfer.stop_command_id = command.id
+        else:
+            transfer.start_command_id = command.id
 
 
 class ReliableHandoff:
@@ -96,7 +145,7 @@ class ReliableHandoff:
             if device.startswith("agent:"):
                 source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == device[6:]))
                 details = (source.last_payload or {}).get("music_player") if source else {}
-                prepared = receipt(details, transfer, {"prepared"})
+                prepared = current_player_receipt(source, command, transfer, {"prepared"})
                 if command and command.status in {"failed", "cancelled"} or receipt(details, transfer, {"error"}):
                     await self.fail(session, transfer, "Целевой ПК не смог подготовить трек или аудиовыход")
                     return
@@ -125,7 +174,8 @@ class ReliableHandoff:
                     if isinstance(position, bool) or not isinstance(position, (int, float)) or not 0 <= position <= 86400:
                         await self.fail(session, transfer, "Прежний ПК не подтвердил точную позицию")
                         return
-                    transfer.position = position
+                    track = await session.get(MusicTrack, target["track_id"])
+                    transfer.position = min(track.duration, position) if track else position
                 if not await self.phase(session, transfer, "waiting", "stopped"):
                     return
             elif command and command.status in {"failed", "cancelled"}:
@@ -164,7 +214,7 @@ class ReliableHandoff:
             command = await session.get(AgentCommand, transfer.start_command_id) if transfer.start_command_id else None
             # A command ACK is merely acceptance. Only the current fenced
             # player heartbeat can confirm that the audio engine is running.
-            if (receipt(details, transfer, {"playing"}) and details.get("track_id") == target["track_id"]
+            if (current_player_receipt(source, command, transfer, {"playing"})
                     and details.get("audio_started") is True):
                 await self.finish(transfer, session)
             elif command and command.status in {"failed", "cancelled"} or receipt(details, transfer, {"error"}):

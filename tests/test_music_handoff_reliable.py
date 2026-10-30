@@ -1,5 +1,5 @@
 """Exercise real authenticated API + SQLite state, without touching a real PC."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import asyncio
 from unittest.mock import AsyncMock, patch
 import unittest
@@ -9,6 +9,9 @@ from sqlalchemy import select
 from app.models import AgentCommand, HeartbeatSource
 from app.music_models import MusicSession
 from app.music_playback_models import MusicPlaybackState, MusicTransfer
+from app.services.agent_commands import acknowledge_agent_commands
+from app.services.agent_lifecycle import AgentDetachedError, detach_agent
+from app import transcription_models  # Register presentation tables before the isolated fixture creates its schema.
 import test_music_transfers as fixtures
 
 
@@ -59,6 +62,16 @@ class ReliableHandoffTests(unittest.IsolatedAsyncioTestCase):
             transfer.target = {**transfer.target, "phase_started": 1}
             await session.commit()
 
+    async def complete_source(self, attempt, *, position=27.375, revision=None):
+        async with self.sessions() as session:
+            transfer = await session.get(MusicTransfer, attempt["transfer_id"])
+            command = await session.get(AgentCommand, transfer.stop_command_id)
+            command.status = "completed"
+            command.result = {"ok": True, "details": {"state": "paused", "position_sec": position,
+                "track_id": transfer.target["track_id"], "handoff_id": transfer.id,
+                "handoff_revision": attempt["revision"] if revision is None else revision}}
+            await session.commit()
+
     async def test_prepare_precedes_source_stop_and_playing_receipt(self):
         track = await self.music_track()
         await self.agent("PC")
@@ -100,6 +113,125 @@ class ReliableHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
         for _ in range(2):
             self.assertEqual((await self.ack_target(attempt, "playing")).json()["status"], "ready")
+
+    async def test_wrong_track_readiness_does_not_pause_the_phone(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        await self.playing(track)
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track + 1)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "preparing")
+        self.assertEqual((await self.ack_source(attempt)).status_code, 409)
+        self.assertEqual([c.command for c in await self.commands()], ["music_prepare"])
+
+    async def test_disconnected_ready_heartbeat_cannot_stop_source(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        await self.playing(track)
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track)
+        async with self.sessions() as session:
+            source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == "PC"))
+            source.last_seen_at = datetime.now(timezone.utc) - timedelta(seconds=16)
+            await session.commit()
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "preparing")
+        self.assertEqual((await self.ack_source(attempt)).status_code, 409)
+
+    async def test_explicit_offline_flag_blocks_fresh_ready_and_playing_receipts(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        await self.playing(track)
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track)
+
+        async def online(value):
+            async with self.sessions() as session:
+                source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == "PC"))
+                source.is_online = value
+                await session.commit()
+
+        await online(False)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "preparing")
+        self.assertEqual((await self.ack_source(attempt)).status_code, 409)
+        await online(True)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "waiting")
+        await self.ack_source(attempt)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        await self.heartbeat("PC", attempt, "playing", track)
+        await online(False)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        await online(True)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["status"], "ready")
+
+    async def test_playing_heartbeat_must_postdate_start_command(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        await self.heartbeat("PC", attempt, "playing", track)
+        async with self.sessions() as session:
+            transfer = await session.get(MusicTransfer, attempt["transfer_id"])
+            command = await session.get(AgentCommand, transfer.start_command_id)
+            source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == "PC"))
+            source.last_seen_at = command.created_at - timedelta(seconds=1)
+            await session.commit()
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        await self.heartbeat("PC", attempt, "playing", track)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["status"], "ready")
+
+    async def test_pc_to_phone_waits_for_preroll_then_exact_stop_then_playing(self):
+        track = await self.music_track()
+        await self.agent("PC", track, "playing")
+        await self.playing(track, device="agent:PC")
+        attempt = await self.transfer(track)
+        self.assertEqual(await self.commands(), [])
+        prepared = await self.ack_target(attempt, "prepared")
+        self.assertEqual(prepared.json()["phase"], "waiting")
+        self.assertEqual([c.command for c in await self.commands()], ["music_pause"])
+        self.assertEqual((await self.ack_target(attempt, "playing")).status_code, 409)
+        await self.complete_source(attempt)
+        starting = await self.poll(attempt["transfer_id"])
+        self.assertEqual(starting["phase"], "starting")
+        self.assertEqual(starting["session"]["position"], 27.375)
+        self.assertEqual(starting["session"]["state"], "loading")
+        self.assertEqual((await self.ack_target(attempt, "playing")).json()["status"], "ready")
+        self.assertEqual([c.command for c in await self.commands()], ["music_pause"])
+
+    async def test_pc_stop_position_is_bounded_by_target_duration(self):
+        track = await self.music_track()
+        await self.agent("PC", track, "playing")
+        await self.playing(track, device="agent:PC")
+        attempt = await self.transfer(track)
+        await self.ack_target(attempt, "prepared")
+        await self.complete_source(attempt, position=601)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["session"]["position"], 600)
+
+    async def test_old_pc_stop_ack_never_starts_phone_or_auto_resumes_pc(self):
+        track = await self.music_track()
+        await self.agent("PC", track, "playing")
+        await self.playing(track, device="agent:PC")
+        attempt = await self.transfer(track)
+        await self.ack_target(attempt, "prepared")
+        await self.complete_source(attempt, revision=attempt["revision"] - 1)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["status"], "failed")
+        self.assertEqual((await self.ack_target(attempt, "playing")).status_code, 409)
+        self.assertEqual([c.command for c in await self.commands()], ["music_pause"])
+
+    async def test_timeout_after_pc_stop_never_auto_resumes_either_device(self):
+        track = await self.music_track()
+        await self.agent("PC", track, "playing")
+        await self.playing(track, device="agent:PC")
+        attempt = await self.transfer(track)
+        await self.ack_target(attempt, "prepared")
+        await self.complete_source(attempt)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        await self.age_phase(attempt)
+        result = await self.poll(attempt["transfer_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertNotEqual(result["session"]["state"], "playing")
+        self.assertEqual((await self.ack_target(attempt, "playing")).status_code, 409)
+        self.assertEqual([c.command for c in await self.commands()], ["music_pause"])
 
     async def test_source_timeout_keeps_source_and_never_starts_target(self):
         track = await self.music_track()
@@ -168,6 +300,79 @@ class ReliableHandoffTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             transfer = await session.get(MusicTransfer, attempt["transfer_id"])
             self.assertEqual(transfer.start_command_id, commands[-1].id)
+
+    async def test_timeout_recovers_and_cancels_orphaned_pending_start(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        start = (await self.commands())[-1]
+        async with self.sessions() as session:
+            transfer = await session.get(MusicTransfer, attempt["transfer_id"])
+            transfer.start_command_id = None
+            transfer.target = {**transfer.target, "phase_started": 1}
+            await session.commit()
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["status"], "failed")
+        async with self.sessions() as session:
+            transfer = await session.get(MusicTransfer, attempt["transfer_id"])
+            recovered = await session.get(AgentCommand, start.id)
+            self.assertEqual(transfer.start_command_id, start.id)
+            self.assertEqual(recovered.status, "cancelled")
+        self.assertEqual(len(await self.commands()), 2)
+
+    async def test_timeout_recovers_delivered_start_and_keeps_audible_uncertainty(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        start = (await self.commands())[-1]
+        async with self.sessions() as session:
+            transfer = await session.get(MusicTransfer, attempt["transfer_id"])
+            transfer.start_command_id = None
+            transfer.target = {**transfer.target, "phase_started": 1}
+            command = await session.get(AgentCommand, start.id)
+            command.status, command.delivered_at = "delivered", datetime.now(timezone.utc)
+            await session.commit()
+        failed = await self.poll(attempt["transfer_id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["session"]["state"], "loading")
+        self.assertEqual(failed["session"]["device"], "agent:PC")
+        self.assertEqual(len(await self.commands()), 2)
+        # Even a new PREPARED heartbeat cannot prove that a delivered START
+        # will not run next. An explicit retry must retain the STOP barrier.
+        await self.heartbeat("PC", attempt, "prepared", track)
+        current = (await self.request("GET", "/api/mini/music/session")).json()["session"]
+        self.assertEqual(current["state"], "loading")
+        retry = await self.transfer(track)
+        self.assertEqual((await self.ack_target(retry, "prepared")).json()["phase"], "waiting")
+        self.assertEqual([c.command for c in await self.commands()],
+            ["music_prepare", "music_start_prepared", "music_pause"])
+
+    async def test_detaching_target_cancels_delivered_start_and_rejects_late_ack(self):
+        track = await self.music_track()
+        await self.agent("PC")
+        attempt = await self.transfer(track, "agent:PC")
+        await self.heartbeat("PC", attempt, "prepared", track)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["phase"], "starting")
+        start = (await self.commands())[-1]
+        async with self.sessions() as session:
+            source = await session.scalar(select(HeartbeatSource).where(HeartbeatSource.source_name == "PC"))
+            command = await session.get(AgentCommand, start.id)
+            command.status, command.delivered_at = "delivered", datetime.now(timezone.utc)
+            await session.commit()
+            await detach_agent(session, source_name="PC", source_id=source.id)
+        self.assertEqual((await self.poll(attempt["transfer_id"]))["status"], "failed")
+        async with self.sessions() as session:
+            with self.assertRaises(AgentDetachedError):
+                await acknowledge_agent_commands(session, source_name="PC", results=[{
+                    "id": start.id, "ok": True, "details": {"state": "playing",
+                        "track_id": track, "handoff_id": attempt["transfer_id"],
+                        "handoff_revision": attempt["revision"], "audio_started": True}}])
+            await session.rollback()
+            self.assertEqual((await session.get(AgentCommand, start.id)).status, "cancelled")
+        self.assertEqual([c.command for c in await self.commands()], ["music_prepare", "music_start_prepared"])
 
 
 if __name__ == "__main__":

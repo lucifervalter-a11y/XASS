@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -160,6 +161,37 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue({'secret_store.py', 'network_client.py', 'music_bridge.py', 'client_update.py', 'runtime_state.py'} <= set(sources))
         self.assertIn('_internal/python312.dll', manifest['required_companion_files'])
         self.assertTrue({'coreclr.dll', 'Microsoft.ui.xaml.dll', 'Xass.Native.pri'} <= set(manifest['required_native_files']))
+
+    def test_branding_manifest_and_bridge_are_required_in_both_published_roles(self):
+        manifest = json.loads(package.MANIFEST.read_text())
+        self.assertTrue({'app.manifest', 'assets/xass.ico', 'assets/xass-icon.png', 'bridge.py',
+                         'Microsoft.WindowsAppRuntime.dll'} <= set(manifest['required_native_files']))
+        self.assertTrue({'_internal/assets/xass.ico', '_internal/assets/xass-icon.png'} <=
+                        set(manifest['required_companion_files']))
+        project = ET.parse(ROOT / 'windows/Xass.Native/Xass.Native.csproj').getroot()
+        self.assertEqual(project.findtext('./PropertyGroup/ApplicationIcon'), r'..\..\pc_client\assets\xass.ico')
+        self.assertEqual(project.findtext('./PropertyGroup/ApplicationManifest'), 'app.manifest')
+        for option in ('WindowsAppSDKSelfContained', 'SelfContained'):
+            self.assertEqual(project.findtext('./PropertyGroup/' + option), 'true')
+        content = {entry.get('Link', entry.get('Include')): entry for entry in project.findall('./ItemGroup/Content')}
+        for name in ('app.manifest', r'assets\xass.ico', r'assets\xass-icon.png', 'bridge.py'):
+            self.assertEqual(content[name].get('CopyToPublishDirectory'), 'PreserveNewest')
+
+    def test_each_required_native_dependency_rejects_an_incomplete_publish(self):
+        required = json.loads(package.MANIFEST.read_text())['required_native_files']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in required:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'fixture')
+            package.require_files(root, required)
+            for name in required:
+                path = root / name
+                path.unlink()
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    package.require_files(root, required)
+                path.write_bytes(b'fixture')
 
     def test_installer_is_separate_per_user_and_preserves_data(self):
         installer = (ROOT / 'windows/packaging/XASS-Native.iss').read_text()

@@ -125,8 +125,7 @@ class NativeUpdater:
             raise ValueError("A stable installation cannot move to the test channel")
         if not re.fullmatch(r"[a-fA-F0-9]{40}", str(self.previous.get("revision") or "")):
             raise ValueError("Installed revision is unknown")
-        if self.installer.stat().st_size != r["size"] or digest(self.installer) != r["sha256"].lower():
-            raise ValueError("Installer verification failed")
+        self.verify_installer()
         self.backup = self.job / "backup"
         self.inventory = {}
         self.popen, self.run, self.sleep, self.clock = popen, run, sleep, clock
@@ -144,6 +143,16 @@ class NativeUpdater:
             "version":self.request["version"],"revision":self.request["revision"],"sha256":self.request["sha256"],"job_id":self.job.name, **extra})
     def check_cancel(self):
         if (self.job / "cancel").exists(): raise InterruptedError("Update cancelled before installation")
+
+    def verify_installer(self):
+        # Preparation may wait for the native UI for up to two minutes. Recheck
+        # immediately before installation as well as on request validation, so
+        # a package changed during that wait never replaces a working runtime.
+        if (not self.installer.is_file() or self.installer.is_symlink()
+                or getattr(self.installer.lstat(), "st_file_attributes", 0) & 0x400
+                or self.installer.stat().st_size != self.request["size"]
+                or digest(self.installer) != self.request["sha256"].lower()):
+            raise ValueError("Installer verification failed")
 
     def prepare(self):
         self.state("preparing", "Проверка установленной версии и свободного места")
@@ -219,6 +228,8 @@ class NativeUpdater:
         if live: raise RuntimeError("Installed process refused to stop")
 
     def install_release(self):
+        self.check_cancel()
+        self.verify_installer()
         self.state("installing", "Установка проверенного нативного пакета")
         self.stop_install_processes()
         self.applied = True

@@ -300,14 +300,34 @@ async def cover_candidates(session, root, *, limit: int = 4, look: int = 60) -> 
     return chosen
 
 
-async def _remember_names(session_factory, track_id: int, title: str, artist: str, picked: tuple[str, str]) -> None:
+async def remember_catalog_names(session, track_id: int, title: str, artist: str, picked: tuple[str, str]) -> bool:
+    """CAS automatic names only while no later owner decision protects them.
+
+    Share track->enrichment lock order with tag edits. Checking the cache before
+    a remote cover fetch is insufficient: even a same-value manual edit must win.
+    The caller commits/rolls back the enclosing transaction.
+    """
     from sqlalchemy import update
 
-    from app.music_models import MusicTrack
+    from app.music_models import MusicEnrichment, MusicTrack
+    locked = await session.execute(update(MusicTrack).where(
+        MusicTrack.id == track_id, MusicTrack.deleted.is_(False)).values(id=track_id))
+    if locked.rowcount != 1:
+        return False
+    record = await session.get(MusicEnrichment, track_id, populate_existing=True)
+    if record and (record.dismissed or (record.result or {}).get("curation_tag_override")):
+        return False
+    changed = await session.execute(update(MusicTrack).where(
+        MusicTrack.id == track_id, MusicTrack.deleted.is_(False),
+        MusicTrack.title == title, MusicTrack.artist == artist).values(artist=picked[0], title=picked[1]))
+    if changed.rowcount == 1 and record:
+        record.revision = (record.revision or 0) + 1
+    return changed.rowcount == 1
+
+
+async def _remember_names(session_factory, track_id: int, title: str, artist: str, picked: tuple[str, str]) -> None:
     async with session_factory() as session:
-        await session.execute(update(MusicTrack).where(
-            MusicTrack.id == track_id, MusicTrack.deleted.is_(False),
-            MusicTrack.title == title, MusicTrack.artist == artist).values(artist=picked[0], title=picked[1]))
+        await remember_catalog_names(session, track_id, title, artist, picked)
         await session.commit()
 
 

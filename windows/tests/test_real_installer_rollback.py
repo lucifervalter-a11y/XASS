@@ -5,11 +5,13 @@ Native GUI health is intentionally a separate installed-app smoke; this fixture
 checks exact file recovery rather than pretending its synthetic EXEs can launch.
 """
 from __future__ import annotations
+from contextlib import closing
 
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -68,6 +70,11 @@ class RealInstallerRollback(unittest.TestCase):
                                        "XASS.Native/preferences.json": b'{"theme":"dark"}'}.items():
                     path = root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
                     protected[relative] = digest(path)
+                database = root / "XASS/archive/messages.sqlite3"
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+                    connection.execute("INSERT INTO messages VALUES (1, 'synthetic encrypted archive envelope')")
+                protected[database.relative_to(root).as_posix()] = digest(database)
                 write_json(job / "request.json", {"schema": 1, "job_id": job.name, "install_root": str(install),
                            "installer": str(installer), "sha256": digest(installer), "size": installer.stat().st_size,
                            "version": "2.0.0", "revision": NEW, "parent_pid": os.getpid(),
@@ -101,6 +108,10 @@ class RealInstallerRollback(unittest.TestCase):
                 self.assertFalse((install / "halfway.txt").exists())
                 verify_tree(install, inventory)
                 self.assertEqual(protected, {relative: digest(root / relative) for relative in protected})
+                with closing(sqlite3.connect(database)) as connection:
+                    self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+                    self.assertEqual(connection.execute("SELECT body FROM messages WHERE id = 1").fetchone(),
+                                     ("synthetic encrypted archive envelope",))
                 state = json.loads((updates / "last-result.json").read_text())
                 self.assertEqual(state["phase"], "rolled-back")
                 self.assertTrue(state["rollback_ok"])
@@ -109,6 +120,7 @@ class RealInstallerRollback(unittest.TestCase):
                 time.sleep(0.3)
                 verify_tree(install, inventory)
                 self.assertFalse((install / "halfway.txt").exists())
+                self.assertEqual(protected, {relative: digest(root / relative) for relative in protected})
 
 
 if __name__ == "__main__": unittest.main()

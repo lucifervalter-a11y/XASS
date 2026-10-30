@@ -21,7 +21,7 @@ from app.music_playback_models import MusicPlaybackState, MusicTransfer, MusicRe
 from app.services.control_status import source_is_online
 from app.services.agent_lifecycle import ensure_agent_attached
 from app.services.music_diagnostics import classify_transfer_failure, transfer_failure_code
-from app.music_handoff import ReliableHandoff, reliable
+from app.music_handoff import ReliableHandoff, recover_command_ids, reliable
 
 
 def aware(value):
@@ -47,6 +47,7 @@ async def playback_meta(session):
 
 async def fail_transfer(session, transfer, detail):
     """Release a failed handoff without claiming an audible target is silent."""
+    await recover_command_ids(session, transfer)
     previous_status = transfer.status
     transfer.status = "failed"
     transfer.detail = detail
@@ -170,7 +171,11 @@ async def current_session(session):
             player = (source.last_payload or {}).get("music_player") or {}
             # A paused heartbeat from before a new play command cannot prove
             # silence if the command was delivered and its ACK was lost.
-            fresh_for_start = item.state != "loading" or aware(source.last_seen_at) >= timestamp
+            fresh_for_start = item.state != "loading" or (
+                aware(source.last_seen_at) >= timestamp and player.get("state") != "prepared")
+            # PREPARED is silent now, but a delivered START may still be in
+            # flight. Preserve uncertainty until playback or a real STOP is
+            # observed; another handoff must still ask that PC to pause.
             if player.get("track_id") == item.track_id and not queue_pending and fresh_for_start:
                 result.update(state=player.get("state", "paused"), position=number(player.get("position_sec")),
                     volume=max(0, min(100, number(player.get("volume"), result["volume"]))),
