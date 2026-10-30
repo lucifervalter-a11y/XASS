@@ -78,14 +78,15 @@ def private_read(path: Path, *, limit: int = 2 * 1024 * 1024) -> bytes:
         return value
 
 
-def atomic_private(path: Path, value: bytes, *, metadata=None) -> None:
+def atomic_private(path: Path, value: bytes, *, metadata=None, mode: int | None = None) -> None:
     no_links(path)
     descriptor, temporary = tempfile.mkstemp(prefix=".xass-deploy-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as output:
             if metadata is not None:
                 os.fchown(output.fileno(), metadata.st_uid, metadata.st_gid)
-            os.chmod(temporary, stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o600)
+            permissions = mode if mode is not None else stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o600
+            os.chmod(temporary, permissions)
             output.write(value)
             output.flush()
             os.fsync(output.fileno())
@@ -175,6 +176,7 @@ class Deployment:
         self.new_env: bytes | None = None
         self.mutation_started = False
         self.env_metadata = None
+        self.env_mode_before = self.env_mode_after = 0o600
         self.original_branch = None
 
     def phase(self, name: str) -> None:
@@ -234,11 +236,15 @@ class Deployment:
             service_uid = pwd.getpwnam(user).pw_uid
         if info.st_uid != current_uid or service_uid != current_uid:
             raise DeployError("Deployment user, configuration owner and backend user must match; inspect service permissions first.")
-        if stat.S_IMODE(info.st_mode) not in {0o600, 0o640}:
-            raise DeployError("The configuration must already have private 0600 or 0640 permissions.")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode not in {0o600, 0o640, 0o644, 0o664}:
+            raise DeployError("Unexpected configuration permissions require separate review.")
         if current_uid != 0 and info.st_gid not in {os.getegid(), *os.getgroups()}:
             raise DeployError("Cannot preserve the existing configuration group without extra privileges.")
         self.env_metadata = info
+        self.env_mode_before = mode
+        # Explicitly approved legacy permission repair: never restore world readability.
+        self.env_mode_after = 0o600 if mode in {0o644, 0o664} else mode
 
     def snapshot(self) -> dict:
         value = json.loads(self.python("-c", SNAPSHOT, timeout=60))
@@ -265,6 +271,40 @@ class Deployment:
 
     def restart(self) -> None:
         self.command("sudo", "-n", "systemctl", "restart", "serverredus-backend", timeout=60)
+
+    def protect_config(self) -> None:
+        """Explicit emergency permission-only repair. Never fetch configuration over HTTP."""
+        self.phase("protect-config: verify live revision, same owner/service UID and regular private path")
+        if self.head() != BEFORE:
+            raise DeployError("Live revision differs from the inspected server; protection stopped.")
+        self.clean()
+        path = self.root / ".env"
+        no_links(path)
+        self.environment_access()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or (info.st_uid, info.st_gid, info.st_ino, info.st_dev) !=
+                    (self.env_metadata.st_uid, self.env_metadata.st_gid, self.env_metadata.st_ino, self.env_metadata.st_dev)):
+                raise DeployError("Configuration path changed or is not a single regular file.")
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        self.phase(f"protect-config: permissions {self.env_mode_before:04o} -> 0600; no contents changed, no service restart")
+        # This is HEAD, not GET: never download or log configuration bytes.
+        code = self.command("curl", "--head", "--silent", "--show-error", "--connect-timeout", "5",
+                            "--max-time", "10", "--output", "/dev/null", "--write-out", "%{http_code}",
+                            LISTEN_URL + "/.env", timeout=12).strip()
+        if code not in {b"403", b"404"}:
+            print("[CRITICAL] Configuration is now 0600 but public HEAD is not403/404. Keep hardened permissions; nginx denial requires immediate review.", flush=True)
+            raise DeployError("Public configuration exposure was not verified closed; permissions remain hardened.")
+        self.health(public=False)
+        body = self.command("curl", "--fail", "--silent", "--show-error", "--connect-timeout", "5",
+                            "--max-time", "10", LISTEN_URL + "/health", timeout=12)
+        if json.loads(body).get("status") != "ok":
+            raise DeployError("Protection completed but public backend health needs review.")
+        print("[OK] protect-config completed: public HEAD denied, backend healthy, config bytes and running services unchanged.", flush=True)
 
     def health(self, *, public: bool) -> None:
         ready = False
@@ -303,7 +343,7 @@ class Deployment:
         self.checkout(BEFORE)
         if self.original_branch and self.git("rev-parse", self.original_branch).decode().strip() == BEFORE:
             self.git("symbolic-ref", "HEAD", self.original_branch)
-        atomic_private(self.root / ".env", self.original_env, metadata=self.env_metadata)
+        atomic_private(self.root / ".env", self.original_env, metadata=self.env_metadata, mode=self.env_mode_after)
         self.python("deploy/repair_public_permissions.py")
         self.restart()
         self.health(public=False)
@@ -330,7 +370,9 @@ class Deployment:
             self.mutation_started = True
             self.phase("activate server-only overlay and preserve configuration metadata")
             self.checkout(self.target)
-            atomic_private(self.root / ".env", self.new_env, metadata=self.env_metadata)
+            if self.env_mode_before != self.env_mode_after:
+                self.phase(f"harden legacy configuration mode {self.env_mode_before:04o} to {self.env_mode_after:04o}; retain owner/group")
+            atomic_private(self.root / ".env", self.new_env, metadata=self.env_metadata, mode=self.env_mode_after)
             self.python("deploy/repair_public_permissions.py")
             stable_after = self.snapshot()
             if stable_after != stable_before:
@@ -344,6 +386,8 @@ class Deployment:
                 "deployment_revision": self.target, "backend_source_revision": SOURCE,
                 "before_revision": BEFORE, "source_package_revision": stable_after["source_revision"],
                 "installer_hashes": stable_after["installers"], "database_restored": False,
+                "configuration_mode_before": f"{self.env_mode_before:04o}",
+                "configuration_mode_after": f"{self.env_mode_after:04o}",
                 "discord_key_sha256": hashlib.sha256(PUBLIC_KEY.encode()).hexdigest(),
             }, indent=2).encode())
         except BaseException:
@@ -362,7 +406,7 @@ class Deployment:
             finally:
                 for sig, handler in saved_handlers.items():
                     signal.signal(sig, handler)
-            print("[ROLLBACK] Previous code/configuration restored; backend healthy; database untouched.", flush=True)
+            print("[ROLLBACK] Previous code/configuration bytes restored; private configuration permissions retained; backend healthy; database untouched.", flush=True)
             raise DeployError("Server-only deployment failed and was rolled back.") from None
         print("[OK] Server-only overlay active; stable source/installers unchanged. Discord signed PING still requires portal verification.", flush=True)
 
@@ -371,6 +415,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--protect-config", action="store_true", help="Explicit permission-only protection; no code/key/service changes")
     args = parser.parse_args()
     if Path.cwd().absolute() != ROOT:
         print("[FAILED] Run only from the explicitly approved server checkout.", flush=True)
@@ -384,7 +429,11 @@ def main() -> int:
             previous[sig] = signal.signal(sig, interrupt)
     try:
         with deployment_lock(ROOT):
-            Deployment(ROOT, args.target, args.run_id).execute()
+            action = Deployment(ROOT, args.target, args.run_id)
+            if args.protect_config:
+                action.protect_config()
+            else:
+                action.execute()
         return 0
     except BaseException:
         print("[FAILED] Server-only deployment did not complete; see bounded status above. Private output was not printed.", flush=True)

@@ -260,6 +260,64 @@ class RecoveryTests(GitFixture):
         self.assertEqual(self.item.head(), self.target)
         self.assert_runtime_untouched()
 
+    def test_protect_config_is_explicit_head_only_permission_repair_without_restart_or_code_changes(self):
+        self.item.environment_access.side_effect = lambda: setattr(self.item, "env_metadata", (self.root / ".env").stat())
+        original_command = self.item.command
+        calls = []
+        def command(*args, **kwargs):
+            calls.append(args)
+            if args[0] == "curl":
+                return b"403" if "--head" in args else b'{"status":"ok"}'
+            return original_command(*args, **kwargs)
+        self.item.command = command
+        with patch.object(deploy.os, "fchmod", create=True) as chmod, redirect_stdout(io.StringIO()):
+            self.item.protect_config()
+        self.assertEqual(chmod.call_args.args[1], 0o600)
+        self.item.restart.assert_not_called()
+        self.item.python.assert_not_called()
+        self.assertEqual(self.item.head(), self.before)
+        self.assertEqual((self.root / ".env").read_bytes(), self.original)
+        private_requests = [args for args in calls if args[-1] == deploy.LISTEN_URL + "/.env"]
+        self.assertEqual(len(private_requests), 1)
+        self.assertIn("--head", private_requests[0])
+        self.assertFalse(self.item.backup.exists())
+
+    def test_protect_config_never_reverts_hardening_when_public_head_is_still_200(self):
+        self.item.environment_access.side_effect = lambda: setattr(self.item, "env_metadata", (self.root / ".env").stat())
+        original_command = self.item.command
+        self.item.command = lambda *args, **kwargs: b"200" if args[0] == "curl" else original_command(*args, **kwargs)
+        with patch.object(deploy.os, "fchmod", create=True) as chmod, redirect_stdout(io.StringIO()), self.assertRaises(deploy.DeployError):
+            self.item.protect_config()
+        self.assertEqual(chmod.call_count, 1)
+        self.assertEqual(chmod.call_args.args[1], 0o600)
+        self.item.restart.assert_not_called()
+        self.assertEqual(self.item.head(), self.before)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owner/mode normalization runs on Linux")
+    def test_legacy_world_readable_env_is_hardened_and_rollback_keeps_hardening(self):
+        path = self.root / ".env"
+        path.chmod(0o664)
+        original_metadata = path.stat()
+        def preflight():
+            self.item.env_metadata = original_metadata
+            self.item.env_mode_before = 0o664
+            self.item.env_mode_after = 0o600
+        self.item.environment_access.side_effect = preflight
+        def health(*, public):
+            current = path.stat()
+            self.assertEqual(current.st_mode & 0o777, 0o600)
+            self.assertEqual((current.st_uid, current.st_gid), (original_metadata.st_uid, original_metadata.st_gid))
+            if public:
+                self.assertIn(deploy.PUBLIC_KEY.encode(), path.read_bytes())
+                raise deploy.DeployError("injected public verification failure")
+            self.assertEqual(path.read_bytes(), self.original)
+        self.item.health.side_effect = health
+        with self.assertRaisesRegex(deploy.DeployError, "rolled back"):
+            self.execute_output()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.read_bytes(), self.original)
+        self.assert_runtime_untouched()
+
 
 class TransportTests(unittest.TestCase):
     def test_configuration_owner_service_user_and_private_mode_checked_before_mutation(self):
@@ -280,7 +338,12 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(deploy.DeployError):
                 item.environment_access()
             info.st_uid = 1001
-            info.st_mode = 0o100644
+            for mode in (0o644, 0o664):
+                info.st_mode = 0o100000 | mode
+                item.environment_access()
+                self.assertEqual(item.env_mode_before, mode)
+                self.assertEqual(item.env_mode_after, 0o600)
+            info.st_mode = 0o100666
             with self.assertRaises(deploy.DeployError):
                 item.environment_access()
 
@@ -315,6 +378,8 @@ class TransportTests(unittest.TestCase):
         workflow = (REPO / ".github/workflows/server-route-diagnostics.yml").read_text()
         self.assertIn("default: inspect", workflow)
         self.assertIn("DEPLOY_BACKEND_ONLY_KEEP_CLIENTS", workflow)
+        self.assertIn("HARDEN_PRIVATE_CONFIG", workflow)
+        self.assertIn("options: [inspect, protect-config, deploy-backend-only]", workflow)
         self.assertIn("target != os.environ['WORKFLOW_SHA']", workflow)
         self.assertIn("actions/workflows/checks.yml/runs?head_sha=", workflow)
         self.assertIn("actions/runs/41105958562", workflow)
