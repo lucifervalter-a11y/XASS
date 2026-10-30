@@ -3,6 +3,17 @@
 Every write is staged next to its target and journaled before atomic replacement.
 The complete original file is retained for exact undo, including uncommon tags.
 Provider match scores are never presented as probabilities of correctness.
+
+Match score contract v1 (ordinal evidence rule, NOT calibrated probability):
+95/green: AcoustID source_score >= .90, both durations known and within 1s,
+matching version markers, no unresolved album/year/track/artwork evidence.
+75/yellow: matching catalog names/versions and duration within 1s, no conflict.
+65/yellow: AcoustID >= .60 but incomplete duration/evidence, or a catalog
+match requiring conflict review. 40/red: weak/unknown catalog match, filename
+heuristic or local AI transcription. Manual edits have no numeric score.
+An artwork proposal is never marked verified by a recording fingerprint: it
+requires review. Existing year/track evidence must be resolved for green.
+All levels require explicit apply. Red additionally requires manual_choice=True.
 """
 from __future__ import annotations
 
@@ -50,6 +61,20 @@ def norm(value):
 
 def variants(value):
     return sorted(set(x.casefold().replace("remastered", "remaster") for x in VARIANTS.findall(value)))
+
+
+def match_rating(*, source_score=None, difference=None, versions_match=True, conflicts=(), catalog=False):
+    """Fixed auditable policy points; provider similarity is returned separately."""
+    source_score = source_score if type(source_score) in (int, float) and math.isfinite(source_score) and 0 <= source_score <= 1 else None
+    close = type(difference) in (int, float) and math.isfinite(difference) and 0 <= difference <= 1
+    if source_score is not None and source_score >= .9 and close and versions_match and not conflicts:
+        score = 95
+    elif versions_match and ((source_score is not None and source_score >= .6) or (source_score is None and catalog and close)):
+        score = 65 if conflicts or not close or (source_score is not None and source_score < .9) else 75
+    else:
+        score = 40
+    return {"match_score": score, "confidence": "high" if score >= 90 else "review" if score >= 60 else "weak",
+            "source_score": source_score, "score_contract": 1}
 
 
 def safe(path):
@@ -110,6 +135,11 @@ def _read_tags(path):
                     return plain(value[:MAX_TEXT], MAX_TEXT)
         return ""
     title, artist, album = first("TIT2", "title", "\xa9nam"), first("TPE1", "artist", "\xa9ART"), first("TALB", "album", "\xa9alb")
+    year, track_number = first("date", "year", "\xa9day"), first("TRCK", "tracknumber")
+    if isinstance(tags, ID3) and tags.get("TDRC"):
+        year = str(tags["TDRC"].text[0])[:32]
+    if tags.get("trkn") and isinstance(tags["trkn"][0], (list, tuple)):
+        track_number = str(tags["trkn"][0][0])
     lyrics = first("lyrics", "unsyncedlyrics", "\xa9lyr")
     if isinstance(tags, ID3):
         lyrics = next((str(x.text)[:MAX_TEXT] for x in tags.getall("USLT") if x.text), lyrics)
@@ -135,7 +165,8 @@ def _read_tags(path):
     if not math.isfinite(duration) or not 0 <= duration <= 86400:
         duration = 0
     return {"title": title[:480], "artist": artist[:480], "album": album[:480], "lyrics": lyrics[:MAX_TEXT],
-            "artwork": art, "cover_preview": preview, "duration": round(duration, 3), "variants": variants(title + " " + path.stem), "filename": path.stem}
+            "year": year[:32], "track_number": track_number[:32], "artwork": art, "cover_preview": preview,
+            "duration": round(duration, 3), "variants": variants(title + " " + path.stem), "filename": path.stem}
 
 
 def write_tags(path, changes):
@@ -231,8 +262,10 @@ def lookup_lyrics(tags):
             stamps = [(int(a) * 60 + float(b)) for a, b in re.findall(r"\[(\d{1,3}):(\d{2}(?:\.\d{1,3})?)\]", lyrics)]
             if not stamps or max(stamps) <= duration + 2:
                 changes["lyrics"] = plain(lyrics, MAX_TEXT)
+        conflicts = [] if exact_album else ["Альбом отличается от исходного"]
         candidates.append({"changes": changes, "source": "LRCLIB", "source_id": str(row["id"]),
-                           "confidence": "review" if close else "weak", "evidence": ["Название и исполнитель совпадают", f"Разница длительности: {difference:.1f} с", "Акустический отпечаток не проверялся"]})
+                           **match_rating(difference=difference if tags["duration"] > 0 else None, conflicts=conflicts, catalog=True),
+                           "evidence": ["Название и исполнитель совпадают", f"Разница длительности: {difference:.1f} с", "Акустический отпечаток не проверялся", *conflicts]})
         if len(candidates) == 5:
             break
     return {"status": "found" if candidates else "not_found", "candidates": candidates}
@@ -341,7 +374,7 @@ def lookup(tags, acoustic=None):
     candidates, warnings = [], []
     if query["title"] != tags["title"] or query["artist"] != tags["artist"]:
         candidates.append({"changes": {"title": query["title"], "artist": query["artist"]}, "source": "Имя файла",
-                           "source_id": "", "confidence": "weak", "evidence": ["Разделители имени файла разобраны локально", "Название и исполнитель не подтверждены каталогом"]})
+                           "source_id": "", **match_rating(), "evidence": ["Разделители имени файла разобраны локально", "Название и исполнитель не подтверждены каталогом"]})
     try:
         candidates.extend(lookup_lyrics(query)["candidates"])
     except Exception:
@@ -380,7 +413,7 @@ def lookup(tags, acoustic=None):
                     or (query["artist"] and SequenceMatcher(None, norm(artist), norm(query["artist"])).ratio() < .7)):
                 continue
             duration = row.get("length")
-            difference = abs(duration / 1000 - tags["duration"]) if type(duration) in (int, float) and math.isfinite(duration) else None
+            difference = abs(duration / 1000 - tags["duration"]) if type(duration) in (int, float) and math.isfinite(duration) and duration > 0 and tags["duration"] > 0 else None
             releases = [r for r in row.get("releases", [])[:50] if isinstance(r, dict) and r.get("status") == "Official"
                         and re.fullmatch(r"[0-9a-f-]{36}", str(r.get("id", ""))) and r.get("title")]
             if query["album"]:
@@ -394,7 +427,7 @@ def lookup(tags, acoustic=None):
             else:
                 evidence.append("Только поиск по тегам, акустический отпечаток не проверялся")
             candidate = {"changes": changes, "source": "AcoustID / MusicBrainz" if "acoustid_score" in row else "MusicBrainz",
-                         "source_id": row["id"], "confidence": "review" if difference is not None and difference <= 1 and row.get("acoustid_score", 1) >= .9 else "weak", "evidence": evidence}
+                         "source_id": row["id"], "evidence": evidence}
             if difference is not None and difference <= 1 and time.monotonic() < deadline:
                 try:
                     lyric_choices = lookup_lyrics({**query, "title": title, "artist": artist, "album": ""})["candidates"]
@@ -416,6 +449,20 @@ def lookup(tags, acoustic=None):
                         candidate["evidence"].append("Обложка: Cover Art Archive, выбранный официальный альбом " + changes["album"])
                 except Exception:
                     warnings.append("Обложку выбранного альбома получить не удалось.")
+            conflicts = []
+            if query["album"] and not release:
+                conflicts.append("Исходный альбом не подтверждён выбранным изданием")
+            if tags.get("year"):
+                original_year = re.match(r"\d{4}", tags["year"])
+                release_year = re.match(r"\d{4}", str((release or {}).get("date", "")))
+                if not original_year or not release_year or original_year[0] != release_year[0]:
+                    conflicts.append("Год отличается или не подтверждён каталогом")
+            if tags.get("track_number"):
+                conflicts.append("Номер трека в этом издании не подтверждён каталогом")
+            if candidate.get("artwork_data"):
+                conflicts.append("Обложка издания требует просмотра: акустический отпечаток её не подтверждает")
+            candidate.update(match_rating(source_score=row.get("acoustid_score"), difference=difference, conflicts=conflicts, catalog=True))
+            candidate["evidence"].extend(conflicts)
             candidates.append(candidate); count += 1
             if count == 3:
                 break
@@ -542,6 +589,7 @@ class CurationService:
         for candidate in result.get("candidates", [])[:8]:
             try:
                 evidence = {k: candidate[k] for k in ("source", "source_id", "confidence", "evidence")}
+                evidence.update({k: candidate[k] for k in ("match_score", "source_score", "score_contract") if k in candidate})
                 if candidate.get("lyric_source"):
                     evidence["lyric_source"] = candidate["lyric_source"]
                 views.append(self.propose(key, candidate["changes"], evidence=evidence, artwork_data=candidate.get("artwork_data", ""), expected_digest=row["digest"]))
@@ -592,6 +640,10 @@ class CurationService:
                 raise CurationError("Обложка каталога не распознана.")
             changes["artwork_data"] = base64.b64encode(art).decode("ascii")
         evidence = evidence or {"source": "Ручная правка", "source_id": "", "confidence": "manual", "evidence": ["Поля выбраны пользователем"]}
+        if evidence["confidence"] != "manual" and "match_score" not in evidence:
+            # Old/custom proposals never become green without the evidence rule.
+            evidence = {**evidence, "match_score": 65 if evidence["confidence"] == "review" else 40,
+                        "source_score": None, "score_contract": 1}
         with self.database() as db:
             row, path = self._track(db, key)
             if not row["digest"] or identity(path) != row["digest"] or (expected_digest is not None and row["digest"] != expected_digest):
@@ -606,6 +658,8 @@ class CurationService:
 
     @staticmethod
     def _proposal_view(key, before, changes, evidence):
+        if evidence.get("confidence") != "manual" and "match_score" not in evidence:
+            evidence = {**evidence, "match_score": 40, "confidence": "weak", "source_score": None, "score_contract": 1}
         after = {**before, **{k: v for k, v in changes.items() if k != "artwork_data"}}
         if "artwork_data" in changes:
             after["artwork"] = True
@@ -693,7 +747,7 @@ class CurationService:
             return {"edits": [{"id": row["id"], "name": Path(row["path"]).name, "state": row["state"], "created": row["created"]}
                               for row in db.execute("SELECT * FROM edits ORDER BY created DESC LIMIT 100")]}
 
-    def apply(self, proposal, confirmed):
+    def apply(self, proposal, confirmed, manual_choice=False):
         if confirmed is not True:
             raise CurationError("Сначала подтвердите просмотренную правку.")
         with self.database() as db:
@@ -701,6 +755,9 @@ class CurationService:
             pending = db.execute("SELECT * FROM proposals WHERE id=?", (plain(proposal, 32),)).fetchone()
             if pending is None:
                 raise CurationError("Правка уже применена или устарела.")
+            evidence = json.loads(pending["evidence"])
+            if evidence.get("confidence") != "manual" and evidence.get("match_score", 40) < 60 and manual_choice is not True:
+                raise CurationError("Слабое совпадение: сначала явно выберите этот вариант вручную после сравнения.")
             _, path = self._track(db, pending["track"])
             before_hash = identity(path)
             if before_hash != pending["digest"]:
@@ -793,7 +850,7 @@ class CurationService:
             if action == "desktop_curation_history":
                 return self.history()
             if action == "desktop_curation_apply":
-                return self.apply(request.get("id"), request.get("confirmed"))
+                return self.apply(request.get("id"), request.get("confirmed"), request.get("manual_choice", False))
             if action == "desktop_curation_undo":
                 return self.undo(request.get("id"), request.get("confirmed"))
             raise CurationError("Неизвестное действие.")

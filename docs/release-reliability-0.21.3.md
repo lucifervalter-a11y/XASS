@@ -20,11 +20,19 @@ No production deployment or installed-profile mutation is implied by this docume
   MusicBrainz, LRCLIB and Cover Art Archive require internet. Acoustic lookup needs
   an already installed fpcalc (`XASS_FPCALC`) and owner-configured AcoustID key
   (`XASS_ACOUSTID_KEY`). Whisper uses the already configured offline model; it is not
-  downloaded automatically. Provider similarity is not a calibrated probability.
+  downloaded automatically. The visible match score is an auditable rule, not a
+  calibrated probability: 95 requires strong acoustic evidence, known duration
+  within one second, matching versions and no unresolved metadata conflict;
+  75/65 means review, 40 requires an additional manual selection. Provider score
+  is shown separately. A recording fingerprint does not verify an album cover.
 - SHA-256 byte duplicates are distinguished from name/version candidates. Duration
   alone does not establish recording identity. No duplicates are deleted. Entire
   originals are journaled before atomic replacement; undo refuses to overwrite
-  later external changes. Backup storage is bounded to 2 GiB and fails closed.
+  later external changes. Multi-select undo runs newest-first and reports partial
+  conflicts; it is not an all-or-nothing album transaction. Local fpcalc comparison
+  does not need an AcoustID key; equal first-120-second fingerprints and duration
+  are review candidates, never permission to delete. Backup storage is bounded
+  to 2 GiB and fails closed.
 - Pinned iOS downloads use a persistent background URLSession, bounded journal,
   Keychain-protected ticket/resume data, and restart-replayable media/index commit.
   A fresh expired ticket may require restarting. Force-quit and OS scheduling are
@@ -42,8 +50,13 @@ No production deployment or installed-profile mutation is implied by this docume
   backups, process-interruption journal recovery, artwork and source candidates.
 - API tests exercise the three phases, exact stopped position, target timeout,
   stale receipts, concurrent polls and retry after command persistence.
-- macOS XCTest/device build, actual ffmpeg conversion and ephemeral full Windows
-  installer smoke must be green for the exact release revision before publication.
+- The intermediate revision `7d2fbf1` passed 1051 backend Python tests (two skipped),
+  including real ffmpeg conversion, and the complete ephemeral Windows installer
+  workflow (333 Windows Python tests, actual WinUI startup, upgrade, rollback,
+  registration restoration, uninstall and synthetic data preservation).
+- macOS XCTest/device build, the AAC/ALAC/Opus and MP3 compatibility matrix, and
+  ephemeral full Windows installer smoke must be green for the exact release
+  revision before publication. Intermediate build results are not release proof.
 
 ## Explicit acceptance limits
 

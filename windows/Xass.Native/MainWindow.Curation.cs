@@ -20,6 +20,10 @@ public sealed partial class MainWindow
     private readonly ListView curationList = new() { DisplayMemberPath = "Display", MaxHeight = 360, SelectionMode = ListViewSelectionMode.Single };
     private readonly TextBlock curationStatus = DLabel("Выберите папку. Файлы проверяются на этом ПК, оригиналы меняются только после вашего подтверждения.");
     private readonly TextBlock curationReview = DLabel("");
+    private readonly TextBlock curationMatchScore = DLabel("", 18);
+    private readonly ProgressBar curationMatchBar = new() { Minimum = 0, Maximum = 100, Visibility = Visibility.Collapsed };
+    private readonly CheckBox curationWeakChoice = new() { Content = "Я сравнил данные и вручную выбираю этот сомнительный вариант", Visibility = Visibility.Collapsed };
+    private Button? curationApplyButton;
     private readonly TextBlock curationDuplicates = DLabel("");
     private readonly ComboBox curationSuggestions = new() { PlaceholderText = "Вариант из каталога", HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly TextBox curationTitle = new() { Header = "Название", MaxLength = 480 };
@@ -82,7 +86,14 @@ public sealed partial class MainWindow
         page.Children.Add(curationArtwork);
         page.Children.Add(DActions(DStack(DLabel("Обложка до"), curationOldCover), DStack(DLabel("Обложка после"), curationNewCover)));
         page.Children.Add(curationOriginalLyrics);
-        page.Children.Add(DActions(DButton("Посмотреть изменения", PreviewCurationAsync), DButton("Применить просмотренную правку", ApplyCurationAsync)));
+        page.Children.Add(curationMatchScore);
+        page.Children.Add(curationMatchBar);
+        page.Children.Add(DLabel("Шкала совпадения: ≥90 — зелёный; 60–89 — жёлтый, требует проверки; <60 — красный, требуется ручной выбор. Это баллы по проверяемым признакам, не вероятность и не гарантия качества текста."));
+        page.Children.Add(curationWeakChoice);
+        curationApplyButton = DButton("Применить просмотренную правку", ApplyCurationAsync);
+        curationWeakChoice.Checked += (_, _) => { if (curationApplyButton is not null) curationApplyButton.IsEnabled = true; };
+        curationWeakChoice.Unchecked += (_, _) => { if (curationApplyButton is not null) curationApplyButton.IsEnabled = curationWeakChoice.Visibility != Visibility.Visible; };
+        page.Children.Add(DActions(DButton("Посмотреть изменения", PreviewCurationAsync), curationApplyButton));
         page.Children.Add(curationReview);
         page.Children.Add(DLabel("Журнал оригиналов", 20));
         page.Children.Add(DLabel("Выберите одну или несколько правок (например, все треки альбома). Откат идёт от новых к старым, по одному файлу. Конфликты пропускаются, а успешные восстановления сохраняются даже при отмене. Дубликаты только показываются — файлы не удаляются."));
@@ -232,6 +243,9 @@ public sealed partial class MainWindow
         }
         // A weak catalog match must be explicitly selected, never preselected.
         curationSuggestions.SelectedIndex = -1; curationProposal = "";
+        curationMatchScore.Text = ""; curationMatchBar.Visibility = Visibility.Collapsed;
+        curationWeakChoice.Visibility = Visibility.Collapsed; curationWeakChoice.IsChecked = false;
+        if (curationApplyButton is not null) curationApplyButton.IsEnabled = true;
     }
 
     private void SetCurationFields(JsonElement tags)
@@ -256,8 +270,20 @@ public sealed partial class MainWindow
         if (DValue(before, "lyrics") != DValue(after, "lyrics")) changes.Add($"Текст: {DValue(before, "lyrics").Length} → {DValue(after, "lyrics").Length} символов (новый текст в поле выше)");
         if (proposal.TryGetProperty("artwork_changed", out var artChanged) && artChanged.GetBoolean()) changes.Add(before.GetProperty("artwork").GetBoolean() ? "Обложка будет заменена" : "Будет добавлена обложка");
         if (!string.IsNullOrEmpty(curationCoverPath)) changes.Add("Обложка: заменить выбранным изображением");
-        string confidence = DValue(proposal, "confidence") switch { "manual" => "Ручной выбор", "review" => "Требует проверки", _ => "Сомнительный вариант: выберите вручную после сравнения" };
-        curationReview.Text = $"Источник: {DValue(proposal, "source")} · {confidence}\n{string.Join("\n", proposal.GetProperty("evidence").EnumerateArray().Select(x => x.GetString()))}\n\n{string.Join("\n", changes)}";
+        bool manual = DValue(proposal, "confidence") == "manual";
+        int score = proposal.TryGetProperty("match_score", out var matchScore) && matchScore.TryGetInt32(out int points) ? points : 40;
+        var color = score >= 90 ? Windows.UI.Color.FromArgb(255, 126, 226, 168) : score >= 60 ? Windows.UI.Color.FromArgb(255, 255, 210, 128) : Windows.UI.Color.FromArgb(255, 255, 147, 147);
+        var brush = new SolidColorBrush(manual ? Microsoft.UI.Colors.LightGray : color);
+        curationMatchScore.Foreground = brush; curationMatchBar.Foreground = brush;
+        curationMatchScore.Text = manual ? "Ручная правка — балл совпадения не вычислялся" : $"{score}/100 · Балл совпадения, не вероятность";
+        curationMatchBar.Visibility = manual ? Visibility.Collapsed : Visibility.Visible; curationMatchBar.Value = score;
+        curationWeakChoice.Visibility = !manual && score < 60 ? Visibility.Visible : Visibility.Collapsed;
+        curationWeakChoice.IsChecked = false;
+        if (curationApplyButton is not null) curationApplyButton.IsEnabled = curationWeakChoice.Visibility != Visibility.Visible;
+        string confidence = manual ? "Ручной выбор" : score >= 90 ? "Сильные признаки совпадения записи; применение только по подтверждению" : score >= 60 ? "Требует проверки" : "Сомнительный вариант: выберите вручную после сравнения";
+        string providerScore = proposal.TryGetProperty("source_score", out var rawScore) && rawScore.ValueKind == JsonValueKind.Number
+            ? $"\nИсходный score AcoustID: {rawScore.GetDouble():0.000} (сходство сервиса, не вероятность)" : "";
+        curationReview.Text = $"Источник: {DValue(proposal, "source")} · {confidence}{providerScore}\n{string.Join("\n", proposal.GetProperty("evidence").EnumerateArray().Select(x => x.GetString()))}\n\n{string.Join("\n", changes)}";
     }
 
     private static async Task LoadCurationCoverAsync(Image image, string encoded)
@@ -290,6 +316,8 @@ public sealed partial class MainWindow
     private Task PreviewCurationAsync() => CurationRunAsync(async token =>
     {
         if (string.IsNullOrEmpty(curationSelected)) throw new InvalidOperationException("Выберите трек.");
+        if (curationWeakChoice.Visibility == Visibility.Visible && curationWeakChoice.IsChecked != true)
+            throw new InvalidOperationException("Сначала подтвердите ручной выбор сомнительного варианта; его данные нельзя автоматически считать ручной правкой.");
         var proposal = await CurationRequestAsync(new { action = "desktop_curation_propose", version = 1, id = curationSelected,
             digest = curationDigest, changes = new { title = curationTitle.Text, artist = curationArtist.Text, album = curationAlbum.Text, lyrics = curationLyrics.Text }, artwork_path = curationCoverPath }, token);
         ShowCurationProposal(proposal);
@@ -318,10 +346,12 @@ public sealed partial class MainWindow
     {
         string proposal = curationProposal;
         if (string.IsNullOrEmpty(proposal)) { curationStatus.Text = "Сначала нажмите «Посмотреть изменения»."; return; }
+        bool manualChoice = curationWeakChoice.Visibility == Visibility.Visible && curationWeakChoice.IsChecked == true;
+        if (curationWeakChoice.Visibility == Visibility.Visible && !manualChoice) { curationStatus.Text = "Сначала сравните данные и отметьте ручной выбор сомнительного варианта."; return; }
         if (!await DesktopConfirmAsync("Записать просмотренные теги?", curationReview.Text + "\n\nИсходный файл целиком сохранится в журнале для отката.", "Записать")) return;
         await CurationRunAsync(async token =>
         {
-            await CurationRequestAsync(new { action = "desktop_curation_apply", version = 1, id = proposal, confirmed = true }, token);
+            await CurationRequestAsync(new { action = "desktop_curation_apply", version = 1, id = proposal, confirmed = true, manual_choice = manualChoice }, token);
             curationProposal = ""; curationCoverPath = "";
             var detail = await CurationRequestAsync(new { action = "desktop_curation_inspect", version = 1, id = curationSelected }, token);
             curationDigest = DValue(detail, "digest"); SetCurationFields(detail.GetProperty("tags"));

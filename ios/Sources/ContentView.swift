@@ -54,7 +54,13 @@ public struct ContentView: View {
         .sheet(isPresented: $showThemeSheet) {
             NavigationStack {
                 ThemeSelectorView()
-                    .toolbar { themeToolbar }
+                    .toolbar(id: "xass-theme-selector") {
+                        ToolbarItem(id: "theme-done", placement: .confirmationAction) {
+                            Button("Готово") { showThemeSheet = false }
+                                .font(.headline)
+                                .foregroundStyle(currentTheme.accentColor)
+                        }
+                    }
             }
             .presentationDetents([.medium, .large])
         }
@@ -64,14 +70,6 @@ public struct ContentView: View {
     }
 
     // MARK: - Tab Navigation
-
-    @ToolbarContentBuilder private var themeToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            Button("Готово") { showThemeSheet = false }
-                .font(.headline)
-                .foregroundStyle(currentTheme.accentColor)
-        }
-    }
 
     private var tabs: some View {
         TabView(selection: $selectedTab) {

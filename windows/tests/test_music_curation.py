@@ -16,7 +16,7 @@ import wave
 
 WINDOWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WINDOWS)); sys.path.insert(0, str(WINDOWS.parent / "pc_client"))
-from music_curation import CurationService, CurationError, identity, write_tags, _read_tags, lookup_lyrics, lookup, search_terms, cover_thumbnail
+from music_curation import CurationService, CurationError, identity, write_tags, _read_tags, lookup_lyrics, lookup, search_terms, cover_thumbnail, match_rating
 
 
 class CurationTests(unittest.TestCase):
@@ -228,6 +228,39 @@ class CurationTests(unittest.TestCase):
         result = self.service.request("desktop_curation_propose", {"id": row["id"], "digest": "0" * 64, "changes": {"title": "No"}})
         self.assertIn("error", result)
 
+    def test_red_candidate_blocks_apply_until_explicit_manual_choice(self):
+        row = self.scan()[0]; original = self.path.read_bytes()
+        evidence = {"source": "Имя файла", "source_id": "", **match_rating(), "evidence": ["Не подтверждено"]}
+        proposal = self.service.propose(row["id"], {"title": "Uncertain"}, evidence=evidence)
+        self.assertEqual(proposal["match_score"], 40)
+        for choice in (False, "true", 1, None):
+            with self.assertRaisesRegex(CurationError, "явно выберите"):
+                self.service.apply(proposal["id"], True, manual_choice=choice)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(self.service.history()["edits"], [])
+        self.service.apply(proposal["id"], True, manual_choice=True)
+        self.assertEqual(_read_tags(self.path)["title"], "Uncertain")
+
+    def test_green_candidate_keeps_source_score_and_still_requires_apply_confirmation(self):
+        row = self.scan()[0]; original = self.path.read_bytes()
+        evidence = {"source": "AcoustID / MusicBrainz", "source_id": "fixture", **match_rating(source_score=.91, difference=1), "evidence": ["Fixture evidence"]}
+        proposal = self.service.propose(row["id"], {"title": "Matched"}, evidence=evidence)
+        again = self.service.inspect(row["id"])["proposals"][0]
+        self.assertEqual((again["match_score"], again["source_score"], again["confidence"]), (95, .91, "high"))
+        with self.assertRaises(CurationError): self.service.apply(proposal["id"], False)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_legacy_unscored_proposal_is_red_in_view_and_backend(self):
+        proposal = self.proposal()
+        evidence = {"source": "MusicBrainz", "source_id": "fixture", "confidence": "review", "evidence": []}
+        with self.service.database() as db:
+            db.execute("UPDATE proposals SET evidence=? WHERE id=?", (json.dumps(evidence), proposal["id"])); db.commit()
+            key = db.execute("SELECT track FROM proposals WHERE id=?", (proposal["id"],)).fetchone()[0]
+        view = self.service.inspect(key)["proposals"][0]
+        self.assertEqual((view["match_score"], view["confidence"]), (40, "weak"))
+        with self.assertRaisesRegex(CurationError, "явно выберите"):
+            self.service.apply(proposal["id"], True)
+
     def test_transcription_is_an_explicit_reviewed_proposal_and_never_opens_microphone(self):
         row = self.scan()[0]; before = self.path.read_bytes()
         model_folder = self.root / "fixture-model"; model_folder.mkdir()
@@ -344,6 +377,45 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(candidate["confidence"], "review")
         self.assertTrue(any("не проверялся" in line for line in candidate["evidence"]))
         self.assertNotIn("90", json.dumps(candidate))
+        self.assertEqual(candidate["match_score"], 75)
+        self.assertIsNone(candidate["source_score"])
+
+    def test_match_score_contract_boundaries_are_not_provider_probabilities(self):
+        self.assertEqual(match_rating(source_score=.9, difference=1)["match_score"], 95)
+        self.assertEqual(match_rating(source_score=.899, difference=1)["match_score"], 65)
+        for difference in (None, 1.001, float("inf"), float("nan"), -1):
+            self.assertLess(match_rating(source_score=.99, difference=difference)["match_score"], 90)
+        for conflict in ("year", "track", "art"):
+            self.assertEqual(match_rating(source_score=.99, difference=0, conflicts=[conflict])["match_score"], 65)
+        self.assertEqual(match_rating(source_score=.99, difference=0, versions_match=False)["match_score"], 40)
+        self.assertEqual(match_rating(source_score=.59, difference=0, catalog=True)["match_score"], 40)
+        self.assertEqual(match_rating(catalog=True, difference=0)["match_score"], 75)
+        self.assertEqual(match_rating(catalog=True, difference=0, conflicts=["album"])["match_score"], 65)
+
+    def acoustic_result(self, tags=None, *, duration=120000, art="", date="2000", score=.98):
+        release = "11111111-1111-1111-1111-111111111111"
+        record = {"id": "22222222-2222-2222-2222-222222222222", "title": "Song", "length": duration,
+                  "artist-credit": [{"name": "Artist"}], "releases": [{"id": release, "title": "Album", "status": "Official", "date": date}]}
+        def provider(url, params):
+            return [] if "lrclib" in url else dict(record)
+        with patch("music_curation._json_get", side_effect=provider), patch("music_curation.cover_thumbnail", return_value=art):
+            result = lookup(tags or self.tags(), acoustic=[(record["id"], score)])
+        return next(candidate for candidate in result["candidates"] if candidate["source"] == "AcoustID / MusicBrainz")
+
+    def test_acoustic_green_requires_known_local_and_catalog_duration(self):
+        candidate = self.acoustic_result()
+        self.assertEqual((candidate["match_score"], candidate["source_score"]), (95, .98))
+        for duration in (None, 0, 124000):
+            self.assertLess(self.acoustic_result(duration=duration)["match_score"], 90)
+        self.assertLess(self.acoustic_result(self.tags(duration=0))["match_score"], 90)
+
+    def test_acoustic_year_track_and_art_conflicts_never_become_green(self):
+        cases = [self.acoustic_result(self.tags(year="2001")), self.acoustic_result(self.tags(track_number="3/12")), self.acoustic_result(art="fixture-image")]
+        for candidate in cases:
+            self.assertEqual(candidate["match_score"], 65)
+            self.assertEqual(candidate["confidence"], "review")
+        self.assertTrue(any("Обложка" in evidence and "не подтверждает" in evidence for evidence in cases[2]["evidence"]))
+        self.assertEqual(self.acoustic_result(self.tags(year="2000"))["match_score"], 95)
 
     def test_wrong_version_and_out_of_range_timestamps_rejected(self):
         with patch("music_curation._json_get", return_value=[self.row(trackName="Song (Live)")]):

@@ -36,7 +36,7 @@ SCHEMAS = {
     "desktop_curation_candidates": {"id"}, "desktop_curation_propose": {"id", "changes", "artwork_path", "digest"},
     "desktop_curation_transcribe": {"id", "model_path"}, "desktop_curation_fingerprint": {"id"},
     "desktop_curation_duplicates": set(), "desktop_curation_history": set(),
-    "desktop_curation_apply": {"id", "confirmed"}, "desktop_curation_undo": {"id", "confirmed"},
+    "desktop_curation_apply": {"id", "confirmed", "manual_choice"}, "desktop_curation_undo": {"id", "confirmed"},
 }
 SETTINGS = {"owner_name", "interval_sec", "auto_update", "transcription_enabled",
             "archive_folder", "archive_max_gb", "archive_retention_days"}

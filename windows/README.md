@@ -1,5 +1,11 @@
 # XASS Native for Windows · initial WinUI 3 milestone
 
+> This page describes the original shell milestone. For the 0.21.3 reliability
+> candidate, implemented safety boundaries and current verification status, see
+> [release acceptance](../docs/release-reliability-0.21.3.md) and
+> [the complete test installer](INSTALLER-THEME.md). It remains a separate test
+> distribution; a successful automated build is not interactive visual acceptance.
+
 A separate, real WinUI 3/C# shell. The existing Python/Tk application and agent
 remain intact. This is **not feature parity, a replacement installer, or a
 Windows-tested release**. A Windows build and runtime acceptance pass are
