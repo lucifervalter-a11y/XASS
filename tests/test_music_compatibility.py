@@ -75,6 +75,44 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(result["sha256"], again["sha256"])
         self.assertEqual(list((self.root / "compatible-audio").glob("*.flac")), [result["path"]])
 
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
+    def test_real_aac_alac_and_opus_prepare_for_flac_only_receiver(self):
+        # Synthetic non-silent fixtures exercise the actual requested codecs,
+        # not an extension rename or a mocked ffmpeg process.
+        for index, (encoder, codec, suffix, mime) in enumerate([
+            ("aac", "aac", "m4a", "audio/mp4"),
+            ("alac", "alac", "m4a", "audio/mp4"),
+            ("libopus", "opus", "ogg", "audio/ogg"),
+        ], start=1):
+            with self.subTest(codec=codec):
+                source = self.root / (f"{index:032x}." + suffix)
+                subprocess.run([shutil.which("ffmpeg"), "-nostdin", "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                    "-c:a", encoder, str(source)], check=True, timeout=20,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                before = source.read_bytes()
+                track = SimpleNamespace(storage_name=source.name,
+                    sha256=hashlib.sha256(before).hexdigest(), mime=mime)
+                actual, duration = compat.probe_codec(source)
+                self.assertEqual(actual, codec)
+                prepared = compat.prepare(self.root, track, ["flac"])
+                converted, converted_duration = compat.probe_codec(prepared["path"])
+                self.assertEqual(converted, "flac")
+                self.assertLess(abs(duration - converted_duration), .1)
+                self.assertNotEqual(source, prepared["path"])
+                self.assertEqual(source.read_bytes(), before)
+                self.assertEqual(prepared["variant"], "flac")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe not installed")
+    def test_real_mp3_only_receiver_gets_complete_fallback(self):
+        before = self.file.read_bytes()
+        prepared = compat.prepare(self.root, self.track, ["mp3"])
+        codec, duration = compat.probe_codec(prepared["path"])
+        self.assertEqual(codec, "mp3")
+        self.assertLess(abs(duration - 5), .5)
+        self.assertEqual(prepared["mime"], "audio/mpeg")
+        self.assertEqual(self.file.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,15 +54,7 @@ public struct ContentView: View {
         .sheet(isPresented: $showThemeSheet) {
             NavigationStack {
                 ThemeSelectorView()
-                    .toolbar {
-                        ToolbarItem(placement: .topBarTrailing) {
-                            Button("Готово") {
-                                showThemeSheet = false
-                            }
-                            .font(.headline)
-                            .foregroundStyle(currentTheme.accentColor)
-                        }
-                    }
+                    .toolbar { themeToolbar }
             }
             .presentationDetents([.medium, .large])
         }
@@ -72,6 +64,14 @@ public struct ContentView: View {
     }
 
     // MARK: - Tab Navigation
+
+    @ToolbarContentBuilder private var themeToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("Готово") { showThemeSheet = false }
+                .font(.headline)
+                .foregroundStyle(currentTheme.accentColor)
+        }
+    }
 
     private var tabs: some View {
         TabView(selection: $selectedTab) {
@@ -202,7 +202,7 @@ public struct ContentView: View {
 
                 Button {
                     store.run {
-                        try await store.togglePlayPause()
+                        try await store.toggle()
                     }
                 } label: {
                     Image(systemName: store.playing ? "pause.fill" : "play.fill")
