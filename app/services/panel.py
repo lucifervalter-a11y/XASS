@@ -29,19 +29,22 @@ def main_panel_keyboard() -> dict:
                 {"text": "🤖 Агенты", "callback_data": "panel:agents"},
             ],
             [
+                {"text": "👥 Доступы", "callback_data": "panel:access"},
                 {"text": "📝 Логи", "callback_data": "panel:logs"},
+            ],
+            [
                 {"text": "📤 Экспорт", "callback_data": "panel:export"},
-            ],
-            [
                 {"text": "⚙️ Настройки", "callback_data": "panel:settings"},
+            ],
+            [
                 {"text": "🌐 Профиль сайта", "callback_data": "panel:profile"},
-            ],
-            [
                 {"text": "🗂 Проекты", "callback_data": "panel:projects"},
-                {"text": "🆕 Обновление", "callback_data": "panel:update"},
             ],
             [
+                {"text": "🆕 Обновление", "callback_data": "panel:update"},
                 {"text": "🤖 XASS AI", "callback_data": "panel:hermes"},
+            ],
+            [
                 {"text": "🎨 Сменить тему", "callback_data": "panel:themes"},
             ],
         ]
@@ -142,6 +145,10 @@ def dot_commands_help_text() -> str:
         "ПК:     /pc"
         "\nАрхив переписок: /chats и /deleted"
         "\nХранение медиа на ПК: /archive"
+        "\n\n👥 Управление доступом:\n"
+        "/grant <user_id>   — выдать доступ (Telegram Business, удалённые)\n"
+        "/revoke <user_id>  — отозвать доступ\n"
+        "/access            — список выданных доступов"
     )
 
 

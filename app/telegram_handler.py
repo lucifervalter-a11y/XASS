@@ -47,6 +47,17 @@ from app.services.app_config import (
 )
 from app.services.agent_pairing import issue_pair_code
 from app.services.auth import is_authorized, is_owner
+from app.services.access_grants import (
+    find_user_by_username,
+    get_business_connection,
+    get_user_connection_ids,
+    grant_user_access,
+    has_active_grant,
+    is_user_permitted,
+    list_all_grants,
+    revoke_user_access,
+    upsert_business_connection,
+)
 from app.services.export import export_messages_csv
 from app.services.heartbeat import delete_source_by_id, list_sources, rename_source
 from app.services.message_logging import handle_update_logging
@@ -193,6 +204,11 @@ class TelegramUpdateHandler:
     async def handle_update(self, session: AsyncSession, update: dict[str, Any]) -> None:
         await self._cache_recent_message(update)
         config = await get_or_create_app_config(session, self.settings)
+
+        business_conn = update.get("business_connection")
+        if business_conn:
+            await self._handle_business_connection_update(session, config, business_conn)
+            return
         await handle_update_logging(
             session,
             update,
@@ -944,12 +960,44 @@ class TelegramUpdateHandler:
         chat_id = (message.get("chat") or {}).get("id")
         if chat_id is None:
             return
-        if not is_authorized(user_id, self.settings):
+        is_owner_user = is_owner(user_id, self.settings)
+        is_admin_user = bool(user_id and user_id in self.settings.admin_user_ids)
+        has_grant = await has_active_grant(session, user_id)
+        if not (is_authorized(user_id, self.settings) or has_grant):
             await self._safe_send(chat_id, "Доступ запрещен.")
             return
 
         config = await get_or_create_app_config(session, self.settings)
         command = text.split()[0].split("@")[0].lower()
+
+        if has_grant and not is_owner_user and not is_admin_user:
+            if command in ("/start", "/help"):
+                await self._send_delegated_user_guide(chat_id, user_id or 0)
+                return
+            if command == "/deleted":
+                await self._handle_deleted_history_command(session, chat_id, user_id)
+                return
+            if command == "/chats":
+                await self._handle_chats_command(session, chat_id, user_id)
+                return
+            if command == "/chat":
+                await self._handle_chat_history_command(session, chat_id, text, user_id)
+                return
+            if command in ("/muz", ".muz", "/music", ".music") and await is_user_permitted(session, user_id, "music", self.settings):
+                await self._handle_muz_command(session, config, message, text)
+                return
+            await self._safe_send(chat_id, "⛔ Эта команда доступна только владельцу бота.")
+            return
+
+        if command == "/grant":
+            await self._handle_grant_command(session, message, text, chat_id, user_id or 0)
+            return
+        if command == "/revoke":
+            await self._handle_revoke_command(session, message, text, chat_id, user_id or 0)
+            return
+        if command in ("/access", "/grants", "/users"):
+            await self._handle_access_command(session, chat_id, user_id or 0)
+            return
 
         ai_commands = {
             "/ai", "/hermes", "/ai_status", "/hermes_status",
@@ -1027,13 +1075,13 @@ class TelegramUpdateHandler:
             await self._handle_archive_command(session, chat_id, int(user_id or 0), text)
             return
         if command == "/chats":
-            await self._handle_chats_command(session, chat_id)
+            await self._handle_chats_command(session, chat_id, user_id)
             return
         if command == "/chat":
-            await self._handle_chat_history_command(session, chat_id, text)
+            await self._handle_chat_history_command(session, chat_id, text, user_id)
             return
         if command == "/deleted":
-            await self._handle_deleted_history_command(session, chat_id)
+            await self._handle_deleted_history_command(session, chat_id, user_id)
             return
         if command == "/export":
             await self._send_export(session, chat_id, user_id)
@@ -2498,6 +2546,19 @@ class TelegramUpdateHandler:
             return
         if data == "panel:agents":
             await self._show_agents_panel(session, config, chat_id, message_id)
+            return
+        if data == "panel:access":
+            if not is_owner(user_id, self.settings):
+                await self._safe_edit_or_send(chat_id, message_id, "Доступ разрешён только владельцу.", self._main_kb(config))
+                return
+            await self._handle_access_command(session, chat_id, user_id or 0)
+            return
+        if data.startswith("grant:revoke:"):
+            if not is_owner(user_id, self.settings):
+                return
+            target_uid = int(data.split(":")[2])
+            await revoke_user_access(session, target_uid)
+            await self._handle_access_command(session, chat_id, user_id or 0)
             return
         if data == "panel:logs":
             await self._safe_edit_or_send(chat_id, message_id, await self._build_logs_text(session), self._main_kb(config))
@@ -4608,6 +4669,17 @@ class TelegramUpdateHandler:
             edited = update.get(key)
             if not edited:
                 continue
+            conn_id = edited.get("business_connection_id")
+            target_chat_id: int | None = None
+            if conn_id:
+                conn = await get_business_connection(session, conn_id)
+                if conn and conn.is_enabled:
+                    if is_owner(conn.user_id, self.settings) or await is_user_permitted(session, conn.user_id, "view_deleted", self.settings):
+                        target_chat_id = conn.user_chat_id or conn.user_id
+            if target_chat_id is None:
+                target_chat_id = notify_chat_id
+            if target_chat_id is None:
+                continue
             chat_id = (edited.get("chat") or {}).get("id")
             message_id = edited.get("message_id")
             if chat_id is None or message_id is None:
@@ -4630,7 +4702,7 @@ class TelegramUpdateHandler:
                 f"<b>Новый текст:</b>\n<blockquote>{escape(new_text[:800] or '—')}</blockquote>\n\n"
                 f"<b>Изменилось:</b>\n<blockquote>{diff}</blockquote>"
             )
-            await self._safe_send(notify_chat_id, card, parse_mode="HTML", disable_web_page_preview=True)
+            await self._safe_send(target_chat_id, card, parse_mode="HTML", disable_web_page_preview=True)
 
     def _build_deleted_message_links(self, chat_id: int, message_id: int, chat_username: str | None = None) -> list[tuple[str, str]]:
         links: list[tuple[str, str]] = []
@@ -4763,9 +4835,18 @@ class TelegramUpdateHandler:
         payload = update.get(DELETED_NOTIFICATION_KEY)
         if not payload:
             return
-        notify_chat_id = self._notify_chat_id(config)
-        if notify_chat_id is None:
+        conn_id = payload.get("business_connection_id")
+        target_chat_id: int | None = None
+        if conn_id:
+            conn = await get_business_connection(session, conn_id)
+            if conn and conn.is_enabled:
+                if is_owner(conn.user_id, self.settings) or await is_user_permitted(session, conn.user_id, "view_deleted", self.settings):
+                    target_chat_id = conn.user_chat_id or conn.user_id
+        if target_chat_id is None:
+            target_chat_id = self._notify_chat_id(config)
+        if target_chat_id is None:
             return
+        notify_chat_id = target_chat_id
         chat = payload.get("chat") or {}
         chat_id = chat.get("id") or payload.get("chat_id")
         chat_username = chat.get("username")
@@ -4968,8 +5049,22 @@ class TelegramUpdateHandler:
             ),
         )
 
-    async def _handle_chats_command(self, session: AsyncSession, chat_id: int) -> None:
-        rows = list(await session.scalars(select(MessageLog).order_by(MessageLog.id.desc()).limit(1000)))
+    async def _handle_chats_command(self, session: AsyncSession, chat_id: int, user_id: int | None = None) -> None:
+        from sqlalchemy import or_
+        if is_owner(user_id, self.settings) or (user_id and user_id in self.settings.admin_user_ids) or user_id is None:
+            rows = list(await session.scalars(select(MessageLog).order_by(MessageLog.id.desc()).limit(1000)))
+        else:
+            user_conn_ids = await get_user_connection_ids(session, user_id)
+            conds = []
+            if user_conn_ids:
+                conds.append(MessageLog.business_connection_id.in_(user_conn_ids))
+            if user_id:
+                conds.append(MessageLog.from_user_id == user_id)
+            if not conds:
+                await self._safe_send(chat_id, "Архив переписки пока пуст.")
+                return
+            rows = list(await session.scalars(select(MessageLog).where(or_(*conds)).order_by(MessageLog.id.desc()).limit(1000)))
+
         chats: dict[int, dict[str, Any]] = {}
         for row in rows:
             item = chats.setdefault(
@@ -4990,7 +5085,7 @@ class TelegramUpdateHandler:
         lines.append("\nВ Mini App доступен поиск, пузырьки переписки и история правок.")
         await self._safe_send(chat_id, "\n\n".join(lines))
 
-    async def _handle_chat_history_command(self, session: AsyncSession, chat_id: int, text: str) -> None:
+    async def _handle_chat_history_command(self, session: AsyncSession, chat_id: int, text: str, user_id: int | None = None) -> None:
         parts = text.split()
         if len(parts) != 2:
             await self._safe_send(chat_id, "Использование: /chat <chat_id>. Список: /chats")
@@ -5000,6 +5095,25 @@ class TelegramUpdateHandler:
         except ValueError:
             await self._safe_send(chat_id, "chat_id должен быть числом. Список: /chats")
             return
+
+        from sqlalchemy import or_
+        if user_id is not None and not is_owner(user_id, self.settings) and user_id not in self.settings.admin_user_ids:
+            user_conn_ids = await get_user_connection_ids(session, user_id)
+            conds = []
+            if user_conn_ids:
+                conds.append(MessageLog.business_connection_id.in_(user_conn_ids))
+            if user_id:
+                conds.append(MessageLog.from_user_id == user_id)
+            if not conds:
+                await self._safe_send(chat_id, "Диалог не найден или у вас нет к нему доступа.")
+                return
+            has_access = await session.scalar(
+                select(MessageLog.id).where(MessageLog.chat_id == source_chat_id, or_(*conds)).limit(1)
+            )
+            if not has_access:
+                await self._safe_send(chat_id, "Диалог не найден или у вас нет к нему доступа.")
+                return
+
         rows = list(
             await session.scalars(
                 select(MessageLog).where(MessageLog.chat_id == source_chat_id).order_by(MessageLog.id.desc()).limit(20)
@@ -5017,14 +5131,25 @@ class TelegramUpdateHandler:
             lines.append(f"{stamp} {direction}{deleted}\n{body}")
         await self._safe_send(chat_id, "\n\n".join(lines)[:4000])
 
-    async def _handle_deleted_history_command(self, session: AsyncSession, chat_id: int) -> None:
-        rows = list(
-            await session.scalars(
-                select(MessageLog).where(MessageLog.deleted.is_(True)).order_by(MessageLog.id.desc()).limit(20)
-            )
-        )
+    async def _handle_deleted_history_command(self, session: AsyncSession, chat_id: int, user_id: int | None = None) -> None:
+        from sqlalchemy import or_
+        if is_owner(user_id, self.settings) or (user_id and user_id in self.settings.admin_user_ids) or user_id is None:
+            stmt = select(MessageLog).where(MessageLog.deleted.is_(True)).order_by(MessageLog.id.desc()).limit(20)
+        else:
+            user_conn_ids = await get_user_connection_ids(session, user_id)
+            conds = []
+            if user_conn_ids:
+                conds.append(MessageLog.business_connection_id.in_(user_conn_ids))
+            if user_id:
+                conds.append(MessageLog.from_user_id == user_id)
+            if not conds:
+                await self._safe_send(chat_id, "Удалённых сообщений в вашем доступном Business‑архиве пока нет.")
+                return
+            stmt = select(MessageLog).where(MessageLog.deleted.is_(True), or_(*conds)).order_by(MessageLog.id.desc()).limit(20)
+
+        rows = list(await session.scalars(stmt))
         if not rows:
-            await self._safe_send(chat_id, "Удалённых сообщений в доступном Business‑архиве пока нет.")
+            await self._safe_send(chat_id, "Удалённых сообщений в вашем доступном Business‑архиве пока нет.")
             return
         lines = ["Последние удалённые сообщения", ""]
         for row in rows:
@@ -5767,3 +5892,325 @@ class TelegramUpdateHandler:
             logger.warning("Не удалось подтвердить callback: %s", exc)
         except Exception:
             logger.warning("Не удалось подтвердить callback", exc_info=True)
+
+    async def _handle_business_connection_update(
+        self,
+        session: AsyncSession,
+        config: AppConfig,
+        business_conn: dict[str, Any],
+    ) -> None:
+        conn_id = business_conn.get("id")
+        user = business_conn.get("user") or {}
+        user_id = user.get("id")
+        user_chat_id = business_conn.get("user_chat_id") or user_id
+        is_enabled = bool(business_conn.get("is_enabled"))
+        can_reply = bool(business_conn.get("can_reply"))
+        username = user.get("username")
+        first_name = user.get("first_name") or "Пользователь"
+
+        if not conn_id or not user_id:
+            return
+
+        is_owner_user = is_owner(user_id, self.settings)
+        permitted = is_owner_user or (await is_user_permitted(session, user_id, "business", self.settings))
+
+        if not permitted:
+            logger.warning("Неавторизованное подключение Telegram Business: user_id=%s, username=%s", user_id, username)
+            if user_chat_id and self.bot_client:
+                await self._safe_send(
+                    user_chat_id,
+                    "⛔ <b>Доступ ограничен</b>\n\n"
+                    "У вас нет разрешения на подключение этого бота к Telegram Business.\n"
+                    "Обратитесь к администратору бота для получения доступа.",
+                    parse_mode="HTML",
+                )
+            notify_chat_id = self._notify_chat_id(config)
+            if notify_chat_id and notify_chat_id != user_chat_id:
+                user_label = f"@{username}" if username else f"ID {user_id}"
+                await self._safe_send(
+                    notify_chat_id,
+                    f"⚠️ <b>Попытка подключения без доступа:</b>\n"
+                    f"Пользователь: {user_label} (<code>{user_id}</code>)\n"
+                    f"Чтобы выдать доступ: <code>/grant {user_id}</code>",
+                    parse_mode="HTML",
+                )
+            return
+
+        await upsert_business_connection(
+            session,
+            connection_id=conn_id,
+            user_id=user_id,
+            user_chat_id=user_chat_id,
+            can_reply=can_reply,
+            is_enabled=is_enabled,
+        )
+
+        if is_enabled:
+            if user_chat_id:
+                await self._safe_send(
+                    user_chat_id,
+                    "✅ <b>Telegram Business подключен к XASS!</b>\n\n"
+                    "Бот активен и будет отслеживать сообщения в ваших бизнес-чатах.\n"
+                    "Если собеседник удалит или изменит сообщение, бот пришлёт вам копию сюда.\n\n"
+                    "Команды:\n"
+                    "• /deleted — список удалённых сообщений\n"
+                    "• /chats — список ваших диалогов\n"
+                    "• /help — справка",
+                    parse_mode="HTML",
+                )
+            if not is_owner_user:
+                notify_chat_id = self._notify_chat_id(config)
+                if notify_chat_id and notify_chat_id != user_chat_id:
+                    user_label = f"@{username}" if username else f"ID {user_id}"
+                    await self._safe_send(
+                        notify_chat_id,
+                        f"📱 Делегированный пользователь {user_label} (<code>{user_id}</code>) "
+                        f"подключил Telegram Business (ID <code>{conn_id}</code>).",
+                        parse_mode="HTML",
+                    )
+        else:
+            if user_chat_id:
+                await self._safe_send(
+                    user_chat_id,
+                    "ℹ️ <b>Telegram Business отключен.</b>\n\n"
+                    "Бот больше не отслеживает сообщения этого аккаунта.",
+                    parse_mode="HTML",
+                )
+            if not is_owner_user:
+                notify_chat_id = self._notify_chat_id(config)
+                if notify_chat_id and notify_chat_id != user_chat_id:
+                    user_label = f"@{username}" if username else f"ID {user_id}"
+                    await self._safe_send(
+                        notify_chat_id,
+                        f"ℹ️ Делегированный пользователь {user_label} (<code>{user_id}</code>) "
+                        f"отключил Telegram Business.",
+                        parse_mode="HTML",
+                    )
+
+    def _extract_target_user(self, message: dict[str, Any], text: str) -> tuple[int | None, str | None, str | None, str | None]:
+        reply = message.get("reply_to_message")
+        if reply and isinstance(reply, dict):
+            origin = reply.get("forward_origin")
+            if isinstance(origin, dict):
+                origin_type = origin.get("type")
+                if origin_type == "user":
+                    sender = origin.get("sender_user") or {}
+                    return sender.get("id"), sender.get("username"), sender.get("first_name"), None
+                if origin_type == "hidden_user":
+                    return None, None, None, "Пользователь скрыл профиль при пересылке. Укажите числовой ID: /grant <user_id>"
+                if origin_type in ("chat", "channel"):
+                    return None, None, None, "Это пересылка из канала/чата. Укажите числовой ID пользователя: /grant <user_id>"
+            fwd_user = reply.get("forward_from")
+            if isinstance(fwd_user, dict) and fwd_user.get("id"):
+                return fwd_user.get("id"), fwd_user.get("username"), fwd_user.get("first_name"), None
+            from_user = reply.get("from")
+            if isinstance(from_user, dict) and from_user.get("id"):
+                return from_user.get("id"), from_user.get("username"), from_user.get("first_name"), None
+
+        parts = text.split()
+        if len(parts) >= 2:
+            token = parts[1].strip()
+            if token.isdigit():
+                return int(token), None, None, None
+            if token.startswith("@"):
+                return None, token.lstrip("@"), None, None
+
+        return None, None, None, "Укажите пользователя числовым ID или ответом на пересланное сообщение."
+
+    async def _handle_grant_command(self, session: AsyncSession, message: dict[str, Any], text: str, chat_id: int, caller_user_id: int) -> None:
+        if not (is_owner(caller_user_id, self.settings) or caller_user_id in self.settings.admin_user_ids):
+            await self._safe_send(chat_id, "⛔ Выдавать доступ может только владелец бота.")
+            return
+
+        target_user_id, target_username, target_first_name, err = self._extract_target_user(message, text)
+        if err and not target_user_id and not target_username:
+            await self._safe_send(
+                chat_id,
+                f"ℹ️ {err}\n\n"
+                "Примеры:\n"
+                "• Перешлите сообщение пользователя и ответьте: <code>/grant</code>\n"
+                "• По ID: <code>/grant 123456789</code>\n"
+                "• Все права: <code>/grant 123456789 all</code>\n"
+                "• По юзернейму: <code>/grant @username</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        if target_user_id is None and target_username:
+            target_user_id = await find_user_by_username(session, target_username)
+            if not target_user_id:
+                await self._safe_send(
+                    chat_id,
+                    f"Не удалось найти пользователя @{target_username} в истории сообщений.\n"
+                    "Пожалуйста, укажите числовой ID пользователя (узнать его можно через @userinfobot) "
+                    "или перешлите любое сообщение от него и ответьте <code>/grant</code>.",
+                    parse_mode="HTML",
+                )
+                return
+
+        tokens = [t.lower() for t in text.split()[1:] if not t.isdigit() and not t.startswith("@")]
+        can_music = any(t in ("all", "full", "music") for t in tokens)
+        can_business = True
+        can_view_deleted = True
+        note_tokens = [t for t in text.split()[1:] if not t.isdigit() and not t.startswith("@") and t.lower() not in ("all", "full", "music", "business", "deleted")]
+        note = " ".join(note_tokens) if note_tokens else None
+
+        grant = await grant_user_access(
+            session,
+            user_id=target_user_id,
+            granted_by=caller_user_id,
+            username=target_username,
+            first_name=target_first_name,
+            can_business=can_business,
+            can_view_deleted=can_view_deleted,
+            can_music=can_music,
+            note=note,
+        )
+
+        user_desc = f"<b>{escape(target_first_name or 'Пользователь')}</b>"
+        if target_username:
+            user_desc += f" (@{escape(target_username)})"
+        user_desc += f" · <code>{target_user_id}</code>"
+
+        perms = ["📱 Telegram Business", "🗑 Чтение удалённых сообщений"]
+        if can_music:
+            perms.append("🎵 Музыка")
+
+        await self._safe_send(
+            chat_id,
+            (
+                f"✅ <b>Доступ успешно выдан!</b>\n\n"
+                f"👤 {user_desc}\n"
+                f"🔑 <b>Разрешения:</b> {', '.join(perms)}\n\n"
+                f"📌 <b>Инструкция для пользователя:</b>\n"
+                f"1. Открыть бота и нажать /start\n"
+                f"2. В Telegram: <i>Настройки → Telegram Business → Чат-боты</i>\n"
+                f"3. Добавить этого бота\n"
+                f"После этого удалённые сообщения из бизнес-чатов будут приходить пользователю сюда."
+            ),
+            parse_mode="HTML",
+        )
+
+        try:
+            await self._safe_send(
+                target_user_id,
+                (
+                    "🎉 <b>Вам выдан доступ к XASS!</b>\n\n"
+                    "Вы можете подключить бота к вашему аккаунту для отслеживания удалённых сообщений:\n"
+                    "1. Откройте <i>Настройки Telegram → Telegram Business → Чат-боты</i>\n"
+                    "2. Добавьте этого бота\n"
+                    "3. Нажмите /start для просмотра команд."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    async def _handle_revoke_command(self, session: AsyncSession, message: dict[str, Any], text: str, chat_id: int, caller_user_id: int) -> None:
+        if not (is_owner(caller_user_id, self.settings) or caller_user_id in self.settings.admin_user_ids):
+            await self._safe_send(chat_id, "⛔ Отзывать доступ может только владелец бота.")
+            return
+
+        target_user_id, target_username, _, _ = self._extract_target_user(message, text)
+        if target_user_id is None and target_username:
+            target_user_id = await find_user_by_username(session, target_username)
+
+        if not target_user_id:
+            await self._safe_send(
+                chat_id,
+                "Использование:\n"
+                "• Ответом на сообщение пользователя: <code>/revoke</code>\n"
+                "• По ID: <code>/revoke &lt;user_id&gt;</code>\n"
+                "• Список пользователей: <code>/access</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        revoked = await revoke_user_access(session, target_user_id)
+        if revoked:
+            await self._safe_send(
+                chat_id,
+                f"🚫 <b>Доступ отозван</b> для пользователя <code>{target_user_id}</code>.",
+                parse_mode="HTML",
+            )
+            try:
+                await self._safe_send(
+                    target_user_id,
+                    "ℹ️ Ваш доступ к боту XASS был отозван администратором.",
+                )
+            except Exception:
+                pass
+        else:
+            await self._safe_send(chat_id, f"Пользователь <code>{target_user_id}</code> не найден в списке доступов.", parse_mode="HTML")
+
+    async def _handle_access_command(self, session: AsyncSession, chat_id: int, caller_user_id: int) -> None:
+        if not (is_owner(caller_user_id, self.settings) or caller_user_id in self.settings.admin_user_ids):
+            await self._safe_send(chat_id, "⛔ Эта команда доступна только владельцу бота.")
+            return
+
+        grants = await list_all_grants(session)
+        if not grants:
+            await self._safe_send(
+                chat_id,
+                "👥 <b>Управление доступом</b>\n\n"
+                "Список выданных доступов пока пуст.\n\n"
+                "Чтобы выдать доступ:\n"
+                "• Перешлите сообщение пользователя и ответьте <code>/grant</code>\n"
+                "• Либо введите <code>/grant &lt;user_id&gt;</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        from app.models import BusinessConnection
+        lines = ["👥 <b>Выданные доступы к XASS:</b>\n"]
+        buttons = []
+        for g in grants:
+            status_emoji = "🟢" if g.is_active else "🔴"
+            status_text = "активен" if g.is_active else "отозван"
+            u_name = f"@{g.username}" if g.username else (g.first_name or f"ID {g.user_id}")
+
+            conns = list(await session.scalars(select(BusinessConnection).where(BusinessConnection.user_id == g.user_id, BusinessConnection.is_enabled.is_(True))))
+            conn_status = f"🟢 Подключен ({len(conns)} шт.)" if conns else "⚪ Не подключен"
+
+            perms = []
+            if g.can_business:
+                perms.append("Business")
+            if g.can_view_deleted:
+                perms.append("Удалённые")
+            if g.can_music:
+                perms.append("Музыка")
+
+            lines.append(
+                f"{status_emoji} <b>{escape(str(u_name))}</b> (<code>{g.user_id}</code>)\n"
+                f"   • Статус: {status_text}\n"
+                f"   • Права: {', '.join(perms) or 'нет'}\n"
+                f"   • Telegram Business: {conn_status}"
+            )
+            if g.is_active:
+                buttons.append([{"text": f"🚫 Отозвать {u_name}", "callback_data": f"grant:revoke:{g.user_id}"}])
+
+        lines.append("\nКоманды: <code>/grant &lt;user_id&gt;</code> | <code>/revoke &lt;user_id&gt;</code>")
+        keyboard = {"inline_keyboard": buttons} if buttons else None
+        await self._safe_send(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+
+    async def _send_delegated_user_guide(self, chat_id: int, user_id: int) -> None:
+        await self._safe_send(
+            chat_id,
+            (
+                "👋 <b>XASS — Сервис чтения удалённых сообщений</b>\n\n"
+                "Вам предоставлен доступ к боту.\n\n"
+                "📱 <b>Подключение Telegram Business:</b>\n"
+                "1. Откройте <i>Настройки Telegram → Telegram Business → Чат-боты</i>\n"
+                "2. Добавьте этого бота в качестве чат-бота\n"
+                "3. Выберите нужные чаты (все или только личные)\n\n"
+                "💡 После подключения бот автоматически сохраняет историю ваших бизнес-чатов. "
+                "Если собеседник удалит или отредактирует сообщение, бот пришлёт вам точный текст и медиафайлы прямо в этот диалог.\n\n"
+                "📋 <b>Доступные команды:</b>\n"
+                "• /deleted — последние удалённые сообщения\n"
+                "• /chats — список ваших бизнес-диалогов\n"
+                "• /chat &lt;id&gt; — история конкретного диалога\n"
+                "• /help — эта справка"
+            ),
+            parse_mode="HTML",
+        )
+

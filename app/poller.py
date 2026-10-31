@@ -17,6 +17,7 @@ ALLOWED_UPDATES = [
     "business_message",
     "edited_business_message",
     "deleted_business_messages",
+    "business_connection",
 ]
 
 

@@ -63,6 +63,13 @@ def _apply_runtime_migrations(connection) -> None:
     inspector = inspect(connection)
     datetime_type = "TIMESTAMP WITH TIME ZONE" if connection.dialect.name == "postgresql" else "DATETIME"
     tables = set(inspector.get_table_names())
+    if "message_logs" in tables:
+        msg_columns = {item["name"] for item in inspector.get_columns("message_logs")}
+        if "business_connection_id" not in msg_columns:
+            connection.execute(text("ALTER TABLE message_logs ADD COLUMN business_connection_id VARCHAR(128)"))
+            index_names = {item["name"] for item in inspector.get_indexes("message_logs")}
+            if "ix_message_logs_business_connection_id" not in index_names:
+                connection.execute(text("CREATE INDEX ix_message_logs_business_connection_id ON message_logs (business_connection_id)"))
     if "media_assets" in tables:
         media_columns = {item["name"] for item in inspector.get_columns("media_assets")}
         if "archive_allowed" not in media_columns:

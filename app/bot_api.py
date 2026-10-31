@@ -121,7 +121,7 @@ class TelegramBotClient:
         return body["result"]
 
     async def set_webhook(self, webhook_url: str, secret_token: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"url": webhook_url, "allowed_updates": ["message", "edited_message", "callback_query", "business_message", "edited_business_message", "deleted_business_messages"]}
+        payload: dict[str, Any] = {"url": webhook_url, "allowed_updates": ["message", "edited_message", "callback_query", "business_message", "edited_business_message", "deleted_business_messages", "business_connection"]}
         if secret_token:
             payload["secret_token"] = secret_token
         return await self._request("setWebhook", payload=payload)

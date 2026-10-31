@@ -138,8 +138,12 @@ def _is_allowed(save_mode: SaveMode, chat_type: str) -> bool:
     return True
 
 
-def _direction(from_user_id: int | None, owner_user_id: int) -> str:
-    if owner_user_id and from_user_id and from_user_id == owner_user_id:
+def _direction(from_user_id: int | None, owner_user_id: int, connection_owner_id: int | None = None) -> str:
+    if from_user_id is None:
+        return "incoming"
+    if owner_user_id and from_user_id == owner_user_id:
+        return "outgoing"
+    if connection_owner_id is not None and from_user_id == connection_owner_id:
         return "outgoing"
     return "incoming"
 
@@ -261,7 +265,14 @@ async def log_single_message(
     message_date = _ts_to_datetime(message.get("date"))
     edited_at = _ts_to_datetime(message.get("edit_date"))
     reply_to = _extract_reply_to(message)
-    direction = _direction(from_user_id, owner_user_id)
+    business_connection_id = message.get("business_connection_id")
+    connection_owner_id: int | None = None
+    if business_connection_id:
+        from app.models import BusinessConnection
+        connection_owner_id = await session.scalar(
+            select(BusinessConnection.user_id).where(BusinessConnection.connection_id == business_connection_id)
+        )
+    direction = _direction(from_user_id, owner_user_id, connection_owner_id)
     media_items = _extract_media_items(message)
 
     existing = await _get_message_log(session, chat_id=chat_id, telegram_message_id=message_id)
@@ -279,7 +290,8 @@ async def log_single_message(
             edited_at=edited_at,
             text_content=text_content,
             raw_event=message,
-            tags="business" if "business_connection_id" in message else None,
+            tags="business" if business_connection_id else None,
+            business_connection_id=business_connection_id,
         )
         session.add(existing)
         await session.flush()
@@ -302,6 +314,9 @@ async def log_single_message(
             existing.message_date = message_date
         if edited_at:
             existing.edited_at = edited_at
+
+        if business_connection_id and not getattr(existing, "business_connection_id", None):
+            existing.business_connection_id = business_connection_id
 
         if event_type == MessageEventType.EDIT and text_content != existing.text_content:
             existing.text_content = text_content
@@ -327,6 +342,7 @@ async def _mark_deleted_message(
         if not _is_allowed(save_mode, chat_type):
             return
         # Keep a tombstone entry when delete event arrives before create event.
+        b_id = payload.get("business_connection_id")
         tombstone = MessageLog(
             chat_id=chat_id,
             chat_type=chat_type,
@@ -343,12 +359,16 @@ async def _mark_deleted_message(
             deleted=True,
             deleted_at=now,
             raw_event=payload,
+            business_connection_id=b_id,
         )
         session.add(tombstone)
         await session.flush()
         await _add_revision(session, tombstone.id, MessageEventType.DELETE, None)
         return
 
+    b_id = payload.get("business_connection_id")
+    if b_id and not getattr(message_log, "business_connection_id", None):
+        message_log.business_connection_id = b_id
     was_deleted = bool(message_log.deleted)
     message_log.deleted = True
     message_log.deleted_at = now
