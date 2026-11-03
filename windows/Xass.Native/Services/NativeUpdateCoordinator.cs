@@ -4,19 +4,49 @@ using System.Text.Json;
 namespace Xass.Native.Services;
 
 public sealed record PreparedNativeUpdate(string JobFolder);
+public sealed record NativeRollbackTarget(string SourceJob, string Version, string Revision, string Distribution,
+    string Sha256, string CurrentRevision, string CurrentDistribution)
+{
+    public static NativeRollbackTarget Parse(JsonElement value)
+    {
+        string Field(string key) => value.GetProperty(key).GetString() ?? throw new InvalidOperationException("Missing rollback field.");
+        var target = new NativeRollbackTarget(Field("source_job"), Field("version"), Field("revision"), Field("distribution"),
+            Field("sha256"), Field("current_revision"), Field("current_distribution"));
+        if (!System.Text.RegularExpressions.Regex.IsMatch(target.SourceJob, "^job-[a-f0-9]{32}$")
+            || !System.Text.RegularExpressions.Regex.IsMatch(target.Sha256, "^[a-f0-9]{64}$")
+            || !System.Text.RegularExpressions.Regex.IsMatch(target.Revision, "^[a-f0-9]{40}$")
+            || !System.Text.RegularExpressions.Regex.IsMatch(target.CurrentRevision, "^[a-f0-9]{40}$")
+            || NativeUpdateVersionPolicy.Parse(target.Version) is null)
+            throw new InvalidOperationException("Invalid rollback snapshot identity.");
+        _ = NativeReleaseChannel.FromDistribution(target.Distribution);
+        _ = NativeReleaseChannel.FromDistribution(target.CurrentDistribution);
+        return target;
+    }
+}
 public sealed class NativeUpdateCoordinator
 {
     internal PreparedNativeUpdate? PendingJob { get; private set; }
     public static string UpdatesRoot => NativeRuntimeMode.UpdatesRoot;
-    public async Task<PreparedNativeUpdate> PrepareAsync(NativeUpdate update, string installer, IProgress<string> progress, CancellationToken token, bool automatic = false)
+    public Task<PreparedNativeUpdate> PrepareAsync(NativeUpdate update, string installer, IProgress<string> progress, CancellationToken token, bool automatic = false)
+        => PrepareCoreAsync(update, installer, progress, token, automatic, null);
+    public Task<PreparedNativeUpdate> PrepareRollbackAsync(NativeRollbackTarget rollback, IProgress<string> progress, CancellationToken token)
+        => PrepareCoreAsync(null, null, progress, token, false, rollback);
+    private async Task<PreparedNativeUpdate> PrepareCoreAsync(NativeUpdate? update, string? installer, IProgress<string> progress,
+        CancellationToken token, bool automatic, NativeRollbackTarget? rollback)
     {
         string install = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
         string marker = Path.Combine(install, "native-install.json"), runtime = Path.Combine(install, "runtime");
         if (!File.Exists(marker) || !File.Exists(Path.Combine(runtime, "XASS.NativeHelper.exe")))
             throw new InvalidOperationException("Автоматическое обновление поддерживается после установки полного нативного пакета.");
-        bool changeChannel;
+        bool changeChannel = false;
         using (var document = JsonDocument.Parse(await File.ReadAllTextAsync(marker, token)))
-            changeChannel = ValidateInstallation(update, document.RootElement);
+        {
+            if (update is not null) changeChannel = ValidateInstallation(update, document.RootElement);
+            else if (rollback is null || automatic
+                || document.RootElement.GetProperty("revision").GetString() != rollback.CurrentRevision
+                || document.RootElement.GetProperty("distribution").GetString() != rollback.CurrentDistribution)
+                throw new InvalidOperationException("Установка изменилась. Повторите выбор резервной копии.");
+        }
         string job = Path.Combine(UpdatesRoot, "job-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(job);
         PendingJob = new PreparedNativeUpdate(job);
@@ -34,10 +64,20 @@ public sealed class NativeUpdateCoordinator
         string request = Path.Combine(job, "request.json");
         using var self = Process.GetCurrentProcess();
         double created = new DateTimeOffset(self.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0;
-        await File.WriteAllTextAsync(request, JsonSerializer.Serialize(new { schema = 2, job_id = Path.GetFileName(job), install_root = install,
-            installer, sha256 = update.Sha256, size = update.Size, version = update.Version, revision = update.Revision,
-            parent_pid = Environment.ProcessId, parent_created = created, automatic,
-            release_distribution = update.Distribution, allow_channel_change = changeChannel }), token);
+        object payload;
+        if (rollback is null && update is not null)
+            payload = new { schema = 2, job_id = Path.GetFileName(job), install_root = install,
+                installer, sha256 = update.Sha256, size = update.Size, version = update.Version, revision = update.Revision,
+                parent_pid = Environment.ProcessId, parent_created = created, automatic,
+                release_distribution = update.Distribution, allow_channel_change = changeChannel };
+        else if (rollback is not null)
+            payload = new { schema = 3, job_id = Path.GetFileName(job), install_root = install,
+                source_job = rollback.SourceJob, sha256 = rollback.Sha256, version = rollback.Version, revision = rollback.Revision,
+                parent_pid = Environment.ProcessId, parent_created = created, automatic = false,
+                release_distribution = rollback.Distribution, current_revision = rollback.CurrentRevision,
+                current_distribution = rollback.CurrentDistribution };
+        else throw new InvalidOperationException("Missing update operation.");
+        await File.WriteAllTextAsync(request, JsonSerializer.Serialize(payload), token);
         var start = new ProcessStartInfo(Path.Combine(helperRoot, "XASS.NativeHelper.exe")) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = job };
         start.ArgumentList.Add("--role"); start.ArgumentList.Add("native-updater");
         start.ArgumentList.Add("--request"); start.ArgumentList.Add(request);

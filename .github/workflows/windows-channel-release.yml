@@ -4,12 +4,13 @@ on:
   push:
     branches:
       - codex/xass-update-channels
+      - codex/xass-release-0.21.5
   workflow_dispatch:
     inputs:
       expected_version:
         description: Three-component version expected in both verified installers
         required: true
-        default: '0.21.4'
+        default: '0.21.5'
         type: string
 
 # Artifacts only: no GitHub Releases writes, production secrets, server deploy,
@@ -22,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  EXPECTED_VERSION: ${{ inputs.expected_version || '0.21.4' }}
+  EXPECTED_VERSION: ${{ inputs.expected_version || '0.21.5' }}
   PYTHONUTF8: '1'
 
 jobs:

@@ -37,7 +37,9 @@ public sealed partial class MainWindow
     private readonly ComboBox nativeUpdateChannel = new() { Header = "Получать обновления", MinWidth = 220 };
     private readonly TextBlock nativeInstalledStatus = DLabel(""), nativeSelectedStatus = DLabel("");
     private readonly TextBlock nativeAgentUpdateStatus = DLabel("");
-    private Button checkNativeUpdate = new();
+    private Button checkNativeUpdate = new(), rollbackNativeUpdate = new(), reviewRemoteNativeUpdate = new();
+    private readonly TextBlock nativeRemoteUpdateStatus = DLabel("Запросов с сервера нет.");
+    private long remoteNativeRequestId;
     private bool nativeChannelChoiceInProgress;
     private NativeUpdate? availableNativeUpdate;
     private readonly NativeUpdateCoordinator updateCoordinator = new();
@@ -240,6 +242,7 @@ public sealed partial class MainWindow
         desktopPolling = true;
         try
         {
+            await PollRemoteNativeUpdateAsync();
             if (desktopPage is "overview" or "device") await RefreshDesktopAsync();
             else if (desktopPage == "settings") transcriptStatus.Text = "Расшифровка песен: " + (await DesktopRequestAsync("desktop_transcription")).ToString();
             else if (desktopPage == "archive" && desktopHost.IsRunning)
@@ -579,6 +582,8 @@ public sealed partial class MainWindow
         var page = AddDesktopPage("updates", "Обновления", Symbol.Download);
         installUpdate = DButton("Скачать и установить", InstallNativeUpdateAsync); installUpdate.IsEnabled = false;
         checkNativeUpdate = DButton("Проверить обновления", CheckNativeUpdateAsync);
+        rollbackNativeUpdate = DButton("Вернуться к предыдущей установке", RollbackNativeUpdateAsync);
+        reviewRemoteNativeUpdate = DButton("Рассмотреть запрос сервера", ReviewRemoteNativeUpdateAsync);
         nativeUpdateChannel.Items.Add(new ComboBoxItem { Content = "Релиз", Tag = NativeReleaseChannel.Stable.Distribution });
         nativeUpdateChannel.Items.Add(new ComboBoxItem { Content = "Бета", Tag = NativeReleaseChannel.Test.Distribution });
         nativeUpdateChannel.SelectedIndex = nativeUpdateSelection.Selected.Prerelease ? 1 : 0;
@@ -587,6 +592,9 @@ public sealed partial class MainWindow
         page.Children.Add(updateStatus); page.Children.Add(DActions(checkNativeUpdate, installUpdate,
             DButton("Перезапустить агент", RestartDesktopAgentAsync), DButton("Отменить подготовку", () => { nativeUpdateCancellation?.Cancel(); return Task.CompletedTask; })));
         page.Children.Add(updateProgress);
+        page.Children.Add(rollbackNativeUpdate);
+        page.Children.Add(nativeRemoteUpdateStatus); page.Children.Add(reviewRemoteNativeUpdate);
+        page.Children.Add(DLabel("Сервер может запросить проверку, установку из канала или возврат к предыдущей установке. Здесь вы выбираете и подтверждаете пакет; запрос сервера сам по себе не закрывает XASS. Пакеты всегда берутся из официального GitHub, не по присланной ссылке. Ручной возврат использует резервную копию последней успешной установки, а не произвольную старую версию. Профиль не откатывается; совместимость старой программы с новыми данными не гарантируется."));
         page.Children.Add(DLabel("Релиз — проверенные выпуски. Бета — предварительные версии. Выбор сохраняется отдельно от установленного пакета и применяется к ручным и автоматическим проверкам. Возврат на релиз не откатывает версию: если релиз старее, XASS дождётся подходящего выпуска. Во время проверки, загрузки и установки менять канал нельзя."));
         page.Children.Add(DLabel("Принимаются только нативные пакеты официального репозитория XASS. SHA-256 и резервная копия проверяются перед установкой; при неудачном запуске выполняется откат. Выбор канала не изменяет старый Python-клиент и его автообновления."));
         page.Children.Add(new Expander { Header = "Служебный агент и история установки", Content = nativeAgentUpdateStatus, HorizontalAlignment = HorizontalAlignment.Stretch });
@@ -597,6 +605,8 @@ public sealed partial class MainWindow
         bool idle = !closed && !nativeUpdateSelection.IsBusy && !nativeUpdateRunning && !nativeChannelChoiceInProgress;
         nativeUpdateChannel.IsEnabled = idle && NativeRuntimeMode.AllowUpdates;
         checkNativeUpdate.IsEnabled = idle && NativeRuntimeMode.AllowUpdates;
+        rollbackNativeUpdate.IsEnabled = idle && NativeRuntimeMode.AllowUpdates;
+        reviewRemoteNativeUpdate.IsEnabled = idle && NativeRuntimeMode.AllowUpdates && remoteNativeRequestId > 0;
         installUpdate.IsEnabled = idle && NativeRuntimeMode.AllowUpdates && availableNativeUpdate is { } available
             && available.Distribution == nativeUpdateSelection.Selected.Distribution;
         nativeInstalledStatus.Text = $"Установлено: XASS {InstalledNativeVersion()} · {installedNativeChannel.DisplayName}\nРевизия: {InstalledNativeRevision()}";
@@ -644,6 +654,7 @@ public sealed partial class MainWindow
         string nativeResult = "Ещё нет";
         try { nativeResult = await File.ReadAllTextAsync(Path.Combine(NativeUpdateCoordinator.UpdatesRoot, "last-result.json")); } catch (IOException) { }
         nativeAgentUpdateStatus.Text = $"Служебный агент: {DValue(result, "version")} · {DValue(result, "distribution")}\nАвтообновление агента: {DValue(result, "auto_update")}\nПоследний результат агента: {DValue(result, "result")}\nСостояние: {DValue(result, "state")}\nНативное обновление: {nativeResult}";
+        await PollRemoteNativeUpdateAsync();
         RefreshNativeUpdateControls();
     }
     private string InstalledNativeRevision()

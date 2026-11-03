@@ -15,8 +15,11 @@ public sealed partial class MainWindow
     private readonly Grid musicWorkspace = new() { ColumnSpacing = 28, RowSpacing = 16 };
     private readonly Grid musicHero = new() { ColumnSpacing = 16, RowSpacing = 16 };
     private readonly Grid musicTransport = new() { RowSpacing = 2 };
-    private readonly Border musicArtFrame = new() { CornerRadius = new CornerRadius(20), HorizontalAlignment = HorizontalAlignment.Center };
-    private readonly TextBlock musicArtist = new() { FontSize = 17, TextWrapping = TextWrapping.Wrap, Opacity = 0.75 };
+    private readonly Border musicTransportCard = new() { Background = new SolidColorBrush(ToColor(0x202127)), BorderBrush = new SolidColorBrush(ToColor(0x3A3B44)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(18), Padding = new Thickness(16,12,16,12), Child = musicTransport };
+    private readonly Border musicArtFrame = new() { CornerRadius = new CornerRadius(22), HorizontalAlignment = HorizontalAlignment.Center, BorderThickness = new Thickness(1) };
+    private readonly TextBlock musicArtist = new() { FontSize = 18, TextWrapping = TextWrapping.Wrap, Opacity = 0.78 };
+    private readonly TextBlock musicKicker = new() { Text = "NOW PLAYING", FontSize = 11, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, CharacterSpacing = 160 };
+    private readonly TextBlock musicCollectionLabel = new() { Text = "YOUR SOUNDTRACK", FontSize = 11, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, CharacterSpacing = 150, Opacity = 0.62 };
     private readonly TextBlock musicElapsed = new() { Text = "0:00", FontSize = 12, Opacity = 0.7 };
     private readonly TextBlock musicDuration = new() { Text = "0:00", FontSize = 12, Opacity = 0.7, HorizontalAlignment = HorizontalAlignment.Right };
     private readonly TextBlock musicQueueEmpty = new() { Text = "Очередь пуста. Добавьте аудиофайлы или выберите библиотеку сервера.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(12,24,12,0) };
@@ -36,6 +39,8 @@ public sealed partial class MainWindow
     private bool musicLyricRevealPending;
     private StackPanel musicLabels = null!;
     private Border musicDetails = null!;
+    private Grid? musicHeaderGrid;
+    private TextBlock? musicBrandTitle, musicBrandSubtitle;
 
     private Button MusicIcon(string glyph, string label, string id, RoutedEventHandler click, bool primary = false)
     {
@@ -56,44 +61,58 @@ public sealed partial class MainWindow
         MusicPage.Children.Clear(); MusicPage.RowDefinitions.Clear();
         MusicPage.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         MusicPage.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        var background = new Border { Background = musicBackdrop, CornerRadius = new CornerRadius(24) };
+        var background = new Border { Background = musicBackdrop, CornerRadius = new CornerRadius(28), BorderBrush = new SolidColorBrush(ToColor(0x3A3B44)), BorderThickness = new Thickness(1) };
         Grid.SetRowSpan(background, 2); MusicPage.Children.Add(background);
-        var header = new Controls.FlowPanel { Margin = new Thickness(20,16,20,0), VerticalSpacing = 8 };
-        var title = DLabel("МУЗЫКА", 13); title.CharacterSpacing = 160; title.VerticalAlignment = VerticalAlignment.Center; title.Margin = new Thickness(0,0,16,0);
-        header.Children.Add(title);
-        musicOpen = MusicButton("Открыть файлы", PickDesktopMusic); AutomationProperties.SetAutomationId(musicOpen, "MusicOpenFiles");
+        var headerGrid = new Grid { Margin = new Thickness(28,22,28,0), ColumnSpacing = 18, RequestedTheme = ElementTheme.Dark };
+        musicHeaderGrid = headerGrid;
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var masthead = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
+        var title = DLabel("XASS  /  MUSIC", 13); title.CharacterSpacing = 180; title.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
+        title.Foreground = new SolidColorBrush(ToColor(0xFFE9E7EC)); masthead.Children.Add(title); musicBrandTitle = title;
+        var subtitle = new TextBlock { Text = "Музыка, которая звучит по-вашему", FontSize = 12, Foreground = new SolidColorBrush(ToColor(0xFFAAA8B0)) };
+        musicBrandSubtitle = subtitle; masthead.Children.Add(subtitle); headerGrid.Children.Add(masthead);
+        var header = new Controls.FlowPanel { VerticalSpacing = 8, HorizontalSpacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        musicOpen = MusicButton("＋  Открыть файлы", PickDesktopMusic); AutomationProperties.SetAutomationId(musicOpen, "MusicOpenFiles");
         header.Children.Add(musicOpen);
-        header.Children.Add(MusicButton("Библиотека", (_, _) => musicSections.SelectedIndex = 0));
+        header.Children.Add(MusicButton("К очереди", (_, _) => musicSections.SelectedIndex = 0));
         var discord = MusicButton("Discord", (_, _) => { }); AutomationProperties.SetAutomationId(discord, "MusicDiscordSettings");
         discord.Flyout = new Flyout { Content = BuildDiscordPresenceControl(), Placement = FlyoutPlacementMode.BottomEdgeAlignedLeft };
-        header.Children.Add(discord); MusicPage.Children.Add(header);
+        header.Children.Add(discord); Grid.SetColumn(header,1); headerGrid.Children.Add(header); MusicPage.Children.Add(headerGrid);
 
-        musicWorkspace.Margin = new Thickness(20,12,20,20); Grid.SetRow(musicWorkspace,1); MusicPage.Children.Add(musicWorkspace);
+        musicWorkspace.Margin = new Thickness(28,22,28,26); musicWorkspace.RequestedTheme = ElementTheme.Dark;
+        Grid.SetRow(musicWorkspace,1); MusicPage.Children.Add(musicWorkspace);
         for (int i=0;i<3;i++) musicWorkspace.RowDefinitions.Add(new RowDefinition());
         for (int i=0;i<2;i++) musicWorkspace.ColumnDefinitions.Add(new ColumnDefinition());
         for (int i=0;i<2;i++) { musicHero.RowDefinitions.Add(new RowDefinition()); musicHero.ColumnDefinitions.Add(new ColumnDefinition()); }
         var art = new Grid();
-        art.Children.Add(new Border { Background = new SolidColorBrush(Microsoft.UI.Colors.Gray), Opacity = 0.13, CornerRadius = new CornerRadius(20) });
+        art.Children.Add(new Border { Background = new SolidColorBrush(ToColor(0xFF26242B)), CornerRadius = new CornerRadius(22) });
         var emptyArt = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Spacing = 12 };
-        emptyArt.Children.Add(new FontIcon { Glyph = "\uE8D6", FontSize = 54 });
-        emptyArt.Children.Add(new TextBlock { Text = "XASS", CharacterSpacing = 180, FontSize = 12, HorizontalAlignment = HorizontalAlignment.Center, Opacity = 0.55 });
-        art.Children.Add(emptyArt); art.Children.Add(musicCover); musicArtFrame.Child = art; musicHero.Children.Add(musicArtFrame);
+        emptyArt.Children.Add(new FontIcon { Glyph = "\uE8D6", FontSize = 54, Foreground = new SolidColorBrush(ToColor(0xFFE9E7EC)) });
+        emptyArt.Children.Add(new TextBlock { Text = "XASS", CharacterSpacing = 210, FontSize = 12, HorizontalAlignment = HorizontalAlignment.Center, Opacity = 0.65, Foreground = new SolidColorBrush(ToColor(0xFFE9E7EC)) });
+        art.Children.Add(emptyArt); art.Children.Add(musicCover); musicArtFrame.BorderBrush = new SolidColorBrush(ToColor(0x464750)); musicArtFrame.Child = art; musicHero.Children.Add(musicArtFrame);
         AutomationProperties.SetName(musicArtFrame, "Обложка текущего трека");
         AutomationProperties.SetAutomationId(musicTitle,"MusicTitle");
         AutomationProperties.SetAutomationId(musicStatus,"MusicStatus");
         AutomationProperties.SetAutomationId(musicElapsed,"MusicElapsed");
         AutomationProperties.SetAutomationId(musicDuration,"MusicDuration");
-        musicTitle.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold; musicTitle.MaxLines = 3;
-        musicLabels = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-        musicLabels.Children.Add(musicTitle); musicLabels.Children.Add(musicArtist);
-        var status = new Controls.FlowPanel(); status.Children.Add(musicLoading); status.Children.Add(musicStatus);
-        musicStatus.FontSize = 12; musicStatus.Opacity = 0.7; musicLabels.Children.Add(status); musicLabels.Children.Add(musicError);
+        musicTitle.FontWeight = Microsoft.UI.Text.FontWeights.Bold; musicTitle.MaxLines = 3;
+        musicTitle.Foreground = new SolidColorBrush(ToColor(0xFFF8F7FA));
+        musicArtist.Foreground = new SolidColorBrush(ToColor(0xFFD0CDD5));
+        musicKicker.Foreground = new SolidColorBrush(ToColor(0xFFB7A7E8));
+        musicStatus.Foreground = new SolidColorBrush(ToColor(0xFFCAC7D0));
+        musicError.Foreground = new SolidColorBrush(ToColor(0xFFFFA69E));
+        musicLabels = new StackPanel { Spacing = 9, VerticalAlignment = VerticalAlignment.Center };
+        musicLabels.Children.Add(musicKicker); musicLabels.Children.Add(musicTitle); musicLabels.Children.Add(musicArtist);
+        var status = new Controls.FlowPanel { VerticalSpacing = 6, HorizontalSpacing = 7 }; status.Children.Add(musicLoading); status.Children.Add(musicStatus);
+        musicStatus.FontSize = 12; musicLabels.Children.Add(status); musicLabels.Children.Add(musicError);
         musicHero.Children.Add(musicLabels); musicWorkspace.Children.Add(musicHero);
         AutomationProperties.SetLiveSetting(musicError, Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite);
-        BuildMusicTransport(); musicWorkspace.Children.Add(musicTransport);
+        BuildMusicTransport(); musicWorkspace.Children.Add(musicTransportCard);
         BuildMusicSections();
-        musicDetails = new Border { Style = (Style)Application.Current.Resources["XassCard"], Padding = new Thickness(16,4,16,12), Child = musicSections };
+        musicDetails = new Border { Background = new SolidColorBrush(ToColor(0xE51F2027)), BorderBrush = new SolidColorBrush(ToColor(0x3A3B44)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(22), Padding = new Thickness(18,10,18,16), Child = musicSections };
         musicWorkspace.Children.Add(musicDetails);
+        musicCollectionLabel.Foreground = new SolidColorBrush(ToColor(0xFFC8C4CE));
         musicWorkspace.SizeChanged += (_, e) => UpdateMusicLayout(e.NewSize);
         musicTransport.SizeChanged += (_, _) => UpdateMusicLayout(new Size(musicWorkspace.ActualWidth, musicWorkspace.ActualHeight));
         RootGrid.ActualThemeChanged += (_, _) => UpdateMusicBackdrop();
@@ -102,10 +121,11 @@ public sealed partial class MainWindow
 
     private void BuildMusicTransport()
     {
-        foreach(var height in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto }) musicTransport.RowDefinitions.Add(new RowDefinition { Height = height });
-        musicSeek.Margin = new Thickness(0); AutomationProperties.SetAutomationId(musicSeek, "MusicSeek");
+        foreach(var height in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, GridLength.Auto }) musicTransport.RowDefinitions.Add(new RowDefinition { Height = height });
+        musicTransport.Children.Add(musicCollectionLabel);
+        musicSeek.Margin = new Thickness(0); Grid.SetRow(musicSeek,1); AutomationProperties.SetAutomationId(musicSeek, "MusicSeek");
         AutomationProperties.SetName(musicSeek, "Позиция трека в секундах"); musicTransport.Children.Add(musicSeek);
-        var clocks = new Grid(); clocks.Children.Add(musicElapsed); clocks.Children.Add(musicDuration); Grid.SetRow(clocks,1); musicTransport.Children.Add(clocks);
+        var clocks = new Grid(); clocks.Children.Add(musicElapsed); clocks.Children.Add(musicDuration); Grid.SetRow(clocks,2); musicTransport.Children.Add(clocks);
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0,4,0,0) };
         musicPrevious = MusicIcon("\uE892", "Предыдущий трек", "MusicPrevious", async (_, _) => await MusicActionAsync(new { action = "previous" }));
         musicNext = MusicIcon("\uE893", "Следующий трек", "MusicNext", async (_, _) => await MusicActionAsync(new { action = "next" }));
@@ -118,7 +138,7 @@ public sealed partial class MainWindow
         musicVolume.Width = 230; AutomationProperties.SetAutomationId(musicVolume,"MusicVolume");
         volume.Flyout = new Flyout { Content = DStack(musicVolume, MusicButton("Применить громкость", async (_, _) => { await CommitMusicVolumeAsync(); volume.Flyout?.Hide(); })) };
         foreach(var control in new UIElement[] { musicPrevious, primary, musicNext, musicStop, volume }) buttons.Children.Add(control);
-        Grid.SetRow(buttons,2); musicTransport.Children.Add(buttons);
+        Grid.SetRow(buttons,3); musicTransport.Children.Add(buttons);
         musicSeek.ValueChanged += (_, _) => { if (!musicUpdating) musicSeekDirty = true; };
         musicVolume.ValueChanged += (_, _) => { if (!musicUpdating) musicVolumeDirty = true; };
         musicSeek.KeyUp += async (_, e) => { if (IsMusicSliderKey(e.Key)) await CommitMusicSeekAsync(); };
@@ -210,7 +230,7 @@ public sealed partial class MainWindow
         musicWorkspace.RowDefinitions[0].Height = musicWide ? new GridLength(1,GridUnitType.Star) : GridLength.Auto;
         musicWorkspace.RowDefinitions[1].Height = musicWide ? GridLength.Auto : new GridLength(1,GridUnitType.Star);
         musicWorkspace.RowDefinitions[2].Height = musicWide ? new GridLength(0) : GridLength.Auto;
-        Grid.SetRow(musicTransport,musicWide ? 1 : 2); Grid.SetColumn(musicDetails,musicWide ? 1 : 0); Grid.SetRow(musicDetails,musicWide ? 0 : 1); Grid.SetRowSpan(musicDetails,musicWide ? 2 : 1);
+        Grid.SetRow(musicTransportCard,musicWide ? 1 : 2); Grid.SetColumn(musicDetails,musicWide ? 1 : 0); Grid.SetRow(musicDetails,musicWide ? 0 : 1); Grid.SetRowSpan(musicDetails,musicWide ? 2 : 1);
         musicHero.ColumnDefinitions[0].Width = musicWide ? new GridLength(1,GridUnitType.Star) : GridLength.Auto;
         musicHero.ColumnDefinitions[1].Width = musicWide ? new GridLength(0) : new GridLength(1,GridUnitType.Star);
         musicHero.RowDefinitions[0].Height = musicWide ? new GridLength(1,GridUnitType.Star) : GridLength.Auto;
@@ -219,25 +239,60 @@ public sealed partial class MainWindow
         double art = musicWide ? Math.Clamp(Math.Min(size.Width*.43, size.Height - Math.Max(110,musicTransport.ActualHeight) - 130),150,420) : size.Height < 430 ? 72 : 100;
         musicArtFrame.Width = musicArtFrame.Height = art; musicCover.Width = musicCover.Height = art;
         musicArtFrame.VerticalAlignment = musicWide ? VerticalAlignment.Center : VerticalAlignment.Top;
-        musicTitle.FontSize = musicWide ? 28 : 21; musicTitle.MaxLines = musicWide ? 3 : 2;
-        musicArtist.FontSize = musicWide ? 17 : 14; musicArtist.MaxLines = 2;
+        musicTitle.FontSize = musicWide ? 38 : 25; musicTitle.MaxLines = musicWide ? 3 : 2;
+        musicArtist.FontSize = musicWide ? 19 : 15; musicArtist.MaxLines = 2;
+        musicLabels.Spacing = musicWide ? 11 : 6;
+        musicArtFrame.Margin = new Thickness(0,0,0,6);
     }
     private void UpdateMusicBackdrop()
     {
-        bool dark = RootGrid.ActualTheme == ElementTheme.Dark;
-        uint surface = dark ? 0x16191Fu : 0xFAFAFCu;
+        uint surface = 0x17181Du;
+        bool highContrast = appearanceAccessibility.HighContrast;
+        musicWorkspace.RequestedTheme = highContrast ? ElementTheme.Default : ElementTheme.Dark;
+        if (musicHeaderGrid is not null) musicHeaderGrid.RequestedTheme = highContrast ? ElementTheme.Default : ElementTheme.Dark;
+        if (highContrast)
+        {
+            var text = appearanceUi.UIElementColor(Windows.UI.ViewManagement.UIElementType.WindowText);
+            if (musicBrandTitle is not null) musicBrandTitle.Foreground = new SolidColorBrush(text);
+            if (musicBrandSubtitle is not null) musicBrandSubtitle.Foreground = new SolidColorBrush(text);
+            musicTitle.Foreground = musicArtist.Foreground = musicStatus.Foreground = musicError.Foreground = new SolidColorBrush(text);
+            musicKicker.Foreground = musicCollectionLabel.Foreground = new SolidColorBrush(appearanceUi.UIElementColor(Windows.UI.ViewManagement.UIElementType.Highlight));
+        }
+        else
+        {
+            if (musicBrandTitle is not null) musicBrandTitle.Foreground = new SolidColorBrush(ToColor(0xFFE9E7EC));
+            if (musicBrandSubtitle is not null) musicBrandSubtitle.Foreground = new SolidColorBrush(ToColor(0xFFAAA8B0));
+            musicTitle.Foreground = new SolidColorBrush(ToColor(0xFFF8F7FA));
+            musicArtist.Foreground = new SolidColorBrush(ToColor(0xFFD0CDD5));
+            musicKicker.Foreground = new SolidColorBrush(ToColor(0xFFB7A7E8));
+            musicStatus.Foreground = new SolidColorBrush(ToColor(0xFFCAC7D0));
+            musicError.Foreground = new SolidColorBrush(ToColor(0xFFFFA69E));
+            musicCollectionLabel.Foreground = new SolidColorBrush(ToColor(0xFFC8C4CE));
+        }
         uint fallback = ResolveAppearanceAccent();
         var palette = coverPalette ?? new CoverPalette(fallback, fallback);
         musicBackdrop.GradientStops.Clear();
-        if (appearanceAccessibility.HighContrast)
+        if (highContrast)
         {
             var background = appearanceUi.UIElementColor(Windows.UI.ViewManagement.UIElementType.Window);
+            var outline = appearanceUi.UIElementColor(Windows.UI.ViewManagement.UIElementType.Highlight);
             musicBackdrop.GradientStops.Add(new GradientStop { Offset = 0, Color = background });
             musicBackdrop.GradientStops.Add(new GradientStop { Offset = 1, Color = background });
+            if (musicDetails is not null) { musicDetails.Background = new SolidColorBrush(background); musicDetails.BorderBrush = new SolidColorBrush(outline); }
+            musicTransportCard.Background = new SolidColorBrush(background); musicTransportCard.BorderBrush = new SolidColorBrush(outline);
+            musicArtFrame.BorderBrush = new SolidColorBrush(outline);
             return;
         }
+        if (musicDetails is not null)
+        {
+            musicDetails.Background = new SolidColorBrush(ToColor(0xE51F2027));
+            musicDetails.BorderBrush = new SolidColorBrush(ToColor(0x3A3B44));
+        }
+        musicTransportCard.Background = new SolidColorBrush(ToColor(0x202127));
+        musicTransportCard.BorderBrush = new SolidColorBrush(ToColor(0x3A3B44));
+        musicArtFrame.BorderBrush = new SolidColorBrush(ToColor(0x464750));
         // Keep small secondary text readable even with an all-white cover.
-        musicBackdrop.GradientStops.Add(new GradientStop { Offset = 0, Color = ToColor(CoverPalette.Blend(palette.Primary,surface,dark ? .20 : .13)) });
-        musicBackdrop.GradientStops.Add(new GradientStop { Offset = 1, Color = ToColor(CoverPalette.Blend(palette.Secondary,surface,dark ? .12 : .06)) });
+        musicBackdrop.GradientStops.Add(new GradientStop { Offset = 0, Color = ToColor(CoverPalette.Blend(palette.Primary,surface,.16)) });
+        musicBackdrop.GradientStops.Add(new GradientStop { Offset = 1, Color = ToColor(CoverPalette.Blend(palette.Secondary,surface,.11)) });
     }
 }
