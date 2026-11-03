@@ -30,7 +30,7 @@ SCHEMAS = {
     "desktop_files": {"root", "path"}, "desktop_archive": set(),
     "desktop_archive_rows": set(), "desktop_archive_detail": {"id"},
     "desktop_archive_probe": {"path"}, "desktop_diagnostics": set(),
-    "desktop_updates": set(), "desktop_check_update": set(), "desktop_transcription": set(),
+    "desktop_updates": set(), "desktop_update_requests": set(), "desktop_ack_update_request": {"id"}, "desktop_check_update": set(), "desktop_transcription": set(),
     "desktop_clipboard": set(), "desktop_screenshot": set(), "desktop_lock": {"confirmed"},
     "desktop_curation_start": {"folder"}, "desktop_curation_inspect": {"id"},
     "desktop_curation_candidates": {"id"}, "desktop_curation_propose": {"id", "changes", "artwork_path", "digest"},
@@ -348,6 +348,13 @@ class DesktopService:
                     if k in {"stage", "state", "phase", "percent", "progress", "error", "message", "detail", "updated_at"}}
         if action == "desktop_updates":
             return self.updates()
+        if action == "desktop_update_requests":
+            from native_update_request import pending
+            return {"requests": pending(self.data)}
+        if action == "desktop_ack_update_request":
+            from native_update_request import acknowledge
+            acknowledge(self.data, request.get("id"))
+            return {"acknowledged": True}
         if action == "desktop_check_update":
             return self.check_update()
         if action == "desktop_diagnostics":
@@ -424,7 +431,16 @@ class DesktopService:
         state = read_json(self.data / ".updates" / ".in-progress")
         result = read_json(self.data / ".updates" / ".last-result.json")
         allowed = {"phase", "version", "revision", "message", "progress", "downloaded", "total", "updated_at", "ok", "finished_at"}
+        from native_updater import rollback_candidate
+        updates_root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "XASS.Native" / "updates"
+        # The source is the frozen helper's runtime subdirectory in installed builds.
+        install = self.source.parent if self.source.name.lower() in {"runtime", "pc_client"} else self.source
+        try:
+            rollback = rollback_candidate(updates_root, install)
+        except (ValueError, OSError, KeyError, TypeError):
+            rollback = None
         return {"version": current_version(), "revision": current_revision(), "distribution": self.native_distribution(),
+                "rollback": rollback,
                 "state": {k: redact(v) if isinstance(v, str) else v for k, v in state.items() if k in allowed},
                 "result": {k: redact(v) if isinstance(v, str) else v for k, v in result.items() if k in allowed},
                 "auto_update": self.settings()["auto_update"]}

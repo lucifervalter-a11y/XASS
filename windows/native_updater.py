@@ -12,7 +12,7 @@ import json
 import math
 import contextlib
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -85,12 +85,68 @@ def copy_tree_verified(source: Path, destination: Path) -> dict:
 
 def verify_tree(root: Path, inventory: dict):
     for relative, record in inventory.items():
+        if (not isinstance(relative, str) or not relative or "\\" in relative or ":" in relative
+                or "\x00" in relative or any(p in {"", ".", ".."} for p in relative.split("/"))):
+            raise ValueError("Unsafe backup entry")
         part = Path(relative)
-        if part.is_absolute() or ".." in part.parts: raise ValueError("Unsafe backup entry")
+        if part.is_absolute() or PureWindowsPath(relative).is_absolute() or ".." in part.parts:
+            raise ValueError("Unsafe backup entry")
+        if (not isinstance(record, dict) or set(record) != {"size", "sha256"} or type(record["size"]) is not int or record["size"] < 0
+                or not isinstance(record["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", record["sha256"])):
+            raise ValueError("Invalid backup record")
         path = root / part
         if not path.resolve().is_relative_to(root.resolve()): raise ValueError("Unsafe backup path")
         if not path.is_file() or path.is_symlink() or path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
             raise ValueError("Backup integrity check failed")
+
+
+def rollback_candidate(root: Path, install: Path, *, verify: bool = False) -> dict | None:
+    """Only the last *successful* transaction can be explicitly undone.
+
+    Preview reads small manifests. The helper rechecks all bytes before preparing
+    shutdown, and again immediately before the atomic replacement. No profile
+    database, key or preference is ever restored to an older schema.
+    """
+    if not (root / "last-result.json").is_file(): return None
+    state = object_file(root / "last-result.json", 16384)
+    job_id = state.get("job_id")
+    if state.get("phase") != "completed" or not isinstance(job_id, str) or not re.fullmatch(r"job-[a-f0-9]{32}", job_id):
+        return None
+    job = root / job_id
+    if job.is_symlink() or getattr(job.lstat(), "st_file_attributes", 0) & 0x400:
+        raise ValueError("Unsafe rollback job")
+    request = object_file(job / "request.json", 16384)
+    current = object_file(install / "native-install.json", 16384)
+    if (Path(request.get("install_root", "")).resolve() != install.resolve()
+            or request.get("revision") != current.get("revision")
+            or current.get("app_id") != APP_ID):
+        return None
+    backup = job / "backup"
+    if backup.is_symlink() or getattr(backup.lstat(), "st_file_attributes", 0) & 0x400:
+        raise ValueError("Unsafe rollback snapshot")
+    target = object_file(backup / "native-install.json", 16384)
+    manifest_path = job / "backup-manifest.json"
+    manifest = object_file(manifest_path, 16 * 1024 * 1024)
+    if (manifest.get("schema") != 1 or not isinstance(manifest.get("files"), dict) or not manifest["files"]
+            or manifest.get("revision") != target.get("revision") or target.get("app_id") != APP_ID
+            or target.get("distribution") not in {"native", "native-test"}
+            or not re.fullmatch(r"[a-f0-9]{40}", str(target.get("revision") or ""))):
+        raise ValueError("Invalid rollback snapshot identity")
+    numeric_version(target.get("version"))
+    if current.get("revision") == target["revision"] and current.get("distribution") == target["distribution"]:
+        return None
+    if verify:
+        inventory = manifest["files"]
+        if {p.relative_to(backup).as_posix() for p in files(backup)} != set(inventory):
+            raise ValueError("Rollback snapshot contains unexpected files")
+        verify_tree(backup, inventory)
+        payload = object_file(backup / "payload-manifest.json", 16 * 1024 * 1024)
+        if payload.get("revision") != target["revision"] or not isinstance(payload.get("files"), list):
+            raise ValueError("Invalid rollback payload")
+        verify_tree(backup, {r["path"]: {"size": r["bytes"], "sha256": r["sha256"]} for r in payload["files"]})
+    return {"source_job": job_id, "revision": target["revision"], "version": target["version"],
+            "distribution": target["distribution"], "sha256": digest(manifest_path),
+            "current_revision": current["revision"], "current_distribution": current["distribution"]}
 
 
 class NativeUpdater:
@@ -350,6 +406,95 @@ class NativeUpdater:
             return 1
 
 
+class NativeRollback(NativeUpdater):
+    """Manual, local-snapshot rollback with a new safety backup of the current app."""
+    def __init__(self, request_path: Path, *, popen=subprocess.Popen, run=subprocess.run, sleep=time.sleep, clock=time.monotonic):
+        self.request_path = request_path.resolve(strict=True); self.job = self.request_path.parent
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "XASS.Native" / "updates"
+        if (self.job.parent.resolve() != root.resolve() or not re.fullmatch(r"job-[a-f0-9]{32}", self.job.name)
+                or self.job.is_symlink() or getattr(self.job.lstat(), "st_file_attributes", 0) & 0x400):
+            raise ValueError("Untrusted rollback job")
+        r = self.request = object_file(self.request_path, 16384)
+        keys = {"schema", "job_id", "install_root", "source_job", "sha256", "version", "revision", "parent_pid",
+                "parent_created", "automatic", "release_distribution", "current_revision", "current_distribution"}
+        if (set(r) != keys or type(r["schema"]) is not int or r["schema"] != 3 or r["automatic"] is not False
+                or r["job_id"] != self.job.name or type(r["parent_pid"]) is not int or r["parent_pid"] <= 0
+                or type(r["parent_created"]) not in (int, float) or not math.isfinite(r["parent_created"]) or r["parent_created"] <= 0):
+            raise ValueError("Rollback requires a bounded manual request")
+        raw_install = Path(r["install_root"])
+        if not raw_install.is_absolute(): raise ValueError("Absolute installation required")
+        if raw_install.is_symlink() or getattr(raw_install.lstat(), "st_file_attributes", 0) & 0x400:
+            raise ValueError("Unsafe installation")
+        self.install = raw_install.resolve(strict=True)
+        for protected in (root.parent, root.parent.parent / "XASS"):
+            protected = protected.resolve()
+            if self.install.is_relative_to(protected) or protected.is_relative_to(self.install):
+                raise ValueError("Installation overlaps durable data or updates")
+        candidate = rollback_candidate(root, self.install, verify=True)
+        if candidate is None or any(r[k] != v for k, v in candidate.items() if k != "distribution") or r["release_distribution"] != candidate["distribution"]:
+            raise ValueError("Rollback target changed; review it again")
+        self.previous = object_file(self.install / "native-install.json", 16384)
+        self.release_distribution = candidate["distribution"]
+        self.source_job = root / candidate["source_job"]
+        self.source_manifest_sha256 = candidate["sha256"]
+        self.source_inventory = object_file(self.source_job / "backup-manifest.json", 16 * 1024 * 1024)["files"]
+        self.target_registry = object_file(self.source_job / "uninstall-registration.json", 16384)
+        self.backup = self.job / "backup"; self.inventory = {}; self.registry = {}
+        self.popen, self.run, self.sleep, self.clock = popen, run, sleep, clock
+        self.installer_shutdown_confirmed = True; self.applied = False
+
+    def prepare(self):
+        required = sum(p.stat().st_size for p in files(self.install)) + sum(r["size"] for r in self.source_inventory.values())
+        if shutil.disk_usage(self.job).free < required + 256 * 1024**2:
+            raise OSError("Insufficient space for rollback and the current-version safety copy")
+        super().prepare()
+
+    def install_release(self):
+        self.check_cancel()
+        if digest(self.source_job / "backup-manifest.json") != self.source_manifest_sha256:
+            raise ValueError("Rollback snapshot changed")
+        source = self.source_job / "backup"
+        verify_tree(source, self.source_inventory)
+        self.state("installing", "Восстановление выбранной предыдущей версии программы; профиль не изменяется")
+        restored = self.install.with_name(self.install.name + ".restore-" + uuid.uuid4().hex)
+        inventory = copy_tree_verified(source, restored)
+        if inventory != self.source_inventory: raise ValueError("Rollback snapshot copy mismatch")
+        self.check_cancel()
+        self.stop_install_processes()
+        quarantine = self.install.with_name(self.install.name + ".before-rollback-" + uuid.uuid4().hex)
+        self.install.rename(quarantine)
+        self.applied = True
+        try: restored.rename(self.install)
+        except Exception:
+            quarantine.rename(self.install)
+            raise
+        write_json(self.job / "quarantine.json", {"path": str(quarantine), "reason": "manual-native-rollback", "original_data_retained": True})
+        current_registration = self.registry
+        try:
+            self.registry = self.target_registry; self.restore_uninstall_registration()
+        finally: self.registry = current_registration
+
+    def execute(self):
+        try:
+            self.prepare(); self.wait_for_parent(); self.install_release()
+            self.state("health-check", "Проверка восстановленной версии")
+            self.verify_installed(self.request["revision"], distribution=self.release_distribution)
+            self.state("completed", "Предыдущая версия восстановлена и проверена. Пользовательский профиль сохранён", ok=True, operation="rollback")
+            return 0
+        except InterruptedError:
+            self.state("cancelled", "Откат отменён до замены программы", ok=False); return 2
+        except Exception:
+            if self.applied:
+                try:
+                    self.restore()
+                    self.state("rolled-back", "Выбранная версия не запустилась. Восстановлена версия до ручного отката", ok=False, rollback_ok=True)
+                    return 3
+                except Exception:
+                    self.state("rollback-failed", "Откат не завершён. Обе резервные копии сохранены; требуется ручное восстановление", ok=False, rollback_ok=False)
+                    return 4
+            self.state("failed", "Откат не начался. Текущая версия и данные сохранены", ok=False); return 1
+
+
 @contextlib.contextmanager
 def update_lock(path: Path):
     with path.open("a+b") as handle:
@@ -376,7 +521,8 @@ def main():
     parser = argparse.ArgumentParser(); parser.add_argument("--request", type=Path, required=True); args = parser.parse_args()
     if os.name != "nt": raise SystemExit("Native installation requires Windows")
     try:
-        updater = NativeUpdater(args.request)
+        schema = object_file(args.request, 16384).get("schema")
+        updater = (NativeRollback if schema == 3 else NativeUpdater)(args.request)
         # This role must execute from a copied helper outside its install root.
         if Path(sys.executable).resolve().is_relative_to(updater.install): raise ValueError("Updater still inside installation")
         with update_lock(updater.job.parent / ".native-update.lock"):

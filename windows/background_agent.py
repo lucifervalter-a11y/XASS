@@ -296,6 +296,34 @@ class DesktopHost:
         self.stop()
 
 
+def configure_native_update_commands(agent, data: Path):
+    """Map server intent to native UI review, never to the legacy installer."""
+    from native_update_request import enqueue, normalize_request
+    original_dispatch = agent._dispatch_agent_command
+    def native_dispatch(job, client, **kwargs):
+        command = str(job.get("command") or "")
+        if job.get("kind") != "auto" and command in {"native_update", "update", "check_update"}:
+            command_id = int(job["id"])
+            try:
+                payload = (normalize_request(job.get("payload")) if command == "native_update" else
+                           {"operation": "check" if command == "check_update" else "install", "channel": "selected"})
+                details = enqueue(data, command_id, payload)
+                agent.store_command_result(command_id, True,
+                    "Запрос передан нативному XASS. Откройте «Обновления» на ПК; установка ещё не выполнена.", details)
+            except (ValueError, OSError):
+                agent.store_command_result(command_id, False, "Запрос обновления не принят. Проверьте канал и ожидающие запросы на ПК.")
+            return None
+        return original_dispatch(job, client, **kwargs)
+    agent._dispatch_agent_command = native_dispatch
+    original_payload = agent.build_payload
+    def native_payload(config):
+        payload = original_payload(config)
+        payload["native_update_capabilities"] = {"schema": 1, "channels": ["native", "native-test"],
+            "operations": ["check", "install", "rollback"], "requires_pc_confirmation": True}
+        return payload
+    agent.build_payload = native_payload
+
+
 def agent_child(source: Path, data: Path):
     bind_runtime(source, data)
     import client_agent
@@ -314,6 +342,7 @@ def agent_child(source: Path, data: Path):
             raise RuntimeError("Use the native test updater for this installation")
         client_agent._apply_update = reject_legacy
         client_agent._apply_installer_update = reject_legacy
+        configure_native_update_commands(client_agent, data)
         revision = str(read_json(source / "build-info.json").get("revision") or "development")
         original_status = client_agent.write_agent_status
         def native_status(state, **details):

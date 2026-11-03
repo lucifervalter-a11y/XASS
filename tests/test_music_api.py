@@ -21,6 +21,8 @@ from app.models import AgentCommand, AgentCredential, HeartbeatSource
 from app.music_api import build_router
 from app.music_models import MusicEnrichment, MusicSession, MusicTrack, MusicUpload
 from app.music_playback_models import MusicPlaybackState
+# Register queue tables before create_all, also in a fresh isolated process.
+from app.transcription_models import TranscriptionJob, TranscriptionWorker  # noqa: F401
 from app.services.music_library import CHUNK_BYTES, issue_ticket
 from app.services.music_broadcast import current_broadcast
 from test_music_library import silent_wav

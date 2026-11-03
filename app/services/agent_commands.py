@@ -18,6 +18,7 @@ DELIVERY_RETRY_AFTER = timedelta(seconds=90)
 
 ALLOWED_AGENT_COMMANDS = {
     "update",
+    "native_update",
     "check_update",
     "restart",
     "reboot",
@@ -39,7 +40,7 @@ ALLOWED_AGENT_COMMANDS = {
     "music_seek", "music_volume", "music_status", "music_storage_sync", "music_prepare", "music_start_prepared",
 }
 DANGEROUS_AGENT_COMMANDS = {
-    "lock", "sleep", "reboot", "shutdown", "restart", "update",
+    "lock", "sleep", "reboot", "shutdown", "restart", "update", "native_update",
     "cleanup_archive", "file_delete", "migration_download",
 }
 # These commands expose private workstation data or write a user-selected file.
@@ -74,6 +75,9 @@ async def enqueue_agent_command(
     normalized = (command or "").strip().lower()
     if normalized not in ALLOWED_AGENT_COMMANDS:
         raise ValueError(f"Unsupported agent command: {normalized}")
+    if normalized == "native_update":
+        from pc_client.native_update_request import normalize_request
+        payload = normalize_request(payload)
     await ensure_agent_attached(session, source_name)
     digest = _idempotency_digest(source_name, normalized, idempotency_key)
     if digest:
@@ -147,7 +151,7 @@ async def acknowledge_agent_commands(
         )
     ))
     by_id = {item.id: item for item in rows}
-    completed: list[tuple[str, str, bool, str, int]] = []
+    completed: list[tuple[str, str, bool, str, int, bool]] = []
     for command_id, result in parsed:
         item = by_id.get(command_id)
         if item is None or item.status not in {"delivered", "pending"}:
@@ -175,14 +179,15 @@ async def acknowledge_agent_commands(
                     }),
                 )
             )
-        completed.append((item.command, item.source_name, ok, item.result["message"], item.id))
+        completed.append((item.command, item.source_name, ok, item.result["message"], item.id,
+                          item.result["details"].get("requires_pc_confirmation") is True))
     await session.commit()
-    for command, device, ok, message, command_id in completed:
+    for command, device, ok, message, command_id, request_only in completed:
         if command in DANGEROUS_AGENT_COMMANDS:
             await emit_notification(
                 session,
                 event_type="dangerous_command",
-                title="Опасная команда выполнена" if ok else "Опасная команда завершилась ошибкой",
+                title=("Запрос ожидает подтверждения на ПК" if request_only else "Опасная команда выполнена") if ok else "Опасная команда завершилась ошибкой",
                 message=f"{command}: {message or ('готово' if ok else 'ошибка')}",
                 device=device,
                 priority="high" if not ok else "normal",
@@ -191,7 +196,7 @@ async def acknowledge_agent_commands(
                 dedup_key=f"command-result:{command_id}",
                 cooldown_sec=86400,
             )
-        if command == "update" and ok:
+        if command == "update" and ok and not request_only:
             await emit_notification(
                 session,
                 event_type="update_completed",

@@ -189,6 +189,20 @@ test('valid update status enables installation only when an update exists', asyn
   }
 });
 
+test('server update result distinguishes Git identity from Windows client updates', async () => {
+  const $ = elements();
+  const context = vm.createContext({$, api: async () => ({status: 200, data: {
+    ok: true, has_updates: false, errors: [], branch: 'main',
+    current: {short_hash: '28a1bd0'}, remote: {short_hash: '28a1bd0'}
+  }})});
+  vm.runInContext(pageFunction('async function loadUpdateStatus()', "\n$('checkUpdateBtn').onclick"), context);
+  await context.loadUpdateStatus();
+  assert.match($('updateResult').textContent, /Сервер: новых обновлений нет/);
+  assert.match($('updateResult').textContent, /main.*установлен 28a1bd0.*origin 28a1bd0/);
+  assert.match($('updateResult').textContent, /Windows-приложение обновляется отдельно/);
+  assert.equal($('runUpdateBtn').disabled, true);
+});
+
 test('worker activation never reloads a login or unsaved form automatically', async () => {
   for (const controlled of [false, true]) {
     const $ = elements(), messages = [], handlers = {};
