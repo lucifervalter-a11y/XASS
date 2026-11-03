@@ -13,6 +13,14 @@ class WindowsMusicVisualRefreshTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, LAYOUT)
 
+    def test_transport_child_is_attached_after_instance_initialization(self):
+        # C# CS0236 forbids a field initializer from using another instance field.
+        field = LAYOUT.split("private readonly Border musicTransportCard =", 1)[1].split(";", 1)[0]
+        self.assertNotIn("Child = musicTransport", field)
+        builder = LAYOUT.split("private void BuildMusicTransport()", 1)[1].split("private void BuildMusicSections()", 1)[0]
+        self.assertIn("musicTransportCard.Child = musicTransport;", builder)
+        self.assertLess(builder.index("musicTransportCard.Child = musicTransport;"), builder.index("musicTransport.RowDefinitions"))
+
     def test_responsive_and_high_contrast_paths_remain(self):
         self.assertIn("musicWide = size.Width >= 760", LAYOUT)
         self.assertIn("appearanceAccessibility.HighContrast", LAYOUT)

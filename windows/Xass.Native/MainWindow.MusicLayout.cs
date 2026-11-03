@@ -15,7 +15,7 @@ public sealed partial class MainWindow
     private readonly Grid musicWorkspace = new() { ColumnSpacing = 28, RowSpacing = 16 };
     private readonly Grid musicHero = new() { ColumnSpacing = 16, RowSpacing = 16 };
     private readonly Grid musicTransport = new() { RowSpacing = 2 };
-    private readonly Border musicTransportCard = new() { Background = new SolidColorBrush(ToColor(0x202127)), BorderBrush = new SolidColorBrush(ToColor(0x3A3B44)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(18), Padding = new Thickness(16,12,16,12), Child = musicTransport };
+    private readonly Border musicTransportCard = new() { Background = new SolidColorBrush(ToColor(0x202127)), BorderBrush = new SolidColorBrush(ToColor(0x3A3B44)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(18), Padding = new Thickness(16,12,16,12) };
     private readonly Border musicArtFrame = new() { CornerRadius = new CornerRadius(22), HorizontalAlignment = HorizontalAlignment.Center, BorderThickness = new Thickness(1) };
     private readonly TextBlock musicArtist = new() { FontSize = 18, TextWrapping = TextWrapping.Wrap, Opacity = 0.78 };
     private readonly TextBlock musicKicker = new() { Text = "NOW PLAYING", FontSize = 11, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, CharacterSpacing = 160 };
@@ -121,6 +121,7 @@ public sealed partial class MainWindow
 
     private void BuildMusicTransport()
     {
+        musicTransportCard.Child = musicTransport;
         foreach(var height in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, GridLength.Auto }) musicTransport.RowDefinitions.Add(new RowDefinition { Height = height });
         musicTransport.Children.Add(musicCollectionLabel);
         musicSeek.Margin = new Thickness(0); Grid.SetRow(musicSeek,1); AutomationProperties.SetAutomationId(musicSeek, "MusicSeek");
