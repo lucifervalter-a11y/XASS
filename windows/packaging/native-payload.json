@@ -23,7 +23,8 @@
     "voice_assistant.py",
     "voice_capture.py",
     "native_music_ownership.py",
-    "native_agent_identity.py"
+    "native_agent_identity.py",
+    "native_update_request.py"
   ],
   "required_native_files": [
     "Xass.Native.exe",

@@ -46,6 +46,28 @@ class AgentCommandDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(other_pc.id, [row["id"] for row in first + second])
             self.assertNotIn(scheduled.id, [row["id"] for row in first + second])
 
+    async def test_native_request_ack_is_not_reported_as_installed_update(self) -> None:
+        async with self.sessions() as session:
+            item = await enqueue_agent_command(session, source_name="PC", command="update", payload={}, actor_user_id=42)
+            with patch("app.services.agent_commands.emit_notification", new_callable=AsyncMock) as notify:
+                await acknowledge_agent_commands(session, source_name="PC", results=[{
+                    "id": item.id, "ok": True, "message": "Запрос ожидает проверки на ПК", "details": {"requires_pc_confirmation": True}}])
+            self.assertEqual(item.status, "completed")
+            self.assertTrue(item.result["details"]["requires_pc_confirmation"])
+            self.assertNotIn("update_completed", [call.kwargs["event_type"] for call in notify.call_args_list])
+            self.assertIn("подтверждения", notify.call_args_list[0].kwargs["title"])
+
+    async def test_native_update_payload_is_checked_before_enqueue(self) -> None:
+        async with self.sessions() as session:
+            with self.assertRaises(ValueError):
+                await enqueue_agent_command(session, source_name="PC", command="native_update",
+                                            payload={"operation": "install", "channel": "unknown"}, actor_user_id=42)
+            item = await enqueue_agent_command(session, source_name="PC", command="native_update",
+                                              payload={"operation": "install", "channel": "native-test"}, actor_user_id=42)
+            self.assertEqual(item.payload, {"operation": "install", "channel": "native-test"})
+            rows = await deliver_agent_commands(session, source_name="PC")
+            self.assertEqual(rows[0]["payload"], item.payload)
+
     async def test_repeated_immediate_update_reuses_pending_command_but_not_scheduled_update(self) -> None:
         async with self.sessions() as session:
             first = await enqueue_agent_command(session, source_name="PC", command="update", payload={}, actor_user_id=42)

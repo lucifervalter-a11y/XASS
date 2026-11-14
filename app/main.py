@@ -201,7 +201,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-APP_VERSION = "0.21.1"
+APP_VERSION = "0.21.5"
 
 settings = get_settings()
 bot_client = TelegramBotClient(settings.bot_token) if settings.bot_token else None
@@ -3075,6 +3075,12 @@ async def mini_agent_command(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
     command_name = payload.command.strip().lower()
     command_payload = payload.payload if isinstance(payload.payload, dict) else {}
+    if command_name == "native_update":
+        from pc_client.native_update_request import normalize_request
+        try:
+            command_payload = normalize_request(command_payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if command_name in {"files_list", "file_download", "file_delete"}:
         try:
             root_name, relative_path = normalize_remote_location(command_payload.get("root"), command_payload.get("path"))

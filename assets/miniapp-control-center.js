@@ -13,14 +13,14 @@
     xass_files: 'XASS Files',
   };
   const COMMAND_LABELS = {
-    ping: 'Проверка связи', check_update: 'Проверка обновления', screenshot: 'Снимок экрана',
+    native_update: 'Запрос нативного обновления', ping: 'Проверка связи', check_update: 'Проверка обновления', screenshot: 'Снимок экрана',
     sleep: 'Сон', lock: 'Блокировка экрана', restart: 'Перезапуск агента', update: 'Обновление агента',
     reboot: 'Перезагрузка ПК', shutdown: 'Выключение ПК', open_archive: 'Открытие архива',
     cleanup_archive: 'Очистка медиа', files_list: 'Открытие папки', file_download: 'Подготовка файла',
     file_delete: 'Удаление файла', clipboard_get: 'Получение буфера', clipboard_set: 'Отправка в буфер',
   };
   const DANGEROUS = new Set([
-    'lock', 'sleep', 'restart', 'update', 'reboot', 'shutdown', 'cleanup_archive', 'file_delete',
+    'lock', 'sleep', 'restart', 'update', 'native_update', 'reboot', 'shutdown', 'cleanup_archive', 'file_delete',
     'screenshot', 'file_download', 'clipboard_get',
   ]);
   const pendingCommands = new Map();
@@ -380,11 +380,20 @@
       (!item.is_online ? '<div class="cc-offline-note">ПК не в сети. Включите компьютер и агент XASS, затем обновите состояние. История команд остаётся доступной.</div>' : '') +
       '<div class="cc-action-group"><div class="cc-action-grid">' + action('lock', 'Заблокировать экран', '', 'primary') + action('screenshot', 'Сделать снимок') + action('ping', 'Проверить связь') + action('history', 'История команд') + '</div></div>' +
       '<div class="cc-action-group"><div class="cc-action-label">Система и обновления</div><div class="cc-action-grid">' + action('sleep', 'Режим сна') + action('check_update', 'Проверить обновление') + action('restart', 'Перезапустить агент') + action('update', 'Обновить агент') + '</div></div>' +
+      nativeUpdateHtml(item) +
       '<div class="cc-action-group"><div class="cc-action-label">Архив</div><div class="cc-action-grid">' + action('open_archive', 'Открыть архив', '▤') + action('cleanup_archive', 'Очистить медиа', '⌫') + '<button class="cc-action wide" id="ccArchiveToggle"><span class="cc-action-icon">◉</span><span>' + (item.archive_enabled ? 'Не хранить архив на этом ПК' : 'Хранить архив на этом ПК') + '</span></button></div></div>' +
       '<div class="cc-action-group"><div class="cc-action-label">Опасные</div><div class="cc-action-grid">' + action('reboot', 'Перезагрузить ПК', '↻', 'danger') + action('shutdown', 'Выключить ПК', '⏻', 'danger') + '</div></div><div class="cc-command-status" id="ccCommandStatus"></div></div>' +
       '<div class="cc-card"><div class="cc-card-title"><span>Экран</span><button class="btn" id="ccScreenshotRefresh">Обновить снимок</button></div><div class="cc-screenshot-shell" id="ccScreenshot"><div class="cc-screenshot-empty">Снимок загружается только по вашему запросу и временно хранится на сервере.</div></div><div class="cc-card-note" id="ccScreenshotMeta" style="margin-top:8px"></div></div>' +
       '<div class="cc-card" id="ccCommandHistory" style="display:none"><div class="cc-card-title"><span>История команд</span><button class="btn" id="ccHistoryClose">Скрыть</button></div><div id="ccCommandHistoryList"></div></div>' +
       (X.state.boot?.user?.is_owner ? '<section class="cc-card cc-agent-detach"><div><h3>Подключение к XASS</h3><p>Отвязка удалит устройство из списка и отзовёт его ключ. Файлы на ПК и сохранённые архивы останутся на месте.</p><p>Для повторного подключения понадобится новый код привязки.</p></div><button type="button" class="btn danger" id="ccAgentDetach">Отвязать агент</button><div id="ccDetachStatus" role="status" aria-live="polite"></div></section>' : '');
+  }
+
+  function nativeUpdateHtml(item) {
+    if (item.last_payload?.native_update_capabilities?.schema !== 1) return '';
+    return '<section class="cc-action-group"><div class="cc-action-label">Нативный Windows-клиент</div>' +
+      '<label for="ccNativeUpdateChannel">Канал обновления</label><select id="ccNativeUpdateChannel"><option value="selected">Выбранный на ПК</option><option value="native">Релиз</option><option value="native-test">Бета</option></select>' +
+      '<div class="cc-action-grid"><button class="cc-action" data-native-update="check">Проверить канал на ПК</button><button class="cc-action" data-native-update="install">Выбрать и установить на ПК</button><button class="cc-action" data-native-update="rollback">Вернуть предыдущую установку</button></div>' +
+      '<p class="cc-card-note">Отправляется запрос, а не готовая установка. Откройте XASS → Обновления на ПК и подтвердите точную версию. Источник пакетов — официальный GitHub. Возврат использует локальную проверенную копию и не откатывает профиль. Для старого клиента сначала потребуется новый нативный установщик.</p></section>';
   }
 
   function bindAgentDetail(item) {
@@ -393,6 +402,14 @@
       const command = button.dataset.ccCommand;
       if (command === 'history') return loadCommandHistory(item.source_name);
       runAgentCommand(item.source_name, command, {}, button);
+    });
+    $('ccAgentBody').querySelectorAll('[data-native-update]').forEach(button => {
+      button.disabled = !item.is_online;
+      button.onclick = () => {
+        const operation = button.dataset.nativeUpdate;
+        const channel = operation === 'rollback' ? 'selected' : $('ccNativeUpdateChannel').value;
+        runAgentCommand(item.source_name, 'native_update', {operation, channel}, button);
+      };
     });
     $('ccScreenshotRefresh').disabled = !item.is_online;
     $('ccScreenshotRefresh').onclick = () => runAgentCommand(item.source_name, 'screenshot', {}, $('ccScreenshotRefresh'), () => loadLatestScreenshot(item.source_name));
@@ -448,7 +465,11 @@
     const agent = (X.state.boot?.sources || []).find(item => item.source_name === source);
     if (!agent?.is_online) { X.toast('Нет связи с ПК. Включите агент и обновите состояние.'); return null; }
     const dangerous = DANGEROUS.has(command);
-    if (dangerous && !await confirmAction((COMMAND_LABELS[command] || command) + ' на «' + source + '»?')) return null;
+    const nativeRequestText = command === 'native_update' ?
+      'Запрос: ' + ({check: 'проверка', install: 'установка', rollback: 'возврат предыдущей установки'}[payload.operation] || '') +
+      ', канал: ' + ({selected: 'выбранный на ПК', native: 'Релиз', 'native-test': 'Бета'}[payload.channel] || '') +
+      '. На ПК потребуется отдельное подтверждение точной версии. ' : '';
+    if (dangerous && !await confirmAction(nativeRequestText + (COMMAND_LABELS[command] || command) + ' на «' + source + '»?')) return null;
     if (pendingCommands.has(key)) return null;
     pendingCommands.set(key, true);
     if (button) button.disabled = true;

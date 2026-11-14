@@ -380,7 +380,8 @@ async function loadUpdateStatus(){
     const r=await api('update-status'),d=r.data||{};
     if(r.status!==200||!d.ok)throw new Error(d.detail||'Сервер не ответил на проверку');
     if(d.errors?.length)throw new Error(d.errors.join('\n'));
-    output.textContent=d.has_updates?'Доступно изменений: '+(d.commits||[]).length:'Новых обновлений нет';
+    const current=d.current?.short_hash||'не определён',remote=d.remote?.short_hash||'не определён';
+    output.textContent=(d.has_updates?'Сервер: доступно изменений: '+(d.commits||[]).length:'Сервер: новых обновлений нет')+'\nВетка: '+(d.branch||'не определена')+' · установлен '+current+' · origin '+remote+'\nЭто проверка серверного кода. Windows-приложение обновляется отдельно в разделе «Обновления» на ПК.';
     button.disabled=!d.has_updates;
   }catch(error){output.textContent='Не удалось проверить обновление: '+(error.message||'нет связи')}
   finally{check.disabled=false}

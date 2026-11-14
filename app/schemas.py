@@ -7,6 +7,7 @@ from app.enums import SourceType
 
 
 class HeartbeatPayload(BaseModel):
+    native_update_capabilities: dict[str, Any] | None = None
     source_name: str = Field(min_length=1, max_length=128)
     source_type: SourceType = SourceType.PC_AGENT
     metrics: dict[str, Any] = Field(default_factory=dict)
